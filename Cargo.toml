@@ -37,6 +37,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 dirs = "5"
 camino = "1"
+libc = "0.2"
 semver = { version = "1", features = ["serde"] }
 tempfile = "3"
 

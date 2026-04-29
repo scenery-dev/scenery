@@ -27,3 +27,8 @@ tracing-subscriber.workspace = true
 clap.workspace = true
 async-trait.workspace = true
 dirs.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+dirs.workspace = true
+libc.workspace = true
