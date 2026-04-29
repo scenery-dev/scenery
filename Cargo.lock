@@ -1804,13 +1804,13 @@ name = "vectorhawkd-shim"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-trait",
+ "dirs",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
- "vectorhawkd-core",
+ "tracing-subscriber",
  "vectorhawkd-mcp",
 ]
 

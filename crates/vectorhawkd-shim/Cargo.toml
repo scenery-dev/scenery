@@ -12,9 +12,12 @@ description = "VectorHawk runner — stdio↔socket relay shim"
 name = "vectorhawkd-shim"
 path = "src/main.rs"
 
+[lib]
+name = "vectorhawkd_shim"
+path = "src/lib.rs"
+
 [dependencies]
 vectorhawkd-mcp = { path = "../vectorhawkd-mcp" }
-vectorhawkd-core = { path = "../vectorhawkd-core" }
 
 tokio = { workspace = true, features = ["rt", "macros", "io-util", "net", "fs", "time", "sync", "signal"] }
 serde.workspace = true
@@ -22,4 +25,5 @@ serde_json.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-async-trait.workspace = true
+tracing-subscriber = { workspace = true }
+dirs.workspace = true
