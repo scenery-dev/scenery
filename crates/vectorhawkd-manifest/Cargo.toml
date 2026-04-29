@@ -8,7 +8,13 @@ license.workspace = true
 repository.workspace = true
 description = "VectorHawk runner — skill manifest and bundle types"
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [dependencies]
+anyhow.workspace = true
+camino.workspace = true
+semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
