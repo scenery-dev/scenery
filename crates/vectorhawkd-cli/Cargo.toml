@@ -16,6 +16,7 @@ path = "src/main.rs"
 vectorhawkd-manifest = { path = "../vectorhawkd-manifest" }
 vectorhawkd-core = { path = "../vectorhawkd-core" }
 vectorhawkd-mcp = { path = "../vectorhawkd-mcp" }
+vectorhawkd-shim = { path = "../vectorhawkd-shim" }
 
 tokio.workspace = true
 serde.workspace = true
