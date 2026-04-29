@@ -1,0 +1,530 @@
+//! The `Backend` trait and its three M0 implementations.
+//!
+//! # Architecture
+//!
+//! `Server<B: Backend>` is the MCP JSON-RPC dispatch loop. The `Backend` trait
+//! is the seam between the loop and the actual work:
+//!
+//! ```text
+//! AI client --stdio MCP--> Server<SocketBackend>   (shim normal path)
+//!                          Server<EmbeddedBackend> (shim fallback path)
+//! shim socket          --> Server<RealBackend>      (daemon)
+//! ```
+//!
+//! # Implementations
+//!
+//! | Type | Who uses it | M0 status |
+//! |---|---|---|
+//! | `SocketBackend` | Shim (normal) | Scaffolded — relay loop lands in Stream 3 |
+//! | `EmbeddedBackend` | Shim (fallback) | Functional — in-memory BackendRegistry |
+//! | `RealBackend` | Daemon | Scaffolded — wired up fully in Stream 4 |
+//!
+//! # Local socket framing
+//!
+//! 4-byte big-endian length prefix followed by a UTF-8 JSON body.
+//!
+//! Rationale: length-prefixed framing is robust to embedded newlines in JSON
+//! payloads (rare but possible in user-supplied strings). Newline-delimited
+//! would be simpler but would require escaping any `\n` inside values.
+//! The LSP-style Content-Length header is more complex than we need for a local
+//! Unix socket. 4-byte prefix is the sweet spot: zero ambiguity, trivially
+//! implemented in `tokio::io`, same convention used by many language servers
+//! and wire protocols.
+
+use crate::{
+    aggregator::{BackendEntry, BackendRegistry, BackendTransport, ToolDefinition, ToolVisibility},
+    protocol::{
+        InitializeResult, JsonRpcResponse, ServerCapabilities, ServerInfo, ToolCallParams,
+        ToolCallResult, ToolDefinition as ProtoToolDef, ToolsCapability, ToolsListResult,
+    },
+};
+use anyhow::{Context, Result};
+use async_trait::async_trait;
+use serde_json::Value;
+use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(unix)]
+use tokio::net::UnixStream;
+
+// ── Backend trait ─────────────────────────────────────────────────────────────
+
+/// The seam between the MCP dispatch loop and its work source.
+///
+/// The daemon installs `RealBackend`; the shim normally installs `SocketBackend`
+/// and falls back to `EmbeddedBackend` when the socket is unreachable.
+///
+/// Methods receive and return fully-typed MCP params/results. The dispatch loop
+/// handles JSON-RPC framing and error serialization around these calls.
+#[async_trait]
+pub trait Backend: Send + Sync + 'static {
+    /// Handle an `initialize` request. Returns server capabilities and metadata.
+    async fn initialize(&self, params: Value) -> Result<InitializeResult>;
+
+    /// Handle a `tools/list` request. Returns all currently available tools.
+    async fn list_tools(&self, params: Value) -> Result<ToolsListResult>;
+
+    /// Handle a `tools/call` request.
+    async fn call_tool(&self, params: ToolCallParams) -> Result<ToolCallResult>;
+
+    /// Optional: called when the server loop starts to allow the backend to
+    /// perform any deferred initialization (e.g. connecting to the daemon
+    /// socket, syncing the backend registry).
+    async fn on_start(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Optional: called when the server loop exits cleanly to allow graceful
+    /// shutdown (e.g. closing the socket, flushing audit events).
+    async fn on_shutdown(&self) {}
+}
+
+// ── Framing helpers ───────────────────────────────────────────────────────────
+
+/// Write a length-prefixed JSON frame to the stream.
+///
+/// Frame format: 4-byte big-endian length (bytes in body) + UTF-8 JSON body.
+pub async fn write_framed<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    body: &[u8],
+) -> std::io::Result<()> {
+    let len = body.len() as u32;
+    writer.write_all(&len.to_be_bytes()).await?;
+    writer.write_all(body).await?;
+    writer.flush().await
+}
+
+/// Read a length-prefixed JSON frame from the stream.
+///
+/// Returns `None` on clean EOF (peer closed connection).
+pub async fn read_framed<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+) -> std::io::Result<Option<Vec<u8>>> {
+    let mut len_buf = [0u8; 4];
+    match reader.read_exact(&mut len_buf).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
+    }
+    let len = u32::from_be_bytes(len_buf) as usize;
+    let mut body = vec![0u8; len];
+    reader.read_exact(&mut body).await?;
+    Ok(Some(body))
+}
+
+// ── EmbeddedBackend ───────────────────────────────────────────────────────────
+
+/// In-process backend that runs dispatch logic directly, with no daemon socket.
+///
+/// The shim uses this when the daemon socket is unreachable (>2 s timeout). It
+/// holds its own `BackendRegistry` and serves the session from memory. No audit
+/// upload, no registry sync, no OAuth callback — those require the long-lived
+/// daemon process.
+///
+/// This is also the canonical reference implementation: every other stream can
+/// use it as the integration test target before the daemon or socket relay is
+/// ready.
+pub struct EmbeddedBackend {
+    registry: Arc<BackendRegistry>,
+    server_name: String,
+    server_version: String,
+}
+
+impl EmbeddedBackend {
+    /// Create an embedded backend with a pre-populated registry.
+    pub fn new(registry: Arc<BackendRegistry>) -> Self {
+        Self {
+            registry,
+            server_name: "vectorhawkd".to_string(),
+            server_version: env!("CARGO_PKG_VERSION").to_string(),
+        }
+    }
+
+    /// Create an embedded backend with a single stub backend pre-registered.
+    ///
+    /// Convenience constructor for tests and the M0 shim fallback.
+    pub fn with_stub_backend(server_id: &str, tools: &[(&str, &str)]) -> Self {
+        let registry = Arc::new(BackendRegistry::new());
+        let tool_defs: Vec<ToolDefinition> = tools
+            .iter()
+            .map(|(name, desc)| ToolDefinition {
+                name: name.to_string(),
+                description: Some(desc.to_string()),
+                input_schema: None,
+            })
+            .collect();
+        registry.register_backend(BackendEntry {
+            server_id: server_id.to_string(),
+            name: server_id.to_string(),
+            transport: BackendTransport::Stub,
+            tools: tool_defs,
+            tool_visibility: ToolVisibility::All,
+            priority: 50,
+        });
+        Self::new(registry)
+    }
+}
+
+#[async_trait]
+impl Backend for EmbeddedBackend {
+    async fn initialize(&self, _params: Value) -> Result<InitializeResult> {
+        Ok(InitializeResult {
+            protocol_version: "2024-11-05".to_string(),
+            capabilities: ServerCapabilities {
+                tools: Some(ToolsCapability { list_changed: true }),
+            },
+            server_info: ServerInfo {
+                name: self.server_name.clone(),
+                version: self.server_version.clone(),
+            },
+            instructions: Some(
+                "VectorHawk runner — governed AI platform. \
+                 Running in in-process fallback mode (daemon unreachable). \
+                 Audit, registry sync, and OAuth are unavailable in this session."
+                    .to_string(),
+            ),
+        })
+    }
+
+    async fn list_tools(&self, _params: Value) -> Result<ToolsListResult> {
+        let backend_tools = self.registry.all_tools();
+        let tools: Vec<ProtoToolDef> = backend_tools
+            .iter()
+            .filter_map(|bt| {
+                let name = bt["name"].as_str()?.to_string();
+                let description = bt["description"].as_str().unwrap_or("").to_string();
+                let input_schema = bt
+                    .get("inputSchema")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({"type": "object", "properties": {}}));
+                Some(ProtoToolDef {
+                    name,
+                    description,
+                    input_schema,
+                })
+            })
+            .collect();
+        Ok(ToolsListResult { tools })
+    }
+
+    async fn call_tool(&self, params: ToolCallParams) -> Result<ToolCallResult> {
+        match self.registry.dispatch(&params.name, &params.arguments) {
+            Some(Ok(value)) => {
+                let text =
+                    serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
+                Ok(ToolCallResult::success(text))
+            }
+            Some(Err(e)) => Ok(ToolCallResult::error_result(format!("backend error: {e}"))),
+            None => Ok(ToolCallResult::error_result(format!(
+                "unknown tool: {}",
+                params.name
+            ))),
+        }
+    }
+
+    async fn on_shutdown(&self) {
+        self.registry.shutdown();
+    }
+}
+
+// ── SocketBackend ─────────────────────────────────────────────────────────────
+//
+// Unix-only (macOS + Linux). Windows support deferred to M2/M3.
+
+/// Backend that relays all MCP calls to the daemon over a Unix domain socket.
+///
+/// Each MCP method call is serialized as a JSON-RPC request, sent over the
+/// socket with length-prefix framing, and the response is awaited and
+/// deserialized. The daemon sees the shim as a client and dispatches the call
+/// to `RealBackend`.
+///
+/// The shim instantiates this first; if the socket is unreachable within 2 s
+/// it falls back to `EmbeddedBackend`.
+///
+/// # M0 status
+///
+/// Scaffolded — the struct and framing helpers exist; the actual relay loop
+/// (`vectorhawkd-shim`) is completed in Stream 3.
+#[cfg(unix)]
+pub struct SocketBackend {
+    socket_path: std::path::PathBuf,
+    /// Live connection to the daemon, established during `on_start`.
+    stream: Arc<tokio::sync::Mutex<Option<UnixStream>>>,
+}
+
+#[cfg(unix)]
+impl SocketBackend {
+    pub fn new(socket_path: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            socket_path: socket_path.into(),
+            stream: Arc::new(tokio::sync::Mutex::new(None)),
+        }
+    }
+
+    /// Connect to the daemon socket with a 2 s timeout.
+    pub async fn connect(&self) -> Result<()> {
+        let timeout = std::time::Duration::from_secs(2);
+        let stream = tokio::time::timeout(timeout, UnixStream::connect(&self.socket_path))
+            .await
+            .context("daemon socket connect timed out (>2 s)")?
+            .context("failed to connect to daemon socket")?;
+
+        *self.stream.lock().await = Some(stream);
+        Ok(())
+    }
+
+    /// Returns `true` if there is a live socket connection.
+    pub async fn is_connected(&self) -> bool {
+        self.stream.lock().await.is_some()
+    }
+
+    /// Send a JSON-RPC request over the socket and await the result value.
+    async fn relay(&self, method: &str, params: Value) -> Result<Value> {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params,
+        });
+        let body = serde_json::to_vec(&request).context("failed to serialize relay request")?;
+
+        let mut guard = self.stream.lock().await;
+        let stream = guard
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("socket not connected — call on_start() first"))?;
+
+        let (mut reader, mut writer) = stream.split();
+
+        write_framed(&mut writer, &body)
+            .await
+            .context("failed to write framed request")?;
+
+        let frame = read_framed(&mut reader)
+            .await
+            .context("failed to read framed response")?
+            .ok_or_else(|| anyhow::anyhow!("daemon closed socket unexpectedly"))?;
+
+        let response: JsonRpcResponse =
+            serde_json::from_slice(&frame).context("failed to parse daemon response")?;
+
+        if let Some(err) = response.error {
+            anyhow::bail!("daemon returned error {}: {}", err.code, err.message);
+        }
+
+        response
+            .result
+            .ok_or_else(|| anyhow::anyhow!("daemon response has no result"))
+    }
+}
+
+#[cfg(unix)]
+#[async_trait]
+impl Backend for SocketBackend {
+    async fn on_start(&self) -> Result<()> {
+        self.connect().await
+    }
+
+    async fn initialize(&self, params: Value) -> Result<InitializeResult> {
+        let resp = self.relay("initialize", params).await?;
+        serde_json::from_value(resp).context("failed to deserialize initialize result")
+    }
+
+    async fn list_tools(&self, params: Value) -> Result<ToolsListResult> {
+        let resp = self.relay("tools/list", params).await?;
+        serde_json::from_value(resp).context("failed to deserialize tools/list result")
+    }
+
+    async fn call_tool(&self, params: ToolCallParams) -> Result<ToolCallResult> {
+        let params_value =
+            serde_json::to_value(&params).context("failed to serialize tool call params")?;
+        let resp = self.relay("tools/call", params_value).await?;
+        serde_json::from_value(resp).context("failed to deserialize tools/call result")
+    }
+}
+
+// ── RealBackend ───────────────────────────────────────────────────────────────
+
+/// The daemon's backend implementation.
+///
+/// Holds the `BackendRegistry` (live HTTP/2 connections to approved backend MCP
+/// servers), dispatches tool calls to the correct backend, and emits audit
+/// events. The daemon instantiates `Server<RealBackend>` which listens on the
+/// Unix socket and handles each shim connection in a separate task.
+///
+/// # M0 status
+///
+/// Scaffolded — the struct exists, `initialize` and `list_tools` return sensible
+/// responses from the in-memory registry. Real HTTP dispatch and audit emission
+/// land in Stream 4 (daemon stream).
+pub struct RealBackend {
+    registry: Arc<BackendRegistry>,
+    server_name: String,
+    server_version: String,
+}
+
+impl RealBackend {
+    pub fn new(registry: Arc<BackendRegistry>) -> Self {
+        Self {
+            registry,
+            server_name: "vectorhawkd".to_string(),
+            server_version: env!("CARGO_PKG_VERSION").to_string(),
+        }
+    }
+}
+
+#[async_trait]
+impl Backend for RealBackend {
+    async fn initialize(&self, _params: Value) -> Result<InitializeResult> {
+        Ok(InitializeResult {
+            protocol_version: "2024-11-05".to_string(),
+            capabilities: ServerCapabilities {
+                tools: Some(ToolsCapability { list_changed: true }),
+            },
+            server_info: ServerInfo {
+                name: self.server_name.clone(),
+                version: self.server_version.clone(),
+            },
+            instructions: Some("VectorHawk runner — governed AI platform.".to_string()),
+        })
+    }
+
+    async fn list_tools(&self, _params: Value) -> Result<ToolsListResult> {
+        let backend_tools = self.registry.all_tools();
+        let tools: Vec<ProtoToolDef> = backend_tools
+            .iter()
+            .filter_map(|bt| {
+                let name = bt["name"].as_str()?.to_string();
+                let description = bt["description"].as_str().unwrap_or("").to_string();
+                let input_schema = bt
+                    .get("inputSchema")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({"type": "object", "properties": {}}));
+                Some(ProtoToolDef {
+                    name,
+                    description,
+                    input_schema,
+                })
+            })
+            .collect();
+        Ok(ToolsListResult { tools })
+    }
+
+    async fn call_tool(&self, params: ToolCallParams) -> Result<ToolCallResult> {
+        // TODO(M1 / Stream 4): real HTTP dispatch, audit event emission
+        match self.registry.dispatch(&params.name, &params.arguments) {
+            Some(Ok(value)) => {
+                let text =
+                    serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
+                Ok(ToolCallResult::success(text))
+            }
+            Some(Err(e)) => Ok(ToolCallResult::error_result(format!(
+                "backend dispatch error: {e}"
+            ))),
+            None => Ok(ToolCallResult::error_result(format!(
+                "unknown tool: {}",
+                params.name
+            ))),
+        }
+    }
+
+    async fn on_shutdown(&self) {
+        self.registry.shutdown();
+    }
+}
+
+// ── Tests ──────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    async fn make_embedded() -> EmbeddedBackend {
+        EmbeddedBackend::with_stub_backend(
+            "test",
+            &[("do_thing", "Does a thing"), ("other_tool", "Another tool")],
+        )
+    }
+
+    #[tokio::test]
+    async fn embedded_initialize_returns_correct_protocol() {
+        let backend = make_embedded().await;
+        let result = backend.initialize(serde_json::json!({})).await.unwrap();
+        assert_eq!(result.protocol_version, "2024-11-05");
+        assert_eq!(result.server_info.name, "vectorhawkd");
+        assert!(result.capabilities.tools.is_some());
+    }
+
+    #[tokio::test]
+    async fn embedded_list_tools_returns_namespaced_tools() {
+        let backend = make_embedded().await;
+        let result = backend.list_tools(serde_json::json!({})).await.unwrap();
+        let names: Vec<&str> = result.tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            names.contains(&"test__do_thing"),
+            "expected test__do_thing in {names:?}"
+        );
+        assert!(
+            names.contains(&"test__other_tool"),
+            "expected test__other_tool in {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn embedded_call_tool_stub_returns_ok() {
+        let backend = make_embedded().await;
+        let result = backend
+            .call_tool(ToolCallParams {
+                name: "test__do_thing".to_string(),
+                arguments: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+        assert!(
+            result.is_error.is_none(),
+            "stub call should not be an error"
+        );
+        assert!(!result.content.is_empty());
+    }
+
+    #[tokio::test]
+    async fn embedded_call_unknown_tool_returns_error_result() {
+        let backend = make_embedded().await;
+        let result = backend
+            .call_tool(ToolCallParams {
+                name: "unknown__tool".to_string(),
+                arguments: serde_json::json!({}),
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.is_error, Some(true));
+    }
+
+    #[tokio::test]
+    async fn framing_write_produces_correct_byte_layout() {
+        let payload = br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+        let mut buf = Vec::new();
+        write_framed(&mut buf, payload).await.unwrap();
+
+        // First 4 bytes: big-endian length.
+        let len_bytes: [u8; 4] = buf[..4].try_into().unwrap();
+        let len = u32::from_be_bytes(len_bytes) as usize;
+        assert_eq!(len, payload.len());
+        // Remaining bytes: the payload verbatim.
+        assert_eq!(&buf[4..], payload);
+    }
+
+    #[tokio::test]
+    async fn framing_round_trip() {
+        let payload = br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+        let mut written = Vec::new();
+        write_framed(&mut written, payload).await.unwrap();
+
+        // Read back via an in-memory channel (avoids std::io::Cursor AsyncRead issue).
+        let (mut server_half, mut client_half) = tokio::io::duplex(1024);
+        client_half.write_all(&written).await.unwrap();
+        drop(client_half); // close write side so EOF is clean
+
+        let frame = read_framed(&mut server_half).await.unwrap().unwrap();
+        assert_eq!(frame, payload);
+    }
+}
