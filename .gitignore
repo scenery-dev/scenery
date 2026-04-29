@@ -1,0 +1,14 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+.DS_Store
+.idea
+.vscode
+*.swp
+*.swo
+.env
+.env.local
+*.log
+state.db
+state.db-*
+agent.sock

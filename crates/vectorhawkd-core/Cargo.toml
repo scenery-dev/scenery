@@ -1,0 +1,26 @@
+[package]
+name = "vectorhawkd-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "VectorHawk runner — core app logic (state, registry, policy, executor)"
+
+[dependencies]
+vectorhawkd-manifest = { path = "../vectorhawkd-manifest" }
+
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+reqwest.workspace = true
+rusqlite.workspace = true
+async-trait.workspace = true
+url.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+dirs.workspace = true
