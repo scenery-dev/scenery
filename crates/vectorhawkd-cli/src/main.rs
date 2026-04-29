@@ -19,7 +19,6 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use tracing::warn;
 
 // ── CLI structure ─────────────────────────────────────────────────────────────
 
@@ -188,48 +187,9 @@ async fn probe_daemon_socket(_path: &str) -> String {
 // ── mcp serve ─────────────────────────────────────────────────────────────────
 
 async fn cmd_mcp_serve() -> Result<()> {
-    use vectorhawkd_core::app::VectorHawkApp;
-    use vectorhawkd_mcp::{backend::EmbeddedBackend, server::Server};
-
-    // Resolve socket path. If bootstrap fails, fall back immediately.
-    let socket_path = match VectorHawkApp::bootstrap() {
-        Ok(app) => Some(app.state.socket_path()),
-        Err(e) => {
-            warn!(error = %e, "state bootstrap failed; skipping daemon connect");
-            None
-        }
-    };
-
-    // Try SocketBackend (daemon relay) first on Unix.
-    #[cfg(unix)]
-    if let Some(ref path) = socket_path {
-        use vectorhawkd_mcp::backend::SocketBackend;
-
-        let backend = SocketBackend::new(path.as_std_path());
-        match try_connect_socket(&backend).await {
-            Ok(()) => {
-                return Server::new(backend).run_stdio().await;
-            }
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    socket = %path,
-                    "daemon unreachable, falling back to EmbeddedBackend"
-                );
-            }
-        }
-    }
-
-    // Fallback: run fully in-process with an empty registry.
-    warn!("running in in-process fallback mode (daemon not reached)");
-    let backend = EmbeddedBackend::with_stub_backend("vectorhawk", &[]);
-    Server::new(backend).run_stdio().await
-}
-
-/// Connect a `SocketBackend`, surfacing connect errors without consuming it.
-#[cfg(unix)]
-async fn try_connect_socket(backend: &vectorhawkd_mcp::backend::SocketBackend) -> Result<()> {
-    backend.connect().await.context("daemon socket unreachable")
+    // Delegate entirely to the shim library, which owns the per-frame read-loop
+    // and the mid-session daemon-kill fallback logic (AC4).
+    vectorhawkd_shim::run_shim().await
 }
 
 // ── mcp setup ────────────────────────────────────────────────────────────────
