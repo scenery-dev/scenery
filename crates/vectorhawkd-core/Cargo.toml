@@ -17,10 +17,12 @@ serde_json.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
-reqwest.workspace = true
+reqwest = { workspace = true, features = ["blocking"] }
 rusqlite.workspace = true
 async-trait.workspace = true
 url.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 dirs.workspace = true
+camino.workspace = true
+semver.workspace = true
