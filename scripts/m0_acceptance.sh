@@ -159,13 +159,13 @@ echo "AC6: verifying mcp setup entry shape..."
 AC6_PASS=0
 
 if [[ -x "${CLI_BIN}" ]]; then
-    # The setup command should print a JSON config line containing the expected shape.
-    # We do a dry-run / print-only to avoid mutating the user's actual AI client config.
-    if "${CLI_BIN}" mcp setup --dry-run 2>&1 | grep -q '"vectorhawk"'; then
-        if "${CLI_BIN}" mcp setup --dry-run 2>&1 | grep -q '"mcp"' && \
-           "${CLI_BIN}" mcp setup --dry-run 2>&1 | grep -q '"serve"'; then
-            AC6_PASS=1
-        fi
+    # Capture output once to avoid SIGPIPE from `grep -q` closing the pipe early
+    # under `set -o pipefail` (which would mark the CLI as having failed).
+    SETUP_OUTPUT="$("${CLI_BIN}" mcp setup --dry-run 2>&1)"
+    if [[ "${SETUP_OUTPUT}" == *'"vectorhawk"'* && \
+          "${SETUP_OUTPUT}" == *'"mcp"'* && \
+          "${SETUP_OUTPUT}" == *'"serve"'* ]]; then
+        AC6_PASS=1
     fi
 else
     echo "  CLI binary not found; verifying via source inspection instead..."
