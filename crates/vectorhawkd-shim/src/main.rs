@@ -1,14 +1,23 @@
-//! VectorHawk runner — stdio↔socket relay shim.
+//! VectorHawk runner — shim binary entry point.
 //!
-//! Spawned per AI-client session. Reads JSON-RPC from stdin, relays to the
-//! daemon over Unix socket, writes responses/notifications back to stdout.
-//! Falls back to running an in-process embedded server if the daemon socket
-//! is unreachable for >2 seconds.
-//!
-//! Typically invoked as `vectorhawk mcp serve`; this binary exists so the
-//! shim can also be tested in isolation.
+//! This is a thin wrapper: initialise tracing, then delegate to
+//! [`vectorhawkd_shim::run_shim`]. All logic lives in the library so that
+//! `vectorhawk mcp serve` (Stream 3 — CLI) can reuse the same entry point
+//! without depending on this binary.
 
-fn main() {
-    eprintln!("vectorhawkd-shim: not yet implemented (M0 placeholder)");
-    std::process::exit(2);
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
+    // Tracing to stderr only; stdout is the MCP wire.
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_env("VECTORHAWK_LOG")
+                .add_directive(tracing::Level::WARN.into()),
+        )
+        .init();
+
+    if let Err(e) = vectorhawkd_shim::run_shim().await {
+        tracing::error!(error = %e, "shim exited with error");
+        std::process::exit(1);
+    }
 }
