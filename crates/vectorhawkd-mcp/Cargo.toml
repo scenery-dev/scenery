@@ -24,3 +24,4 @@ bytes.workspace = true
 reqwest.workspace = true
 url.workspace = true
 uuid.workspace = true
+dirs = "5"
