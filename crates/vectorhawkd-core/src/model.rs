@@ -61,6 +61,13 @@ impl MockModelClient {
             completion_tokens: 5,
         }
     }
+
+    /// Override the token counts returned by this mock.
+    pub fn with_tokens(mut self, prompt: u64, completion: u64) -> Self {
+        self.prompt_tokens = prompt;
+        self.completion_tokens = completion;
+        self
+    }
 }
 
 impl ModelClient for MockModelClient {

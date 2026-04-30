@@ -14,10 +14,11 @@ vectorhawkd-manifest = { path = "../vectorhawkd-manifest" }
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml = "0.9"
 thiserror.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
-reqwest = { workspace = true, features = ["blocking"] }
+reqwest = { workspace = true, features = ["blocking", "multipart"] }
 rusqlite.workspace = true
 async-trait.workspace = true
 url.workspace = true
@@ -26,3 +27,13 @@ chrono.workspace = true
 dirs.workspace = true
 camino.workspace = true
 semver.workspace = true
+jsonschema = "0.17"
+tar = "0.4"
+flate2 = "1"
+tempfile.workspace = true
+sha2 = "0.10"
+hex = "0.4"
+urlencoding = "2"
+
+[dev-dependencies]
+mockito = "1"
