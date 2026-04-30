@@ -73,9 +73,7 @@ pub fn build_tool_list(state: &AppState, registry_url: &Option<String>) -> Vec<T
 
     let logged_in = registry_url
         .as_ref()
-        .and_then(|url| {
-            auth::load_tokens(state, url).ok().flatten()
-        })
+        .and_then(|url| auth::load_tokens(state, url).ok().flatten())
         .is_some();
 
     // Add installed skills as tools
@@ -86,10 +84,11 @@ pub fn build_tool_list(state: &AppState, registry_url: &Option<String>) -> Vec<T
     // Management tools — always available (local operations)
     tools.push(ToolDefinition {
         name: "vectorhawk_list".to_string(),
-        description: "List all installed skills available to the user. Use this when the user asks \
+        description:
+            "List all installed skills available to the user. Use this when the user asks \
             'what skills do I have', 'what tools are available', or 'what can you do'. \
             Shows skill IDs, versions, and descriptions."
-            .to_string(),
+                .to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {},
@@ -395,9 +394,7 @@ pub fn handle_tool_call(
         "vectorhawk_mcp_catalog" => handle_mcp_catalog(state, registry_url),
         "vectorhawk_mcp_request" => handle_mcp_request(arguments, state, registry_url),
         "vectorhawk_mcp_status" => handle_mcp_status(state, registry_url),
-        "vectorhawk_mcp_install" => {
-            handle_mcp_install(arguments, state, registry_url, aggregator)
-        }
+        "vectorhawk_mcp_install" => handle_mcp_install(arguments, state, registry_url, aggregator),
         "vectorhawk_mcp_uninstall" => handle_mcp_uninstall(arguments, registry_url, aggregator),
         _ => handle_skill_run(
             name,
@@ -471,10 +468,7 @@ fn handle_list(state: &AppState) -> ToolCallResult {
     }
 }
 
-fn handle_search(
-    arguments: &serde_json::Value,
-    registry_url: &Option<String>,
-) -> ToolCallResult {
+fn handle_search(arguments: &serde_json::Value, registry_url: &Option<String>) -> ToolCallResult {
     let url = match registry_url {
         Some(u) => u,
         None => return ToolCallResult::error_result("No registry URL configured"),
@@ -577,7 +571,9 @@ fn handle_info(arguments: &serde_json::Value, state: &AppState) -> ToolCallResul
 
     let (_, version, install_root) = match row {
         Some(r) => r,
-        None => return ToolCallResult::error_result(format!("Skill '{skill_id}' is not installed")),
+        None => {
+            return ToolCallResult::error_result(format!("Skill '{skill_id}' is not installed"))
+        }
     };
 
     let active_path = format!("{}/active", install_root);
@@ -790,7 +786,9 @@ fn handle_import(
                 };
                 match mcp_governance::import_preview(url, input, &new_token) {
                     Ok(v) => v,
-                    Err(e) => return ToolCallResult::error_result(format!("Import preview failed: {e}")),
+                    Err(e) => {
+                        return ToolCallResult::error_result(format!("Import preview failed: {e}"))
+                    }
                 }
             } else {
                 return ToolCallResult::error_result(format!("Import preview failed: {e}"));
@@ -1038,30 +1036,38 @@ fn handle_mcp_request(
         Err(e) => return e,
     };
 
-    let result = match mcp_governance::submit_mcp_request(url, server_name, package_source, &access_token) {
-        Ok(v) => v,
-        Err(e) => {
-            let err_str = e.to_string();
-            if err_str.contains("401") || err_str.contains("Unauthorized") {
-                let refresh_token = match auth::load_tokens(state, url) {
-                    Ok(Some(t)) => t.refresh_token,
-                    _ => return auth_elicitation_prompt(url),
-                };
-                let new_token = match try_refresh_auth(state, url, &refresh_token) {
-                    Ok(t) => t,
-                    Err(e) => return e,
-                };
-                match mcp_governance::submit_mcp_request(url, server_name, package_source, &new_token) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        return ToolCallResult::error_result(format!("Failed to submit request: {e}"))
+    let result =
+        match mcp_governance::submit_mcp_request(url, server_name, package_source, &access_token) {
+            Ok(v) => v,
+            Err(e) => {
+                let err_str = e.to_string();
+                if err_str.contains("401") || err_str.contains("Unauthorized") {
+                    let refresh_token = match auth::load_tokens(state, url) {
+                        Ok(Some(t)) => t.refresh_token,
+                        _ => return auth_elicitation_prompt(url),
+                    };
+                    let new_token = match try_refresh_auth(state, url, &refresh_token) {
+                        Ok(t) => t,
+                        Err(e) => return e,
+                    };
+                    match mcp_governance::submit_mcp_request(
+                        url,
+                        server_name,
+                        package_source,
+                        &new_token,
+                    ) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return ToolCallResult::error_result(format!(
+                                "Failed to submit request: {e}"
+                            ))
+                        }
                     }
+                } else {
+                    return ToolCallResult::error_result(format!("Failed to submit request: {e}"));
                 }
-            } else {
-                return ToolCallResult::error_result(format!("Failed to submit request: {e}"));
             }
-        }
-    };
+        };
 
     let req_status = result
         .get("status")
@@ -1079,9 +1085,7 @@ fn handle_mcp_request(
              Run `vectorhawk_mcp_status` to check on it later, then use \
              `vectorhawk_mcp_install` to activate it once approved."
         )),
-        _ => ToolCallResult::success(format!(
-            "Request submitted with status: {req_status}"
-        )),
+        _ => ToolCallResult::success(format!("Request submitted with status: {req_status}")),
     }
 }
 
@@ -1112,7 +1116,9 @@ fn handle_mcp_status(state: &AppState, registry_url: &Option<String>) -> ToolCal
                 match mcp_governance::list_mcp_requests(url, &new_token) {
                     Ok(v) => v,
                     Err(e) => {
-                        return ToolCallResult::error_result(format!("Failed to fetch requests: {e}"))
+                        return ToolCallResult::error_result(format!(
+                            "Failed to fetch requests: {e}"
+                        ))
                     }
                 }
             } else {
@@ -1398,10 +1404,7 @@ fn handle_skill_run(
 /// M1.4: wire to the real update-check when `HttpRegistryClient` gains
 /// `check_for_update`. For now the cache is populated externally (e.g. by
 /// the daemon's registry sync loop).
-fn maybe_build_update_prompt(
-    skill_id: &str,
-    cache: &UpdateCheckCache,
-) -> Option<ToolCallResult> {
+fn maybe_build_update_prompt(skill_id: &str, cache: &UpdateCheckCache) -> Option<ToolCallResult> {
     let cached = cache.lock().ok().and_then(|guard| {
         guard.get(skill_id).and_then(|entry| {
             if entry.checked_at.elapsed() < UPDATE_CHECK_TTL {
@@ -1426,7 +1429,9 @@ fn maybe_build_update_prompt(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
     use super::*;
+    use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
     use vectorhawkd_core::installer::install_unpacked_skill;
 
@@ -1540,7 +1545,10 @@ mod tests {
         let tools = build_tool_list(&state, &None);
         let skill_tool = tools.iter().find(|t| t.name == "test-skill");
 
-        assert!(skill_tool.is_some(), "installed skill should appear as tool");
+        assert!(
+            skill_tool.is_some(),
+            "installed skill should appear as tool"
+        );
         let tool = skill_tool.unwrap();
         assert!(
             tool.description
@@ -1568,7 +1576,10 @@ mod tests {
         let result = handle_list(&state);
         assert!(result.is_error.is_none());
         let text = &result.content[0].text;
-        assert!(text.contains("test-skill"), "should list test-skill, got: {text}");
+        assert!(
+            text.contains("test-skill"),
+            "should list test-skill, got: {text}"
+        );
 
         let _ = fs::remove_dir_all(&state_root);
         let _ = fs::remove_dir_all(&skill_root);
@@ -1605,8 +1616,7 @@ mod tests {
         );
         assert_eq!(result.is_error, Some(true));
         assert!(
-            result.content[0].text.contains("path")
-                || result.content[0].text.contains("skill_id")
+            result.content[0].text.contains("path") || result.content[0].text.contains("skill_id")
         );
 
         let _ = fs::remove_dir_all(&state_root);
@@ -1812,11 +1822,7 @@ mod tests {
     fn handle_import_no_registry() {
         let state_root = temp_root("import-no-reg");
         let state = AppState::bootstrap_in(state_root.clone()).unwrap();
-        let result = handle_import(
-            &serde_json::json!({"input": "some-package"}),
-            &state,
-            &None,
-        );
+        let result = handle_import(&serde_json::json!({"input": "some-package"}), &state, &None);
         assert_eq!(result.is_error, Some(true));
         assert!(result.content[0].text.contains("registry"));
         let _ = fs::remove_dir_all(&state_root);

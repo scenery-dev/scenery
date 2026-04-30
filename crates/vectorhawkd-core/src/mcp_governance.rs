@@ -227,7 +227,8 @@ pub fn fetch_mcp_catalog(base_url: &str) -> Result<McpServersResponse> {
         anyhow::bail!("registry returned HTTP {status} for MCP catalog: {preview}");
     }
 
-    resp.json().context("failed to deserialize MCP catalog response")
+    resp.json()
+        .context("failed to deserialize MCP catalog response")
 }
 
 /// Submit an MCP server access request.
@@ -258,7 +259,8 @@ pub fn submit_mcp_request(
         anyhow::bail!("MCP request submission failed (HTTP {status}): {body}");
     }
 
-    resp.json().context("failed to deserialize MCP request response")
+    resp.json()
+        .context("failed to deserialize MCP request response")
 }
 
 /// List the current user's MCP server access requests.
@@ -278,15 +280,12 @@ pub fn list_mcp_requests(base_url: &str, auth_token: &str) -> Result<serde_json:
         anyhow::bail!("failed to fetch MCP requests (HTTP {status}): {body}");
     }
 
-    resp.json().context("failed to deserialize MCP requests response")
+    resp.json()
+        .context("failed to deserialize MCP requests response")
 }
 
 /// Preview an external import (skill or MCP server).
-pub fn import_preview(
-    base_url: &str,
-    input: &str,
-    auth_token: &str,
-) -> Result<serde_json::Value> {
+pub fn import_preview(base_url: &str, input: &str, auth_token: &str) -> Result<serde_json::Value> {
     let url = format!("{}/portal/import/preview", base_url.trim_end_matches('/'));
     let body = serde_json::json!({ "url": input });
 
@@ -304,15 +303,12 @@ pub fn import_preview(
         anyhow::bail!("import preview failed (HTTP {status}): {body}");
     }
 
-    resp.json().context("failed to deserialize import preview response")
+    resp.json()
+        .context("failed to deserialize import preview response")
 }
 
 /// Submit an external import for approval.
-pub fn import_submit(
-    base_url: &str,
-    input: &str,
-    auth_token: &str,
-) -> Result<serde_json::Value> {
+pub fn import_submit(base_url: &str, input: &str, auth_token: &str) -> Result<serde_json::Value> {
     let url = format!("{}/portal/import/submit", base_url.trim_end_matches('/'));
     let body = serde_json::json!({ "url": input });
 
@@ -330,7 +326,8 @@ pub fn import_submit(
         anyhow::bail!("import submit failed (HTTP {status}): {body}");
     }
 
-    resp.json().context("failed to deserialize import submit response")
+    resp.json()
+        .context("failed to deserialize import submit response")
 }
 
 /// Search the skill registry.
@@ -353,12 +350,11 @@ pub fn search_skills(base_url: &str, query: &str) -> Result<Vec<serde_json::Valu
         anyhow::bail!("skill search failed (HTTP {status}): {body}");
     }
 
-    let results: serde_json::Value = resp.json().context("failed to deserialize search results")?;
+    let results: serde_json::Value = resp
+        .json()
+        .context("failed to deserialize search results")?;
 
-    Ok(results
-        .as_array()
-        .cloned()
-        .unwrap_or_default())
+    Ok(results.as_array().cloned().unwrap_or_default())
 }
 
 /// Install a skill from the registry by ID and optional version.
@@ -371,7 +367,9 @@ pub fn install_from_registry(
     _skill_id: &str,
     _version: Option<&str>,
 ) -> Result<String> {
-    anyhow::bail!("M1.4 — registry install not yet implemented (pending HttpRegistryClient expansion)")
+    anyhow::bail!(
+        "M1.4 — registry install not yet implemented (pending HttpRegistryClient expansion)"
+    )
 }
 
 // ── Logging helpers ───────────────────────────────────────────────────────────
