@@ -149,7 +149,10 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     });
 
     let vh_registry = Arc::new(build_stub_registry());
-    let backend = Arc::new(RealBackend::new(Arc::clone(&vh_registry)));
+    let backend = Arc::new(RealBackend::with_audit(
+        Arc::clone(&vh_registry),
+        Arc::clone(&audit_buffer) as Arc<dyn AuditBuffer>,
+    ));
     info!(
         "backend registry ready ({} backends)",
         vh_registry.backend_count()
