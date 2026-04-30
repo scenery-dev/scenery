@@ -7,6 +7,24 @@
 //!
 //! Frame format (matches `vectorhawkd_mcp::backend`):
 //!   4-byte big-endian length | UTF-8 JSON body
+//!
+//! # spawn_blocking requirement for audit (M1.4)
+//!
+//! When M1.4 wires audit emission into `RealBackend::call_tool`, the audit
+//! `record()` call MUST be wrapped in `tokio::task::spawn_blocking`:
+//!
+//! ```ignore
+//! // WRONG (blocks the current-thread executor):
+//! audit_buffer.record(&event)?;
+//!
+//! // CORRECT:
+//! let buf = Arc::clone(&audit_buffer);
+//! let event_clone = event.clone();
+//! tokio::task::spawn_blocking(move || buf.record(&event_clone)).await??;
+//! ```
+//!
+//! `SqliteAuditBuffer::record` opens a `rusqlite::Connection` synchronously.
+//! Running it on the executor thread serializes all concurrent tool calls.
 
 use anyhow::Result;
 use std::sync::Arc;
