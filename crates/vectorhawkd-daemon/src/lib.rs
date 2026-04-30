@@ -195,6 +195,8 @@ fn build_stub_registry() -> BackendRegistry {
         ],
         tool_visibility: ToolVisibility::All,
         priority: 50,
+        consecutive_errors: 0,
+        unhealthy: false,
     });
     registry
 }
