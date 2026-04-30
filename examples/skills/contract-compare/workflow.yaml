@@ -1,0 +1,19 @@
+name: contract_compare
+steps:
+  - id: extract_a
+    type: tool
+    tool: extract_text
+    input: doc_a
+
+  - id: extract_b
+    type: tool
+    tool: extract_text
+    input: doc_b
+
+  - id: compare
+    type: llm
+    prompt: prompts/compare.txt
+    inputs:
+      text_a: extract_a.output
+      text_b: extract_b.output
+    output_schema: schemas/output.schema.json
