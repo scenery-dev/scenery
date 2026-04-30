@@ -20,7 +20,7 @@ use vectorhawkd_manifest::SkillPackage;
 /// Returns `true` if an update was performed, `false` if none was needed.
 pub fn auto_update_if_needed(
     state: &AppState,
-    registry: &dyn RegistryClient,
+    registry: &RegistryClient,
     skill_id: &str,
     policy: &Policy,
 ) -> Result<bool> {
@@ -62,7 +62,7 @@ pub fn auto_update_if_needed(
 /// Returns the installed version string.
 pub fn install_from_registry(
     state: &AppState,
-    registry: &dyn RegistryClient,
+    registry: &RegistryClient,
     skill_id: &str,
     version: Option<&str>,
 ) -> Result<String> {
@@ -146,7 +146,7 @@ pub fn package_skill(skill_dir: &Utf8Path) -> Result<(Utf8PathBuf, String)> {
 
 fn download_and_install(
     state: &AppState,
-    registry: &dyn RegistryClient,
+    registry: &RegistryClient,
     skill_id: &str,
     version: &str,
 ) -> Result<()> {
@@ -218,7 +218,7 @@ fn query_installed_version(state: &AppState, skill_id: &str) -> Result<Option<St
 /// This function is intentionally read-only — it never installs anything.
 pub fn check_for_update(
     state: &AppState,
-    registry: &dyn RegistryClient,
+    registry: &RegistryClient,
     skill_id: &str,
 ) -> Result<Option<Version>> {
     let installed_str = match query_installed_version(state, skill_id)? {
@@ -265,7 +265,7 @@ pub fn check_for_update(
 /// Returns the total number of state transitions (lifecycle changes + version updates).
 pub fn check_skill_updates(
     state: &AppState,
-    registry: &dyn RegistryClient,
+    registry: &RegistryClient,
     policy_client: &dyn crate::policy::PolicyClient,
 ) -> Result<usize> {
     // ── Phase 1: collect all installed skills (active + deactivated) ──────────
