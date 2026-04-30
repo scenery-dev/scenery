@@ -25,6 +25,8 @@ fn make_backend() -> Arc<RealBackend> {
         }],
         tool_visibility: ToolVisibility::All,
         priority: 50,
+        consecutive_errors: 0,
+        unhealthy: false,
     });
     Arc::new(RealBackend::new(registry))
 }

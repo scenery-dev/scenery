@@ -22,21 +22,31 @@
 //! 2. Installed skill execution tools (handled outside this module, priority 90)
 //! 3. Backend proxied tools, ordered by `BackendEntry::priority` descending
 //!
-//! # M0 limitations
+//! # Health tracking
 //!
-//! - HTTP dispatch stubs out (returns an error); real HTTP call lands in M1.
-//! - Stdio subprocess backends are not yet wired (M1).
-//! - Registry sync (`sync_from_registry`) is stubbed to a no-op; the daemon
-//!   stream (Stream 4) will wire in real backends via `register_backend`.
+//! Each backend tracks consecutive errors. After `UNHEALTHY_THRESHOLD` errors in
+//! a row the backend is marked unhealthy and excluded from `tools/list` until a
+//! successful call resets the error count to zero.
+//!
+//! # Transport variants
+//!
+//! - `Stub` — in-memory echo, always available, used for tests and the fallback.
+//! - `Http` — async reqwest HTTP/2 call to a remote MCP server endpoint.
+//!   Lazy: no connection is opened until the first tool call.
+//! - `Stdio` — spawns a child process MCP server. Uses `tokio::task::spawn_blocking`
+//!   to bridge the sync blocking I/O of `StdioProcess` into the async runtime.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::Value;
 use std::{
+    cmp::Reverse,
     collections::HashMap,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
+
+use crate::stdio_process::StdioProcess;
 
 // ── Tool budget ───────────────────────────────────────────────────────────────
 
@@ -134,26 +144,59 @@ impl ToolVisibility {
     }
 }
 
+/// Number of consecutive errors before a backend is marked unhealthy.
+const UNHEALTHY_THRESHOLD: u32 = 3;
+
 /// Transport variant for a backend MCP server.
-///
-/// M0 only wires `Stub` (in-memory) and `Http` (structure present, dispatch
-/// returns an error until M1). `Stdio` is scaffolded for M1.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum BackendTransport {
     /// In-memory stub — used for tests and the EmbeddedBackend fallback.
     Stub,
-    /// HTTP MCP endpoint. `url` is the base URL; dispatch is stubbed in M0.
+    /// HTTP MCP endpoint. Dispatches JSON-RPC via reqwest HTTP/2 (async).
+    /// Lazy dial: no connection opened until first tool call.
     Http {
         url: String,
         /// Optional Bearer token for gateway-authenticated backends.
         auth_token: Option<String>,
     },
-    /// Stdio child-process backend. Wired in M1.
+    /// Stdio child-process backend.
+    ///
+    /// The `process` field holds the live child process once lazily spawned.
+    /// `Arc<Mutex<Option<...>>>` keeps `Clone` working while sharing one process
+    /// across registry clones.
     Stdio {
         command: String,
         args: Vec<String>,
         env: HashMap<String, String>,
+        /// Shared slot for the live child process; `None` until first use.
+        process: Arc<Mutex<Option<StdioProcess>>>,
     },
+}
+
+// Manual impl: StdioProcess doesn't impl Clone, so we need special handling.
+// Cloning a Stdio transport shares the same Arc (same child process), which is
+// the correct behaviour — registry clones should reuse an already-spawned child.
+impl Clone for BackendTransport {
+    fn clone(&self) -> Self {
+        match self {
+            BackendTransport::Stub => BackendTransport::Stub,
+            BackendTransport::Http { url, auth_token } => BackendTransport::Http {
+                url: url.clone(),
+                auth_token: auth_token.clone(),
+            },
+            BackendTransport::Stdio {
+                command,
+                args,
+                env,
+                process,
+            } => BackendTransport::Stdio {
+                command: command.clone(),
+                args: args.clone(),
+                env: env.clone(),
+                process: process.clone(),
+            },
+        }
+    }
 }
 
 /// A registered backend MCP server.
@@ -165,12 +208,43 @@ pub struct BackendEntry {
     pub tools: Vec<ToolDefinition>,
     pub tool_visibility: ToolVisibility,
     pub priority: u8,
+    /// Consecutive error count; reset to 0 on success.
+    pub consecutive_errors: u32,
+    /// Whether this backend has been marked unhealthy.
+    pub unhealthy: bool,
 }
 
 impl BackendEntry {
     /// Iterate tools filtered by visibility policy.
     pub fn visible_tools(&self) -> Vec<&ToolDefinition> {
+        if self.unhealthy {
+            return vec![];
+        }
         self.tool_visibility.filter(&self.tools)
+    }
+
+    /// Record a successful dispatch; reset error counter.
+    pub fn record_success(&mut self) {
+        self.consecutive_errors = 0;
+        self.unhealthy = false;
+    }
+
+    /// Record a dispatch error. Returns `true` if this pushed the backend
+    /// over the unhealthy threshold.
+    pub fn record_error(&mut self) -> bool {
+        self.consecutive_errors += 1;
+        if self.consecutive_errors >= UNHEALTHY_THRESHOLD {
+            if !self.unhealthy {
+                warn!(
+                    server_id = %self.server_id,
+                    consecutive_errors = self.consecutive_errors,
+                    "backend marked unhealthy after consecutive errors"
+                );
+                self.unhealthy = true;
+            }
+            return true;
+        }
+        false
     }
 }
 
@@ -189,24 +263,36 @@ struct RegistryInner {
 #[derive(Clone)]
 pub struct BackendRegistry {
     inner: Arc<Mutex<RegistryInner>>,
+    /// Shared async HTTP client used for HTTP transport dispatch.
+    http: reqwest::Client,
 }
 
 impl BackendRegistry {
     /// Create a new, empty registry. Call `register_backend` to populate.
     pub fn new() -> Self {
+        let http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(30))
+            // HTTP/2 is used automatically when the server supports it via ALPN.
+            // The reqwest 0.12 + rustls TLS backend handles protocol negotiation.
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+
         Self {
             inner: Arc::new(Mutex::new(RegistryInner {
                 backends: HashMap::new(),
                 budget: ToolBudget::new(),
                 last_synced: None,
             })),
+            http,
         }
     }
 
     /// Register a backend entry directly. Used by the daemon and tests.
     ///
-    /// If a backend with the same `server_id` already exists it is replaced.
-    /// Budget accounting is updated accordingly.
+    /// Backends are inserted in priority order during bulk loads; when called
+    /// for a single entry the budget is updated accordingly. If a backend with
+    /// the same `server_id` already exists it is replaced.
     pub fn register_backend(&self, entry: BackendEntry) {
         let mut inner = self.inner.lock().unwrap();
         let server_id = entry.server_id.clone();
@@ -217,7 +303,9 @@ impl BackendRegistry {
             tool_count
         } else {
             let remaining = inner.budget.remaining();
-            inner.budget.record_truncation(&server_id);
+            if tool_count > 0 {
+                inner.budget.record_truncation(&server_id);
+            }
             inner.budget.consume(remaining);
             remaining
         };
@@ -235,12 +323,57 @@ impl BackendRegistry {
         inner.last_synced = Some(Instant::now());
     }
 
-    /// Returns all namespaced tool definitions from all active backends.
+    /// Register multiple backends at once, allocating budget in priority order
+    /// (highest priority first). This is the preferred bulk-load path.
+    ///
+    /// All existing backends are cleared and the budget is reset before loading.
+    pub fn register_backends_with_priority(&self, mut entries: Vec<BackendEntry>) {
+        // Sort descending by priority so highest-priority backends get budget first.
+        entries.sort_by_key(|e| Reverse(e.priority));
+
+        let mut inner = self.inner.lock().unwrap();
+        inner.backends.clear();
+        inner.budget.reset();
+
+        for entry in entries {
+            let server_id = entry.server_id.clone();
+            let tool_count = entry.visible_tools().len();
+
+            let budget_slots = if inner.budget.has_room_for(tool_count) {
+                inner.budget.consume(tool_count);
+                tool_count
+            } else {
+                let remaining = inner.budget.remaining();
+                if tool_count > 0 {
+                    inner.budget.record_truncation(&server_id);
+                }
+                inner.budget.consume(remaining);
+                remaining
+            };
+
+            let mut entry = entry;
+            entry.tools.truncate(budget_slots);
+
+            info!(server_id = %server_id, tools = budget_slots, priority = entry.priority, "registered backend");
+            inner.backends.insert(server_id, entry);
+        }
+
+        inner.last_synced = Some(Instant::now());
+        info!(
+            backends = inner.backends.len(),
+            "bulk backend registration complete"
+        );
+    }
+
+    /// Returns all namespaced tool definitions from all active (healthy) backends.
     pub fn all_tools(&self) -> Vec<Value> {
         let inner = self.inner.lock().unwrap();
         let mut out = Vec::new();
 
         for backend in inner.backends.values() {
+            if backend.unhealthy {
+                continue;
+            }
             let server_id = &backend.server_id;
             for tool in backend.visible_tools() {
                 let namespaced_name = namespace_tool(server_id, &tool.name);
@@ -265,54 +398,141 @@ impl BackendRegistry {
     ///
     /// Returns `None` if the tool name does not match any registered backend
     /// (i.e. it should be handled by the skill/governance layer instead).
-    pub fn dispatch(&self, namespaced_tool: &str, args: &Value) -> Option<Result<Value>> {
+    ///
+    /// For Stub and Http transports, the inner lock is released before I/O.
+    /// For Stdio, the process Arc is cloned and the lock is released before
+    /// calling `spawn_blocking`, so concurrent tool calls are not serialized.
+    pub async fn dispatch(&self, namespaced_tool: &str, args: &Value) -> Option<Result<Value>> {
         let (server_id, original_tool) = parse_tool_name(namespaced_tool)?;
 
-        let inner = self.inner.lock().unwrap();
-        let backend = inner.backends.get(server_id)?;
-
-        // Verify the tool exists on this backend.
-        let tool_exists = backend.tools.iter().any(|t| t.name == original_tool);
-        if !tool_exists {
-            return Some(Err(anyhow::anyhow!(
-                "tool '{}' not found on backend '{}'",
-                original_tool,
-                server_id
-            )));
+        // ── Extract dispatch target from locked state ─────────────────────────
+        enum DispatchTarget {
+            Stub {
+                response: String,
+            },
+            Http {
+                url: String,
+                auth_token: Option<String>,
+            },
+            Stdio {
+                process: Arc<Mutex<Option<StdioProcess>>>,
+                command: String,
+                args_list: Vec<String>,
+                env: HashMap<String, String>,
+            },
         }
 
-        let transport = backend.transport.clone();
-        // Release lock before any I/O.
-        drop(inner);
+        let (target, server_id_owned) = {
+            let inner = self.inner.lock().unwrap();
+            let backend = inner.backends.get(server_id)?;
 
-        // `args` is passed through to the backend dispatcher in M1.
-        // For M0 only the Stub transport is functional; all others return errors.
-        let result = match transport {
-            BackendTransport::Stub => Ok(serde_json::json!({
-                "content": [{"type": "text", "text": format!("stub response for {namespaced_tool}: {args}")}]
-            })),
-            BackendTransport::Http { .. } => {
-                // TODO(M1): real HTTP dispatch via reqwest async client
-                Err(anyhow::anyhow!(
-                    "HTTP backend dispatch not yet implemented (M1) for '{namespaced_tool}'"
-                ))
+            if backend.unhealthy {
+                return Some(Err(anyhow::anyhow!(
+                    "backend '{}' is unhealthy (too many consecutive errors)",
+                    server_id
+                )));
             }
-            BackendTransport::Stdio { .. } => {
-                // TODO(M1): stdio child-process dispatch
-                Err(anyhow::anyhow!(
-                    "stdio backend dispatch not yet implemented (M1) for '{namespaced_tool}'"
-                ))
+
+            // Verify the tool exists on this backend.
+            let tool_exists = backend.tools.iter().any(|t| t.name == original_tool);
+            if !tool_exists {
+                return Some(Err(anyhow::anyhow!(
+                    "tool '{}' not found on backend '{}'",
+                    original_tool,
+                    server_id
+                )));
             }
+
+            let target = match &backend.transport {
+                BackendTransport::Stub => DispatchTarget::Stub {
+                    response: format!("stub response for {namespaced_tool}: {args}"),
+                },
+                BackendTransport::Http { url, auth_token } => DispatchTarget::Http {
+                    url: url.clone(),
+                    auth_token: auth_token.clone(),
+                },
+                BackendTransport::Stdio {
+                    command,
+                    args: args_list,
+                    env,
+                    process,
+                } => DispatchTarget::Stdio {
+                    process: process.clone(),
+                    command: command.clone(),
+                    args_list: args_list.clone(),
+                    env: env.clone(),
+                },
+            };
+
+            (target, server_id.to_string())
+            // inner lock released here
         };
+
+        let args_owned = args.clone();
+        let tool_name_owned = original_tool.to_string();
+
+        let result = match target {
+            DispatchTarget::Stub { response } => Ok(serde_json::json!({
+                "content": [{"type": "text", "text": response}]
+            })),
+
+            DispatchTarget::Http { url, auth_token } => {
+                self.call_http_tool(&url, &tool_name_owned, &args_owned, auth_token.as_deref())
+                    .await
+            }
+
+            DispatchTarget::Stdio {
+                process,
+                command,
+                args_list,
+                env,
+            } => tokio::task::spawn_blocking(move || {
+                call_stdio_tool_with_arc(
+                    &process,
+                    &command,
+                    &args_list,
+                    &env,
+                    &tool_name_owned,
+                    &args_owned,
+                )
+            })
+            .await
+            .context("spawn_blocking panicked in stdio dispatch")
+            .and_then(|r| r),
+        };
+
+        // ── Update health state ───────────────────────────────────────────────
+        {
+            let mut inner = self.inner.lock().unwrap();
+            if let Some(backend) = inner.backends.get_mut(&server_id_owned) {
+                match &result {
+                    Ok(_) => backend.record_success(),
+                    Err(_) => {
+                        backend.record_error();
+                    }
+                }
+            }
+        }
 
         Some(result)
     }
 
     /// Shut down all backend connections gracefully.
-    /// For M0 (no live connections) this just clears the map.
+    /// For stdio backends this sends a kill signal to the child process.
     pub fn shutdown(&self) {
         let mut inner = self.inner.lock().unwrap();
         let count = inner.backends.len();
+
+        for backend in inner.backends.values() {
+            if let BackendTransport::Stdio { process, .. } = &backend.transport {
+                if let Ok(mut guard) = process.lock() {
+                    if let Some(proc) = guard.as_mut() {
+                        let _ = proc.shutdown();
+                    }
+                }
+            }
+        }
+
         inner.backends.clear();
         inner.budget.reset();
         info!(backends = count, "aggregator shut down");
@@ -365,12 +585,214 @@ impl BackendRegistry {
             .truncated_servers()
             .to_vec()
     }
+
+    /// IDs of backends currently marked unhealthy.
+    pub fn unhealthy_backends(&self) -> Vec<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .backends
+            .values()
+            .filter(|b| b.unhealthy)
+            .map(|b| b.server_id.clone())
+            .collect()
+    }
+
+    /// Mark a backend healthy again (resets consecutive error count).
+    /// Called externally by the health-check loop if a probe succeeds.
+    pub fn mark_healthy(&self, server_id: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(backend) = inner.backends.get_mut(server_id) {
+            if backend.unhealthy {
+                info!(server_id = %server_id, "backend recovered — marking healthy");
+                backend.consecutive_errors = 0;
+                backend.unhealthy = false;
+            }
+        }
+    }
+
+    // ── Private HTTP dispatch ─────────────────────────────────────────────────
+
+    /// Call a tool on an HTTP backend using async reqwest.
+    ///
+    /// MCP Streamable HTTP transport: POST JSON-RPC to the endpoint URL.
+    /// The method is in the request body, not appended to the path.
+    async fn call_http_tool(
+        &self,
+        base_url: &str,
+        tool_name: &str,
+        args: &Value,
+        auth_token: Option<&str>,
+    ) -> Result<Value> {
+        let url = base_url.trim_end_matches('/').to_string();
+        debug!(url = %url, tool = %tool_name, "dispatching tool call to HTTP backend");
+
+        let mut req = self.http.post(&url).json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": tool_name,
+                "arguments": args,
+            }
+        }));
+
+        if let Some(token) = auth_token {
+            req = req.header("authorization", format!("Bearer {token}"));
+        }
+
+        let resp = req
+            .send()
+            .await
+            .with_context(|| format!("failed to reach HTTP backend at {url}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("HTTP backend tool call failed ({status}): {body}");
+        }
+
+        let body: Value = resp
+            .json()
+            .await
+            .context("failed to parse HTTP backend tools/call response")?;
+
+        if let Some(err) = body.get("error") {
+            anyhow::bail!("HTTP backend returned JSON-RPC error: {err}");
+        }
+
+        Ok(body.get("result").cloned().unwrap_or(Value::Null))
+    }
+
+    /// Fetch the tool list from an HTTP MCP backend. Used during registration.
+    pub async fn fetch_tools_http(
+        &self,
+        url: &str,
+        auth_token: Option<&str>,
+    ) -> Result<Vec<ToolDefinition>> {
+        let tools_url = url.trim_end_matches('/').to_string();
+        debug!(url = %tools_url, "fetching tools from HTTP backend");
+
+        let mut req = self.http.post(&tools_url).json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": {}
+        }));
+
+        if let Some(token) = auth_token {
+            req = req.header("authorization", format!("Bearer {token}"));
+        }
+
+        let resp = req
+            .send()
+            .await
+            .with_context(|| format!("failed to reach HTTP backend at {tools_url}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            anyhow::bail!("HTTP backend returned HTTP {status} on tools/list");
+        }
+
+        let body: Value = resp
+            .json()
+            .await
+            .context("failed to parse tools/list response")?;
+
+        let tools = body
+            .get("result")
+            .and_then(|r| r.get("tools"))
+            .and_then(|t| t.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok(tools)
+    }
+
+    /// Fetch the tool list from a stdio backend (blocking; wraps spawn_blocking).
+    pub async fn fetch_tools_stdio(
+        command: &str,
+        args: &[String],
+        env: &HashMap<String, String>,
+    ) -> Result<Vec<ToolDefinition>> {
+        let command = command.to_string();
+        let args = args.to_vec();
+        let env = env.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let mut proc = StdioProcess::spawn(&command, &args, &env)
+                .context("failed to spawn stdio backend for tool fetch")?;
+            proc.list_tools()
+        })
+        .await
+        .context("spawn_blocking panicked in fetch_tools_stdio")
+        .and_then(|r| r)
+    }
 }
 
 impl Default for BackendRegistry {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ── Stdio dispatch helpers ────────────────────────────────────────────────────
+
+/// Spawn a new `StdioProcess` into `slot` if the slot is `None` or the
+/// existing process is no longer alive.
+///
+/// On failure the slot is left as `None` and the error is returned.
+fn spawn_if_needed(
+    slot: &mut Option<StdioProcess>,
+    command: &str,
+    args: &[String],
+    env: &HashMap<String, String>,
+) -> anyhow::Result<()> {
+    let needs_spawn = match slot.as_mut() {
+        None => true,
+        Some(p) => !p.is_alive(),
+    };
+
+    if !needs_spawn {
+        return Ok(());
+    }
+
+    if slot.is_some() {
+        warn!(command = %command, "stdio backend process died — attempting restart");
+        *slot = None;
+    }
+
+    let proc = StdioProcess::spawn(command, args, env)
+        .with_context(|| format!("failed to spawn stdio backend '{command}'"))?;
+
+    *slot = Some(proc);
+    debug!(command = %command, "stdio backend process spawned");
+    Ok(())
+}
+
+/// Call a tool on a stdio backend, handling lazy spawn and one-shot restart.
+///
+/// Accepts the `Arc<Mutex<Option<StdioProcess>>>` so the outer registry lock
+/// is not held during I/O.
+///
+/// This function is synchronous and must be called from within `spawn_blocking`.
+fn call_stdio_tool_with_arc(
+    proc_arc: &Arc<Mutex<Option<StdioProcess>>>,
+    command: &str,
+    args_list: &[String],
+    env: &HashMap<String, String>,
+    tool_name: &str,
+    arguments: &Value,
+) -> Result<Value> {
+    let mut guard = proc_arc.lock().unwrap();
+    spawn_if_needed(&mut guard, command, args_list, env)?;
+
+    let proc = guard.as_mut().unwrap(); // guaranteed by spawn_if_needed
+    proc.call_tool(tool_name, arguments)
 }
 
 // ── Free functions ────────────────────────────────────────────────────────────
@@ -429,6 +851,8 @@ mod tests {
                 .collect(),
             tool_visibility: ToolVisibility::All,
             priority: 50,
+            consecutive_errors: 0,
+            unhealthy: false,
         }
     }
 
@@ -571,6 +995,40 @@ mod tests {
         assert_eq!(sanitize_id("plain"), "plain");
     }
 
+    // ── BackendEntry health ───────────────────────────────────────────────────
+
+    #[test]
+    fn backend_entry_becomes_unhealthy_after_threshold() {
+        let mut entry = stub_backend("test", &["tool_a"]);
+        for _ in 0..UNHEALTHY_THRESHOLD - 1 {
+            let became_unhealthy = entry.record_error();
+            assert!(!became_unhealthy);
+        }
+        let became_unhealthy = entry.record_error();
+        assert!(became_unhealthy);
+        assert!(entry.unhealthy);
+    }
+
+    #[test]
+    fn backend_entry_recovers_on_success() {
+        let mut entry = stub_backend("test", &["tool_a"]);
+        for _ in 0..UNHEALTHY_THRESHOLD {
+            entry.record_error();
+        }
+        assert!(entry.unhealthy);
+        entry.record_success();
+        assert!(!entry.unhealthy);
+        assert_eq!(entry.consecutive_errors, 0);
+    }
+
+    #[test]
+    fn unhealthy_backend_hides_tools() {
+        let mut entry = stub_backend("test", &["tool_a", "tool_b"]);
+        assert_eq!(entry.visible_tools().len(), 2);
+        entry.unhealthy = true;
+        assert_eq!(entry.visible_tools().len(), 0);
+    }
+
     // ── BackendRegistry ───────────────────────────────────────────────────────
 
     #[test]
@@ -588,26 +1046,55 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_returns_none_for_non_namespaced_tool() {
+    fn all_tools_excludes_unhealthy_backends() {
         let registry = BackendRegistry::new();
-        let result = registry.dispatch("skillclub_search", &Value::Null);
+        registry.register_backend(stub_backend("healthy", &["tool_a"]));
+        let mut sick = stub_backend("sick", &["tool_b"]);
+        sick.unhealthy = true;
+        registry.register_backend(sick);
+
+        let tools = registry.all_tools();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "healthy__tool_a");
+    }
+
+    #[tokio::test]
+    async fn dispatch_returns_none_for_non_namespaced_tool() {
+        let registry = BackendRegistry::new();
+        let result = registry.dispatch("skillclub_search", &Value::Null).await;
         assert!(result.is_none());
     }
 
-    #[test]
-    fn dispatch_returns_none_for_unknown_server() {
+    #[tokio::test]
+    async fn dispatch_returns_none_for_unknown_server() {
         let registry = BackendRegistry::new();
-        let result = registry.dispatch("unknown__some_tool", &Value::Null);
+        let result = registry.dispatch("unknown__some_tool", &Value::Null).await;
         assert!(result.is_none());
     }
 
-    #[test]
-    fn dispatch_stub_backend_returns_ok() {
+    #[tokio::test]
+    async fn dispatch_stub_backend_returns_ok() {
         let registry = BackendRegistry::new();
         registry.register_backend(stub_backend("test", &["do_thing"]));
-        let result = registry.dispatch("test__do_thing", &serde_json::json!({}));
+        let result = registry
+            .dispatch("test__do_thing", &serde_json::json!({}))
+            .await;
         assert!(result.is_some());
         assert!(result.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn dispatch_unhealthy_backend_returns_error() {
+        let registry = BackendRegistry::new();
+        let mut entry = stub_backend("sick", &["tool_a"]);
+        entry.unhealthy = true;
+        registry.register_backend(entry);
+
+        let result = registry
+            .dispatch("sick__tool_a", &serde_json::json!({}))
+            .await;
+        assert!(result.is_some());
+        assert!(result.unwrap().is_err());
     }
 
     #[test]
@@ -663,4 +1150,73 @@ mod tests {
         let registry = BackendRegistry::new();
         assert!(registry.backend_tools("unknown").is_empty());
     }
+
+    // ── Priority-based budget truncation ──────────────────────────────────────
+
+    #[test]
+    fn register_backends_with_priority_high_priority_wins_budget() {
+        let registry = BackendRegistry::new();
+
+        // Fill most of the budget with a low-priority backend (50 tools = half of 80).
+        let mut low = stub_backend("low", &[]);
+        low.priority = 10;
+        low.tools = (0..50)
+            .map(|i| ToolDefinition {
+                name: format!("tool_{i}"),
+                description: None,
+                input_schema: None,
+            })
+            .collect();
+
+        // High-priority backend with 50 tools too.
+        let mut high = stub_backend("high", &[]);
+        high.priority = 90;
+        high.tools = (0..50)
+            .map(|i| ToolDefinition {
+                name: format!("tool_{i}"),
+                description: None,
+                input_schema: None,
+            })
+            .collect();
+
+        registry.register_backends_with_priority(vec![low, high]);
+
+        // High priority should get all 50 tools; low priority should get only 30
+        // (BACKEND_TOOL_BUDGET=80, 80-50=30).
+        let high_tools = registry.backend_tools("high");
+        let low_tools = registry.backend_tools("low");
+        assert_eq!(
+            high_tools.len(),
+            50,
+            "high priority should get full allocation"
+        );
+        assert_eq!(
+            low_tools.len(),
+            30,
+            "low priority truncated to remaining budget"
+        );
+        assert!(registry.truncated_backends().contains(&"low".to_string()));
+    }
+
+    // ── mark_healthy ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn mark_healthy_resets_unhealthy_backend() {
+        let registry = BackendRegistry::new();
+        let mut entry = stub_backend("test", &["tool_a"]);
+        entry.unhealthy = true;
+        registry.register_backend(entry);
+
+        registry.mark_healthy("test");
+
+        let inner = registry.inner.lock().unwrap();
+        let backend = inner.backends.get("test").unwrap();
+        assert!(!backend.unhealthy);
+    }
 }
+
+// ── Stdio integration tests ───────────────────────────────────────────────────
+
+#[cfg(test)]
+#[path = "aggregator_stdio_tests.rs"]
+mod stdio_tests;
