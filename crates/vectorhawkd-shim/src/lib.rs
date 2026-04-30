@@ -74,7 +74,18 @@ pub fn daemon_socket_path() -> Option<PathBuf> {
 
 /// The shim's current dispatch mode for the session.
 ///
-/// One-way transition: `Relaying → Embedded` on socket I/O error.
+/// # One-way transition invariant (M0, reaffirmed M1.6)
+///
+/// The state machine is one-directional: `Relaying → Embedded`.
+///
+/// Once the shim falls back to `Embedded` mode (daemon socket unreachable or
+/// dead), it stays there for the lifetime of the session. There is NO reconnect
+/// attempt: reconnecting mid-session would require re-issuing `initialize` to
+/// the daemon, which would give the AI client a different capability set than
+/// what it negotiated at session start, violating MCP protocol invariants.
+///
+/// If a future stream wants reconnect support, it MUST add a new state
+/// (e.g., `Reconnecting`) — never reverse this transition. See M1.6 tracking.
 enum SessionMode {
     /// Forwarding frames to the daemon over a Unix socket.
     #[cfg(unix)]

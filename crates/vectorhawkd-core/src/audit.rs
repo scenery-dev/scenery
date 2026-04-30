@@ -62,6 +62,21 @@ impl AuditBuffer for NoOpAuditBuffer {
 /// rows, posts them to the registry's audit endpoint, and DELETEs the rows
 /// on success (leaving them for retry on failure).
 ///
+/// # spawn_blocking requirement (M1.6 audit)
+///
+/// Both `record()` and `flush()` issue synchronous SQLite I/O. They MUST
+/// NOT be called directly from an async context running on a current-thread
+/// Tokio executor. All call sites in the daemon's per-connection tasks or
+/// background loops must wrap these calls in `tokio::task::spawn_blocking`.
+///
+/// The daemon's registry sync loop already does this correctly:
+/// ```ignore
+/// tokio::task::spawn_blocking(move || run_sync_tick(...)).await?;
+/// ```
+///
+/// When M1.4 wires audit into the per-tool-call path (`socket_dispatch.rs`),
+/// the same pattern must be applied. See the comment in `socket_dispatch.rs`.
+///
 /// Callers must invoke `flush()` on a background task — it issues synchronous
 /// I/O and must not run on the async executor thread. Use
 /// `tokio::task::spawn_blocking`.

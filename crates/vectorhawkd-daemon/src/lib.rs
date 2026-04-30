@@ -20,6 +20,39 @@
 //!
 //! Permissions are set to 0600 (owner-only). A stale socket file from a
 //! previous daemon run is removed on startup.
+//!
+//! # spawn_blocking discipline (M1.6 audit)
+//!
+//! The daemon uses `tokio::runtime::Builder::new_current_thread()`. Any
+//! blocking call on the executor thread stalls ALL concurrent connections.
+//! The following invariants are enforced and must be preserved by future
+//! contributors:
+//!
+//! ## Hot path (per-shim-connection tasks spawned by the accept loop)
+//!
+//! - `socket_dispatch::serve_connection` → `RealBackend::call_tool` → SAFE:
+//!   - `BackendTransport::Stub`: pure in-memory, no I/O.
+//!   - `BackendTransport::Http`: async `reqwest` (tokio-native), non-blocking.
+//!   - `BackendTransport::Stdio`: wrapped in `tokio::task::spawn_blocking` in
+//!     `aggregator.rs::dispatch`.
+//! - `audit.record()` from `RealBackend` — NOT YET WIRED (M1.4 pending). When
+//!   it is wired, the call site MUST go through `spawn_blocking` because
+//!   `SqliteAuditBuffer::record` opens a `rusqlite::Connection` synchronously.
+//!   See the TODO comment in `socket_dispatch.rs`.
+//!
+//! ## Background tasks
+//!
+//! - Registry sync loop: wraps `run_sync_tick` in `spawn_blocking`. This
+//!   function issues sync HTTP (`reqwest::blocking`) and sync SQLite calls.
+//!   Adding any new sync I/O to `run_sync_tick` is safe.
+//! - Final audit flush on shutdown: wrapped in `spawn_blocking`.
+//!
+//! ## Startup (before accept loop)
+//!
+//! - `AppState::bootstrap()`, `std::fs::create_dir_all`, `std::fs::remove_file`,
+//!   `std::fs::set_permissions`: called once before the Tokio accept loop is hot.
+//!   These are acceptable at startup time and must NOT be moved into the accept
+//!   loop or per-connection handlers without adding `spawn_blocking`.
 
 mod socket_dispatch;
 
