@@ -17,7 +17,12 @@ name = "vectorhawkd_shim"
 path = "src/lib.rs"
 
 [dependencies]
-vectorhawkd-mcp = { path = "../vectorhawkd-mcp" }
+# Explicitly opt out of the `daemon` feature to avoid pulling in rusqlite
+# (~1.5 MB link weight), vectorhawkd-core, and vectorhawkd-manifest.
+# The shim only needs: protocol, Backend trait, SocketBackend, EmbeddedBackend,
+# aggregator (for EmbeddedBackend's BackendRegistry), and stdio_process.
+# All of these are available without the `daemon` feature.
+vectorhawkd-mcp = { path = "../vectorhawkd-mcp", default-features = false }
 
 tokio = { workspace = true, features = ["rt", "macros", "io-util", "net", "fs", "time", "sync", "signal"] }
 serde.workspace = true

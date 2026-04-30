@@ -28,8 +28,15 @@
 pub mod aggregator;
 pub mod backend;
 pub mod protocol;
-pub mod sampling;
 pub mod server;
 pub mod setup;
 pub mod stdio_process;
+
+// Modules that depend on `vectorhawkd-core` and `vectorhawkd-manifest`.
+// Gated behind the `daemon` Cargo feature so the shim binary does not link
+// in rusqlite, the full registry HTTP client, or the skill-execution stack.
+// The daemon enables this feature by default; the shim explicitly opts out.
+#[cfg(feature = "daemon")]
+pub mod sampling;
+#[cfg(feature = "daemon")]
 pub mod tools;

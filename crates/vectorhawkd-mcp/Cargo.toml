@@ -8,10 +8,41 @@ license.workspace = true
 repository.workspace = true
 description = "VectorHawk runner — MCP protocol, aggregator, and Backend trait"
 
-[dependencies]
-vectorhawkd-manifest = { path = "../vectorhawkd-manifest" }
-vectorhawkd-core = { path = "../vectorhawkd-core" }
+# Feature gates for binary size control.
+#
+# `daemon` — enables the full daemon-side tool surface:
+#   - `tools` module (skill + governance + auth + management tool handlers)
+#   - `sampling` module (HybridModelClient, McpSamplingClient)
+#   - `vectorhawkd-core` and `vectorhawkd-manifest` dependencies (SQLite, HTTP)
+#
+# The shim binary depends on `vectorhawkd-mcp` WITHOUT this feature, which
+# avoids pulling in `rusqlite` (~1.5 MB link weight) and the full registry
+# HTTP client stack. This is the primary lever for keeping the shim ≤ 2 MB.
+#
+# Default: enabled (so `cargo build` without explicit features builds everything
+# and existing tests / daemon crate continue to work without changes).
+[features]
+default = ["daemon"]
+daemon = [
+    "dep:vectorhawkd-manifest",
+    "dep:vectorhawkd-core",
+    "dep:camino",
+    "dep:rusqlite",
+    "dep:semver",
+    "dep:uuid",
+]
 
+[dependencies]
+# Daemon-only dependencies — gated behind the `daemon` feature.
+vectorhawkd-manifest = { path = "../vectorhawkd-manifest", optional = true }
+vectorhawkd-core = { path = "../vectorhawkd-core", optional = true }
+camino = { workspace = true, optional = true }
+rusqlite = { workspace = true, optional = true }
+semver = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
+
+# Always-available dependencies used by protocol, aggregator, backend, server,
+# stdio_process, and setup — all paths that the shim also exercises.
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -23,8 +54,4 @@ futures.workspace = true
 bytes.workspace = true
 reqwest.workspace = true
 url.workspace = true
-uuid.workspace = true
 dirs = "5"
-camino.workspace = true
-rusqlite.workspace = true
-semver.workspace = true
