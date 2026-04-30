@@ -8,6 +8,10 @@ license.workspace = true
 repository.workspace = true
 description = "vectorhawkd — VectorHawk runner daemon"
 
+[lib]
+name = "vectorhawkd_daemon"
+path = "src/lib.rs"
+
 [[bin]]
 name = "vectorhawkd"
 path = "src/main.rs"
@@ -16,6 +20,7 @@ path = "src/main.rs"
 vectorhawkd-manifest = { path = "../vectorhawkd-manifest" }
 vectorhawkd-core = { path = "../vectorhawkd-core" }
 vectorhawkd-mcp = { path = "../vectorhawkd-mcp" }
+camino.workspace = true
 
 tokio.workspace = true
 serde.workspace = true
