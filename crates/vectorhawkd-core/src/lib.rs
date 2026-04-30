@@ -34,7 +34,12 @@ pub mod ollama;
 pub mod resolver;
 pub mod validator;
 
-// `updater` re-enabled in M1.4 — RegistryClient now has full HTTP impl with
-// all methods updater.rs requires (fetch_skill_detail, fetch_artifact_metadata,
-// download_artifact, check_skill_status).
+// `updater` re-enabled in M1.4 — RegistryClient now has the full HTTP impl
+// with all methods updater.rs requires (fetch_skill_detail,
+// fetch_artifact_metadata, download_artifact, check_skill_status).
 pub mod updater;
+
+// M1.2: MCP governance types + HTTP helpers consumed by `vectorhawkd-mcp::tools`.
+// Some of these helpers will migrate onto `RegistryClient` proper as M1.4's
+// trait expansion settles.
+pub mod mcp_governance;
