@@ -344,7 +344,10 @@ mod tests {
         let after: i64 = conn
             .query_row("SELECT COUNT(*) FROM audit_events", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(after, 0, "all rows should be deleted after successful upload");
+        assert_eq!(
+            after, 0,
+            "all rows should be deleted after successful upload"
+        );
 
         mock.assert();
         let _ = std::fs::remove_dir_all(&root);
@@ -382,10 +385,7 @@ mod tests {
         let (state, root) = temp_state("sqlite-empty");
         let mut server = Server::new();
         // Should not be called at all.
-        server
-            .mock("POST", "/api/runner/audit")
-            .expect(0)
-            .create();
+        server.mock("POST", "/api/runner/audit").expect(0).create();
 
         let registry = Arc::new(RegistryClient::new(server.url()));
         let buf = SqliteAuditBuffer::new(Arc::clone(&registry), &state);

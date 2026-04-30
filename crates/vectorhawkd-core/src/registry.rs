@@ -349,10 +349,7 @@ impl RegistryClient {
             return Ok(());
         }
 
-        let url = format!(
-            "{}/api/runner/audit",
-            self.base_url.trim_end_matches('/')
-        );
+        let url = format!("{}/api/runner/audit", self.base_url.trim_end_matches('/'));
         debug!(url, count = events.len(), "uploading audit batch");
 
         let mut req = self.http.post(&url).json(events);
@@ -566,7 +563,11 @@ impl RegistryClient {
 
         let base = self.base_url.trim_end_matches('/');
         let url = format!("{base}/portal/skills/compile");
-        debug!(url, size_bytes = source_tar_gz_bytes.len(), "uploading SKILL.md tree");
+        debug!(
+            url,
+            size_bytes = source_tar_gz_bytes.len(),
+            "uploading SKILL.md tree"
+        );
 
         let file_part = reqwest::blocking::multipart::Part::bytes(source_tar_gz_bytes)
             .file_name("skill-source.tar.gz")
@@ -809,8 +810,14 @@ impl MockRegistryClient {
         })
     }
 
-    pub fn fetch_artifact_metadata(&self, skill_id: &str, version: &str) -> Result<ArtifactMetadata> {
-        anyhow::bail!("MockRegistryClient.fetch_artifact_metadata not implemented for {skill_id}@{version}")
+    pub fn fetch_artifact_metadata(
+        &self,
+        skill_id: &str,
+        version: &str,
+    ) -> Result<ArtifactMetadata> {
+        anyhow::bail!(
+            "MockRegistryClient.fetch_artifact_metadata not implemented for {skill_id}@{version}"
+        )
     }
 
     pub fn download_artifact(
@@ -992,9 +999,9 @@ fn map_submit_response_to_outcome(wire: ImportSubmitResponse) -> Result<ImportOu
             })
         }
         "mcp_server_requested" => {
-            let server_name = wire
-                .server_name
-                .ok_or_else(|| anyhow::anyhow!("mcp_server_requested outcome missing server_name"))?;
+            let server_name = wire.server_name.ok_or_else(|| {
+                anyhow::anyhow!("mcp_server_requested outcome missing server_name")
+            })?;
             Ok(ImportOutcome::McpServerRequested {
                 server_name,
                 status: wire.status.unwrap_or_else(|| "pending".to_string()),
@@ -1180,10 +1187,7 @@ mod tests {
     fn health_check_returns_true_on_200() {
         use mockito::Server;
         let mut server = Server::new();
-        let mock = server
-            .mock("GET", "/health")
-            .with_status(200)
-            .create();
+        let mock = server.mock("GET", "/health").with_status(200).create();
 
         let client = RegistryClient::new(server.url());
         assert!(client.health_check().unwrap());
@@ -1218,9 +1222,7 @@ mod tests {
             .mock("GET", "/skills/cached-skill/policy")
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(
-                r#"{"skill_id":"cached-skill","status":"active","policy_ttl_seconds":3600}"#,
-            )
+            .with_body(r#"{"skill_id":"cached-skill","status":"active","policy_ttl_seconds":3600}"#)
             .create();
 
         let root = temp_root("http-policy-cache");

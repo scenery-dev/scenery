@@ -1,5 +1,7 @@
 use crate::{
-    installer::{install_unpacked_skill, reactivate_skill, deactivate_skill, uninstall_skill, InstallMode},
+    installer::{
+        deactivate_skill, install_unpacked_skill, reactivate_skill, uninstall_skill, InstallMode,
+    },
     policy::Policy,
     registry::RegistryClient,
     state::AppState,
@@ -286,68 +288,69 @@ pub fn check_skill_updates(
     // ── Phase 2: lifecycle check ──────────────────────────────────────────────
     // `published_ids` is Some(set) when the endpoint succeeded — only skills in
     // the set are eligible for version updates.  None means "skip lifecycle, update all active".
-    let published_ids: Option<std::collections::HashSet<String>> =
-        match registry.check_skill_status(&all_skill_ids) {
-            Ok(status_resp) => {
-                let mut published = std::collections::HashSet::new();
-                for (skill_id, local_status) in &all_installed {
-                    if status_resp.unknown.contains(skill_id) {
-                        // Skill was deleted from registry — full cleanup.
-                        match uninstall_skill(state, skill_id) {
-                            Ok(Some(_)) => {
-                                info!(skill_id, "sync: skill removed from registry, uninstalled");
-                                changes += 1;
-                            }
-                            Ok(None) => {}
-                            Err(e) => {
-                                tracing::warn!(skill_id, error = %e, "sync: failed to uninstall unknown skill");
-                            }
+    let published_ids: Option<std::collections::HashSet<String>> = match registry
+        .check_skill_status(&all_skill_ids)
+    {
+        Ok(status_resp) => {
+            let mut published = std::collections::HashSet::new();
+            for (skill_id, local_status) in &all_installed {
+                if status_resp.unknown.contains(skill_id) {
+                    // Skill was deleted from registry — full cleanup.
+                    match uninstall_skill(state, skill_id) {
+                        Ok(Some(_)) => {
+                            info!(skill_id, "sync: skill removed from registry, uninstalled");
+                            changes += 1;
                         }
-                    } else if let Some(entry) = status_resp.statuses.get(skill_id) {
-                        match entry.status.as_str() {
-                            "unpublished" => {
-                                if local_status == "active" {
-                                    match deactivate_skill(state, skill_id) {
-                                        Ok(true) => {
-                                            info!(skill_id, "sync: skill unpublished, deactivated");
-                                            changes += 1;
-                                        }
-                                        Ok(false) => {}
-                                        Err(e) => {
-                                            tracing::warn!(skill_id, error = %e, "sync: failed to deactivate unpublished skill");
-                                        }
-                                    }
-                                }
-                            }
-                            "published" => {
-                                published.insert(skill_id.clone());
-                                if local_status == "deactivated" {
-                                    match reactivate_skill(state, skill_id) {
-                                        Ok(true) => {
-                                            info!(skill_id, "sync: skill republished, reactivated");
-                                            changes += 1;
-                                        }
-                                        Ok(false) => {}
-                                        Err(e) => {
-                                            tracing::warn!(skill_id, error = %e, "sync: failed to reactivate republished skill");
-                                        }
-                                    }
-                                }
-                            }
-                            _ => {}
+                        Ok(None) => {}
+                        Err(e) => {
+                            tracing::warn!(skill_id, error = %e, "sync: failed to uninstall unknown skill");
                         }
                     }
+                } else if let Some(entry) = status_resp.statuses.get(skill_id) {
+                    match entry.status.as_str() {
+                        "unpublished" => {
+                            if local_status == "active" {
+                                match deactivate_skill(state, skill_id) {
+                                    Ok(true) => {
+                                        info!(skill_id, "sync: skill unpublished, deactivated");
+                                        changes += 1;
+                                    }
+                                    Ok(false) => {}
+                                    Err(e) => {
+                                        tracing::warn!(skill_id, error = %e, "sync: failed to deactivate unpublished skill");
+                                    }
+                                }
+                            }
+                        }
+                        "published" => {
+                            published.insert(skill_id.clone());
+                            if local_status == "deactivated" {
+                                match reactivate_skill(state, skill_id) {
+                                    Ok(true) => {
+                                        info!(skill_id, "sync: skill republished, reactivated");
+                                        changes += 1;
+                                    }
+                                    Ok(false) => {}
+                                    Err(e) => {
+                                        tracing::warn!(skill_id, error = %e, "sync: failed to reactivate republished skill");
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
                 }
-                Some(published)
             }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "skill lifecycle check unavailable; skipping, proceeding with version updates only"
-                );
-                None
-            }
-        };
+            Some(published)
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "skill lifecycle check unavailable; skipping, proceeding with version updates only"
+            );
+            None
+        }
+    };
 
     // ── Phase 3: version updates ──────────────────────────────────────────────
     // Re-query active skills after lifecycle changes may have altered statuses.
