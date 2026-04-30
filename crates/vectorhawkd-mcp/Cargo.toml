@@ -25,3 +25,6 @@ reqwest.workspace = true
 url.workspace = true
 uuid.workspace = true
 dirs = "5"
+camino.workspace = true
+rusqlite.workspace = true
+semver.workspace = true

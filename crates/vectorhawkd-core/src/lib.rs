@@ -41,3 +41,6 @@ pub mod validator;
 // `registry.rs` end-to-end. Leaving the ported file in the tree but
 // excluded from compilation so M1.4 can pick it up.
 // pub mod updater;
+
+// M1.2: MCP governance types and HTTP helpers for tools.rs
+pub mod mcp_governance;
