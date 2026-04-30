@@ -34,17 +34,50 @@
 use crate::{
     aggregator::{BackendEntry, BackendRegistry, BackendTransport, ToolDefinition, ToolVisibility},
     protocol::{
-        InitializeResult, JsonRpcResponse, ServerCapabilities, ServerInfo, ToolCallParams,
-        ToolCallResult, ToolDefinition as ProtoToolDef, ToolsCapability, ToolsListResult,
+        InitializeResult, ServerCapabilities, ServerInfo, ToolCallParams, ToolCallResult,
+        ToolDefinition as ProtoToolDef, ToolsCapability, ToolsListResult,
     },
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(unix)]
 use tokio::net::UnixStream;
+
+// ── Strict daemon response type ───────────────────────────────────────────────
+
+/// A strict JSON-RPC response type used when deserializing daemon socket frames.
+///
+/// Unlike `JsonRpcResponse` (which tolerates unknown fields), this type uses
+/// `#[serde(deny_unknown_fields)]` so that unexpected fields surface as a clear
+/// deserialization error instead of silently mapping to `INTERNAL_ERROR`.
+///
+/// This catches daemon protocol drift early — if the daemon adds a required
+/// field that the shim doesn't know about, the error message will include the
+/// raw frame text, making the mismatch immediately obvious.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DaemonResponse {
+    pub jsonrpc: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<DaemonResponseError>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DaemonResponseError {
+    pub code: i64,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
+}
 
 // ── Backend trait ─────────────────────────────────────────────────────────────
 
@@ -159,6 +192,8 @@ impl EmbeddedBackend {
             tools: tool_defs,
             tool_visibility: ToolVisibility::All,
             priority: 50,
+            consecutive_errors: 0,
+            unhealthy: false,
         });
         Self::new(registry)
     }
@@ -207,7 +242,11 @@ impl Backend for EmbeddedBackend {
     }
 
     async fn call_tool(&self, params: ToolCallParams) -> Result<ToolCallResult> {
-        match self.registry.dispatch(&params.name, &params.arguments) {
+        match self
+            .registry
+            .dispatch(&params.name, &params.arguments)
+            .await
+        {
             Some(Ok(value)) => {
                 let text =
                     serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
@@ -278,6 +317,10 @@ impl SocketBackend {
     }
 
     /// Send a JSON-RPC request over the socket and await the result value.
+    ///
+    /// Uses `DaemonResponse` (which applies `deny_unknown_fields`) so that
+    /// unexpected fields in the daemon response surface as a clear
+    /// deserialization error rather than silently mapping to INTERNAL_ERROR.
     async fn relay(&self, method: &str, params: Value) -> Result<Value> {
         let request = serde_json::json!({
             "jsonrpc": "2.0",
@@ -303,8 +346,16 @@ impl SocketBackend {
             .context("failed to read framed response")?
             .ok_or_else(|| anyhow::anyhow!("daemon closed socket unexpectedly"))?;
 
-        let response: JsonRpcResponse =
-            serde_json::from_slice(&frame).context("failed to parse daemon response")?;
+        // Use the strict response type: unknown fields are surfaced as a
+        // deserialization error rather than silently swallowed.
+        let response: DaemonResponse = serde_json::from_slice(&frame).with_context(|| {
+            // Include the raw frame text (truncated) to aid debugging.
+            let preview: String = String::from_utf8_lossy(&frame).chars().take(200).collect();
+            format!(
+                "daemon response failed schema validation (unknown or missing fields): {}",
+                preview
+            )
+        })?;
 
         if let Some(err) = response.error {
             anyhow::bail!("daemon returned error {}: {}", err.code, err.message);
@@ -409,8 +460,11 @@ impl Backend for RealBackend {
     }
 
     async fn call_tool(&self, params: ToolCallParams) -> Result<ToolCallResult> {
-        // TODO(M1 / Stream 4): real HTTP dispatch, audit event emission
-        match self.registry.dispatch(&params.name, &params.arguments) {
+        match self
+            .registry
+            .dispatch(&params.name, &params.arguments)
+            .await
+        {
             Some(Ok(value)) => {
                 let text =
                     serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
