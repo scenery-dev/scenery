@@ -52,6 +52,23 @@ impl AppState {
         Ok(Self { root_dir, db_path })
     }
 
+    /// Return all skill IDs currently tracked in `installed_skills`.
+    ///
+    /// Used by the daemon sync loop to determine which skills to pass to
+    /// `check_skill_status`. Returns an empty vec if no skills are installed.
+    pub fn list_installed_skill_ids(&self) -> Result<Vec<String>> {
+        let conn = Connection::open(&self.db_path).context("failed to open state DB")?;
+        let mut stmt = conn
+            .prepare("SELECT skill_id FROM installed_skills")
+            .context("failed to prepare skill id query")?;
+        let ids: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .context("failed to query installed skills")?
+            .collect::<rusqlite::Result<_>>()
+            .context("failed to collect skill ids")?;
+        Ok(ids)
+    }
+
     /// Convenience: return the path where the daemon Unix socket is expected.
     ///
     /// macOS: `~/Library/Application Support/VectorHawk/agent.sock`

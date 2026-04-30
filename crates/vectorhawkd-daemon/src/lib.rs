@@ -30,7 +30,11 @@ use tokio::{
     signal::unix::{signal, SignalKind},
 };
 use tracing::{error, info, warn};
-use vectorhawkd_core::state::AppState;
+use vectorhawkd_core::{
+    audit::{AuditBuffer, SqliteAuditBuffer},
+    registry::RegistryClient,
+    state::AppState,
+};
 use vectorhawkd_mcp::{
     aggregator::{BackendEntry, BackendRegistry, BackendTransport, ToolDefinition, ToolVisibility},
     backend::{Backend, RealBackend},
@@ -39,43 +43,83 @@ use vectorhawkd_mcp::{
 /// Configuration for the daemon entry point.
 ///
 /// The binary's `main.rs` populates these from environment variables; the CLI
-/// (`vectorhawk daemon run`) populates them from CLI flags. M1.4 will extend
-/// this with registry policy / sync overrides as those land.
+/// (`vectorhawk daemon run`) populates them from CLI flags.
 #[derive(Debug, Default, Clone)]
 pub struct DaemonOpts {
     /// Override the registry URL. If `None`, falls back to env
     /// (`SKILLCLUB_REGISTRY_URL`) or registry-driven defaults.
-    /// Honored by M1.4 once the registry is wired into the daemon's sync loop.
     pub registry_url: Option<String>,
 
     /// Override the socket path. If `None`, uses `AppState::socket_path()`.
     pub socket_path_override: Option<camino::Utf8PathBuf>,
 }
 
+/// How often (in seconds) the background sync loop ticks.
+const SYNC_INTERVAL_SECS: u64 = 300;
+
 /// Run the daemon to completion.
 ///
-/// Bootstraps state, builds the (M0 stub) backend registry, listens on the
-/// Unix socket, and serves shim connections until SIGTERM/SIGINT.
+/// Bootstraps state, builds the backend registry, starts the registry sync
+/// loop + audit flush loop, listens on the Unix socket, and serves shim
+/// connections until SIGTERM/SIGINT.
 ///
 /// **Tracing must be initialized by the caller** before invoking this function.
-/// The binary and the CLI both wire up `tracing_subscriber` themselves so this
-/// function does not double-init.
 pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     let state = AppState::bootstrap().context("failed to bootstrap application state")?;
     info!(root = %state.root_dir, "application state bootstrapped");
 
-    if let Some(url) = &opts.registry_url {
-        info!(
-            registry_url = %url,
-            "registry URL override (not yet honored — M1.4)"
-        );
-    }
+    let registry_url = opts
+        .registry_url
+        .clone()
+        .or_else(|| std::env::var("SKILLCLUB_REGISTRY_URL").ok())
+        .unwrap_or_else(|| "https://registry.vectorhawk.ai".to_string());
 
-    let registry = Arc::new(build_stub_registry());
-    let backend = Arc::new(RealBackend::new(Arc::clone(&registry)));
+    info!(registry_url, "connecting to registry");
+
+    let registry = Arc::new(RegistryClient::new(&registry_url));
+    let audit_buffer = Arc::new(SqliteAuditBuffer::new(Arc::clone(&registry), &state));
+
+    // Spawn the registry sync loop (300 s interval).
+    // All synchronous I/O happens inside spawn_blocking so the current-thread
+    // Tokio executor is never blocked by HTTP or SQLite calls.
+    let sync_registry = Arc::clone(&registry);
+    let sync_audit = Arc::clone(&audit_buffer);
+    let sync_db_path = state.db_path.clone();
+    let sync_root_dir = state.root_dir.clone();
+    tokio::spawn(async move {
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_secs(SYNC_INTERVAL_SECS));
+        // Skip the immediate first tick — let the accept loop start first.
+        interval.tick().await;
+
+        loop {
+            interval.tick().await;
+
+            let reg = Arc::clone(&sync_registry);
+            let aud = Arc::clone(&sync_audit);
+            let db = sync_db_path.clone();
+            let root = sync_root_dir.clone();
+
+            let result =
+                tokio::task::spawn_blocking(move || run_sync_tick(&reg, &aud, &db, &root)).await;
+
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    warn!(error = %e, "registry sync tick failed; will retry on next interval");
+                }
+                Err(join_err) => {
+                    warn!(error = %join_err, "registry sync task panicked; will retry");
+                }
+            }
+        }
+    });
+
+    let vh_registry = Arc::new(build_stub_registry());
+    let backend = Arc::new(RealBackend::new(Arc::clone(&vh_registry)));
     info!(
         "backend registry ready ({} backends)",
-        registry.backend_count()
+        vh_registry.backend_count()
     );
 
     let socket_path = opts
@@ -138,6 +182,20 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
 
     info!("draining in-flight connections (up to 2 s)");
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // Final audit flush on clean shutdown (best-effort — do not abort shutdown on error).
+    let final_audit = Arc::clone(&audit_buffer);
+    let shutdown_state = AppState {
+        root_dir: state.root_dir.clone(),
+        db_path: state.db_path.clone(),
+    };
+    let _ = tokio::task::spawn_blocking(move || {
+        if let Err(e) = final_audit.flush(&shutdown_state) {
+            warn!(error = %e, "final audit flush on shutdown failed");
+        }
+    })
+    .await;
+
     backend.on_shutdown().await;
 
     if socket_path_for_cleanup.exists() {
@@ -153,6 +211,79 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     }
 
     info!("vectorhawkd shut down cleanly");
+    Ok(())
+}
+
+/// One tick of the registry sync loop.
+///
+/// Called from `spawn_blocking` — issues synchronous SQLite and HTTP I/O.
+///
+/// Steps:
+/// 1. Flush pending audit events to the registry.
+/// 2. Refresh the approved-server list.
+/// 3. Check skill lifecycle status for all installed skills.
+///
+/// Each step failure logs at WARN and continues; only a total inability to
+/// open the database returns `Err`.
+fn run_sync_tick(
+    registry: &RegistryClient,
+    audit: &SqliteAuditBuffer,
+    db_path: &camino::Utf8PathBuf,
+    root_dir: &camino::Utf8PathBuf,
+) -> Result<()> {
+    // ── 1. Audit flush ────────────────────────────────────────────────────────
+    let state_view = AppState {
+        root_dir: root_dir.clone(),
+        db_path: db_path.clone(),
+    };
+    match audit.flush(&state_view) {
+        Ok(n) if n > 0 => info!(count = n, "sync: audit flush uploaded events"),
+        Ok(_) => {}
+        Err(e) => warn!(error = %e, "sync: audit flush failed"),
+    }
+
+    // ── 2. Approved-server list refresh ──────────────────────────────────────
+    match registry.fetch_approved_servers() {
+        Ok(resp) => {
+            info!(
+                count = resp.servers.len(),
+                "sync: approved server list refreshed"
+            );
+        }
+        Err(e) => {
+            warn!(error = %e, "sync: failed to refresh approved server list");
+        }
+    }
+
+    // ── 3. Skill lifecycle + version refresh ─────────────────────────────────
+    let skill_ids = match state_view.list_installed_skill_ids() {
+        Ok(ids) => ids,
+        Err(e) => {
+            warn!(error = %e, "sync: failed to read installed skills");
+            return Ok(());
+        }
+    };
+
+    if skill_ids.is_empty() {
+        return Ok(());
+    }
+
+    match registry.check_skill_status(&skill_ids) {
+        Ok(status_resp) => {
+            info!(
+                checked = skill_ids.len(),
+                unknown_count = status_resp.unknown.len(),
+                "sync: skill lifecycle status refreshed"
+            );
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                "sync: skill lifecycle check failed; skipping version updates this tick"
+            );
+        }
+    }
+
     Ok(())
 }
 
