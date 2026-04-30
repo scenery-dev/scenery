@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "doc_a": { "type": "string" },
+    "doc_b": { "type": "string" }
+  },
+  "required": ["doc_a", "doc_b"],
+  "additionalProperties": false
+}

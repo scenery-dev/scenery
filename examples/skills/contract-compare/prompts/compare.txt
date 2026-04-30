@@ -1,0 +1,9 @@
+Compare the two contract texts provided and return a JSON object with exactly these fields:
+- "summary": a one-paragraph string summarising the material differences
+- "differences": an array of strings, each describing one specific difference
+- "risk_level": one of "low", "medium", or "high" based on the severity of the changes
+
+Respond with only the JSON object. No markdown, no code fences, no additional text.
+
+Example format:
+{"summary": "The contracts differ in delivery date and payment terms.", "differences": ["Delivery date changed from Jan 1 to Mar 1", "Payment terms changed from net 30 to net 60"], "risk_level": "medium"}
