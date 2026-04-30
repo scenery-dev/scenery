@@ -400,16 +400,15 @@ impl Backend for SocketBackend {
 /// servers), dispatches tool calls to the correct backend, and emits audit
 /// events. The daemon instantiates `Server<RealBackend>` which listens on the
 /// Unix socket and handles each shim connection in a separate task.
-///
-/// # M0 status
-///
-/// Scaffolded — the struct exists, `initialize` and `list_tools` return sensible
-/// responses from the in-memory registry. Real HTTP dispatch and audit emission
-/// land in Stream 4 (daemon stream).
 pub struct RealBackend {
     registry: Arc<BackendRegistry>,
     server_name: String,
     server_version: String,
+    /// Optional audit sink. When `Some`, every successful or failed `call_tool`
+    /// invocation records an `AuditEvent` via `spawn_blocking` so the SQLite
+    /// write does not stall the current-thread async runtime.
+    #[cfg(feature = "daemon")]
+    audit: Option<Arc<dyn vectorhawkd_core::audit::AuditBuffer>>,
 }
 
 impl RealBackend {
@@ -418,6 +417,23 @@ impl RealBackend {
             registry,
             server_name: "vectorhawkd".to_string(),
             server_version: env!("CARGO_PKG_VERSION").to_string(),
+            #[cfg(feature = "daemon")]
+            audit: None,
+        }
+    }
+
+    /// Construct a `RealBackend` with a backing audit buffer. Every `call_tool`
+    /// emits a `tool_called` audit event via `tokio::task::spawn_blocking`.
+    #[cfg(feature = "daemon")]
+    pub fn with_audit(
+        registry: Arc<BackendRegistry>,
+        audit: Arc<dyn vectorhawkd_core::audit::AuditBuffer>,
+    ) -> Self {
+        Self {
+            registry,
+            server_name: "vectorhawkd".to_string(),
+            server_version: env!("CARGO_PKG_VERSION").to_string(),
+            audit: Some(audit),
         }
     }
 }
@@ -460,24 +476,59 @@ impl Backend for RealBackend {
     }
 
     async fn call_tool(&self, params: ToolCallParams) -> Result<ToolCallResult> {
-        match self
+        let started = std::time::Instant::now();
+        let dispatch_outcome = self
             .registry
             .dispatch(&params.name, &params.arguments)
-            .await
-        {
+            .await;
+        let latency_ms = started.elapsed().as_millis() as u64;
+
+        let (result, status) = match dispatch_outcome {
             Some(Ok(value)) => {
                 let text =
                     serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
-                Ok(ToolCallResult::success(text))
+                (Ok(ToolCallResult::success(text)), "ok")
             }
-            Some(Err(e)) => Ok(ToolCallResult::error_result(format!(
-                "backend dispatch error: {e}"
-            ))),
-            None => Ok(ToolCallResult::error_result(format!(
-                "unknown tool: {}",
-                params.name
-            ))),
+            Some(Err(e)) => (
+                Ok(ToolCallResult::error_result(format!(
+                    "backend dispatch error: {e}"
+                ))),
+                "backend_error",
+            ),
+            None => (
+                Ok(ToolCallResult::error_result(format!(
+                    "unknown tool: {}",
+                    params.name
+                ))),
+                "unknown_tool",
+            ),
+        };
+
+        // Best-effort audit emission. Failures here must not affect the AI
+        // client's response, only log a warning. SQLite write goes through
+        // spawn_blocking so the current-thread runtime is not stalled.
+        #[cfg(feature = "daemon")]
+        if let Some(audit) = &self.audit {
+            let audit = Arc::clone(audit);
+            let event = vectorhawkd_core::audit::AuditEvent {
+                event_type: "tool_called".to_string(),
+                payload: serde_json::json!({
+                    "tool": params.name,
+                    "status": status,
+                    "latency_ms": latency_ms,
+                    "args_size": params.arguments.to_string().len(),
+                }),
+            };
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) = audit.record(&event) {
+                    tracing::warn!(error = %e, "failed to record audit event");
+                }
+            });
         }
+        let _ = status; // silence unused on no-default-feature builds
+        let _ = latency_ms;
+
+        result
     }
 
     async fn on_shutdown(&self) {

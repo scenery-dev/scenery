@@ -357,21 +357,17 @@ fn m1_three_concurrent_shims_shared_tool_list_and_audit() {
     // lock escalation bug), this call would error or return stale results.
     // The absence of errors here proves the single-writer invariant holds.
     //
-    // TODO(M1.7): tighten this assertion to `>= 9` once M1.4 wires
-    // `audit.record()` into `RealBackend::call_tool`. Currently `RealBackend`
-    // does not emit per-tool-call audit events; the `SqliteAuditBuffer` is only
-    // called from the registry sync loop. When the per-call path lands, remove
-    // the `eprintln!` and restore the hard `>= 9` assertion.
-    let rows_after = count_audit_rows(&db_path);
+    // M1.7: per-call audit emission is wired in `RealBackend::call_tool` via
+    // `tokio::task::spawn_blocking`. Three shims times three tool calls each =
+    // nine `tool_called` events at minimum. Allow a small grace window for the
+    // spawn_blocking tasks to land their writes before this assertion fires.
+    let rows_after = wait_for_audit_rows(&db_path, rows_before + 9, Duration::from_secs(3));
     let new_rows = rows_after.saturating_sub(rows_before);
-    eprintln!(
-        "audit rows: before={rows_before}, after={rows_after}, new={new_rows} \
-         (expect >= 9 once RealBackend::call_tool emits audit events)"
-    );
-    // Only assert no negative delta — the positive count is guarded by TODO above.
+    eprintln!("audit rows: before={rows_before}, after={rows_after}, new={new_rows}");
     assert!(
-        rows_after >= rows_before,
-        "audit_events count decreased during test (rows_before={rows_before}, rows_after={rows_after})"
+        new_rows >= 9,
+        "expected >= 9 new audit_events rows (3 shims * 3 tool calls), got {new_rows} \
+         (rows_before={rows_before}, rows_after={rows_after})"
     );
 
     // ---- Cleanup ------------------------------------------------------------
@@ -386,6 +382,20 @@ fn m1_three_concurrent_shims_shared_tool_list_and_audit() {
             start.elapsed() < Duration::from_secs(3),
             "daemon did not exit within 3 s after SIGTERM"
         );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Poll the audit_events table until it reaches `target` rows, or the deadline
+/// elapses. Returns the final row count seen (which may be < target if the
+/// daemon's `spawn_blocking` writes haven't landed in time — the caller asserts).
+fn wait_for_audit_rows(db_path: &PathBuf, target: usize, timeout: Duration) -> usize {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let count = count_audit_rows(db_path);
+        if count >= target || Instant::now() >= deadline {
+            return count;
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
 }
