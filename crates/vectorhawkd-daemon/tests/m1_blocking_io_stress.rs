@@ -413,3 +413,222 @@ fn m1_fifty_concurrent_tool_calls_no_deadlock() {
         std::thread::sleep(Duration::from_millis(50));
     }
 }
+
+/// M1 spawn_blocking acceptance — slow blocking backend must not head-of-line
+/// block independent calls.
+///
+/// The daemon is spawned with `VECTORHAWK_STUB_LATENCY_MS=1500`, which causes
+/// the stub backend's dispatch to perform a 1.5 s `std::thread::sleep` wrapped
+/// in `tokio::task::spawn_blocking`. This simulates a real slow backend (such
+/// as a stdio MCP server with high latency) without requiring a fixture binary.
+///
+/// We then fire 5 concurrent slow `tools/call` invocations through 5 separate
+/// shims, and concurrently send a `tools/list` through a 6th shim. The fast
+/// `tools/list` must respond well under 1.5 s — proving the current-thread
+/// runtime is not serializing the slow calls onto the executor thread.
+///
+/// If `spawn_blocking` were missing on the slow path, the executor thread
+/// would be parked inside `std::thread::sleep` and the fast call would queue
+/// behind it, taking >1.5 s.
+///
+/// Marked `#[ignore]` — requires pre-built release binaries.
+#[test]
+#[ignore = "requires pre-built release binaries — run cargo build --workspace --release first"]
+fn m1_slow_backend_does_not_block_independent_calls() {
+    let daemon_bin = release_bin("vectorhawkd");
+    let shim_bin = release_bin("vectorhawkd-shim");
+
+    assert!(
+        daemon_bin.exists(),
+        "daemon binary not found at {daemon_bin:?} — run cargo build --workspace --release"
+    );
+    assert!(
+        shim_bin.exists(),
+        "shim binary not found at {shim_bin:?} — run cargo build --workspace --release"
+    );
+
+    let socket_path = daemon_socket_path();
+
+    kill_stale_daemon();
+    remove_socket_if_present(&socket_path);
+
+    // Spawn daemon with the stub-latency env var. Every stub backend
+    // dispatch will sleep 1.5 s in spawn_blocking.
+    let mut daemon = Command::new(&daemon_bin)
+        .env("VECTORHAWK_STUB_LATENCY_MS", "1500")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn vectorhawkd");
+
+    let socket_appeared = wait_for_socket(&socket_path, Duration::from_secs(5));
+    if !socket_appeared {
+        kill_child(&mut daemon);
+        panic!("daemon socket did not appear within 5 s at {socket_path:?}");
+    }
+
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Discover the stub tool name via a quick shim.
+    let tool_name = {
+        let mut probe = Command::new(&shim_bin)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn probe shim");
+        let mut stdin = probe.stdin.take().expect("stdin");
+        let stdout_raw = probe.stdout.take().expect("stdout");
+        let mut stdout = std::io::BufReader::new(stdout_raw);
+
+        let _ = send_rpc(
+            &mut stdin,
+            &mut stdout,
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05", "capabilities": {},
+                    "clientInfo": { "name": "probe", "version": "0.0.1" }
+                }
+            }),
+        );
+        let list = send_rpc(
+            &mut stdin,
+            &mut stdout,
+            json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {} }),
+        );
+        let tool = list["result"]["tools"][0]["name"]
+            .as_str()
+            .expect("at least one tool listed")
+            .to_string();
+        drop(stdin);
+        let _ = probe.wait();
+        tool
+    };
+
+    // ---- Fire 5 concurrent slow tool calls through 5 separate shims --------
+
+    let slow_call_count = 5usize;
+    let mut slow_handles = Vec::with_capacity(slow_call_count);
+    for i in 0..slow_call_count {
+        let bin = shim_bin.clone();
+        let tool = tool_name.clone();
+        slow_handles.push(std::thread::spawn(move || {
+            let mut shim = Command::new(&bin)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn slow-call shim");
+            let mut stdin = shim.stdin.take().expect("stdin");
+            let stdout_raw = shim.stdout.take().expect("stdout");
+            let mut stdout = std::io::BufReader::new(stdout_raw);
+            let _ = send_rpc(
+                &mut stdin,
+                &mut stdout,
+                json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2024-11-05", "capabilities": {},
+                        "clientInfo": { "name": format!("slow-{i}"), "version": "0.0.1" }
+                    }
+                }),
+            );
+            let resp = send_rpc(
+                &mut stdin,
+                &mut stdout,
+                json!({
+                    "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                    "params": { "name": tool, "arguments": {} }
+                }),
+            );
+            drop(stdin);
+            let _ = shim.wait();
+            resp
+        }));
+    }
+
+    // Give the 5 slow calls time to be in-flight inside spawn_blocking.
+    std::thread::sleep(Duration::from_millis(300));
+
+    // ---- Now fire a fast tools/list through a fresh shim --------------------
+    // tools/list is served by RealBackend::list_tools (in-memory snapshot of
+    // the registry) — no dispatch, no sleep. If the runtime is unblocked it
+    // returns immediately.
+
+    let fast_start = Instant::now();
+    let mut fast_shim = Command::new(&shim_bin)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn fast probe shim");
+    let mut fast_stdin = fast_shim.stdin.take().expect("stdin");
+    let fast_stdout_raw = fast_shim.stdout.take().expect("stdout");
+    let mut fast_stdout = std::io::BufReader::new(fast_stdout_raw);
+
+    let _ = send_rpc(
+        &mut fast_stdin,
+        &mut fast_stdout,
+        json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05", "capabilities": {},
+                "clientInfo": { "name": "fast-probe", "version": "0.0.1" }
+            }
+        }),
+    );
+    let list_resp = send_rpc(
+        &mut fast_stdin,
+        &mut fast_stdout,
+        json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {} }),
+    );
+    let fast_elapsed = fast_start.elapsed();
+    drop(fast_stdin);
+    let _ = fast_shim.wait();
+
+    assert!(
+        list_resp.get("result").is_some() && list_resp.get("error").is_none(),
+        "fast tools/list must succeed: {list_resp}"
+    );
+
+    // The hard ceiling is 1500ms (one slow call's sleep). We allow generous
+    // headroom for shim spawn + initialize + tools/list — but well under the
+    // serialization threshold. If the runtime was blocked, this would be
+    // >= 1500 ms because the executor would be parked in std::thread::sleep.
+    const FAST_CEILING_MS: u128 = 800;
+    assert!(
+        fast_elapsed.as_millis() < FAST_CEILING_MS,
+        "fast tools/list took {} ms (must be < {} ms — slow blocking calls are head-of-line blocking the runtime)",
+        fast_elapsed.as_millis(),
+        FAST_CEILING_MS
+    );
+    eprintln!(
+        "fast tools/list completed in {} ms while {} slow calls were in flight (spawn_blocking discipline holds)",
+        fast_elapsed.as_millis(),
+        slow_call_count
+    );
+
+    // ---- Drain slow calls + cleanup -----------------------------------------
+
+    for (i, h) in slow_handles.into_iter().enumerate() {
+        let resp = h.join().expect("slow-call thread panicked");
+        assert!(
+            resp.get("result").is_some() && resp.get("error").is_none(),
+            "slow call {i} must succeed: {resp}"
+        );
+    }
+
+    let _ = nix_kill(daemon.id(), libc_sigterm());
+    let start = Instant::now();
+    loop {
+        if let Ok(Some(_)) = daemon.try_wait() {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "daemon did not exit within 5 s after SIGTERM"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}

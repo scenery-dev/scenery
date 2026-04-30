@@ -472,9 +472,26 @@ impl BackendRegistry {
         let tool_name_owned = original_tool.to_string();
 
         let result = match target {
-            DispatchTarget::Stub { response } => Ok(serde_json::json!({
-                "content": [{"type": "text", "text": response}]
-            })),
+            DispatchTarget::Stub { response } => {
+                // Test hook: `VECTORHAWK_STUB_LATENCY_MS` injects a blocking
+                // sleep wrapped in `spawn_blocking` to simulate a slow real
+                // backend. Used by the M1.7 blocking-I/O stress test to
+                // validate that independent calls aren't head-of-line blocked
+                // when other calls are doing slow blocking work. No-op when
+                // the env var is unset, so production code path is unchanged.
+                if let Some(latency_ms) = std::env::var("VECTORHAWK_STUB_LATENCY_MS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                {
+                    let _ = tokio::task::spawn_blocking(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(latency_ms));
+                    })
+                    .await;
+                }
+                Ok(serde_json::json!({
+                    "content": [{"type": "text", "text": response}]
+                }))
+            }
 
             DispatchTarget::Http { url, auth_token } => {
                 self.call_http_tool(&url, &tool_name_owned, &args_owned, auth_token.as_deref())
