@@ -10,9 +10,11 @@ use vectorhawkd_mcp::{
     protocol::{JsonRpcRequest, METHOD_NOT_FOUND},
 };
 
-use super::dispatch;
+use crate::oauth_state::OAuthState;
 
-fn make_backend() -> Arc<RealBackend> {
+use super::{dispatch, DaemonContext};
+
+fn make_ctx() -> DaemonContext {
     let registry = Arc::new(BackendRegistry::new());
     registry.register_backend(BackendEntry {
         server_id: "echo".to_string(),
@@ -28,7 +30,11 @@ fn make_backend() -> Arc<RealBackend> {
         consecutive_errors: 0,
         unhealthy: false,
     });
-    Arc::new(RealBackend::new(registry))
+    DaemonContext {
+        backend: Arc::new(RealBackend::new(registry)),
+        oauth_state: Arc::new(OAuthState::new()),
+        listener_port: Some(39127),
+    }
 }
 
 fn make_request(method: &str, params: serde_json::Value) -> JsonRpcRequest {
@@ -42,8 +48,8 @@ fn make_request(method: &str, params: serde_json::Value) -> JsonRpcRequest {
 
 #[tokio::test]
 async fn dispatch_initialize_returns_protocol_version() {
-    let backend = make_backend();
-    let resp = dispatch(&*backend, make_request("initialize", serde_json::json!({}))).await;
+    let ctx = make_ctx();
+    let resp = dispatch(&ctx, make_request("initialize", serde_json::json!({}))).await;
     assert!(
         resp.error.is_none(),
         "initialize should not error: {:?}",
@@ -57,8 +63,8 @@ async fn dispatch_initialize_returns_protocol_version() {
 
 #[tokio::test]
 async fn dispatch_list_tools_returns_namespaced_stub_tool() {
-    let backend = make_backend();
-    let resp = dispatch(&*backend, make_request("tools/list", serde_json::json!({}))).await;
+    let ctx = make_ctx();
+    let resp = dispatch(&ctx, make_request("tools/list", serde_json::json!({}))).await;
     assert!(
         resp.error.is_none(),
         "tools/list should not error: {:?}",
@@ -74,9 +80,9 @@ async fn dispatch_list_tools_returns_namespaced_stub_tool() {
 
 #[tokio::test]
 async fn dispatch_call_stub_tool_returns_content() {
-    let backend = make_backend();
+    let ctx = make_ctx();
     let resp = dispatch(
-        &*backend,
+        &ctx,
         make_request(
             "tools/call",
             serde_json::json!({"name": "echo__echo", "arguments": {"input": "hello"}}),
@@ -94,9 +100,9 @@ async fn dispatch_call_stub_tool_returns_content() {
 
 #[tokio::test]
 async fn dispatch_call_unknown_tool_returns_error_content() {
-    let backend = make_backend();
+    let ctx = make_ctx();
     let resp = dispatch(
-        &*backend,
+        &ctx,
         make_request(
             "tools/call",
             serde_json::json!({"name": "echo__nonexistent", "arguments": {}}),
@@ -111,9 +117,9 @@ async fn dispatch_call_unknown_tool_returns_error_content() {
 
 #[tokio::test]
 async fn dispatch_unknown_method_returns_method_not_found() {
-    let backend = make_backend();
+    let ctx = make_ctx();
     let resp = dispatch(
-        &*backend,
+        &ctx,
         make_request("nonexistent/method", serde_json::json!({})),
     )
     .await;
@@ -123,14 +129,43 @@ async fn dispatch_unknown_method_returns_method_not_found() {
 
 #[tokio::test]
 async fn dispatch_invalid_tool_call_params_returns_invalid_params() {
-    let backend = make_backend();
+    let ctx = make_ctx();
     // tools/call requires a "name" field
     let resp = dispatch(
-        &*backend,
+        &ctx,
         make_request("tools/call", serde_json::json!({"bad": "params"})),
     )
     .await;
     assert!(resp.error.is_some());
     use vectorhawkd_mcp::protocol::INVALID_PARAMS;
     assert_eq!(resp.error.unwrap().code, INVALID_PARAMS);
+}
+
+#[tokio::test]
+async fn dispatch_auth_get_oauth_listener_port_returns_port() {
+    let ctx = make_ctx(); // listener_port = Some(39127)
+    let resp = dispatch(
+        &ctx,
+        make_request("auth/get_oauth_listener_port", serde_json::json!({})),
+    )
+    .await;
+    assert!(resp.error.is_none(), "should not error: {:?}", resp.error);
+    assert_eq!(resp.result.unwrap()["port"], 39127);
+}
+
+#[tokio::test]
+async fn dispatch_auth_get_oauth_listener_port_when_none() {
+    let registry = Arc::new(BackendRegistry::new());
+    let ctx = DaemonContext {
+        backend: Arc::new(RealBackend::new(registry)),
+        oauth_state: Arc::new(OAuthState::new()),
+        listener_port: None,
+    };
+    let resp = dispatch(
+        &ctx,
+        make_request("auth/get_oauth_listener_port", serde_json::json!({})),
+    )
+    .await;
+    use vectorhawkd_mcp::protocol::INTERNAL_ERROR;
+    assert_eq!(resp.error.unwrap().code, INTERNAL_ERROR);
 }

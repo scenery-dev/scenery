@@ -38,25 +38,45 @@ use vectorhawkd_mcp::{
     },
 };
 
+use crate::{
+    auth_dispatch::{handle_get_oauth_listener_port, handle_wait_for_callback},
+    oauth_state::OAuthState,
+};
+
+/// Shared daemon context passed to every per-connection handler.
+///
+/// Adding new daemon-wide resources (auth state, rate limiters, etc.) should
+/// be done by extending this struct rather than adding more individual
+/// parameters to `serve_connection`.
+#[derive(Clone)]
+pub struct DaemonContext {
+    /// Backend registry — tool dispatch.
+    pub backend: Arc<RealBackend>,
+    /// OAuth notification hub — `auth/wait_for_callback`.
+    pub oauth_state: Arc<OAuthState>,
+    /// Bound port of the HTTP callback listener, or `None` if it failed to start.
+    pub listener_port: Option<u16>,
+}
+
 /// Drive a single shim connection to completion.
 ///
 /// Spawned as a Tokio task per connection.  Errors inside the loop are logged
 /// and cause the connection to close; they do not propagate to the caller.
-pub async fn serve_connection(stream: UnixStream, backend: Arc<RealBackend>) {
+pub async fn serve_connection(stream: UnixStream, ctx: DaemonContext) {
     let peer = stream
         .peer_addr()
         .map(|a| format!("{a:?}"))
         .unwrap_or_else(|_| "unknown".to_string());
     info!(peer = %peer, "shim connected");
 
-    if let Err(e) = run_loop(stream, backend).await {
+    if let Err(e) = run_loop(stream, ctx).await {
         debug!(peer = %peer, error = %e, "connection loop ended");
     }
 
     info!(peer = %peer, "shim disconnected");
 }
 
-async fn run_loop(stream: UnixStream, backend: Arc<RealBackend>) -> Result<()> {
+async fn run_loop(stream: UnixStream, ctx: DaemonContext) -> Result<()> {
     let (mut reader, mut writer) = stream.into_split();
 
     loop {
@@ -91,19 +111,19 @@ async fn run_loop(stream: UnixStream, backend: Arc<RealBackend>) -> Result<()> {
             continue;
         }
 
-        let response = dispatch(&backend, request).await;
+        let response = dispatch(&ctx, request).await;
         send_response(&mut writer, &response).await;
     }
 
     Ok(())
 }
 
-/// Dispatch one JSON-RPC request to the backend and return a response.
-pub(crate) async fn dispatch(backend: &RealBackend, request: JsonRpcRequest) -> JsonRpcResponse {
+/// Dispatch one JSON-RPC request and return a response.
+pub(crate) async fn dispatch(ctx: &DaemonContext, request: JsonRpcRequest) -> JsonRpcResponse {
     let id = request.id.clone();
 
     match request.method.as_str() {
-        "initialize" => match backend.initialize(request.params).await {
+        "initialize" => match ctx.backend.initialize(request.params).await {
             Ok(result) => {
                 let v = serde_json::to_value(result).unwrap_or_default();
                 JsonRpcResponse::success(id, v)
@@ -114,7 +134,7 @@ pub(crate) async fn dispatch(backend: &RealBackend, request: JsonRpcRequest) -> 
             }
         },
 
-        "tools/list" => match backend.list_tools(request.params).await {
+        "tools/list" => match ctx.backend.list_tools(request.params).await {
             Ok(result) => {
                 let v = serde_json::to_value(result).unwrap_or_default();
                 JsonRpcResponse::success(id, v)
@@ -136,7 +156,7 @@ pub(crate) async fn dispatch(backend: &RealBackend, request: JsonRpcRequest) -> 
                     );
                 }
             };
-            match backend.call_tool(params).await {
+            match ctx.backend.call_tool(params).await {
                 Ok(result) => {
                     let v = serde_json::to_value(result).unwrap_or_default();
                     JsonRpcResponse::success(id, v)
@@ -146,6 +166,14 @@ pub(crate) async fn dispatch(backend: &RealBackend, request: JsonRpcRequest) -> 
                     JsonRpcResponse::error(id, INTERNAL_ERROR, format!("{e}"))
                 }
             }
+        }
+
+        "auth/get_oauth_listener_port" => {
+            handle_get_oauth_listener_port(id, ctx.listener_port).await
+        }
+
+        "auth/wait_for_callback" => {
+            handle_wait_for_callback(id, request.params, Arc::clone(&ctx.oauth_state)).await
         }
 
         other => {

@@ -33,6 +33,10 @@ clap.workspace = true
 async-trait.workspace = true
 dirs.workspace = true
 
+# OAuth callback HTTP listener — daemon-only dep (shim does not link axum).
+# axum 0.8 targets tokio 1.x, matching the workspace tokio version.
+axum = { version = "0.8", default-features = false, features = ["http1", "query", "tokio"] }
+
 [dev-dependencies]
 serde_json.workspace = true
 dirs.workspace = true
@@ -42,3 +46,5 @@ libc.workspace = true
 # without the CLI installed. rusqlite is already in the workspace via
 # vectorhawkd-core, so this adds no extra build cost.
 rusqlite.workspace = true
+# reqwest used by oauth_listener unit tests to exercise the HTTP callback endpoint.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
