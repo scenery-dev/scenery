@@ -202,12 +202,16 @@ mod tests {
         cleanup(&root);
     }
 
+    // macOS uses `~/Library/Application Support/VectorHawk/agent.sock`; Linux
+    // uses `$XDG_RUNTIME_DIR/vectorhawk/agent.sock` which is NOT under the data
+    // root the test creates. Gate this assertion to macOS only — the equivalent
+    // Linux assertion would have to introspect XDG_RUNTIME_DIR.
+    #[cfg(target_os = "macos")]
     #[test]
     fn socket_path_is_inside_root_on_macos() {
         let root = temp_root("socket");
         let state = AppState::bootstrap_in(root.clone()).expect("bootstrap");
         let sock = state.socket_path();
-        // On macOS (and Linux without XDG_RUNTIME_DIR set in test env) should be in root_dir
         assert!(
             sock.as_str().contains("VectorHawk") || sock.as_str().contains("vh-state-tests"),
             "socket path should be under the data dir: {sock}"

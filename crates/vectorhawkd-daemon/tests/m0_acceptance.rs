@@ -131,8 +131,12 @@ fn send_rpc(
 
 /// Kill any lingering `vectorhawkd` process that might be left from a prior run.
 fn kill_stale_daemon() {
-    // Best-effort: ignore errors (process may not exist).
-    let _ = Command::new("pkill").args(["-f", "vectorhawkd"]).status();
+    // `-x vectorhawkd` matches the process *name* exactly. The previous
+    // `-f vectorhawkd` matched the full command line, which on Linux
+    // matches `cargo test -p vectorhawkd-daemon` (the test runner's own
+    // cmdline) and SIGTERMs it with exit 143. Surfaced by the testhost
+    // Linux acceptance run.
+    let _ = Command::new("pkill").args(["-x", "vectorhawkd"]).status();
     std::thread::sleep(Duration::from_millis(300));
 }
 

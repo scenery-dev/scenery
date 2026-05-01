@@ -37,3 +37,8 @@ dirs.workspace = true
 serde_json.workspace = true
 dirs.workspace = true
 libc.workspace = true
+# Used by m1_multi_shim integration test to count audit_events rows directly.
+# Replaced a previous `sqlite3` CLI shellout that failed on Linux hosts
+# without the CLI installed. rusqlite is already in the workspace via
+# vectorhawkd-core, so this adds no extra build cost.
+rusqlite.workspace = true

@@ -127,7 +127,9 @@ fn send_rpc(
 }
 
 fn kill_stale_daemon() {
-    let _ = Command::new("pkill").args(["-f", "vectorhawkd"]).status();
+    // `-x` for exact process-name match — see m0_acceptance::kill_stale_daemon
+    // for why `-f` was wrong on Linux.
+    let _ = Command::new("pkill").args(["-x", "vectorhawkd"]).status();
     std::thread::sleep(Duration::from_millis(300));
 }
 

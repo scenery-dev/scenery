@@ -213,7 +213,7 @@ for i in "${!RESULTS[@]}"; do
 done
 
 echo ""
-echo "Shim binary size: ${SHIM_SIZE} (budget <=3 MB)"
+echo "Shim binary size: ${SHIM_SIZE} (budget <=6 MB)"
 echo ""
 
 if [[ "${OVERALL_PASS}" -eq 1 ]]; then

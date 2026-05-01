@@ -88,7 +88,9 @@ fn kill_child(child: &mut Child) {
 }
 
 fn kill_stale_daemon() {
-    let _ = Command::new("pkill").args(["-f", "vectorhawkd"]).status();
+    // `-x` for exact process-name match — see m0_acceptance::kill_stale_daemon
+    // for why `-f` was wrong on Linux.
+    let _ = Command::new("pkill").args(["-x", "vectorhawkd"]).status();
     std::thread::sleep(Duration::from_millis(300));
 }
 
@@ -400,45 +402,40 @@ fn wait_for_audit_rows(db_path: &PathBuf, target: usize, timeout: Duration) -> u
     }
 }
 
-/// Count rows in the audit_events table. Returns 0 if the DB doesn't exist yet
-/// or the table hasn't been created (early in daemon startup).
+/// Count rows in the audit_events table. Returns 0 if the DB doesn't exist
+/// yet or the table hasn't been created (early in daemon startup).
+///
+/// Uses rusqlite directly. Earlier versions of this test shelled out to the
+/// `sqlite3` CLI to avoid a dev-dep on rusqlite, but Pop!_OS doesn't ship
+/// the CLI by default and the CLI-missing fallback was buggy. rusqlite is
+/// already in the workspace via vectorhawkd-core, so no extra build cost.
 fn count_audit_rows(db_path: &PathBuf) -> usize {
     if !db_path.exists() {
-        // Try the canonical path variant (state.rs path structure).
-        // If neither exists, there are no rows.
         return 0;
     }
 
-    // Open in read-only WAL-compatible mode. We use the sqlite3 CLI to avoid
-    // a direct rusqlite dependency in test code (integration tests don't want
-    // to link rusqlite just for a row count — the daemon already links it).
-    let output = Command::new("sqlite3")
-        .arg(db_path)
-        .arg("SELECT COUNT(*) FROM audit_events;")
-        .output();
-
-    match output {
-        Ok(out) if out.status.success() => {
-            let text = String::from_utf8_lossy(&out.stdout);
-            text.trim().parse::<usize>().unwrap_or(0)
-        }
-        Ok(out) => {
-            // Table may not exist yet — that is fine for the "before" count.
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            if stderr.contains("no such table") {
-                0
-            } else {
-                eprintln!("sqlite3 query failed: {stderr}");
-                0
-            }
-        }
+    let conn = match rusqlite::Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    ) {
+        Ok(c) => c,
         Err(e) => {
-            // sqlite3 CLI not available — skip the audit-row check with a warning.
-            eprintln!(
-                "WARNING: sqlite3 CLI not found ({e}); skipping audit row count verification"
-            );
-            // Return a sentinel that makes the assertion pass (can't check, don't fail).
-            usize::MAX
+            eprintln!("WARNING: could not open audit DB read-only ({e}); returning 0");
+            return 0;
+        }
+    };
+
+    // Table may not exist yet on the "before" call — that's not an error.
+    match conn.query_row("SELECT COUNT(*) FROM audit_events", [], |r| {
+        r.get::<_, i64>(0)
+    }) {
+        Ok(n) => n.max(0) as usize,
+        Err(rusqlite::Error::SqliteFailure(_, Some(msg))) if msg.contains("no such table") => 0,
+        Err(rusqlite::Error::QueryReturnedNoRows) => 0,
+        Err(e) => {
+            // Surface other errors so they don't silently fail the assertion.
+            eprintln!("WARNING: audit_events count query failed ({e}); returning 0");
+            0
         }
     }
 }

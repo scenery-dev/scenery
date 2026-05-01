@@ -265,6 +265,12 @@ pub fn check_for_update(
 /// - Otherwise, checks if a newer version is available from the registry and applies it.
 ///
 /// Returns the total number of state transitions (lifecycle changes + version updates).
+// `collapsible_match` triggers on clippy >= 1.95 inside the lifecycle / version
+// dispatch table below. The "flattened" form would be a tuple-match across
+// (registry status, local status), which isn't cleaner — the published arm has
+// shared logic (set insertion) that runs regardless of local status. The match
+// arms read better as written.
+#[allow(clippy::collapsible_match)]
 pub fn check_skill_updates(
     state: &AppState,
     registry: &RegistryClient,

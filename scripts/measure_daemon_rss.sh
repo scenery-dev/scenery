@@ -32,9 +32,9 @@ fi
 
 # ── Kill any stale daemon from a previous run ─────────────────────────────────
 
-if pgrep -f "vectorhawkd$" > /dev/null 2>&1; then
+if pgrep -x vectorhawkd > /dev/null 2>&1; then
     echo "INFO: killing stale vectorhawkd process(es) before measurement"
-    pkill -f "vectorhawkd$" || true
+    pkill -x vectorhawkd || true
     sleep 1
 fi
 
