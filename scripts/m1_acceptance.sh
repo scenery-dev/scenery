@@ -42,6 +42,18 @@ DAEMON_BIN="${REPO_ROOT}/target/release/vectorhawkd"
 SHIM_BIN="${REPO_ROOT}/target/release/vectorhawkd-shim"
 CLI_BIN="${REPO_ROOT}/target/release/vectorhawk"
 
+# Initial cleanup — required when this script is chained from m4_acceptance.sh
+# (or any other gate) and a stale daemon from a previous step still holds the
+# socket. Each gate must be safe to run from a dirty starting state.
+case "$(uname -s)" in
+    Darwin) _M1_INIT_SOCK="${HOME}/Library/Application Support/VectorHawk/agent.sock" ;;
+    Linux)  _M1_INIT_SOCK="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/vectorhawk/agent.sock" ;;
+    *)      _M1_INIT_SOCK="${HOME}/.local/share/vectorhawk/agent.sock" ;;
+esac
+pkill -x vectorhawkd 2>/dev/null || true
+rm -f "${_M1_INIT_SOCK}" 2>/dev/null || true
+unset _M1_INIT_SOCK
+
 if [[ -t 1 ]]; then
     GREEN="\033[0;32m"; RED="\033[0;31m"; YELLOW="\033[0;33m"; RESET="\033[0m"
 else

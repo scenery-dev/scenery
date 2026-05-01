@@ -88,6 +88,18 @@ cleanup_gate_daemon() {
 
 trap cleanup_gate_daemon EXIT INT TERM
 
+# ── Initial cleanup ───────────────────────────────────────────────────────────
+# Kill any stale daemon and remove a leftover socket from a previous gate run.
+# Required when this script is chained from another gate (e.g. m4_acceptance.sh).
+case "$(uname -s)" in
+    Darwin) _M3_INIT_SOCK="${HOME}/Library/Application Support/VectorHawk/agent.sock" ;;
+    Linux)  _M3_INIT_SOCK="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/vectorhawk/agent.sock" ;;
+    *)      _M3_INIT_SOCK="${HOME}/.local/share/vectorhawk/agent.sock" ;;
+esac
+pkill -x vectorhawkd 2>/dev/null || true
+rm -f "${_M3_INIT_SOCK}" 2>/dev/null || true
+unset _M3_INIT_SOCK
+
 # ── Platform helpers ──────────────────────────────────────────────────────────
 
 OS="$(uname -s)"
