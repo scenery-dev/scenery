@@ -29,6 +29,8 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
+mod install;
+
 // ── CLI structure ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Parser)]
@@ -299,6 +301,24 @@ async fn cmd_doctor(registry_url: Option<&str>) -> Result<()> {
 
             let last_sync = query_last_sync_time(&app.state.db_path);
             println!("Last sync:       {last_sync}");
+
+            // M2: daemon install status.
+            match install::status() {
+                Ok(install::InstallStatus::NotInstalled) => {
+                    println!("Daemon install:  not installed");
+                }
+                Ok(install::InstallStatus::InstalledNotRunning { unit_path }) => {
+                    println!("Daemon install:  installed but not running");
+                    println!("  Unit path:     {unit_path}");
+                }
+                Ok(install::InstallStatus::InstalledAndRunning { unit_path }) => {
+                    println!("Daemon install:  installed and running");
+                    println!("  Unit path:     {unit_path}");
+                }
+                Err(e) => {
+                    println!("Daemon install:  unknown ({e:#})");
+                }
+            }
         }
         Err(e) => {
             eprintln!("warning: could not bootstrap state directory: {e:#}");
@@ -852,6 +872,32 @@ async fn cmd_mcp_setup(client: Option<&str>, dry_run: bool) -> Result<()> {
                 return Ok(());
             }
 
+            // ── M2: provision the daemon before writing AI client config ──────
+            //
+            // If the daemon is not installed/running, install it now so the
+            // AI client finds it on first use. `ensure_installed` is idempotent.
+            {
+                let install_status = tokio::task::spawn_blocking(install::status)
+                    .await
+                    .context("install status task panicked")?
+                    .context("failed to check daemon install status")?;
+
+                let was_not_running = !matches!(
+                    install_status,
+                    install::InstallStatus::InstalledAndRunning { .. }
+                );
+
+                if was_not_running {
+                    tokio::task::spawn_blocking(install::ensure_installed)
+                        .await
+                        .context("ensure_installed task panicked")?
+                        .context("failed to provision daemon")?;
+
+                    // Wait up to 5 s for the socket to appear.
+                    wait_for_daemon_socket(5_000).await;
+                }
+            }
+
             // Real write path.
             let config = detect_claude_code().ok_or_else(|| {
                 anyhow::anyhow!(
@@ -888,6 +934,36 @@ async fn cmd_mcp_setup(client: Option<&str>, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
+/// Poll the daemon socket up to `timeout_ms` milliseconds, checking every
+/// 250 ms. Prints a warning if the socket does not appear in time and returns
+/// without error — the AI client config write proceeds regardless.
+#[cfg(unix)]
+async fn wait_for_daemon_socket(timeout_ms: u64) {
+    use tokio::time::{sleep, Duration, Instant};
+
+    let socket_path = install::daemon_socket_path();
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+
+    while Instant::now() < deadline {
+        if install::socket_is_reachable(&socket_path, 200) {
+            println!("Daemon is running and reachable on socket.");
+            return;
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+
+    eprintln!(
+        "warning: daemon socket not reachable within {timeout_ms} ms. \
+         The config entry has been written; the daemon will be available after \
+         your next login or once `vectorhawk daemon install` completes."
+    );
+}
+
+#[cfg(not(unix))]
+async fn wait_for_daemon_socket(_timeout_ms: u64) {
+    // No-op on platforms without Unix sockets.
+}
+
 // ── mcp sync / backends (deferred — M1.4) ────────────────────────────────────
 
 async fn cmd_mcp_sync() -> Result<()> {
@@ -914,13 +990,17 @@ async fn cmd_daemon_run(registry_url: Option<String>) -> Result<()> {
 }
 
 async fn cmd_daemon_install() -> Result<()> {
-    eprintln!("vectorhawk daemon install: not yet implemented (M2)");
-    std::process::exit(2);
+    tokio::task::spawn_blocking(install::install)
+        .await
+        .context("install task panicked")?
+        .context("daemon install failed")
 }
 
 async fn cmd_daemon_uninstall() -> Result<()> {
-    eprintln!("vectorhawk daemon uninstall: not yet implemented (M2)");
-    std::process::exit(2);
+    tokio::task::spawn_blocking(install::uninstall)
+        .await
+        .context("uninstall task panicked")?
+        .context("daemon uninstall failed")
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

@@ -2420,6 +2420,8 @@ dependencies = [
  "camino",
  "chrono",
  "clap",
+ "dirs",
+ "libc",
  "reqwest 0.12.28",
  "rusqlite",
  "serde",

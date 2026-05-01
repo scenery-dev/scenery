@@ -30,3 +30,5 @@ camino.workspace = true
 reqwest = { workspace = true, features = ["rustls-tls", "json"] }
 rusqlite.workspace = true
 chrono.workspace = true
+dirs.workspace = true
+libc.workspace = true
