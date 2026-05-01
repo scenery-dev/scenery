@@ -1,0 +1,125 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-14
+          - target: x86_64-apple-darwin
+            runner: macos-13
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: install rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-cargo-
+
+      - name: build release binaries
+        run: cargo build --workspace --release --target ${{ matrix.target }}
+
+      - name: strip binaries (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          strip target/${{ matrix.target }}/release/vectorhawk
+          strip target/${{ matrix.target }}/release/vectorhawkd
+          strip target/${{ matrix.target }}/release/vectorhawkd-shim
+
+      - name: strip binaries (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          strip target/${{ matrix.target }}/release/vectorhawk
+          strip target/${{ matrix.target }}/release/vectorhawkd
+          strip target/${{ matrix.target }}/release/vectorhawkd-shim
+
+      - name: package tarball
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          TRIPLE="${{ matrix.target }}"
+          ARCHIVE_NAME="vectorhawk-${VERSION}-${TRIPLE}.tar.gz"
+
+          STAGING_DIR="$(mktemp -d)"
+          PKG_DIR="${STAGING_DIR}/vectorhawk-${VERSION}-${TRIPLE}"
+          mkdir -p "${PKG_DIR}"
+
+          cp target/${TRIPLE}/release/vectorhawk "${PKG_DIR}/"
+          cp target/${TRIPLE}/release/vectorhawkd "${PKG_DIR}/"
+          cp target/${TRIPLE}/release/vectorhawkd-shim "${PKG_DIR}/"
+          cp LICENSE "${PKG_DIR}/"
+          cp README.md "${PKG_DIR}/"
+
+          tar -czf "${ARCHIVE_NAME}" -C "${STAGING_DIR}" "vectorhawk-${VERSION}-${TRIPLE}"
+
+          # Write GNU sha256sum-compatible single-line checksum file.
+          # Format: "<hash>  <filename>" (two spaces between hash and name).
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${ARCHIVE_NAME}" > "${ARCHIVE_NAME}.sha256"
+          else
+            # macOS shasum with -a 256 produces the same format
+            shasum -a 256 "${ARCHIVE_NAME}" > "${ARCHIVE_NAME}.sha256"
+          fi
+
+          echo "ARCHIVE_NAME=${ARCHIVE_NAME}" >> "${GITHUB_ENV}"
+
+      - name: upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARCHIVE_NAME }}
+          path: |
+            ${{ env.ARCHIVE_NAME }}
+            ${{ env.ARCHIVE_NAME }}.sha256
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - name: download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+          merge-multiple: true
+
+      - name: list artifacts
+        run: find artifacts/ -type f | sort
+
+      - name: create or update github release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.sha256
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
