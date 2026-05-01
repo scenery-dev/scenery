@@ -54,6 +54,9 @@
 //!   These are acceptable at startup time and must NOT be moved into the accept
 //!   loop or per-connection handlers without adding `spawn_blocking`.
 
+mod auth_dispatch;
+mod oauth_listener;
+mod oauth_state;
 mod socket_dispatch;
 
 use anyhow::{Context, Result};
@@ -72,6 +75,9 @@ use vectorhawkd_mcp::{
     aggregator::{BackendEntry, BackendRegistry, BackendTransport, ToolDefinition, ToolVisibility},
     backend::{Backend, RealBackend},
 };
+
+pub use oauth_state::OAuthState;
+pub use socket_dispatch::DaemonContext;
 
 /// Configuration for the daemon entry point.
 ///
@@ -158,6 +164,29 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
         vh_registry.backend_count()
     );
 
+    // Build the OAuth notification hub.
+    let oauth_state = Arc::new(OAuthState::new());
+
+    // Start the OAuth callback HTTP listener (non-fatal if all ports in use).
+    let (listener_port, listener_handle) = match oauth_listener::start_listener(Arc::clone(
+        &oauth_state,
+    ))
+    .await
+    {
+        Ok(Some((addr, handle))) => {
+            info!(port = addr.port(), "OAuth callback listener started");
+            (Some(addr.port()), Some(handle))
+        }
+        Ok(None) => {
+            warn!("OAuth callback listener could not bind — auth login will be unavailable");
+            (None, None)
+        }
+        Err(e) => {
+            warn!(error = %e, "OAuth callback listener failed to start — auth login will be unavailable");
+            (None, None)
+        }
+    };
+
     let socket_path = opts
         .socket_path_override
         .unwrap_or_else(|| state.socket_path());
@@ -194,11 +223,12 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, _addr)) => {
-                        let backend_clone = Arc::clone(&backend);
-                        tokio::spawn(socket_dispatch::serve_connection(
-                            stream,
-                            backend_clone,
-                        ));
+                        let ctx = DaemonContext {
+                            backend: Arc::clone(&backend),
+                            oauth_state: Arc::clone(&oauth_state),
+                            listener_port,
+                        };
+                        tokio::spawn(socket_dispatch::serve_connection(stream, ctx));
                     }
                     Err(e) => {
                         error!(error = %e, "accept failed");
@@ -218,6 +248,14 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
 
     info!("draining in-flight connections (up to 2 s)");
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // Cancel all pending OAuth waiters so CLI subscribers get a clean error.
+    oauth_state.cancel_all().await;
+
+    // Stop the OAuth HTTP listener.
+    if let Some(handle) = listener_handle {
+        handle.abort();
+    }
 
     // Final audit flush on clean shutdown (best-effort — do not abort shutdown on error).
     let final_audit = Arc::clone(&audit_buffer);
