@@ -1,0 +1,289 @@
+//! Linux systemd-user unit install/uninstall for the VectorHawk daemon.
+//!
+//! Primary path: systemd user unit at
+//! `~/.config/systemd/user/vectorhawk-agent.service`.
+//!
+//! Fallback (no systemctl): XDG autostart desktop entry at
+//! `~/.config/autostart/vectorhawk.desktop` with a printed notice.
+//!
+//! Install sequence (systemd path):
+//! 1. Write the .service unit.
+//! 2. `systemctl --user daemon-reload`
+//! 3. `systemctl --user enable --now vectorhawk-agent.service`
+//!
+//! Uninstall sequence (systemd path):
+//! 1. `systemctl --user disable --now vectorhawk-agent.service`
+//! 2. Remove the unit file.
+//! 3. `systemctl --user daemon-reload`
+//!
+//! Note on lingering: on headless/server boxes the user session may not start
+//! without a graphical login. To run without an active session, the user can
+//! run `sudo loginctl enable-linger $USER` manually. This is intentionally NOT
+//! done automatically because it requires elevated privileges.
+
+use anyhow::{Context, Result};
+use std::{fs, process::Command};
+
+use super::{current_exe_path, daemon_socket_path, socket_is_reachable, InstallStatus};
+
+const SERVICE_NAME: &str = "vectorhawk-agent.service";
+const DESKTOP_FILENAME: &str = "vectorhawk.desktop";
+
+/// Return `~/.config/systemd/user/vectorhawk-agent.service`.
+fn unit_path() -> Result<std::path::PathBuf> {
+    let config = dirs::config_dir().context("failed to resolve XDG config directory")?;
+    Ok(config.join("systemd").join("user").join(SERVICE_NAME))
+}
+
+/// Return `~/.config/autostart/vectorhawk.desktop`.
+fn desktop_path() -> Result<std::path::PathBuf> {
+    let config = dirs::config_dir().context("failed to resolve XDG config directory")?;
+    Ok(config.join("autostart").join(DESKTOP_FILENAME))
+}
+
+/// Generate the systemd user unit content.
+fn render_unit(bin_path: &std::path::Path) -> Result<String> {
+    let bin_str = bin_path
+        .to_str()
+        .context("binary path is not valid UTF-8")?;
+
+    Ok(format!(
+        r#"[Unit]
+Description=VectorHawk daemon — governed AI platform agent
+After=network.target
+
+[Service]
+Type=simple
+ExecStart={bin_str} daemon run --foreground
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
+"#
+    ))
+}
+
+/// Generate the XDG autostart .desktop entry (fallback when systemd is absent).
+fn render_desktop(bin_path: &std::path::Path) -> Result<String> {
+    let bin_str = bin_path
+        .to_str()
+        .context("binary path is not valid UTF-8")?;
+
+    Ok(format!(
+        r#"[Desktop Entry]
+Type=Application
+Name=VectorHawk Agent
+Comment=VectorHawk daemon — governed AI platform agent
+Exec={bin_str} daemon run --foreground
+Hidden=false
+NoDisplay=false
+X-GNOME-Autostart-enabled=true
+"#
+    ))
+}
+
+/// Run a `systemctl --user` command, capturing stderr, and return a descriptive
+/// error on non-zero exit.
+fn systemctl_user(args: &[&str]) -> Result<()> {
+    let mut full_args = vec!["--user"];
+    full_args.extend_from_slice(args);
+
+    let output = Command::new("systemctl")
+        .args(&full_args)
+        .output()
+        .context("failed to spawn systemctl")?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let code = output.status.code().unwrap_or(-1);
+    anyhow::bail!(
+        "systemctl --user {} failed (exit {code}): {stderr}",
+        args.join(" ")
+    )
+}
+
+/// Returns `true` if `systemctl --user` is usable on this system.
+fn systemctl_available() -> bool {
+    Command::new("systemctl")
+        .args(["--user", "--version"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Returns `true` if the systemd unit is currently enabled.
+fn unit_is_enabled() -> bool {
+    Command::new("systemctl")
+        .args(["--user", "is-enabled", SERVICE_NAME])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+// ── Public install / uninstall ────────────────────────────────────────────────
+
+/// Install and start the daemon via systemd user unit (or XDG autostart fallback).
+pub fn install() -> Result<()> {
+    let bin_path = current_exe_path().context("failed to resolve current binary path")?;
+
+    if systemctl_available() {
+        install_systemd(&bin_path)
+    } else {
+        install_desktop_fallback(&bin_path)
+    }
+}
+
+/// Systemd user unit install path.
+fn install_systemd(bin_path: &std::path::Path) -> Result<()> {
+    let unit = unit_path().context("failed to resolve unit file path")?;
+
+    // ── Idempotency guard ─────────────────────────────────────────────────────
+    if unit.exists() && unit_is_enabled() {
+        println!("VectorHawk daemon is already installed and enabled — no changes made.");
+        return Ok(());
+    }
+
+    // ── 1. Ensure unit dir exists ─────────────────────────────────────────────
+    if let Some(parent) = unit.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create systemd user dir: {}", parent.display()))?;
+    }
+
+    // ── 2. Write unit file ────────────────────────────────────────────────────
+    let content = render_unit(bin_path).context("failed to render systemd unit")?;
+    fs::write(&unit, &content)
+        .with_context(|| format!("failed to write unit file: {}", unit.display()))?;
+
+    println!("Wrote systemd user unit: {}", unit.display());
+
+    // ── 3. daemon-reload ──────────────────────────────────────────────────────
+    systemctl_user(&["daemon-reload"]).context("systemctl daemon-reload failed")?;
+
+    // ── 4. enable --now ───────────────────────────────────────────────────────
+    systemctl_user(&["enable", "--now", SERVICE_NAME])
+        .context("failed to enable and start systemd unit")?;
+
+    println!("Systemd user unit enabled and started ({SERVICE_NAME}).");
+    println!(
+        "Note: on headless servers without an active user session, you may need to run \
+         `sudo loginctl enable-linger $USER` so the agent starts without a graphical login."
+    );
+    Ok(())
+}
+
+/// XDG autostart fallback when systemd is not available.
+fn install_desktop_fallback(bin_path: &std::path::Path) -> Result<()> {
+    let desktop = desktop_path().context("failed to resolve desktop entry path")?;
+
+    if desktop.exists() {
+        println!(
+            "VectorHawk autostart entry already exists at {} — no changes made.",
+            desktop.display()
+        );
+        return Ok(());
+    }
+
+    if let Some(parent) = desktop.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create autostart dir: {}", parent.display()))?;
+    }
+
+    let content = render_desktop(bin_path).context("failed to render .desktop entry")?;
+    fs::write(&desktop, &content)
+        .with_context(|| format!("failed to write desktop entry: {}", desktop.display()))?;
+
+    println!("Notice: systemctl was not found — falling back to XDG autostart.");
+    println!("Wrote autostart entry: {}", desktop.display());
+    println!(
+        "The VectorHawk daemon will start at your next graphical login. \
+         To start it now, run: {} daemon run --foreground &",
+        bin_path.display()
+    );
+    Ok(())
+}
+
+/// Stop and uninstall the daemon (systemd or autostart fallback).
+pub fn uninstall() -> Result<()> {
+    if systemctl_available() {
+        uninstall_systemd()
+    } else {
+        uninstall_desktop_fallback()
+    }
+}
+
+fn uninstall_systemd() -> Result<()> {
+    let unit = unit_path().context("failed to resolve unit file path")?;
+    let enabled = unit_is_enabled();
+    let unit_exists = unit.exists();
+
+    if !enabled && !unit_exists {
+        println!("VectorHawk daemon is not installed — nothing to remove.");
+        return Ok(());
+    }
+
+    // ── 1. Disable + stop ─────────────────────────────────────────────────────
+    if enabled {
+        systemctl_user(&["disable", "--now", SERVICE_NAME])
+            .context("failed to disable and stop systemd unit")?;
+        println!("Systemd unit disabled and stopped.");
+    }
+
+    // ── 2. Remove unit file ───────────────────────────────────────────────────
+    if unit_exists {
+        fs::remove_file(&unit)
+            .with_context(|| format!("failed to remove unit file: {}", unit.display()))?;
+        println!("Removed unit file: {}", unit.display());
+    }
+
+    // ── 3. daemon-reload ──────────────────────────────────────────────────────
+    let _ = systemctl_user(&["daemon-reload"]);
+
+    println!("VectorHawk daemon uninstalled.");
+    Ok(())
+}
+
+fn uninstall_desktop_fallback() -> Result<()> {
+    let desktop = desktop_path().context("failed to resolve desktop entry path")?;
+
+    if !desktop.exists() {
+        println!("VectorHawk daemon is not installed — nothing to remove.");
+        return Ok(());
+    }
+
+    fs::remove_file(&desktop)
+        .with_context(|| format!("failed to remove desktop entry: {}", desktop.display()))?;
+
+    println!("Removed autostart entry: {}", desktop.display());
+    println!("VectorHawk daemon uninstalled.");
+    Ok(())
+}
+
+/// Return the current install/running status.
+pub fn status() -> Result<InstallStatus> {
+    // Check systemd unit first; fall back to desktop entry.
+    let unit = unit_path().context("failed to resolve unit file path")?;
+    let desktop = desktop_path().context("failed to resolve desktop entry path")?;
+
+    let unit_path_str = if unit.exists() {
+        unit.to_str().unwrap_or("(non-UTF-8 path)").to_string()
+    } else if desktop.exists() {
+        desktop.to_str().unwrap_or("(non-UTF-8 path)").to_string()
+    } else {
+        return Ok(InstallStatus::NotInstalled);
+    };
+
+    let socket_path = daemon_socket_path();
+    if socket_is_reachable(&socket_path, 500) {
+        Ok(InstallStatus::InstalledAndRunning {
+            unit_path: unit_path_str,
+        })
+    } else {
+        Ok(InstallStatus::InstalledNotRunning {
+            unit_path: unit_path_str,
+        })
+    }
+}
