@@ -49,6 +49,15 @@ cargo test
 cargo clippy
 ```
 
+## Uninstalling
+
+- **curl install**: `rm -rf ~/.vectorhawk` and remove the `$PATH` entry the installer added to your
+  shell rc file (e.g. `~/.zshrc` or `~/.bashrc`).
+- **Homebrew**: `brew uninstall vectorhawk`
+
+Neither of these uninstall the LaunchAgent or systemd user unit. To remove those, run
+`vectorhawk daemon uninstall` before removing the binaries.
+
 ## License
 
-Apache-2.0.
+Apache-2.0. See [LICENSE](./LICENSE).
