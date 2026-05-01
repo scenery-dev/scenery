@@ -319,6 +319,10 @@ async fn cmd_doctor(registry_url: Option<&str>) -> Result<()> {
                     println!("Daemon install:  unknown ({e:#})");
                 }
             }
+
+            // M3: OAuth listener status — query the running daemon.
+            let oauth_status = probe_oauth_listener_port(socket_path.as_str()).await;
+            println!("OAuth listener:  {oauth_status}");
         }
         Err(e) => {
             eprintln!("warning: could not bootstrap state directory: {e:#}");
@@ -329,6 +333,7 @@ async fn cmd_doctor(registry_url: Option<&str>) -> Result<()> {
             println!("Registry:        unknown");
             println!("Audit queue:     unknown");
             println!("Last sync:       unknown");
+            println!("OAuth listener:  not running");
         }
     }
 
@@ -353,6 +358,98 @@ async fn probe_daemon_socket(path: &str) -> String {
 #[cfg(not(unix))]
 async fn probe_daemon_socket(_path: &str) -> String {
     "unknown (daemon socket probe not supported on this platform)".to_string()
+}
+
+/// Query the running daemon for its OAuth callback listener port.
+///
+/// Issues `auth/get_oauth_listener_port` over the Unix socket (500 ms timeout).
+/// Returns a human-readable status string:
+/// - "running on port 39127"          — success
+/// - "running on port 39134 (fallback)" — success on a non-default port
+/// - "not running"                    — daemon unreachable or listener not bound
+#[cfg(unix)]
+async fn probe_oauth_listener_port(socket_path: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UnixStream;
+    use tokio::time::{timeout, Duration};
+
+    const OAUTH_PORT_BASE: u16 = 39127;
+
+    let path = socket_path.to_string();
+    let connected = match timeout(Duration::from_millis(500), UnixStream::connect(&path)).await {
+        Ok(Ok(s)) => s,
+        _ => return "not running".to_string(),
+    };
+
+    let (mut reader, mut writer) = connected.into_split();
+
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 99,
+        "method": "auth/get_oauth_listener_port",
+        "params": {}
+    });
+
+    let body = match serde_json::to_vec(&request) {
+        Ok(b) => b,
+        Err(_) => return "not running".to_string(),
+    };
+    let len = body.len() as u32;
+
+    if writer.write_all(&len.to_be_bytes()).await.is_err() {
+        return "not running".to_string();
+    }
+    if writer.write_all(&body).await.is_err() {
+        return "not running".to_string();
+    }
+    if writer.flush().await.is_err() {
+        return "not running".to_string();
+    }
+
+    // Read response with a 500 ms timeout.
+    let read_result = timeout(Duration::from_millis(500), async {
+        let mut len_buf = [0u8; 4];
+        reader.read_exact(&mut len_buf).await?;
+        let resp_len = u32::from_be_bytes(len_buf) as usize;
+        let mut resp_body = vec![0u8; resp_len];
+        reader.read_exact(&mut resp_body).await?;
+        Ok::<Vec<u8>, tokio::io::Error>(resp_body)
+    })
+    .await;
+
+    let resp_bytes = match read_result {
+        Ok(Ok(b)) => b,
+        _ => return "not running".to_string(),
+    };
+
+    let resp: serde_json::Value = match serde_json::from_slice(&resp_bytes) {
+        Ok(v) => v,
+        Err(_) => return "not running".to_string(),
+    };
+
+    if resp.get("error").is_some() {
+        return "not running".to_string();
+    }
+
+    let port = match resp
+        .get("result")
+        .and_then(|r| r.get("port"))
+        .and_then(|p| p.as_u64())
+    {
+        Some(p) => p as u16,
+        None => return "not running".to_string(),
+    };
+
+    if port == OAUTH_PORT_BASE {
+        format!("running on port {port}")
+    } else {
+        format!("running on port {port} (fallback)")
+    }
+}
+
+#[cfg(not(unix))]
+async fn probe_oauth_listener_port(_socket_path: &str) -> String {
+    "not running (Unix sockets not supported on this platform)".to_string()
 }
 
 /// Probe the registry health endpoint with a 1 s timeout.
