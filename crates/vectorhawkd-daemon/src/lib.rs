@@ -68,6 +68,7 @@ use tokio::{
 use tracing::{error, info, warn};
 use vectorhawkd_core::{
     audit::{AuditBuffer, SqliteAuditBuffer},
+    auth::{load_all_tokens, save_tokens, AuthClient},
     registry::RegistryClient,
     state::AppState,
 };
@@ -95,6 +96,9 @@ pub struct DaemonOpts {
 
 /// How often (in seconds) the background sync loop ticks.
 const SYNC_INTERVAL_SECS: u64 = 300;
+
+/// How often (in seconds) the token refresh loop checks for near-expiry tokens.
+const REFRESH_INTERVAL_SECS: u64 = 60;
 
 /// Run the daemon to completion.
 ///
@@ -149,6 +153,47 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
                 }
                 Err(join_err) => {
                     warn!(error = %join_err, "registry sync task panicked; will retry");
+                }
+            }
+        }
+    });
+
+    // Spawn the token refresh loop (60 s interval).
+    // Checks every stored access token and refreshes any that are within 5 min
+    // of expiry.  All sync I/O (SQLite + HTTP) happens inside spawn_blocking
+    // per the spawn_blocking discipline documented at the top of this file.
+    let refresh_db_path = state.db_path.clone();
+    let refresh_root_dir = state.root_dir.clone();
+    let refresh_registry_url = registry_url.clone();
+    tokio::spawn(async move {
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_secs(REFRESH_INTERVAL_SECS));
+        // Skip the immediate first tick — let the accept loop start first.
+        interval.tick().await;
+
+        loop {
+            interval.tick().await;
+
+            let db = refresh_db_path.clone();
+            let root = refresh_root_dir.clone();
+            let reg_url = refresh_registry_url.clone();
+
+            let result = tokio::task::spawn_blocking(move || {
+                let state_view = AppState {
+                    root_dir: root,
+                    db_path: db,
+                };
+                refresh_one_tick(&state_view, &reg_url)
+            })
+            .await;
+
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    warn!(error = %e, "token refresh tick failed; will retry on next interval");
+                }
+                Err(join_err) => {
+                    warn!(error = %join_err, "token refresh task panicked; will retry");
                 }
             }
         }
@@ -288,6 +333,72 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     Ok(())
 }
 
+/// One tick of the token refresh loop.
+///
+/// Called from `spawn_blocking` — issues synchronous SQLite and HTTP I/O.
+///
+/// Steps:
+/// 1. Load all rows from `auth_tokens`.
+/// 2. For each row whose `access_token` expires within 5 minutes, call
+///    `AuthClient::refresh` using the stored `refresh_token`.
+/// 3. On success, overwrite the row with the new tokens and log INFO.
+/// 4. On failure, log WARN and continue to the next row (do not panic).
+///
+/// This function is exposed as `pub` so tests can drive a single tick
+/// without running the full 60-second loop.
+pub fn refresh_one_tick(state: &AppState, registry_url: &str) -> Result<()> {
+    let rows = load_all_tokens(state).context("refresh_one_tick: failed to load auth_tokens")?;
+
+    for row in rows {
+        if !AuthClient::needs_refresh(&row.access_token) {
+            continue;
+        }
+
+        tracing::debug!(
+            registry_url = %row.registry_url,
+            "token near expiry — attempting refresh"
+        );
+
+        // Use the registry_url stored in the row (each row may target a
+        // different registry) rather than the daemon's primary registry_url.
+        let client = AuthClient::new(&row.registry_url);
+        match client.refresh(&row.refresh_token) {
+            Ok(new_tokens) => {
+                match save_tokens(
+                    state,
+                    &row.registry_url,
+                    &new_tokens.access_token,
+                    &new_tokens.refresh_token,
+                ) {
+                    Ok(()) => {
+                        info!(
+                            registry_url = %row.registry_url,
+                            "refresh_one_tick: token rotated successfully"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            registry_url = %row.registry_url,
+                            "refresh_one_tick: failed to save rotated token"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    registry_url = %row.registry_url,
+                    "refresh_one_tick: token refresh HTTP call failed"
+                );
+            }
+        }
+    }
+
+    let _ = registry_url; // primary registry_url param kept for future rate-limit context
+    Ok(())
+}
+
 /// One tick of the registry sync loop.
 ///
 /// Called from `spawn_blocking` — issues synchronous SQLite and HTTP I/O.
@@ -405,3 +516,9 @@ fn build_stub_registry() -> BackendRegistry {
     });
     registry
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+#[path = "refresh_loop_tests.rs"]
+mod refresh_loop_tests;

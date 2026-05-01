@@ -705,17 +705,124 @@ async fn cmd_skill_validate(path: camino::Utf8PathBuf) -> Result<()> {
 
 // ── auth login ────────────────────────────────────────────────────────────────
 
+/// Connect to the daemon Unix socket and perform a JSON-RPC auth login flow.
+///
+/// Steps:
+///   1. Connect to the daemon socket (timeout 2 s). If unreachable, exit 2.
+///   2. Issue `auth/get_oauth_listener_port` to learn the bound HTTP port.
+///   3. Initiate PKCE flow with the loopback redirect URI.
+///   4. Open browser to the authorization URL.
+///   5. Issue `auth/wait_for_callback` and wait up to 300 s.
+///   6. Exchange the code via `AuthClient::exchange_oauth_code`.
+///   7. Save tokens and print user identity.
+///
+/// No stdin prompt remains. The paste-the-code path has been removed.
 async fn cmd_auth_login(registry_url: &str) -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UnixStream;
     use vectorhawkd_core::{
         auth::{save_tokens, AuthClient},
         state::AppState,
     };
 
     let state = AppState::bootstrap().context("failed to bootstrap state")?;
+    let socket_path = state.socket_path();
+
+    // Connect to the daemon socket with a 2-second timeout.
+    let stream = match tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        UnixStream::connect(socket_path.as_std_path()),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(_)) | Err(_) => {
+            eprintln!(
+                "vectorhawk: auth login requires the running daemon — \
+                 run `vectorhawk daemon install` first"
+            );
+            std::process::exit(2);
+        }
+    };
+
+    let (mut reader, mut writer) = stream.into_split();
+
+    // ── helpers: write/read one framed JSON-RPC call ──────────────────────────
+
+    async fn send_rpc<W: AsyncWriteExt + Unpin>(
+        writer: &mut W,
+        request: &serde_json::Value,
+    ) -> Result<()> {
+        let body = serde_json::to_vec(request).context("failed to serialize JSON-RPC request")?;
+        let len = body.len() as u32;
+        writer
+            .write_all(&len.to_be_bytes())
+            .await
+            .context("failed to write frame length")?;
+        writer
+            .write_all(&body)
+            .await
+            .context("failed to write frame body")?;
+        writer.flush().await.context("failed to flush socket")?;
+        Ok(())
+    }
+
+    async fn recv_rpc<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<serde_json::Value> {
+        let mut len_buf = [0u8; 4];
+        reader
+            .read_exact(&mut len_buf)
+            .await
+            .context("failed to read frame length")?;
+        let len = u32::from_be_bytes(len_buf) as usize;
+        let mut body = vec![0u8; len];
+        reader
+            .read_exact(&mut body)
+            .await
+            .context("failed to read frame body")?;
+        serde_json::from_slice(&body).context("failed to parse JSON-RPC response")
+    }
+
+    // ── Step 2: get the OAuth listener port ──────────────────────────────────
+
+    send_rpc(
+        &mut writer,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "auth/get_oauth_listener_port",
+            "params": {}
+        }),
+    )
+    .await?;
+
+    let port_resp = recv_rpc(&mut reader).await?;
+
+    if let Some(err) = port_resp.get("error") {
+        eprintln!(
+            "vectorhawk: OAuth listener not running on the daemon: {}",
+            err.get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown error")
+        );
+        std::process::exit(2);
+    }
+
+    let port = port_resp
+        .get("result")
+        .and_then(|r| r.get("port"))
+        .and_then(|p| p.as_u64())
+        .context("auth/get_oauth_listener_port returned unexpected result shape")?
+        as u16;
+
+    // ── Step 3: initiate PKCE flow ────────────────────────────────────────────
+
+    let redirect_uri = format!("http://127.0.0.1:{port}/oauth/cli/callback");
     let client = AuthClient::new(registry_url);
     let init = client
-        .initiate_oauth_flow()
-        .context("failed to initiate OAuth flow")?;
+        .initiate_oauth_flow_with_redirect(&redirect_uri)
+        .context("failed to initiate OAuth PKCE flow")?;
+
+    // ── Step 4: open browser ──────────────────────────────────────────────────
 
     println!("Opening browser for VectorHawk login...");
     println!();
@@ -725,24 +832,48 @@ async fn cmd_auth_login(registry_url: &str) -> Result<()> {
 
     open_browser(&init.auth_url);
 
-    // M1: full PKCE callback listener lands in M3. For now we prompt the user
-    // to paste the authorization code (the redirect lands at the registry's
-    // callback page which will display the code).
-    println!("After authorizing, the registry will display an authorization code.");
-    print!("Paste the code here: ");
-    std::io::Write::flush(&mut std::io::stdout()).ok();
+    // ── Step 5: wait for callback via daemon ──────────────────────────────────
 
-    let mut code = String::new();
-    std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut code)
-        .context("failed to read authorization code from stdin")?;
-    let code = code.trim().to_string();
-    if code.is_empty() {
-        anyhow::bail!("no authorization code provided — login cancelled");
+    println!("Waiting for authorization (up to 5 minutes)...");
+
+    send_rpc(
+        &mut writer,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "auth/wait_for_callback",
+            "params": {
+                "state": init.state,
+                "timeout_secs": 300
+            }
+        }),
+    )
+    .await?;
+
+    let callback_resp = recv_rpc(&mut reader).await?;
+
+    if let Some(err) = callback_resp.get("error") {
+        let msg = err
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("unknown error");
+        anyhow::bail!("auth/wait_for_callback failed: {msg}");
     }
+
+    let code = callback_resp
+        .get("result")
+        .and_then(|r| r.get("code"))
+        .and_then(|c| c.as_str())
+        .context("auth/wait_for_callback returned unexpected result shape")?
+        .to_string();
+
+    // ── Step 6: exchange code for tokens ─────────────────────────────────────
 
     let tokens = client
         .exchange_oauth_code(&code, &init.code_verifier)
         .context("OAuth token exchange failed")?;
+
+    // ── Step 7: save tokens and print identity ────────────────────────────────
 
     save_tokens(
         &state,
@@ -752,7 +883,6 @@ async fn cmd_auth_login(registry_url: &str) -> Result<()> {
     )
     .context("failed to save auth tokens")?;
 
-    // Fetch and display user info to confirm.
     match client.me(&tokens.access_token) {
         Ok(user) => {
             println!("Logged in as {} ({}).", user.display_name, user.email);
