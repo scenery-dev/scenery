@@ -28,7 +28,8 @@
 #   AC2: vectorhawkd daemon boots, listens on Unix socket, holds stub backend.
 #   AC3: vectorhawk mcp serve (shim) connects, relays initialize + tools/list
 #        + >=5 tools/call invocations.
-#   AC4: Killing daemon mid-session causes shim to fall back within 2 seconds.
+#   AC4: Killing daemon mid-session causes shim to surface a JSON-RPC error
+#        with the 'daemon' install hint (M4 contract; supersedes M0 fallback).
 #   AC5: Daemon idle RSS <=50 MB on macOS arm64.
 #   AC6: `mcp setup` entry shape is `command=vectorhawk args=[mcp, serve]`.
 
@@ -140,14 +141,14 @@ fi
 echo ""
 echo "AC4: running m0_daemon_kill integration test..."
 if cargo test --release -p vectorhawkd-daemon --test m0_daemon_kill -- --include-ignored --nocapture 2>&1; then
-    record "PASS" "AC4: daemon-kill shim fallback <=2 s" "m0_daemon_kill test passed"
+    record "PASS" "AC4: daemon-kill shim returns daemon-required error <=3 s" "m0_daemon_kill test passed"
 else
     EXIT=$?
     if ! ls "${REPO_ROOT}/target/release/deps/m0_daemon_kill"* >/dev/null 2>&1 && \
        ! cargo test --release -p vectorhawkd-daemon --test m0_daemon_kill -- --list 2>/dev/null | grep -q m0_daemon_kill; then
-        record "SKIP" "AC4: daemon-kill shim fallback <=2 s" "m0_daemon_kill test binary not compiled (Streams 3/4/5 not merged)"
+        record "SKIP" "AC4: daemon-kill shim returns daemon-required error <=3 s" "m0_daemon_kill test binary not compiled"
     else
-        record "FAIL" "AC4: daemon-kill shim fallback <=2 s" "m0_daemon_kill test failed (exit ${EXIT})"
+        record "FAIL" "AC4: daemon-kill shim returns daemon-required error <=3 s" "m0_daemon_kill test failed (exit ${EXIT})"
     fi
 fi
 

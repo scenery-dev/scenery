@@ -23,8 +23,9 @@
 //! ```
 //!
 //! `mcp serve` is the AI-client entry point — what `mcp setup` writes into
-//! Claude Code / Cursor / etc. configs. On socket connect success it relays
-//! over `SocketBackend`; on 2 s timeout it falls back to `EmbeddedBackend`.
+//! Claude Code / Cursor / etc. configs. The shim relays over `SocketBackend`
+//! and, when the daemon is unreachable, returns a structured JSON-RPC error
+//! containing install/restart instructions (M4 contract).
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -160,8 +161,9 @@ pub enum AuthCommand {
 pub enum McpCommand {
     /// Start the MCP relay shim — written into AI client configs by `mcp setup`.
     ///
-    /// Connects to the vectorhawkd daemon over a Unix socket. Falls back to
-    /// an in-process `EmbeddedBackend` if the daemon is unreachable within 2 s.
+    /// Connects to the vectorhawkd daemon over a Unix socket. If the daemon
+    /// is unreachable, returns a JSON-RPC error containing install/restart
+    /// instructions for every request — never a silent in-process fallback.
     Serve,
 
     /// Write the VectorHawk MCP entry into the specified AI client's config.

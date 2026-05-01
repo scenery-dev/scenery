@@ -98,6 +98,6 @@ Existing code at `../skillrunner/crates/`:
 1. Workspace builds (`cargo build` green).
 2. `vectorhawkd` daemon boots, listens on a Unix socket at `~/Library/Application Support/VectorHawk/agent.sock` (mac) / `$XDG_RUNTIME_DIR/vectorhawk/agent.sock` (Linux), holds at least one stub backend MCP connection.
 3. `vectorhawk mcp serve` (shim) connects to the socket, relays an MCP `initialize` handshake + `tools/list` + ≥5 `tools/call` invocations from a real AI client (Claude Code preferred).
-4. Killing the daemon mid-session causes the shim to fall back to in-process within 2 seconds; the AI client does not error.
+4. Killing the daemon mid-session causes the shim to surface a JSON-RPC error (code -32001) containing the `vectorhawk daemon install` hint within 3 seconds. (M0 originally accepted silent in-process fallback; M4 changed the contract — see `context/RUN1_M4_STREAMS.md`.)
 5. Daemon idle RSS measured ≤50 MB on macOS arm64. Linux measurement deferred-but-not-blocking.
 6. `mcp setup` (or equivalent) demonstrates that the AI client config entry would be `command = "vectorhawk", args = ["mcp", "serve"]` — same shape as skillrunner today.

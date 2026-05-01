@@ -1,32 +1,26 @@
-//! M0 daemon-kill fallback test — verifies AC4: killing the daemon mid-session
-//! causes the shim to fall back to in-process mode within 2 seconds.
+//! M0 daemon-kill test — verifies the M4 contract: killing the daemon
+//! mid-session causes the shim to surface a JSON-RPC error containing the
+//! "daemon" install hint, not a silent in-process fallback.
 //!
-//! # Overview
+//! # M4 contract (replaces the M0 fallback contract)
 //!
-//! M0 acceptance criterion AC4:
+//! Up through M3 the shim transparently switched to an `EmbeddedBackend`
+//! (in-process stub) when the daemon socket died. M4 deletes that
+//! silent-degradation path. The new contract is:
 //!
-//!   Killing the daemon mid-session causes the shim to fall back to in-process
-//!   within 2 seconds; the AI client does not error.
+//!   Killing the daemon mid-session causes the shim to return a JSON-RPC
+//!   error response (code -32001) containing a "daemon" install hint
+//!   within 3 seconds. The AI client surfaces the error to the user.
 //!
 //! This test:
 //!   1. Spawns `vectorhawkd` (daemon) and `vectorhawkd-shim` (shim).
-//!   2. Performs a successful `initialize` + `tools/list` round-trip via the
-//!      daemon socket path (confirming the live path works).
-//!   3. Kills the daemon with SIGKILL (hard kill, not SIGTERM, to simulate a
-//!      crash rather than an orderly shutdown).
+//!   2. Performs a successful `initialize` + `tools/list` round-trip via
+//!      the daemon socket path (confirming the live path works).
+//!   3. Kills the daemon with SIGKILL (hard kill).
 //!   4. Sends a `tools/call` to the shim.
-//!   5. Asserts the shim responds successfully within 3 seconds (2s fallback
-//!      grace + 1s buffer) and that the response does NOT contain a JSON-RPC
-//!      `error` field.
-//!
-//! # Fallback mechanism
-//!
-//! When the socket becomes unreachable the shim switches to `EmbeddedBackend`
-//! (in-process execution).  The spec requires this transition to complete within
-//! 2 seconds.  The shim SHOULD emit a `WARN`-level log message containing
-//! "fallback" when it switches modes; this test validates the observable
-//! behavior (successful response) but does NOT inspect stderr for the warning
-//! text — that is left as an open question for Stream 5 (see notes below).
+//!   5. Asserts the shim responds within 3 s with a JSON-RPC `error` whose
+//!      `message` contains the substring `daemon`. The response MUST NOT
+//!      have a `result` field.
 //!
 //! # Running
 //!
@@ -42,17 +36,9 @@
 //! Or via the acceptance gate (preferred):
 //!
 //! ```text
-//! bash scripts/m0_acceptance.sh
+//! bash scripts/m0_acceptance.sh   # uses the new M4 contract
+//! bash scripts/m4_acceptance.sh   # full M4 verification
 //! ```
-//!
-//! # Open question for Stream 5 (shim)
-//!
-//! The daemon-kill test asserts a successful `tools/call` response after the
-//! daemon is killed.  It does NOT currently inspect the shim's stderr for the
-//! expected WARN fallback message because the exact substring is not yet
-//! specified (Stream 5 implements the fallback).  If Stream 5 settles on a
-//! stable log message (e.g. "switching to embedded fallback"), add a
-//! `stderr_contains("embedded fallback")` assertion here.
 
 #![allow(clippy::unwrap_used)] // integration tests may unwrap for clarity
 
@@ -161,14 +147,14 @@ fn libc_sigkill() -> i32 {
 
 // ── AC4 test ──────────────────────────────────────────────────────────────────
 
-/// Kill the daemon mid-session; assert the shim falls back and responds within
-/// 3 seconds.
+/// Kill the daemon mid-session; assert the shim surfaces a JSON-RPC error
+/// containing the "daemon" install hint within 3 seconds.
 ///
 /// Marked `#[ignore]` — requires pre-built release binaries.
 /// See the module-level documentation for running instructions.
 #[test]
 #[ignore = "requires pre-built release binaries — run cargo build --workspace --release first"]
-fn ac4_daemon_kill_shim_falls_back_within_3s() {
+fn ac4_daemon_kill_shim_returns_daemon_required_error_within_3s() {
     let daemon_bin = release_bin("vectorhawkd");
     let shim_bin = release_bin("vectorhawkd-shim");
 
@@ -306,8 +292,20 @@ fn ac4_daemon_kill_shim_falls_back_within_3s() {
     assert_eq!(post_kill_resp["jsonrpc"], "2.0");
     assert_eq!(post_kill_resp["id"], 3);
     assert!(
-        post_kill_resp.get("result").is_some() && post_kill_resp.get("error").is_none(),
-        "post-kill tools/call must return result (shim in embedded fallback mode); got: {post_kill_resp}"
+        post_kill_resp.get("error").is_some() && post_kill_resp.get("result").is_none(),
+        "post-kill tools/call must return a JSON-RPC error (shim in DaemonRequired mode); got: {post_kill_resp}"
+    );
+    let error_msg = post_kill_resp["error"]["message"]
+        .as_str()
+        .expect("error.message must be a string")
+        .to_string();
+    assert!(
+        error_msg.to_lowercase().contains("daemon"),
+        "error message must contain 'daemon'; got: {error_msg}"
+    );
+    assert_eq!(
+        post_kill_resp["error"]["code"], -32001i64,
+        "error code must be -32001 (DAEMON_UNREACHABLE)"
     );
 
     // ---- Cleanup ------------------------------------------------------------

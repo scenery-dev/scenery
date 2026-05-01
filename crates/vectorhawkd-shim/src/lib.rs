@@ -3,27 +3,39 @@
 //! Exposes [`run_shim`], the single entry point for the shim binary and for
 //! the `vectorhawk mcp serve` subcommand.
 //!
-//! # Behaviour
+//! # Single-mode posture (M4)
 //!
-//! 1. Resolve the daemon socket path (platform-appropriate; see [`daemon_socket_path`]).
-//! 2. Try to connect to the daemon socket with a 2-second timeout.
-//! 3. On success: enter relay mode (`SocketBackend`). Each JSON-RPC frame from
-//!    stdin is forwarded to the daemon; the daemon's response is written back to
-//!    stdout.  **If the daemon dies mid-session** (socket I/O error on any
-//!    frame), the shim silently switches to `EmbeddedBackend` for that frame and
-//!    all subsequent frames. The AI client never sees a JSON-RPC `error` caused
-//!    by the daemon dying.
-//! 4. On connect failure or timeout: enter embedded mode immediately.
+//! The shim is daemon-only. It tries the daemon socket on startup. On any
+//! failure (initial connect or mid-session socket death), the shim does NOT
+//! fall back to in-process execution. Instead it enters `DaemonRequired`
+//! mode and answers every JSON-RPC request with a structured error
+//! containing install/restart instructions. The AI client surfaces the
+//! error to the user, who runs `vectorhawk daemon install` (or restarts
+//! the existing agent) and retries. There is no in-process degradation
+//! mode in production code.
 //!
-//! # Mid-session fallback state machine
+//! # State machine
 //!
 //! ```text
-//! Relaying(SocketBackend)  --[socket I/O error]-->  Embedded(EmbeddedBackend)
+//! Relaying(SocketBackend)  --[socket I/O error]-->  DaemonRequired
 //! ```
 //!
-//! The transition is one-way for the session. Once fallen back, the shim stays
-//! in embedded mode (no reconnect attempt to the daemon mid-session — that is
-//! M1 scope).
+//! The transition is one-way for the session: once in `DaemonRequired`,
+//! the shim never reconnects mid-session. AI clients are expected to
+//! handle reconnect-with-backoff per the MCP spec — they re-spawn the
+//! shim, which retries the daemon socket from scratch.
+//!
+//! # Why not silently fall back to embedded?
+//!
+//! Up through M3 the shim transparently switched to an in-process
+//! `EmbeddedBackend` with stub tools (list_skills, run_skill, etc.) on
+//! daemon failure. The stub responses were hardcoded, not real — the AI
+//! client believed VectorHawk was working when it wasn't. M4 deletes
+//! that silent-degradation path: a missing daemon must be visible to the
+//! user.
+//!
+//! `EmbeddedBackend` still exists in `vectorhawkd-mcp::backend` for tests
+//! and unit-test scaffolding, but no shim production code constructs it.
 //!
 //! # Socket path
 //!
@@ -31,21 +43,23 @@
 //! in `rusqlite` (bundled SQLite, ~1.5 MB of link weight). The socket path
 //! function is duplicated here from `vectorhawkd-core::state`. The canonical
 //! implementation lives there; any change must be mirrored here.
-//!
-//! Tracked in: TODO(M1) — extract socket path into `vectorhawkd-manifest` or a
-//! zero-dep `vectorhawkd-paths` crate so neither core nor shim needs to duplicate it.
 
 use anyhow::Result;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use tracing::{debug, error, info, warn};
 use vectorhawkd_mcp::{
-    backend::{EmbeddedBackend, SocketBackend},
-    protocol::{
-        JsonRpcRequest, JsonRpcResponse, ToolCallParams, INTERNAL_ERROR, INVALID_PARAMS,
-        METHOD_NOT_FOUND, PARSE_ERROR,
-    },
+    backend::SocketBackend,
+    protocol::{JsonRpcRequest, JsonRpcResponse, PARSE_ERROR},
 };
+
+// ── JSON-RPC error code for the daemon-required state ────────────────────────
+
+/// Server-defined JSON-RPC error code for the daemon-required state.
+///
+/// Per JSON-RPC 2.0, the range -32000..=-32099 is reserved for server-defined
+/// errors. We use -32001 for "VectorHawk daemon unreachable".
+const DAEMON_UNREACHABLE: i64 = -32001;
 
 // ── Socket path ───────────────────────────────────────────────────────────────
 
@@ -74,24 +88,15 @@ pub fn daemon_socket_path() -> Option<PathBuf> {
 
 /// The shim's current dispatch mode for the session.
 ///
-/// # One-way transition invariant (M0, reaffirmed M1.6)
-///
-/// The state machine is one-directional: `Relaying → Embedded`.
-///
-/// Once the shim falls back to `Embedded` mode (daemon socket unreachable or
-/// dead), it stays there for the lifetime of the session. There is NO reconnect
-/// attempt: reconnecting mid-session would require re-issuing `initialize` to
-/// the daemon, which would give the AI client a different capability set than
-/// what it negotiated at session start, violating MCP protocol invariants.
-///
-/// If a future stream wants reconnect support, it MUST add a new state
-/// (e.g., `Reconnecting`) — never reverse this transition. See M1.6 tracking.
+/// One-way transition: `Relaying → DaemonRequired`. Once degraded, the shim
+/// stays there for the lifetime of the session. Reconnect is the AI client's
+/// responsibility (re-spawn the shim).
 enum SessionMode {
     /// Forwarding frames to the daemon over a Unix socket.
     #[cfg(unix)]
     Relaying(SocketBackend),
-    /// In-process dispatch, no daemon involvement.
-    Embedded(EmbeddedBackend),
+    /// Daemon unreachable. Every request gets a structured JSON-RPC error.
+    DaemonRequired { reason: String },
 }
 
 // ── run_shim ──────────────────────────────────────────────────────────────────
@@ -101,17 +106,12 @@ enum SessionMode {
 /// Reads newline-delimited JSON-RPC from stdin, writes responses to stdout.
 /// Returns when stdin closes (AI client disconnects) or on an unrecoverable error.
 ///
-/// The shim tries the daemon socket first (2 s timeout). On failure it falls
-/// back to `EmbeddedBackend` with a pre-registered stub tool set. If the daemon
-/// dies mid-session, the shim transparently switches to `EmbeddedBackend` on the
-/// failing frame without surfacing a JSON-RPC error to the AI client.
-///
-/// The fallback warning is written to stderr (WARN level via `tracing`); it does
-/// not appear on stdout (which is the MCP wire).
+/// The shim tries the daemon socket first (2 s timeout). On any failure it
+/// enters `DaemonRequired` mode and serves the same JSON-RPC error to every
+/// subsequent request — never an in-process degradation in production.
 pub async fn run_shim() -> Result<()> {
     let socket_path = daemon_socket_path();
 
-    // Determine initial session mode.
     #[cfg(unix)]
     let mut mode = {
         if let Some(ref path) = socket_path {
@@ -122,24 +122,23 @@ pub async fn run_shim() -> Result<()> {
                     SessionMode::Relaying(probe)
                 }
                 Err(e) => {
-                    warn!(
-                        error = %e,
-                        socket = %path.display(),
-                        "daemon socket unreachable on startup — falling back to in-process embedded backend"
-                    );
-                    SessionMode::Embedded(make_embedded_backend())
+                    let reason = format!("daemon socket {} unreachable: {e}", path.display());
+                    warn!(%reason, "shim entering daemon-required mode");
+                    SessionMode::DaemonRequired { reason }
                 }
             }
         } else {
-            warn!("daemon socket path unavailable — falling back to in-process embedded backend");
-            SessionMode::Embedded(make_embedded_backend())
+            let reason = "daemon socket path is unavailable on this platform".to_string();
+            warn!(%reason, "shim entering daemon-required mode");
+            SessionMode::DaemonRequired { reason }
         }
     };
 
     #[cfg(not(unix))]
     let mut mode = {
-        warn!("daemon socket relay not supported on this platform (M0) — using embedded backend");
-        SessionMode::Embedded(make_embedded_backend())
+        let reason = "daemon socket relay not supported on this platform".to_string();
+        warn!(%reason, "shim entering daemon-required mode");
+        SessionMode::DaemonRequired { reason }
     };
 
     let stdin = io::stdin();
@@ -188,13 +187,6 @@ pub async fn run_shim() -> Result<()> {
     }
 
     info!("shim read-loop exiting");
-
-    // Shutdown the embedded backend if we ended up there.
-    if let SessionMode::Embedded(ref backend) = mode {
-        use vectorhawkd_mcp::backend::Backend;
-        backend.on_shutdown().await;
-    }
-
     Ok(())
 }
 
@@ -204,7 +196,6 @@ pub async fn run_shim() -> Result<()> {
 ///
 /// Returns `None` for notifications (no `id`), `Some(response)` otherwise.
 async fn dispatch_line(line: &str, mode: &mut SessionMode) -> Option<JsonRpcResponse> {
-    // Parse the JSON-RPC request.
     let request: JsonRpcRequest = match serde_json::from_str(line) {
         Ok(r) => r,
         Err(e) => {
@@ -218,7 +209,6 @@ async fn dispatch_line(line: &str, mode: &mut SessionMode) -> Option<JsonRpcResp
 
     debug!(method = %request.method, id = ?request.id, "received request");
 
-    // Notifications (no id) get no response.
     if request.id.is_none() {
         debug!(method = %request.method, "received notification, no response needed");
         return None;
@@ -227,36 +217,33 @@ async fn dispatch_line(line: &str, mode: &mut SessionMode) -> Option<JsonRpcResp
     Some(dispatch_request(request, mode).await)
 }
 
-/// Dispatch a parsed request, switching to embedded mode on socket failure.
+/// Dispatch a parsed request, switching to `DaemonRequired` on socket failure.
 async fn dispatch_request(request: JsonRpcRequest, mode: &mut SessionMode) -> JsonRpcResponse {
     let id = request.id.clone();
 
     #[cfg(unix)]
     if let SessionMode::Relaying(ref backend) = *mode {
-        // Try the relay. On any error, fall through to embedded fallback.
-        let relay_result = relay_via_socket(backend, &request).await;
-        match relay_result {
+        match relay_via_socket(backend, &request).await {
             Ok(response) => return response,
             Err(e) => {
-                warn!(
-                    error = %e,
-                    method = %request.method,
-                    "daemon socket error mid-session — falling back to in-process embedded backend"
-                );
-                // One-way transition: switch to embedded for this frame and all future frames.
-                *mode = SessionMode::Embedded(make_embedded_backend());
+                let reason = format!("daemon socket error: {e}");
+                warn!(%reason, method = %request.method, "shim transitioning to daemon-required mode");
+                *mode = SessionMode::DaemonRequired { reason };
             }
         }
     }
 
-    // Embedded path (either initial fallback or post-transition).
     match mode {
-        SessionMode::Embedded(ref backend) => dispatch_to_embedded(backend, request).await,
+        SessionMode::DaemonRequired { reason } => daemon_required_error(id, reason),
         #[cfg(unix)]
         SessionMode::Relaying(_) => {
-            // Unreachable: we always transition above before reaching here,
-            // but the compiler needs an exhaustive match.
-            JsonRpcResponse::error(id, INTERNAL_ERROR, "unexpected relaying state")
+            // Unreachable: the relay branch above either returned a response
+            // or transitioned to DaemonRequired.
+            JsonRpcResponse::error(
+                id,
+                DAEMON_UNREACHABLE,
+                "internal: relaying state should have been handled".to_string(),
+            )
         }
     }
 }
@@ -266,14 +253,16 @@ async fn dispatch_request(request: JsonRpcRequest, mode: &mut SessionMode) -> Js
 /// Send the request over the socket and return the daemon's JSON-RPC response.
 ///
 /// Returns `Err` on any I/O failure (broken pipe, closed socket, timeout).
-/// The caller is responsible for switching to embedded mode on error.
+/// The caller is responsible for switching to `DaemonRequired` mode on error.
 #[cfg(unix)]
 async fn relay_via_socket(
     backend: &SocketBackend,
     request: &JsonRpcRequest,
 ) -> Result<JsonRpcResponse> {
     use vectorhawkd_mcp::backend::Backend;
-    use vectorhawkd_mcp::protocol::{InitializeResult, ToolCallResult, ToolsListResult};
+    use vectorhawkd_mcp::protocol::{
+        InitializeResult, ToolCallParams, ToolCallResult, ToolsListResult, METHOD_NOT_FOUND,
+    };
 
     let id = request.id.clone();
 
@@ -295,90 +284,26 @@ async fn relay_via_socket(
             let value = serde_json::to_value(result).unwrap_or_default();
             Ok(JsonRpcResponse::success(id, value))
         }
-        other => {
-            // Unknown method: return METHOD_NOT_FOUND (not a relay error).
-            // Wrap in Ok so the caller does not trigger fallback for this.
-            Ok(JsonRpcResponse::error(
-                id,
-                METHOD_NOT_FOUND,
-                format!("unknown method: {other}"),
-            ))
-        }
+        other => Ok(JsonRpcResponse::error(
+            id,
+            METHOD_NOT_FOUND,
+            format!("unknown method: {other}"),
+        )),
     }
 }
 
-// ── Embedded dispatch ─────────────────────────────────────────────────────────
+// ── DaemonRequired error response ─────────────────────────────────────────────
 
-/// Dispatch a request to the in-process embedded backend.
-async fn dispatch_to_embedded(
-    backend: &EmbeddedBackend,
-    request: JsonRpcRequest,
-) -> JsonRpcResponse {
-    use vectorhawkd_mcp::backend::Backend;
-
-    let id = request.id.clone();
-
-    match request.method.as_str() {
-        "initialize" => match backend.initialize(request.params).await {
-            Ok(result) => {
-                JsonRpcResponse::success(id, serde_json::to_value(result).unwrap_or_default())
-            }
-            Err(e) => {
-                warn!(error = %e, "embedded initialize failed");
-                JsonRpcResponse::error(id, INTERNAL_ERROR, e.to_string())
-            }
-        },
-        "tools/list" => match backend.list_tools(request.params).await {
-            Ok(result) => {
-                JsonRpcResponse::success(id, serde_json::to_value(result).unwrap_or_default())
-            }
-            Err(e) => {
-                warn!(error = %e, "embedded tools/list failed");
-                JsonRpcResponse::error(id, INTERNAL_ERROR, e.to_string())
-            }
-        },
-        "tools/call" => {
-            let params: ToolCallParams = match serde_json::from_value(request.params) {
-                Ok(p) => p,
-                Err(e) => {
-                    return JsonRpcResponse::error(
-                        id,
-                        INVALID_PARAMS,
-                        format!("invalid tool call params: {e}"),
-                    );
-                }
-            };
-            match backend.call_tool(params).await {
-                Ok(result) => {
-                    JsonRpcResponse::success(id, serde_json::to_value(result).unwrap_or_default())
-                }
-                Err(e) => {
-                    warn!(error = %e, "embedded tools/call failed");
-                    JsonRpcResponse::error(id, INTERNAL_ERROR, e.to_string())
-                }
-            }
-        }
-        other => {
-            debug!(method = %other, "unknown method");
-            JsonRpcResponse::error(id, METHOD_NOT_FOUND, format!("unknown method: {other}"))
-        }
-    }
-}
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-/// Construct the stub embedded backend used for the fallback path.
-fn make_embedded_backend() -> EmbeddedBackend {
-    EmbeddedBackend::with_stub_backend(
-        "vectorhawk",
-        &[
-            ("list_skills", "List installed VectorHawk skills"),
-            ("run_skill", "Run a VectorHawk skill"),
-            ("install_skill", "Install a skill from the registry"),
-            ("search_skills", "Search the skill registry"),
-            ("get_status", "Get VectorHawk runner status"),
-        ],
-    )
+/// Build the standard JSON-RPC error response served while the shim is in
+/// `DaemonRequired` mode. The same shape is returned for every request so
+/// AI clients can display a consistent message to the user.
+fn daemon_required_error(id: Option<serde_json::Value>, reason: &str) -> JsonRpcResponse {
+    let message = format!(
+        "VectorHawk daemon unreachable. Run `vectorhawk daemon install` to install \
+         and start it, or restart it with `launchctl kickstart gui/$(id -u)/com.vectorhawk.agent` \
+         (macOS) / `systemctl --user start vectorhawk-agent` (Linux). Detail: {reason}"
+    );
+    JsonRpcResponse::error(id, DAEMON_UNREACHABLE, message)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

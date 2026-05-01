@@ -4,125 +4,7 @@
 //! and does not pollute production code.
 #![allow(clippy::unwrap_used)]
 
-use vectorhawkd_mcp::{
-    backend::{Backend, EmbeddedBackend},
-    protocol::ToolCallParams,
-};
-
-/// Round-trip `initialize` through `EmbeddedBackend` — the in-process fallback.
-///
-/// This is the canonical shim fallback test: verifies that the embedded
-/// backend (which is what `run_shim` uses when the daemon socket is
-/// unreachable) correctly handles an MCP initialize request.
-#[tokio::test]
-async fn embedded_initialize_round_trip() {
-    let backend = EmbeddedBackend::with_stub_backend(
-        "vectorhawk",
-        &[
-            ("list_skills", "List installed VectorHawk skills"),
-            ("run_skill", "Run a VectorHawk skill"),
-        ],
-    );
-
-    let result = backend.initialize(serde_json::json!({})).await.unwrap();
-
-    assert_eq!(
-        result.protocol_version, "2024-11-05",
-        "protocol version must match MCP spec"
-    );
-    assert_eq!(
-        result.server_info.name, "vectorhawkd",
-        "server name must be vectorhawkd"
-    );
-    assert!(
-        result.capabilities.tools.is_some(),
-        "tools capability must be present"
-    );
-    // Fallback instructions are set — this is the distinguishing marker that
-    // lets support identify embedded mode in logs.
-    let instructions = result.instructions.unwrap_or_default();
-    assert!(
-        instructions.contains("fallback"),
-        "embedded mode instructions must mention fallback; got: {instructions:?}"
-    );
-}
-
-/// Round-trip `tools/list` through `EmbeddedBackend`.
-///
-/// Verifies that stub tools appear with the expected namespace prefix
-/// (`vectorhawk__<tool_name>`).
-#[tokio::test]
-async fn embedded_tools_list_round_trip() {
-    let backend = EmbeddedBackend::with_stub_backend(
-        "vectorhawk",
-        &[
-            ("list_skills", "List installed VectorHawk skills"),
-            ("run_skill", "Run a VectorHawk skill"),
-            ("install_skill", "Install a skill from the registry"),
-            ("search_skills", "Search the skill registry"),
-            ("get_status", "Get VectorHawk runner status"),
-        ],
-    );
-
-    let result = backend.list_tools(serde_json::json!({})).await.unwrap();
-
-    assert_eq!(result.tools.len(), 5, "all 5 stub tools must appear");
-
-    let names: Vec<&str> = result.tools.iter().map(|t| t.name.as_str()).collect();
-    assert!(
-        names.contains(&"vectorhawk__list_skills"),
-        "expected vectorhawk__list_skills in {names:?}"
-    );
-    assert!(
-        names.contains(&"vectorhawk__get_status"),
-        "expected vectorhawk__get_status in {names:?}"
-    );
-}
-
-/// Five `tools/call` round-trips through `EmbeddedBackend`.
-///
-/// Satisfies M0 acceptance criterion: the in-process fallback can service
-/// >=5 tool calls without JSON-RPC error.
-#[tokio::test]
-async fn embedded_five_tool_calls_round_trip() {
-    let backend = EmbeddedBackend::with_stub_backend(
-        "vectorhawk",
-        &[
-            ("list_skills", "List installed VectorHawk skills"),
-            ("run_skill", "Run a VectorHawk skill"),
-            ("install_skill", "Install a skill from the registry"),
-            ("search_skills", "Search the skill registry"),
-            ("get_status", "Get VectorHawk runner status"),
-        ],
-    );
-
-    let tool_names = [
-        "vectorhawk__list_skills",
-        "vectorhawk__run_skill",
-        "vectorhawk__install_skill",
-        "vectorhawk__search_skills",
-        "vectorhawk__get_status",
-    ];
-
-    for tool_name in tool_names {
-        let result = backend
-            .call_tool(ToolCallParams {
-                name: tool_name.to_string(),
-                arguments: serde_json::json!({}),
-            })
-            .await
-            .unwrap();
-
-        assert!(
-            result.is_error.is_none() || result.is_error == Some(false),
-            "stub call should not be an error for {tool_name}"
-        );
-        assert!(
-            !result.content.is_empty(),
-            "content must not be empty for {tool_name}"
-        );
-    }
-}
+use crate::{daemon_required_error, dispatch_line, SessionMode};
 
 /// `daemon_socket_path` returns a path ending in `agent.sock`.
 ///
@@ -151,5 +33,87 @@ fn daemon_socket_path_contains_vectorhawk_on_macos() {
         path.to_string_lossy().contains("VectorHawk"),
         "macOS socket path must be under VectorHawk data dir; got: {}",
         path.display()
+    );
+}
+
+/// `daemon_required_error` returns an error with code -32001 and a message
+/// containing the install hint.
+#[test]
+fn daemon_required_error_contains_install_hint() {
+    let resp = daemon_required_error(
+        Some(serde_json::json!(1)),
+        "daemon socket unreachable: connection refused",
+    );
+    let err = resp
+        .error
+        .expect("daemon-required response must be an error");
+    assert_eq!(err.code, -32001i64, "must use the DAEMON_UNREACHABLE code");
+    assert!(
+        err.message.contains("vectorhawk daemon install"),
+        "message must include `vectorhawk daemon install` install hint; got: {}",
+        err.message
+    );
+    assert!(
+        err.message.contains("connection refused"),
+        "message must include the underlying reason; got: {}",
+        err.message
+    );
+}
+
+/// In `DaemonRequired` mode, every recognized request gets the standard
+/// daemon-unreachable error.
+#[tokio::test]
+async fn daemon_required_mode_returns_error_for_initialize() {
+    let mut mode = SessionMode::DaemonRequired {
+        reason: "test: socket missing".to_string(),
+    };
+    let line = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+    let resp = dispatch_line(line, &mut mode)
+        .await
+        .expect("initialize must produce a response");
+    let err = resp.error.expect("response must be an error");
+    assert_eq!(err.code, -32001);
+    assert!(err.message.contains("daemon"));
+}
+
+/// In `DaemonRequired` mode, `tools/list` also gets the standard error
+/// (every method, not just initialize).
+#[tokio::test]
+async fn daemon_required_mode_returns_error_for_tools_list() {
+    let mut mode = SessionMode::DaemonRequired {
+        reason: "test".to_string(),
+    };
+    let line = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#;
+    let resp = dispatch_line(line, &mut mode)
+        .await
+        .expect("tools/list must produce a response");
+    assert_eq!(resp.error.expect("must error").code, -32001);
+}
+
+/// Notifications (no id) get no response even in `DaemonRequired` mode.
+#[tokio::test]
+async fn daemon_required_mode_drops_notifications() {
+    let mut mode = SessionMode::DaemonRequired {
+        reason: "test".to_string(),
+    };
+    let line = r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#;
+    let resp = dispatch_line(line, &mut mode).await;
+    assert!(resp.is_none(), "notifications must not produce a response");
+}
+
+/// Malformed JSON gets a parse-error response regardless of mode.
+#[tokio::test]
+async fn malformed_json_gets_parse_error() {
+    let mut mode = SessionMode::DaemonRequired {
+        reason: "test".to_string(),
+    };
+    let resp = dispatch_line("this is not json", &mut mode)
+        .await
+        .expect("must produce a response");
+    let err = resp.error.expect("must error");
+    assert_eq!(
+        err.code,
+        vectorhawkd_mcp::protocol::PARSE_ERROR,
+        "must surface the parse error code, not the daemon-unreachable code"
     );
 }

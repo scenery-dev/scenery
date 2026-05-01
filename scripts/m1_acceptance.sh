@@ -31,7 +31,8 @@
 #   AC8:  Multi-shim multiplexing — 3 shims share state, no SQLite contention.
 #   AC9:  CLI surface — skill / auth / daemon / mcp / doctor commands wired.
 #   AC10: Compute budget — daemon idle <=50 MB, under load <=100 MB, shim <=3 MB.
-#   AC11: Mid-session fallback regression — M0 AC4 still passes.
+#   AC11: Mid-session daemon-kill regression — M0 AC4 still passes (M4 contract:
+#         shim surfaces a JSON-RPC error containing 'daemon').
 #   AC12: spawn_blocking discipline — slow backend does not head-of-line block.
 
 set -uo pipefail
@@ -291,15 +292,15 @@ else
         "idle=${IDLE_RSS_MB}MB (<=50) load=${LOAD_RSS_MB}MB (<=100) shim=${SHIM_SIZE_MB}MB (<=6)"
 fi
 
-# ── AC11: Mid-session fallback regression (M0 AC4) ───────────────────────────
+# ── AC11: Mid-session daemon-kill regression (M0 AC4 / M4 contract) ──────────
 
-echo "AC11: mid-session fallback regression (M0 AC4) ..."
+echo "AC11: daemon-kill regression (M0 AC4 / M4 error contract) ..."
 if cargo test --release -p vectorhawkd-daemon --test m0_daemon_kill \
         -- --ignored 2>&1 | grep -q "test result: ok. 1 passed"; then
-    record "PASS" 'AC11: M0 mid-session fallback (regression)' \
+    record "PASS" 'AC11: M0 daemon-kill regression (M4 error contract)' \
         "m0_daemon_kill test passed"
 else
-    record "FAIL" 'AC11: M0 mid-session fallback (regression)' \
+    record "FAIL" 'AC11: M0 daemon-kill regression (M4 error contract)' \
         "m0_daemon_kill test failed"
 fi
 
