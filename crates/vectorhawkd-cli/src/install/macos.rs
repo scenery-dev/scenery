@@ -174,7 +174,7 @@ pub fn install() -> Result<()> {
         let _ = launchctl(&["bootout", &service_target(uid)]);
     }
 
-    // ── 5. Bootstrap the service (loads + starts it immediately) ─────────────
+    // ── 5. Bootstrap the service (loads into the domain) ─────────────────────
     let plist_str = plist.to_str().context("plist path is not valid UTF-8")?;
     launchctl(&["bootstrap", &domain_target(uid), plist_str])
         .context("failed to bootstrap LaunchAgent")?;
@@ -183,6 +183,18 @@ pub fn install() -> Result<()> {
     // `enable` marks the service as not disabled; if it was previously disabled
     // via `disable`, this re-arms the RunAtLoad behavior on next login.
     launchctl(&["enable", &service_target(uid)]).context("failed to enable LaunchAgent")?;
+
+    // ── 7. Kickstart for immediate launch ─────────────────────────────────────
+    // On macOS 15+ (Sequoia) `bootstrap` may defer the initial start as
+    // "speculative" even with RunAtLoad=true. `kickstart -k` forces an
+    // immediate start. We use `-k` (kill existing) so that if a stale process
+    // somehow survived the earlier bootout it is replaced.
+    //
+    // Non-fatal: if kickstart fails (e.g. process already started by the time
+    // we get here) we log a warning but do not fail the overall install.
+    if let Err(e) = launchctl(&["kickstart", "-k", &service_target(uid)]) {
+        eprintln!("warning: kickstart returned an error (daemon may still start): {e:#}");
+    }
 
     println!("LaunchAgent loaded and started (label: {LABEL}).");
     println!("The daemon will start automatically at login.");
