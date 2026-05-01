@@ -304,3 +304,49 @@ fn daemon_uninstall_parses() {
 fn unknown_command_fails() {
     assert!(try_parse(&["notacommand"]).is_err());
 }
+
+// ── M3: doctor OAuth listener line ───────────────────────────────────────────
+
+/// AC5 (M3): `vectorhawk doctor` must emit an `OAuth listener:` line.
+///
+/// When the daemon is not running the line reads "not running".  The test
+/// exercises the output label — not the daemon state — so it does not require
+/// a live daemon.
+///
+/// Marked `#[ignore]` because it requires the release binary.
+#[test]
+#[ignore = "requires pre-built release binary — run cargo build --workspace --release first"]
+fn doctor_output_contains_oauth_listener_line() {
+    use std::{path::PathBuf, process::Command};
+
+    // Locate the release binary relative to CARGO_MANIFEST_DIR.
+    let manifest_dir =
+        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set by cargo");
+    let workspace_root = PathBuf::from(&manifest_dir)
+        .parent()
+        .expect("cli crate should have a parent")
+        .parent()
+        .expect("crates/ should have a parent (workspace root)")
+        .to_path_buf();
+    let cli_bin = workspace_root
+        .join("target")
+        .join("release")
+        .join("vectorhawk");
+
+    assert!(
+        cli_bin.exists(),
+        "vectorhawk release binary not found at {cli_bin:?} — run cargo build --workspace --release"
+    );
+
+    let output = Command::new(&cli_bin)
+        .args(["doctor"])
+        .output()
+        .expect("failed to spawn vectorhawk doctor");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        stdout.contains("OAuth listener:"),
+        "doctor output must contain 'OAuth listener:' line; got:\n{stdout}"
+    );
+}
