@@ -197,6 +197,7 @@ pub fn send_list_changed_notification<W: Write>(writer: &mut W) -> Result<()> {
 mod tests {
     use super::*;
     use crate::backend::EmbeddedBackend;
+    #[allow(unused_imports)]
     use crate::protocol::{ToolCallResult, ToolsListResult};
 
     /// Drive a `Server<EmbeddedBackend>` through a sequence of JSON-RPC frames

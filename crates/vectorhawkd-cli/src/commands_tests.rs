@@ -20,9 +20,21 @@ fn try_parse(args: &[&str]) -> Result<Cli, clap::Error> {
 #[test]
 fn doctor_parses() {
     use super::Command;
+    // Clear any inherited VECTORHAWK_REGISTRY_URL so this test doesn't
+    // depend on the user's shell — Doctor::registry_url is wired with
+    // `#[arg(env = "VECTORHAWK_REGISTRY_URL")]`, and the test's intent
+    // is "no CLI flag → field is None", not "no env var".
+    //
+    // SAFETY: env mutation is process-global; this test is fast and
+    // doesn't share state with other parallel tests because it doesn't
+    // re-set the var.
+    unsafe { std::env::remove_var("VECTORHAWK_REGISTRY_URL") };
     match parse(&["doctor"]).command {
         Command::Doctor { registry_url } => {
-            assert!(registry_url.is_none());
+            assert!(
+                registry_url.is_none(),
+                "expected None, got {registry_url:?}"
+            );
         }
         other => panic!("expected Doctor, got {other:?}"),
     }
