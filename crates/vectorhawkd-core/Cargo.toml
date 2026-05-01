@@ -33,6 +33,7 @@ flate2 = "1"
 tempfile.workspace = true
 sha2 = "0.10"
 base64.workspace = true
+getrandom.workspace = true
 hex = "0.4"
 urlencoding = "2"
 

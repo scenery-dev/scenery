@@ -77,23 +77,8 @@ pub struct StoredTokens {
 /// unreserved character set `[A-Z a-z 0-9 - . _ ~]`. Base64url-no-padding
 /// over 32 bytes satisfies this requirement.
 fn generate_code_verifier() -> String {
-    // rand is not in the workspace; use getrandom via uuid's underlying entropy,
-    // or directly via std-available /dev/urandom. We avoid adding a new dep by
-    // using uuid v4's 122 random bits, but for 256-bit verifier we need our own
-    // 32-byte fill. Use uuid internals as entropy twice and XOR, or use
-    // the sha2/rand combo already present. Actually, the simplest approach is
-    // to use the `getrandom` crate via the uuid feature already present, but
-    // uuid doesn't expose that. Instead, use two uuid v4 values (together they
-    // give 244 bits of entropy) and hash them to produce 32 bytes.
-    //
-    // NOTE: this is deliberately conservative — 32 random bytes from two UUID4s
-    // digested through SHA-256 is cryptographically sufficient for PKCE.
-    let u1 = uuid::Uuid::new_v4();
-    let u2 = uuid::Uuid::new_v4();
-    let mut hasher = Sha256::new();
-    hasher.update(u1.as_bytes());
-    hasher.update(u2.as_bytes());
-    let bytes: [u8; 32] = hasher.finalize().into();
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes).expect("OS RNG must be available");
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
