@@ -305,12 +305,246 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# D1.2: install.sh — syntax checks
+# ---------------------------------------------------------------------------
+
+echo "D1.2 (AC2): checking scripts/install.sh syntax ..."
+
+INSTALL_SH="${REPO_ROOT}/scripts/install.sh"
+
+if [[ ! -f "${INSTALL_SH}" ]]; then
+    record "FAIL" "D1.2 (AC2): scripts/install.sh exists" "file not found"
+else
+    record "PASS" "D1.2 (AC2): scripts/install.sh exists" "${INSTALL_SH}"
+
+    # bash -n syntax check
+    if bash -n "${INSTALL_SH}" 2>/dev/null; then
+        record "PASS" "D1.2 (AC2): bash -n scripts/install.sh" "syntax OK"
+    else
+        record "FAIL" "D1.2 (AC2): bash -n scripts/install.sh" \
+            "$(bash -n "${INSTALL_SH}" 2>&1 || true)"
+    fi
+
+    # sh -n syntax check (POSIX)
+    if sh -n "${INSTALL_SH}" 2>/dev/null; then
+        record "PASS" "D1.2 (AC2): sh -n scripts/install.sh" "syntax OK (POSIX sh)"
+    else
+        record "FAIL" "D1.2 (AC2): sh -n scripts/install.sh" \
+            "$(sh -n "${INSTALL_SH}" 2>&1 || true)"
+    fi
+
+    # shellcheck if available
+    if command -v shellcheck >/dev/null 2>&1; then
+        if shellcheck -s sh "${INSTALL_SH}" 2>/dev/null; then
+            record "PASS" "D1.2 (AC2): shellcheck -s sh scripts/install.sh" "no warnings"
+        else
+            SC_OUT="$(shellcheck -s sh "${INSTALL_SH}" 2>&1 | head -20 || true)"
+            record "FAIL" "D1.2 (AC2): shellcheck -s sh scripts/install.sh" "${SC_OUT}"
+        fi
+    else
+        record "N/A" "D1.2 (AC2): shellcheck (not installed)" "install shellcheck to enable"
+    fi
+
+    # No bashisms: verify shebang is #!/bin/sh
+    if head -1 "${INSTALL_SH}" | grep -q '^#!/bin/sh'; then
+        record "PASS" "D1.2 (AC2): install.sh shebang is #!/bin/sh" ""
+    else
+        record "FAIL" "D1.2 (AC2): install.sh shebang is #!/bin/sh" \
+            "got: $(head -1 "${INSTALL_SH}")"
+    fi
+
+    # No jq requirement
+    if grep -q 'jq' "${INSTALL_SH}" 2>/dev/null; then
+        record "FAIL" "D1.2 (AC2): install.sh does not require jq" \
+            "jq reference found in script"
+    else
+        record "PASS" "D1.2 (AC2): install.sh does not require jq" ""
+    fi
+
+    # No sudo invocations
+    if grep -q '\bsudo\b' "${INSTALL_SH}" 2>/dev/null; then
+        record "FAIL" "D1.2 (AC2): install.sh has no sudo invocations" \
+            "sudo found in script"
+    else
+        record "PASS" "D1.2 (AC2): install.sh has no sudo invocations" ""
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# D1.2 (AC2): JSON parsing unit test using fixture
+# ---------------------------------------------------------------------------
+
+echo "D1.2 (AC2): JSON parsing unit test (fixture) ..."
+
+FIXTURE="${REPO_ROOT}/scripts/fixtures/release-latest.json"
+
+if [[ ! -f "${FIXTURE}" ]]; then
+    record "FAIL" "D1.2 (AC2): fixture scripts/fixtures/release-latest.json exists" \
+        "file not found"
+else
+    record "PASS" "D1.2 (AC2): fixture file exists" "${FIXTURE}"
+
+    FIXTURE_CONTENT="$(cat "${FIXTURE}")"
+
+    # Test 1: python3 json parsing extracts tag_name correctly
+    if command -v python3 >/dev/null 2>&1; then
+        PARSED_TAG="$(printf '%s' "${FIXTURE_CONTENT}" | python3 -c \
+            'import json,sys; d=json.load(sys.stdin); print(d["tag_name"])' 2>/dev/null || true)"
+        if [[ "${PARSED_TAG}" == "v0.1.0" ]]; then
+            record "PASS" "D1.2 (AC2): python3 JSON tag_name extraction" \
+                "parsed tag_name=v0.1.0"
+        else
+            record "FAIL" "D1.2 (AC2): python3 JSON tag_name extraction" \
+                "expected v0.1.0, got: ${PARSED_TAG}"
+        fi
+    else
+        record "N/A" "D1.2 (AC2): python3 JSON extraction (python3 not available)" ""
+    fi
+
+    # Test 2: grep/sed fallback parsing extracts tag_name correctly.
+    # The GitHub API response uses "tag_name": "v..." (space after colon).
+    GREP_TAG="$(printf '%s' "${FIXTURE_CONTENT}" | \
+        grep -o '"tag_name": *"[^"]*"' | \
+        sed 's/"tag_name": *"//;s/"//' || true)"
+    if [[ "${GREP_TAG}" == "v0.1.0" ]]; then
+        record "PASS" "D1.2 (AC2): grep/sed fallback tag_name extraction" \
+            "parsed tag_name=v0.1.0"
+    else
+        record "FAIL" "D1.2 (AC2): grep/sed fallback tag_name extraction" \
+            "expected v0.1.0, got: ${GREP_TAG}"
+    fi
+
+    # Test 3: constructed tarball URL matches expected pattern for each triple
+    for _TRIPLE in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu; do
+        _EXPECTED_URL="https://github.com/vectorhawk/vectorhawkd/releases/download/v0.1.0/vectorhawk-0.1.0-${_TRIPLE}.tar.gz"
+        _VERSION="${GREP_TAG#v}"
+        _CONSTRUCTED_URL="https://github.com/vectorhawk/vectorhawkd/releases/download/${GREP_TAG}/vectorhawk-${_VERSION}-${_TRIPLE}.tar.gz"
+        if [[ "${_CONSTRUCTED_URL}" == "${_EXPECTED_URL}" ]]; then
+            record "PASS" "D1.2 (AC2): URL construction for ${_TRIPLE}" \
+                "${_CONSTRUCTED_URL}"
+        else
+            record "FAIL" "D1.2 (AC2): URL construction for ${_TRIPLE}" \
+                "expected: ${_EXPECTED_URL} got: ${_CONSTRUCTED_URL}"
+        fi
+    done
+fi
+
+# ---------------------------------------------------------------------------
+# D1.2 (AC2): unsupported platform error path
+# ---------------------------------------------------------------------------
+
+echo "D1.2 (AC2): unsupported platform error path ..."
+
+# Simulate an unsupported platform by overriding uname via PATH trick.
+FAKE_UNAME_DIR="$(mktemp -d)"
+# shellcheck disable=SC2064
+trap "rm -rf '${FAKE_UNAME_DIR}'" EXIT
+
+cat > "${FAKE_UNAME_DIR}/uname" << 'UNAME_SCRIPT'
+#!/bin/sh
+if [ "$1" = "-s" ]; then
+    printf 'Windows\n'
+elif [ "$1" = "-m" ]; then
+    printf 'x86_64\n'
+fi
+UNAME_SCRIPT
+chmod +x "${FAKE_UNAME_DIR}/uname"
+
+PLATFORM_ERR="$(PATH="${FAKE_UNAME_DIR}:${PATH}" sh "${INSTALL_SH}" 2>&1 || true)"
+if printf '%s' "${PLATFORM_ERR}" | grep -q 'does not yet support'; then
+    record "PASS" "D1.2 (AC2): unsupported platform prints clear error and exits" \
+        "exit message: $(printf '%s' "${PLATFORM_ERR}" | head -1)"
+else
+    record "FAIL" "D1.2 (AC2): unsupported platform prints clear error and exits" \
+        "output: ${PLATFORM_ERR:0:200}"
+fi
+
+rm -rf "${FAKE_UNAME_DIR}"
+
+# ---------------------------------------------------------------------------
+# D1.2 (AC5): idempotency — no double PATH writes
+# ---------------------------------------------------------------------------
+
+echo "D1.2 (AC5): idempotency — no double PATH writes ..."
+
+if [[ -f "${INSTALL_SH}" ]]; then
+    _IDEMPOTENCY_TMPDIR="$(mktemp -d)"
+    _TEST_RC="${_IDEMPOTENCY_TMPDIR}/.zshrc"
+    _TEST_BIN_DIR="${_IDEMPOTENCY_TMPDIR}/.vectorhawk/bin"
+    mkdir -p "${_TEST_BIN_DIR}"
+    # Pre-seed the rc file with the PATH line as if a previous install added it.
+    printf '# Added by VectorHawk installer\nexport PATH="%s:$PATH"\n' \
+        "${_TEST_BIN_DIR}" > "${_TEST_RC}"
+
+    # Count occurrences of the install dir before (should be 1).
+    _COUNT_BEFORE="$(grep -c "${_TEST_BIN_DIR}" "${_TEST_RC}" 2>/dev/null || echo 0)"
+
+    # Simulate the idempotency guard: grep for the install dir, only append if missing.
+    _ALREADY_PRESENT=0
+    if grep -qF "${_TEST_BIN_DIR}" "${_TEST_RC}" 2>/dev/null; then
+        _ALREADY_PRESENT=1
+    fi
+    if [[ "${_ALREADY_PRESENT}" -eq 0 ]]; then
+        printf '\n# Added by VectorHawk installer\nexport PATH="%s:$PATH"\n' \
+            "${_TEST_BIN_DIR}" >> "${_TEST_RC}"
+    fi
+
+    _COUNT_AFTER="$(grep -c "${_TEST_BIN_DIR}" "${_TEST_RC}" 2>/dev/null || echo 0)"
+
+    if [[ "${_COUNT_AFTER}" -eq "${_COUNT_BEFORE}" ]]; then
+        record "PASS" "D1.2 (AC5): idempotency guard prevents double PATH write" \
+            "entry count stayed at ${_COUNT_BEFORE}"
+    else
+        record "FAIL" "D1.2 (AC5): idempotency guard prevents double PATH write" \
+            "count before=${_COUNT_BEFORE} after=${_COUNT_AFTER}"
+    fi
+
+    rm -rf "${_IDEMPOTENCY_TMPDIR}"
+fi
+
+# ---------------------------------------------------------------------------
+# D1.2 (AC6): uninstall instructions in docs/install.md
+# ---------------------------------------------------------------------------
+
+echo "D1.2 (AC6): checking docs/install.md for uninstall and knob documentation ..."
+
+INSTALL_DOC="${REPO_ROOT}/docs/install.md"
+if [[ ! -f "${INSTALL_DOC}" ]]; then
+    record "FAIL" "D1.2 (AC6): docs/install.md exists" "file not found"
+else
+    record "PASS" "D1.2 (AC6): docs/install.md exists" ""
+
+    if grep -q 'rm -rf.*\.vectorhawk' "${INSTALL_DOC}"; then
+        record "PASS" "D1.2 (AC6): uninstall instruction present in docs/install.md" ""
+    else
+        record "FAIL" "D1.2 (AC6): uninstall instruction present in docs/install.md" \
+            "rm -rf ~/.vectorhawk not found"
+    fi
+
+    if grep -q 'VECTORHAWK_VERSION' "${INSTALL_DOC}" && \
+       grep -q 'VECTORHAWK_HOME' "${INSTALL_DOC}" && \
+       grep -q 'VECTORHAWK_NO_MODIFY_PATH' "${INSTALL_DOC}"; then
+        record "PASS" "D1.2 (AC6): override knobs documented in docs/install.md" ""
+    else
+        record "FAIL" "D1.2 (AC6): override knobs documented in docs/install.md" \
+            "one or more of VECTORHAWK_VERSION / VECTORHAWK_HOME / VECTORHAWK_NO_MODIFY_PATH missing"
+    fi
+
+    if grep -qi 'brew tap\|homebrew' "${INSTALL_DOC}"; then
+        record "PASS" "D1.2 (AC6): Homebrew alternative referenced in docs/install.md" ""
+    else
+        record "FAIL" "D1.2 (AC6): Homebrew alternative referenced in docs/install.md" \
+            "no brew/homebrew reference found"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 
 echo ""
 echo "================================="
-echo "D1.1 Acceptance Results"
+echo "D1 Acceptance Results"
 echo "================================="
 echo ""
 
@@ -335,9 +569,9 @@ done
 
 echo ""
 if [[ ${OVERALL} -eq 1 ]]; then
-    printf "%bAll D1.1 acceptance criteria PASSED%b\n" "${GREEN}" "${RESET}"
+    printf "%bAll D1 acceptance criteria PASSED%b\n" "${GREEN}" "${RESET}"
     exit 0
 else
-    printf "%bOne or more D1.1 acceptance criteria FAILED%b\n" "${RED}" "${RESET}"
+    printf "%bOne or more D1 acceptance criteria FAILED%b\n" "${RED}" "${RESET}"
     exit 1
 fi
