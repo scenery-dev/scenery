@@ -9,6 +9,9 @@ on:
 permissions:
   contents: write
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
 jobs:
   build:
     name: build ${{ matrix.target }}
@@ -19,11 +22,11 @@ jobs:
         include:
           - target: aarch64-apple-darwin
             runner: macos-14
+          # x86_64-apple-darwin: cross-compiled from macos-14 (arm64 host) via Xcode universal SDK
+          - target: x86_64-apple-darwin
+            runner: macos-14
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-22.04
-          # x86_64-apple-darwin (Intel) deferred: GitHub free-tier macos-13
-          # runner pool exhaustion blocks public-repo builds for hours+.
-          # Re-add via cross-compile from macos-14 in a follow-up workflow tweak.
 
     steps:
       - name: checkout
