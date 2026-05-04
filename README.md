@@ -49,6 +49,38 @@ cargo test
 cargo clippy
 ```
 
+## Install
+
+### Homebrew (macOS)
+
+```bash
+brew install vectorhawk/tap/vectorhawk
+```
+
+Supports macOS arm64 (Apple Silicon) and macOS x86_64 (Intel). The Homebrew formula
+selects the correct binary for your architecture automatically.
+
+### Linux
+
+A curl-install script is available for Linux x86_64:
+
+```bash
+curl -fsSL https://install.vectorhawk.ai | sh
+```
+
+### Manual install
+
+Download the tarball for your platform from the [GitHub Releases](../../releases) page, extract it,
+and place the binaries on your `$PATH`.
+
+## Supported targets
+
+| Target | Platform |
+|--------|----------|
+| `aarch64-apple-darwin` | macOS arm64 (Apple Silicon) |
+| `x86_64-apple-darwin` | macOS x86_64 (Intel) — cross-compiled from arm64 host |
+| `x86_64-unknown-linux-gnu` | Linux x86_64 |
+
 ## Uninstalling
 
 - **curl install**: `rm -rf ~/.vectorhawk` and remove the `$PATH` entry the installer added to your
