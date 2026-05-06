@@ -83,9 +83,6 @@ pub struct Manifest {
     /// Trigger phrases that help AI clients decide when to invoke this skill.
     #[serde(default)]
     pub triggers: Vec<String>,
-    /// Whether this skill can be offloaded to a cheaper/faster model.
-    #[serde(default)]
-    pub offload_eligible: Option<bool>,
 }
 
 impl Manifest {

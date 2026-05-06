@@ -7,6 +7,7 @@ use std::io::{BufRead, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use vectorhawkd_core::model::{ModelClient, ModelRequest, ModelResponse, ModelSource};
+use vectorhawkd_manifest::ModelFallback;
 
 /// Shared I/O handle used by both the MCP server loop and the sampling client.
 ///
@@ -175,12 +176,34 @@ impl ModelClient for HybridModelClient<'_> {
         // prefer_local=false: try MCP sampling → fall back to Ollama
         if request.prefer_local {
             if let Some(ollama) = self.ollama {
-                match ollama.generate(request.clone()) {
-                    Ok(response) => return Ok(response),
-                    Err(e) => {
-                        tracing::warn!("local model failed, falling back to MCP sampling: {e}");
+                if local_model_compatible(ollama, &request.recommended_models) {
+                    match ollama.generate(request.clone()) {
+                        Ok(response) => return Ok(response),
+                        Err(e) => {
+                            tracing::warn!("local model failed: {e}");
+                            if matches!(request.fallback, Some(ModelFallback::Error)) {
+                                return Err(e);
+                            }
+                        }
+                    }
+                } else {
+                    tracing::warn!(
+                        "local model {:?} not in recommended list {:?}; honoring fallback",
+                        ollama.local_model_name(),
+                        request.recommended_models,
+                    );
+                    if matches!(request.fallback, Some(ModelFallback::Error)) {
+                        anyhow::bail!(
+                            "local model {:?} does not match any of the skill's recommended models {:?}, and fallback=error",
+                            ollama.local_model_name().unwrap_or("(unknown)"),
+                            request.recommended_models,
+                        );
                     }
                 }
+            } else if matches!(request.fallback, Some(ModelFallback::Error)) {
+                anyhow::bail!(
+                    "local model preferred but no Ollama backend is configured, and fallback=error"
+                );
             }
             tracing::debug!("delegating LLM call to AI client via MCP sampling");
             return self.sampling.generate(request);
@@ -200,6 +223,19 @@ impl ModelClient for HybridModelClient<'_> {
             }
         }
     }
+}
+
+/// Returns true if the configured local model satisfies the skill's
+/// `recommended_models` list. An empty list means no constraint — any local
+/// model is acceptable.
+fn local_model_compatible(client: &dyn ModelClient, recommended: &[String]) -> bool {
+    if recommended.is_empty() {
+        return true;
+    }
+    let Some(name) = client.local_model_name() else {
+        return false;
+    };
+    recommended.iter().any(|r| r == name)
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
@@ -233,6 +269,7 @@ mod tests {
                 user_message: "Say hello".to_string(),
                 json_output: false,
                 prefer_local: false,
+                ..Default::default()
             })
             .unwrap();
 
@@ -259,6 +296,7 @@ mod tests {
                 user_message: "test".to_string(),
                 json_output: false,
                 prefer_local: false,
+                ..Default::default()
             })
             .expect_err("should fail on error response");
 
@@ -288,6 +326,7 @@ mod tests {
                 user_message: "test".to_string(),
                 json_output: false,
                 prefer_local: true,
+                ..Default::default()
             })
             .unwrap();
 
@@ -314,6 +353,7 @@ mod tests {
                 user_message: "test".to_string(),
                 json_output: false,
                 prefer_local: false,
+                ..Default::default()
             })
             .unwrap();
 
@@ -347,10 +387,136 @@ mod tests {
                 user_message: "test".to_string(),
                 json_output: false,
                 prefer_local: true,
+                ..Default::default()
             })
             .unwrap();
 
         assert_eq!(result.text, "fallback response");
+    }
+
+    /// A MockModelClient that reports a configurable local model name so we
+    /// can exercise `recommended_models` compatibility checks.
+    struct NamedLocalClient {
+        name: String,
+        response: String,
+    }
+
+    impl ModelClient for NamedLocalClient {
+        fn local_model_name(&self) -> Option<&str> {
+            Some(&self.name)
+        }
+        fn generate(&self, _request: ModelRequest) -> Result<ModelResponse> {
+            Ok(ModelResponse {
+                text: self.response.clone(),
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                latency_ms: 1,
+                source: ModelSource::Local(self.name.clone()),
+            })
+        }
+    }
+
+    #[test]
+    fn hybrid_uses_local_when_recommended_model_matches() {
+        let local = NamedLocalClient {
+            name: "llama3:8b".to_string(),
+            response: "from local llama3".to_string(),
+        };
+        let response_json = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1000,
+            "result": {"role": "assistant", "content": {"type": "text", "text": "from sampling"}}
+        });
+        let reader = Box::new(Cursor::new(
+            format!("{}\n", serde_json::to_string(&response_json).unwrap()).into_bytes(),
+        ));
+        let writer = Box::new(Vec::<u8>::new());
+        let sampling = McpSamplingClient::new(writer, reader);
+
+        let hybrid = HybridModelClient::new(Some(&local), &sampling);
+        let result = hybrid
+            .generate(ModelRequest {
+                prefer_local: true,
+                recommended_models: vec!["llama3:8b".to_string()],
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(result.text, "from local llama3");
+    }
+
+    #[test]
+    fn hybrid_skips_local_when_recommended_model_doesnt_match() {
+        // Local Ollama is configured with `mistral`, but the skill recommends
+        // only `llama3:8b`. Routing must skip Ollama and use sampling.
+        let local = NamedLocalClient {
+            name: "mistral".to_string(),
+            response: "should not be used".to_string(),
+        };
+        let response_json = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1000,
+            "result": {"role": "assistant", "content": {"type": "text", "text": "from sampling"}}
+        });
+        let reader = Box::new(Cursor::new(
+            format!("{}\n", serde_json::to_string(&response_json).unwrap()).into_bytes(),
+        ));
+        let writer = Box::new(Vec::<u8>::new());
+        let sampling = McpSamplingClient::new(writer, reader);
+
+        let hybrid = HybridModelClient::new(Some(&local), &sampling);
+        let result = hybrid
+            .generate(ModelRequest {
+                prefer_local: true,
+                recommended_models: vec!["llama3:8b".to_string()],
+                fallback: Some(ModelFallback::McpSampling),
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(result.text, "from sampling");
+        assert!(matches!(result.source, ModelSource::McpSampling));
+    }
+
+    #[test]
+    fn hybrid_errors_when_recommended_mismatch_and_fallback_error() {
+        let local = NamedLocalClient {
+            name: "mistral".to_string(),
+            response: "ignored".to_string(),
+        };
+        // Sampling reader is unused — we expect an early error before sampling.
+        let reader = Box::new(Cursor::new(Vec::<u8>::new()));
+        let writer = Box::new(Vec::<u8>::new());
+        let sampling = McpSamplingClient::new(writer, reader);
+
+        let hybrid = HybridModelClient::new(Some(&local), &sampling);
+        let err = hybrid
+            .generate(ModelRequest {
+                prefer_local: true,
+                recommended_models: vec!["llama3:8b".to_string()],
+                fallback: Some(ModelFallback::Error),
+                ..Default::default()
+            })
+            .expect_err("should error when fallback=Error and local mismatch");
+
+        assert!(err.to_string().contains("does not match"), "got: {err}");
+    }
+
+    #[test]
+    fn hybrid_errors_when_no_local_and_fallback_error() {
+        // No Ollama backend at all + prefer_local + fallback=Error → error.
+        let reader = Box::new(Cursor::new(Vec::<u8>::new()));
+        let writer = Box::new(Vec::<u8>::new());
+        let sampling = McpSamplingClient::new(writer, reader);
+
+        let hybrid = HybridModelClient::new(None, &sampling);
+        let err = hybrid
+            .generate(ModelRequest {
+                prefer_local: true,
+                fallback: Some(ModelFallback::Error),
+                ..Default::default()
+            })
+            .expect_err("should error with no Ollama and fallback=Error");
+
+        assert!(err.to_string().contains("no Ollama backend"), "got: {err}");
     }
 
     #[test]

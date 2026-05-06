@@ -1,7 +1,8 @@
 use anyhow::Result;
+use vectorhawkd_manifest::ModelFallback;
 
 /// A request to generate text from a language model.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct ModelRequest {
     /// System prompt (instructions / persona).
     pub system_prompt: String,
@@ -14,6 +15,13 @@ pub struct ModelRequest {
     /// is available. When `false` (the default), the runtime uses MCP sampling
     /// directly — the AI client handles the generation.
     pub prefer_local: bool,
+    /// Manifest-declared list of recommended local models (Ollama tags).
+    /// When non-empty, the routing layer requires the configured Ollama
+    /// model to match one of these names; otherwise it skips local execution.
+    pub recommended_models: Vec<String>,
+    /// What to do when local execution is unavailable or rejected.
+    /// `None` is treated as `McpSampling` (delegate to AI client).
+    pub fallback: Option<ModelFallback>,
 }
 
 /// Identifies which backend produced a model response.
@@ -43,6 +51,13 @@ pub struct ModelResponse {
 /// Abstraction over any text-generation backend.
 pub trait ModelClient: Send + Sync {
     fn generate(&self, request: ModelRequest) -> Result<ModelResponse>;
+
+    /// Returns the configured local model name, if this backend runs locally
+    /// (Ollama). Used by `HybridModelClient` to validate compatibility against
+    /// a skill's `recommended_models` list before routing to local execution.
+    fn local_model_name(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// A mock model client that returns a configurable fixed response.

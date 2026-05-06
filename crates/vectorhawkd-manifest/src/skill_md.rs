@@ -182,7 +182,6 @@ pub(crate) fn load_from_skill_md_dir(root: Utf8PathBuf) -> Result<SkillPackage, 
             auto_update: Some(true),
         }),
         triggers: validate_and_normalize_triggers(frontmatter.vh_triggers.clone())?,
-        offload_eligible: None,
     };
 
     let workflow = build_workflow(&root, &frontmatter, &manifest.name, body)?;

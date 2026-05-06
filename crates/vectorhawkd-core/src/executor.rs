@@ -306,18 +306,20 @@ fn execute_llm_step(pkg: &SkillPackage, p: LlmStepParams<'_>) -> Result<StepResu
 
     let user_message = resolve_inputs(step_inputs, run_input, step_outputs);
 
-    let prefer_local = pkg
-        .manifest
-        .model_requirements
-        .as_ref()
-        .and_then(|m| m.prefer_local)
-        .unwrap_or(false);
+    let model_reqs = pkg.manifest.model_requirements.as_ref();
+    let prefer_local = model_reqs.and_then(|m| m.prefer_local).unwrap_or(false);
+    let recommended_models = model_reqs
+        .map(|m| m.recommended.clone())
+        .unwrap_or_default();
+    let fallback = model_reqs.and_then(|m| m.fallback);
 
     let request = ModelRequest {
         system_prompt,
         user_message,
         json_output: output_schema_rel.is_some(),
         prefer_local,
+        recommended_models,
+        fallback,
     };
 
     let response = client

@@ -125,6 +125,10 @@ struct OllamaGenerateResponse {
 // ── ModelClient impl ──────────────────────────────────────────────────────────
 
 impl ModelClient for OllamaClient {
+    fn local_model_name(&self) -> Option<&str> {
+        Some(&self.model)
+    }
+
     fn generate(&self, request: ModelRequest) -> Result<ModelResponse> {
         let url = format!("{}/api/generate", self.base_url.trim_end_matches('/'));
 
@@ -298,6 +302,7 @@ mod tests {
                 user_message: "Say hello".to_string(),
                 json_output: false,
                 prefer_local: false,
+                ..Default::default()
             })
             .expect("generate");
 
@@ -323,6 +328,7 @@ mod tests {
                 user_message: "test".to_string(),
                 json_output: false,
                 prefer_local: false,
+                ..Default::default()
             })
             .expect_err("should fail on 500");
 

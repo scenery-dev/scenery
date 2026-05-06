@@ -720,7 +720,8 @@ async fn cmd_skill_run(id: &str, input_path: camino::Utf8PathBuf, stub: bool) ->
         run_skill(&state, &policy, id, &input, None)
             .with_context(|| format!("failed to run skill '{id}' in stub mode"))?
     } else {
-        let ollama_url = std::env::var("OLLAMA_BASE_URL")
+        let ollama_url = std::env::var("VECTORHAWK_OLLAMA_URL")
+            .or_else(|_| std::env::var("OLLAMA_BASE_URL"))
             .unwrap_or_else(|_| "http://localhost:11434".to_string());
         let ollama_model = std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "llama3".to_string());
         let model = OllamaClient::new(ollama_url, ollama_model);
@@ -744,6 +745,14 @@ async fn cmd_skill_run(id: &str, input_path: camino::Utf8PathBuf, stub: bool) ->
         println!("[{}] {} ({})", status, step.id, step.step_type);
         if !step.note.is_empty() {
             println!("    {}", step.note);
+        }
+        if let Some(source) = &step.model_source {
+            use vectorhawkd_core::model::ModelSource;
+            let label = match source {
+                ModelSource::Local(name) => format!("local Ollama ({name})"),
+                ModelSource::McpSampling => "MCP sampling (delegated to AI client)".to_string(),
+            };
+            println!("    model:  {label}");
         }
         if let Some(out) = &step.output {
             println!(
