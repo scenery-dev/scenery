@@ -63,12 +63,60 @@ fn skill_list_parses() {
 }
 
 #[test]
-fn skill_install_parses() {
+fn skill_install_local_path_parses() {
     use super::{Command, SkillCommand};
-    match parse(&["skill", "install", "--path", "./my-skill"]).command {
-        Command::Skill(SkillCommand::Install { path, link }) => {
-            assert_eq!(path.as_str(), "./my-skill");
+    unsafe { std::env::remove_var("VECTORHAWK_REGISTRY_URL") };
+    match parse(&["skill", "install", "./my-skill"]).command {
+        Command::Skill(SkillCommand::Install {
+            skill_ref,
+            link,
+            registry_url,
+        }) => {
+            assert_eq!(skill_ref, "./my-skill");
             assert!(!link);
+            assert!(registry_url.is_none());
+        }
+        other => panic!("expected Skill(Install), got {other:?}"),
+    }
+}
+
+#[test]
+fn skill_install_registry_id_parses() {
+    use super::{Command, SkillCommand};
+    unsafe { std::env::remove_var("VECTORHAWK_REGISTRY_URL") };
+    match parse(&["skill", "install", "contract-compare"]).command {
+        Command::Skill(SkillCommand::Install {
+            skill_ref,
+            link,
+            registry_url,
+        }) => {
+            assert_eq!(skill_ref, "contract-compare");
+            assert!(!link);
+            assert!(registry_url.is_none());
+        }
+        other => panic!("expected Skill(Install), got {other:?}"),
+    }
+}
+
+#[test]
+fn skill_install_registry_url_flag_parses() {
+    use super::{Command, SkillCommand};
+    match parse(&[
+        "skill",
+        "install",
+        "contract-compare",
+        "--registry-url",
+        "http://localhost:8000",
+    ])
+    .command
+    {
+        Command::Skill(SkillCommand::Install {
+            skill_ref,
+            registry_url,
+            ..
+        }) => {
+            assert_eq!(skill_ref, "contract-compare");
+            assert_eq!(registry_url.as_deref(), Some("http://localhost:8000"));
         }
         other => panic!("expected Skill(Install), got {other:?}"),
     }
@@ -77,8 +125,9 @@ fn skill_install_parses() {
 #[test]
 fn skill_install_link_flag_parses() {
     use super::{Command, SkillCommand};
-    match parse(&["skill", "install", "--path", "./my-skill", "--link"]).command {
-        Command::Skill(SkillCommand::Install { path: _, link }) => {
+    unsafe { std::env::remove_var("VECTORHAWK_REGISTRY_URL") };
+    match parse(&["skill", "install", "./my-skill", "--link"]).command {
+        Command::Skill(SkillCommand::Install { skill_ref: _, link, .. }) => {
             assert!(link);
         }
         other => panic!("expected Skill(Install), got {other:?}"),

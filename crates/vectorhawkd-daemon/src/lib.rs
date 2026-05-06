@@ -446,7 +446,7 @@ pub fn refresh_one_tick(state: &AppState, registry_url: &str) -> Result<()> {
 ///
 /// Each step failure logs at WARN and continues; only a total inability to
 /// open the database returns `Err`.
-fn run_sync_tick(
+pub fn run_sync_tick(
     registry: &RegistryClient,
     audit: &SqliteAuditBuffer,
     db_path: &camino::Utf8PathBuf,
@@ -513,7 +513,7 @@ fn run_sync_tick(
 /// Registers a single in-memory backend (`stub`) with two tools (`echo`,
 /// `ping`) so that `tools/list` returns at least one result. Real HTTP
 /// backends land in M1.3.
-fn build_stub_registry() -> BackendRegistry {
+pub fn build_stub_registry() -> BackendRegistry {
     let registry = BackendRegistry::new();
     registry.register_backend(BackendEntry {
         server_id: "stub".to_string(),

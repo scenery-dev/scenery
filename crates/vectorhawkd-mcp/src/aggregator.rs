@@ -250,6 +250,15 @@ impl BackendEntry {
 
 // ── Backend registry ──────────────────────────────────────────────────────────
 
+/// Lightweight summary of a registered backend, returned by `BackendRegistry::list_backends`.
+#[derive(Debug, Clone)]
+pub struct BackendSummary {
+    pub server_id: String,
+    pub name: String,
+    pub tool_count: usize,
+    pub unhealthy: bool,
+}
+
 struct RegistryInner {
     backends: HashMap<String, BackendEntry>,
     budget: ToolBudget,
@@ -613,6 +622,25 @@ impl BackendRegistry {
             .filter(|b| b.unhealthy)
             .map(|b| b.server_id.clone())
             .collect()
+    }
+
+    /// Snapshot of all registered backends, ordered by server_id.
+    ///
+    /// Returns lightweight summary rows — avoids cloning full tool lists.
+    pub fn list_backends(&self) -> Vec<BackendSummary> {
+        let inner = self.inner.lock().unwrap();
+        let mut entries: Vec<BackendSummary> = inner
+            .backends
+            .values()
+            .map(|b| BackendSummary {
+                server_id: b.server_id.clone(),
+                name: b.name.clone(),
+                tool_count: b.tools.len(),
+                unhealthy: b.unhealthy,
+            })
+            .collect();
+        entries.sort_by(|a, b| a.server_id.cmp(&b.server_id));
+        entries
     }
 
     /// Mark a backend healthy again (resets consecutive error count).
