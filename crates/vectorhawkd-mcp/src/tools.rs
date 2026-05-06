@@ -39,11 +39,13 @@ use tracing::debug;
 use vectorhawkd_core::{
     auth::{self, AuthClient},
     executor::{run_skill, RunResult},
-    installer::{install_unpacked_skill, InstallMode},
+    installer::{install_unpacked_skill, uninstall_skill, InstallMode},
     mcp_governance,
     model::{ModelClient, ModelSource},
     policy::PolicyClient,
+    registry::RegistryClient,
     state::AppState,
+    updater::install_from_registry,
     validator::validate_bundle,
 };
 use vectorhawkd_manifest::SkillPackage;
@@ -152,6 +154,41 @@ pub fn build_tool_list(state: &AppState, registry_url: &Option<String>) -> Vec<T
             "required": ["skill_id"]
         }),
     });
+
+    tools.push(ToolDefinition {
+        name: "vectorhawk_uninstall".to_string(),
+        description: "Uninstall an installed VectorHawk skill by its ID. Removes skill files and database records.".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "skill_id": {
+                    "type": "string",
+                    "description": "The ID of the installed skill to uninstall"
+                }
+            },
+            "required": ["skill_id"]
+        }),
+    });
+
+    // Update is available whenever a registry URL is configured.
+    if registry_url.is_some() {
+        tools.push(ToolDefinition {
+            name: "vectorhawk_update".to_string(),
+            description: "Update an installed skill to the latest version from the registry. \
+                Call this after being notified that a newer version is available."
+                .to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "skill_id": {
+                        "type": "string",
+                        "description": "The skill ID to update"
+                    }
+                },
+                "required": ["skill_id"]
+            }),
+        });
+    }
 
     tools.push(ToolDefinition {
         name: "vectorhawk_import".to_string(),
@@ -396,6 +433,8 @@ pub fn handle_tool_call(
         "vectorhawk_mcp_status" => handle_mcp_status(state, registry_url),
         "vectorhawk_mcp_install" => handle_mcp_install(arguments, state, registry_url, aggregator),
         "vectorhawk_mcp_uninstall" => handle_mcp_uninstall(arguments, registry_url, aggregator),
+        "vectorhawk_uninstall" => handle_uninstall(arguments, state),
+        "vectorhawk_update" => handle_update(arguments, state, registry_url),
         _ => handle_skill_run(
             name,
             arguments,
@@ -1255,6 +1294,51 @@ pub fn handle_mcp_uninstall(
         ToolCallResult::error_result(format!(
             "No active MCP server found with name '{server_name}'. Use vectorhawk_mcp_status to see your servers."
         ))
+    }
+}
+
+// ── Skill lifecycle handlers (GAP-07, GAP-08) ─────────────────────────────────
+
+fn handle_uninstall(arguments: &serde_json::Value, state: &AppState) -> ToolCallResult {
+    let skill_id = match arguments.get("skill_id").and_then(|v| v.as_str()) {
+        Some(id) => id,
+        None => return ToolCallResult::error_result("Missing required parameter: skill_id"),
+    };
+
+    match uninstall_skill(state, skill_id) {
+        Ok(Some(version)) => {
+            ToolCallResult::success(format!("Successfully uninstalled {skill_id}@{version}."))
+        }
+        Ok(None) => {
+            ToolCallResult::error_result(format!("Skill '{skill_id}' is not installed."))
+        }
+        Err(e) => ToolCallResult::error_result(format!("Failed to uninstall '{skill_id}': {e}")),
+    }
+}
+
+fn handle_update(
+    arguments: &serde_json::Value,
+    state: &AppState,
+    registry_url: &Option<String>,
+) -> ToolCallResult {
+    let skill_id = match arguments.get("skill_id").and_then(|v| v.as_str()) {
+        Some(id) => id,
+        None => return ToolCallResult::error_result("Missing required parameter: skill_id"),
+    };
+
+    let url = match registry_url {
+        Some(u) => u,
+        None => {
+            return ToolCallResult::error_result(
+                "No registry configured — cannot update skills",
+            )
+        }
+    };
+
+    let registry = RegistryClient::new(url);
+    match install_from_registry(state, &registry, skill_id, None) {
+        Ok(version) => ToolCallResult::success(format!("Updated {skill_id} to v{version}.")),
+        Err(e) => ToolCallResult::error_result(format!("Update failed: {e}")),
     }
 }
 

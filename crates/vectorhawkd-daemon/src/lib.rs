@@ -75,6 +75,7 @@ use vectorhawkd_core::{
 use vectorhawkd_mcp::{
     aggregator::{BackendEntry, BackendRegistry, BackendTransport, ToolDefinition, ToolVisibility},
     backend::{Backend, RealBackend},
+    tools::UpdateCheckCache,
 };
 
 pub use oauth_state::OAuthState;
@@ -208,10 +209,36 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
              include governance language"
         );
     }
-    let backend = Arc::new(RealBackend::with_audit_and_managed(
+
+    let registry_url_opt: Option<String> = opts
+        .registry_url
+        .clone()
+        .or_else(|| std::env::var("SKILLCLUB_REGISTRY_URL").ok());
+
+    let policy_client: Arc<dyn vectorhawkd_core::policy::PolicyClient + Send + Sync> =
+        Arc::new(vectorhawkd_core::policy::MockPolicyClient::new());
+    // TODO: replace MockPolicyClient with HttpPolicyClient once M1.4 wires the
+    // registry-backed policy into the daemon. For now allow-all is correct
+    // for the M1 scope.
+
+    let update_check_cache: UpdateCheckCache = Arc::new(std::sync::Mutex::new(
+        std::collections::HashMap::new(),
+    ));
+
+    let state_arc = Arc::new(AppState {
+        root_dir: state.root_dir.clone(),
+        db_path: state.db_path.clone(),
+    });
+
+    let backend = Arc::new(RealBackend::with_full_context(
         Arc::clone(&vh_registry),
         Arc::clone(&audit_buffer) as Arc<dyn AuditBuffer>,
         managed_config,
+        state_arc,
+        registry_url_opt,
+        policy_client,
+        None, // model_client: wire OllamaClient / HybridModelClient in a future stream
+        update_check_cache,
     ));
     info!(
         "backend registry ready ({} backends)",

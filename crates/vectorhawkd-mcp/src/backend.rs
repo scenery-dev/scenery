@@ -46,6 +46,8 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(unix)]
 use tokio::net::UnixStream;
+#[cfg(feature = "daemon")]
+use crate::tools::UpdateCheckCache;
 
 // ── Strict daemon response type ───────────────────────────────────────────────
 
@@ -413,6 +415,27 @@ pub struct RealBackend {
     /// present and `managed=true`). Drives the `initialize` instructions copy.
     #[cfg(feature = "daemon")]
     managed: Option<vectorhawkd_core::managed::ManagedConfig>,
+    /// Application state (SQLite path, root dir). Required for management tool
+    /// dispatch via `tools::handle_tool_call`.
+    #[cfg(feature = "daemon")]
+    state: Option<Arc<vectorhawkd_core::state::AppState>>,
+    /// Registry URL forwarded to management tool handlers (search, install, etc.).
+    #[cfg(feature = "daemon")]
+    registry_url: Option<String>,
+    /// Policy client used when executing skill steps through management tools.
+    /// `MockPolicyClient` (allow-all) is the default until a registry-backed
+    /// policy client is wired in a future stream.
+    // TODO: replace with HttpPolicyClient once M1.4 wires it into the daemon.
+    #[cfg(feature = "daemon")]
+    policy_client: Option<Arc<dyn vectorhawkd_core::policy::PolicyClient + Send + Sync>>,
+    /// Optional model client (Ollama or HybridModelClient). When `None`, skill
+    /// steps that require a model will surface the existing "no model client"
+    /// error message. A future stream will wire the model client here.
+    #[cfg(feature = "daemon")]
+    model_client: Option<Arc<dyn vectorhawkd_core::model::ModelClient>>,
+    /// Per-skill update-check cache shared between all tool call invocations.
+    #[cfg(feature = "daemon")]
+    update_check_cache: Option<UpdateCheckCache>,
 }
 
 impl RealBackend {
@@ -425,6 +448,16 @@ impl RealBackend {
             audit: None,
             #[cfg(feature = "daemon")]
             managed: None,
+            #[cfg(feature = "daemon")]
+            state: None,
+            #[cfg(feature = "daemon")]
+            registry_url: None,
+            #[cfg(feature = "daemon")]
+            policy_client: None,
+            #[cfg(feature = "daemon")]
+            model_client: None,
+            #[cfg(feature = "daemon")]
+            update_check_cache: None,
         }
     }
 
@@ -441,6 +474,11 @@ impl RealBackend {
             server_version: env!("CARGO_PKG_VERSION").to_string(),
             audit: Some(audit),
             managed: None,
+            state: None,
+            registry_url: None,
+            policy_client: None,
+            model_client: None,
+            update_check_cache: None,
         }
     }
 
@@ -459,6 +497,44 @@ impl RealBackend {
             server_version: env!("CARGO_PKG_VERSION").to_string(),
             audit: Some(audit),
             managed,
+            state: None,
+            registry_url: None,
+            policy_client: None,
+            model_client: None,
+            update_check_cache: None,
+        }
+    }
+
+    /// Construct a `RealBackend` with full management-tool context.
+    ///
+    /// This is the constructor used by the daemon for production. It wires in
+    /// all context needed for `tools::handle_tool_call` and
+    /// `tools::build_tool_list` so that management tools (`vectorhawk_list`,
+    /// `vectorhawk_install`, `vectorhawk_search`, etc.) are reachable from
+    /// `list_tools` / `call_tool`.
+    #[cfg(feature = "daemon")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_full_context(
+        registry: Arc<BackendRegistry>,
+        audit: Arc<dyn vectorhawkd_core::audit::AuditBuffer>,
+        managed: Option<vectorhawkd_core::managed::ManagedConfig>,
+        state: Arc<vectorhawkd_core::state::AppState>,
+        registry_url: Option<String>,
+        policy_client: Arc<dyn vectorhawkd_core::policy::PolicyClient + Send + Sync>,
+        model_client: Option<Arc<dyn vectorhawkd_core::model::ModelClient>>,
+        update_check_cache: UpdateCheckCache,
+    ) -> Self {
+        Self {
+            registry,
+            server_name: "vectorhawkd".to_string(),
+            server_version: env!("CARGO_PKG_VERSION").to_string(),
+            audit: Some(audit),
+            managed,
+            state: Some(state),
+            registry_url,
+            policy_client: Some(policy_client),
+            model_client,
+            update_check_cache: Some(update_check_cache),
         }
     }
 }
@@ -485,28 +561,126 @@ impl Backend for RealBackend {
     }
 
     async fn list_tools(&self, _params: Value) -> Result<ToolsListResult> {
-        let backend_tools = self.registry.all_tools();
-        let tools: Vec<ProtoToolDef> = backend_tools
-            .iter()
-            .filter_map(|bt| {
-                let name = bt["name"].as_str()?.to_string();
-                let description = bt["description"].as_str().unwrap_or("").to_string();
-                let input_schema = bt
-                    .get("inputSchema")
-                    .cloned()
-                    .unwrap_or_else(|| serde_json::json!({"type": "object", "properties": {}}));
-                Some(ProtoToolDef {
-                    name,
-                    description,
-                    input_schema,
+        // Management tools (vectorhawk_*) from the installed tools layer.
+        // Only available when the full context has been wired (daemon path).
+        #[cfg(feature = "daemon")]
+        let mut tools: Vec<ProtoToolDef> = if let Some(state) = &self.state {
+            crate::tools::build_tool_list(state, &self.registry_url)
+                .into_iter()
+                .map(|td| ProtoToolDef {
+                    name: td.name,
+                    description: td.description,
+                    input_schema: td.input_schema,
                 })
-            })
-            .collect();
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        #[cfg(not(feature = "daemon"))]
+        let mut tools: Vec<ProtoToolDef> = Vec::new();
+
+        // Merge in namespaced backend tools from the BackendRegistry.
+        // Names are already namespaced with `__` so they cannot collide with
+        // `vectorhawk_*` management tools.
+        let backend_tools = self.registry.all_tools();
+        for bt in &backend_tools {
+            let name = match bt["name"].as_str() {
+                Some(n) if !n.is_empty() => n.to_string(),
+                _ => continue,
+            };
+            let description = bt["description"].as_str().unwrap_or("").to_string();
+            let input_schema = bt
+                .get("inputSchema")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({"type": "object", "properties": {}}));
+            tools.push(ProtoToolDef {
+                name,
+                description,
+                input_schema,
+            });
+        }
+
         Ok(ToolsListResult { tools })
     }
 
     async fn call_tool(&self, params: ToolCallParams) -> Result<ToolCallResult> {
         let started = std::time::Instant::now();
+
+        // Route vectorhawk_* management tools and installed skill IDs through
+        // the tools layer. Namespaced backend tools (containing `__`) go
+        // straight to the BackendRegistry.
+        #[cfg(feature = "daemon")]
+        if let Some(state) = &self.state {
+            let is_management_tool = params.name.starts_with("vectorhawk_");
+            let is_backend_tool = params.name.contains("__");
+
+            if is_management_tool || !is_backend_tool {
+                use vectorhawkd_core::policy::MockPolicyClient;
+                let empty_cache = std::sync::Arc::new(std::sync::Mutex::new(
+                    std::collections::HashMap::new(),
+                ));
+                let cache = self
+                    .update_check_cache
+                    .as_ref()
+                    .unwrap_or(&empty_cache);
+
+                let tool_result = if let Some(pc) = &self.policy_client {
+                    crate::tools::handle_tool_call(
+                        &params.name,
+                        &params.arguments,
+                        state,
+                        pc.as_ref(),
+                        self.model_client.as_deref(),
+                        &self.registry_url,
+                        cache,
+                        Some(&*self.registry),
+                    )
+                } else {
+                    let mock_policy = MockPolicyClient::new();
+                    crate::tools::handle_tool_call(
+                        &params.name,
+                        &params.arguments,
+                        state,
+                        &mock_policy,
+                        self.model_client.as_deref(),
+                        &self.registry_url,
+                        cache,
+                        Some(&*self.registry),
+                    )
+                };
+
+                let latency_ms = started.elapsed().as_millis() as u64;
+                let status = if tool_result.is_error == Some(true) {
+                    "tool_error"
+                } else {
+                    "ok"
+                };
+
+                #[cfg(feature = "daemon")]
+                if let Some(audit) = &self.audit {
+                    let audit = Arc::clone(audit);
+                    let event = vectorhawkd_core::audit::AuditEvent {
+                        event_type: "tool_called".to_string(),
+                        payload: serde_json::json!({
+                            "tool": params.name,
+                            "status": status,
+                            "latency_ms": latency_ms,
+                        }),
+                    };
+                    tokio::task::spawn_blocking(move || {
+                        if let Err(e) = audit.record(&event) {
+                            tracing::warn!(error = %e, "failed to record audit event");
+                        }
+                    });
+                }
+                let _ = status;
+                let _ = latency_ms;
+
+                return Ok(tool_result);
+            }
+        }
+
         let dispatch_outcome = self
             .registry
             .dispatch(&params.name, &params.arguments)
