@@ -5,7 +5,7 @@
 //! ```text
 //! vectorhawk doctor
 //! vectorhawk skill list
-//! vectorhawk skill install <id> [--path <bundle>]
+//! vectorhawk skill install <skill-ref> [--registry-url <url>]
 //! vectorhawk skill info <id>
 //! vectorhawk skill run <id> --input <file> [--stub]
 //! vectorhawk skill import <path>
@@ -83,15 +83,22 @@ pub enum SkillCommand {
     /// List all installed skills.
     List,
 
-    /// Install a skill from a local bundle directory.
+    /// Install a skill from a local bundle directory or a registry ID.
+    ///
+    /// SKILL_REF is treated as a local path if the path exists on disk;
+    /// otherwise it is sent to the registry as an ID.
     Install {
-        /// Path to the skill bundle directory to install.
-        #[arg(long, value_name = "BUNDLE_PATH")]
-        path: camino::Utf8PathBuf,
+        /// Local bundle directory path or registry skill ID.
+        skill_ref: String,
 
         /// Symlink instead of copying the bundle (Unix only, dev mode).
+        /// Ignored for registry installs.
         #[arg(long, default_value_t = false)]
         link: bool,
+
+        /// Registry base URL (registry installs only).
+        #[arg(long, env = "VECTORHAWK_REGISTRY_URL")]
+        registry_url: Option<String>,
     },
 
     /// Show detailed information about an installed skill.
@@ -275,7 +282,11 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Doctor { registry_url } => cmd_doctor(registry_url.as_deref()).await,
 
         Command::Skill(SkillCommand::List) => cmd_skill_list().await,
-        Command::Skill(SkillCommand::Install { path, link }) => cmd_skill_install(path, link).await,
+        Command::Skill(SkillCommand::Install {
+            skill_ref,
+            link,
+            registry_url,
+        }) => cmd_skill_install(&skill_ref, link, registry_url.as_deref()).await,
         Command::Skill(SkillCommand::Info { id }) => cmd_skill_info(&id).await,
         Command::Skill(SkillCommand::Run { id, input, stub }) => {
             cmd_skill_run(&id, input, stub).await
@@ -636,29 +647,54 @@ async fn cmd_skill_list() -> Result<()> {
 
 // ── skill install ─────────────────────────────────────────────────────────────
 
-async fn cmd_skill_install(path: camino::Utf8PathBuf, link: bool) -> Result<()> {
-    use vectorhawkd_core::installer::{install_unpacked_skill, InstallMode};
+async fn cmd_skill_install(skill_ref: &str, link: bool, registry_url: Option<&str>) -> Result<()> {
     use vectorhawkd_core::state::AppState;
-    use vectorhawkd_manifest::SkillPackage;
 
     let state = AppState::bootstrap().context("failed to bootstrap state")?;
 
-    let pkg = SkillPackage::load_from_dir(&path)
-        .with_context(|| format!("failed to load skill bundle at {path}"))?;
+    // Treat skill_ref as a local path when the path exists on disk.
+    let path = camino::Utf8Path::new(skill_ref);
+    if path.exists() {
+        use vectorhawkd_core::installer::{install_unpacked_skill, InstallMode};
+        use vectorhawkd_manifest::SkillPackage;
 
-    let mode = if link {
-        InstallMode::Symlink
+        let pkg = SkillPackage::load_from_dir(path)
+            .with_context(|| format!("failed to load skill bundle at {skill_ref}"))?;
+
+        let mode = if link {
+            InstallMode::Symlink
+        } else {
+            InstallMode::Copy
+        };
+
+        install_unpacked_skill(&state, &pkg, mode)
+            .with_context(|| format!("failed to install skill '{}'", pkg.manifest.id))?;
+
+        println!(
+            "Installed skill '{}' version {}.",
+            pkg.manifest.id, pkg.manifest.version
+        );
     } else {
-        InstallMode::Copy
-    };
+        // Treat as a registry ID; download and install.
+        use vectorhawkd_core::registry::RegistryClient;
+        use vectorhawkd_core::updater::install_from_registry;
 
-    install_unpacked_skill(&state, &pkg, mode)
-        .with_context(|| format!("failed to install skill '{}'", pkg.manifest.id))?;
+        let url = registry_url.unwrap_or("https://registry.vectorhawk.ai");
+        let registry = RegistryClient::new(url);
 
-    println!(
-        "Installed skill '{}' version {}.",
-        pkg.manifest.id, pkg.manifest.version
-    );
+        // install_from_registry issues blocking HTTP + SQLite calls; run on a
+        // blocking thread so we don't stall the tokio current-thread executor.
+        let skill_id = skill_ref.to_string();
+        let version = tokio::task::spawn_blocking(move || {
+            install_from_registry(&state, &registry, &skill_id, None)
+        })
+        .await
+        .context("install task panicked")?
+        .with_context(|| format!("failed to install '{skill_ref}' from registry"))?;
+
+        println!("Installed skill '{skill_ref}' version {version} from registry.");
+    }
+
     Ok(())
 }
 
@@ -1426,16 +1462,65 @@ async fn cmd_plugin_import(
     Ok(())
 }
 
-// ── mcp sync / backends (deferred — M1.4) ────────────────────────────────────
+// ── mcp sync ──────────────────────────────────────────────────────────────────
 
+/// Trigger one registry sync tick in-process (Route A).
+///
+/// Equivalent to one period of the daemon's background sync loop, but runs
+/// directly in the CLI process against the same state directory and registry.
+/// This does NOT communicate with a running daemon — it operates on the shared
+/// SQLite state independently.
 async fn cmd_mcp_sync() -> Result<()> {
-    eprintln!("vectorhawk mcp sync: M1.4 sync trigger not yet implemented");
-    std::process::exit(2);
+    use std::sync::Arc;
+    use vectorhawkd_core::{
+        audit::SqliteAuditBuffer, registry::RegistryClient, state::AppState,
+    };
+    use vectorhawkd_daemon::run_sync_tick;
+
+    let state = AppState::bootstrap().context("failed to bootstrap state")?;
+    let registry_url = std::env::var("VECTORHAWK_REGISTRY_URL")
+        .unwrap_or_else(|_| "https://registry.vectorhawk.ai".to_string());
+
+    let registry = Arc::new(RegistryClient::new(&registry_url));
+    let audit = Arc::new(SqliteAuditBuffer::new(Arc::clone(&registry), &state));
+    let db_path = state.db_path.clone();
+    let root_dir = state.root_dir.clone();
+
+    tokio::task::spawn_blocking(move || run_sync_tick(&registry, &audit, &db_path, &root_dir))
+        .await
+        .context("sync task panicked")?
+        .context("registry sync failed")?;
+
+    println!("Registry sync complete.");
+    Ok(())
 }
 
+// ── mcp backends ──────────────────────────────────────────────────────────────
+
+/// List registered backends from the stub registry.
+///
+/// Builds the same stub registry the daemon uses and prints each backend's
+/// ID, name, tool count, and health status. Real HTTP backends arrive in M1.3;
+/// until then this shows the M0 stub entries.
 async fn cmd_mcp_backends() -> Result<()> {
-    eprintln!("vectorhawk mcp backends: M1.4 backend list not yet implemented");
-    std::process::exit(2);
+    use vectorhawkd_daemon::build_stub_registry;
+
+    let registry = build_stub_registry();
+    let backends = registry.list_backends();
+
+    if backends.is_empty() {
+        println!("No backends registered.");
+        return Ok(());
+    }
+
+    println!("{:<20} {:<20} {:<8} STATUS", "SERVER ID", "NAME", "TOOLS");
+    println!("{}", "-".repeat(60));
+    for b in &backends {
+        let status = if b.unhealthy { "unhealthy" } else { "healthy" };
+        println!("{:<20} {:<20} {:<8} {status}", b.server_id, b.name, b.tool_count);
+    }
+
+    Ok(())
 }
 
 // ── daemon subcommands ────────────────────────────────────────────────────────

@@ -35,3 +35,8 @@ libc.workspace = true
 
 [dev-dependencies]
 mockito = "1"
+tempfile.workspace = true
+tar = "0.4"
+flate2 = "1"
+sha2 = "0.10"
+hex = "0.4"
