@@ -77,7 +77,9 @@ fn mcp_sync_succeeds_when_registry_unreachable() {
     let registry = Arc::new(RegistryClient::new("http://127.0.0.1:1"));
     let audit = Arc::new(SqliteAuditBuffer::new(Arc::clone(&registry), &state));
 
-    let result = run_sync_tick(&registry, &audit, &state.db_path, &state.root_dir);
+    let update_cache: vectorhawkd_mcp::tools::UpdateCheckCache =
+        Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let result = run_sync_tick(&registry, &audit, &state.db_path, &state.root_dir, &update_cache);
     assert!(
         result.is_ok(),
         "run_sync_tick must return Ok even when the registry is unreachable: {result:?}"
@@ -126,7 +128,9 @@ fn mcp_sync_calls_registry_endpoints_when_reachable() {
     let registry = Arc::new(RegistryClient::new(server.url()));
     let audit = Arc::new(SqliteAuditBuffer::new(Arc::clone(&registry), &state));
 
-    let result = run_sync_tick(&registry, &audit, &state.db_path, &state.root_dir);
+    let update_cache: vectorhawkd_mcp::tools::UpdateCheckCache =
+        Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let result = run_sync_tick(&registry, &audit, &state.db_path, &state.root_dir, &update_cache);
     assert!(result.is_ok(), "run_sync_tick must succeed: {result:?}");
 
     // The approved-servers endpoint must have been called.

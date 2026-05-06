@@ -1476,6 +1476,7 @@ async fn cmd_mcp_sync() -> Result<()> {
         audit::SqliteAuditBuffer, registry::RegistryClient, state::AppState,
     };
     use vectorhawkd_daemon::run_sync_tick;
+    use vectorhawkd_mcp::tools::UpdateCheckCache;
 
     let state = AppState::bootstrap().context("failed to bootstrap state")?;
     let registry_url = std::env::var("VECTORHAWK_REGISTRY_URL")
@@ -1485,8 +1486,12 @@ async fn cmd_mcp_sync() -> Result<()> {
     let audit = Arc::new(SqliteAuditBuffer::new(Arc::clone(&registry), &state));
     let db_path = state.db_path.clone();
     let root_dir = state.root_dir.clone();
+    let update_cache: UpdateCheckCache =
+        Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
-    tokio::task::spawn_blocking(move || run_sync_tick(&registry, &audit, &db_path, &root_dir))
+    tokio::task::spawn_blocking(move || {
+        run_sync_tick(&registry, &audit, &db_path, &root_dir, &update_cache)
+    })
         .await
         .context("sync task panicked")?
         .context("registry sync failed")?;

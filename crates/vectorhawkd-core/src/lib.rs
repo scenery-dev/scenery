@@ -48,3 +48,6 @@ pub mod mcp_governance;
 // GAP-11: .mcpb Desktop Extension export/import.
 pub mod plugin_export;
 pub mod plugin_import;
+
+// GAP-05: ratings + execution-count tracking for registry sync.
+pub mod ratings;
