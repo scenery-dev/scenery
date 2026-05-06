@@ -200,9 +200,18 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     });
 
     let vh_registry = Arc::new(build_stub_registry());
-    let backend = Arc::new(RealBackend::with_audit(
+    let managed_config = vectorhawkd_core::managed::load_managed_config(&state);
+    if let Some(ref m) = managed_config {
+        info!(
+            org = m.org.as_deref().unwrap_or("(unspecified)"),
+            "running in managed mode — MCP instructions will name the org and \
+             include governance language"
+        );
+    }
+    let backend = Arc::new(RealBackend::with_audit_and_managed(
         Arc::clone(&vh_registry),
         Arc::clone(&audit_buffer) as Arc<dyn AuditBuffer>,
+        managed_config,
     ));
     info!(
         "backend registry ready ({} backends)",

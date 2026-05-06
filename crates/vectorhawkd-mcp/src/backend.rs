@@ -409,6 +409,10 @@ pub struct RealBackend {
     /// write does not stall the current-thread async runtime.
     #[cfg(feature = "daemon")]
     audit: Option<Arc<dyn vectorhawkd_core::audit::AuditBuffer>>,
+    /// Managed-deployment config when the runner is enrolled (`managed.json`
+    /// present and `managed=true`). Drives the `initialize` instructions copy.
+    #[cfg(feature = "daemon")]
+    managed: Option<vectorhawkd_core::managed::ManagedConfig>,
 }
 
 impl RealBackend {
@@ -419,6 +423,8 @@ impl RealBackend {
             server_version: env!("CARGO_PKG_VERSION").to_string(),
             #[cfg(feature = "daemon")]
             audit: None,
+            #[cfg(feature = "daemon")]
+            managed: None,
         }
     }
 
@@ -434,6 +440,25 @@ impl RealBackend {
             server_name: "vectorhawkd".to_string(),
             server_version: env!("CARGO_PKG_VERSION").to_string(),
             audit: Some(audit),
+            managed: None,
+        }
+    }
+
+    /// Construct a `RealBackend` with both an audit buffer and managed-mode
+    /// config. The managed config is used to render dynamic `initialize`
+    /// instructions (BL1).
+    #[cfg(feature = "daemon")]
+    pub fn with_audit_and_managed(
+        registry: Arc<BackendRegistry>,
+        audit: Arc<dyn vectorhawkd_core::audit::AuditBuffer>,
+        managed: Option<vectorhawkd_core::managed::ManagedConfig>,
+    ) -> Self {
+        Self {
+            registry,
+            server_name: "vectorhawkd".to_string(),
+            server_version: env!("CARGO_PKG_VERSION").to_string(),
+            audit: Some(audit),
+            managed,
         }
     }
 }
@@ -441,6 +466,11 @@ impl RealBackend {
 #[async_trait]
 impl Backend for RealBackend {
     async fn initialize(&self, _params: Value) -> Result<InitializeResult> {
+        #[cfg(feature = "daemon")]
+        let instructions = crate::instructions::build_instructions(self.managed.as_ref(), "daemon");
+        #[cfg(not(feature = "daemon"))]
+        let instructions = "VectorHawk runner — governed AI platform.".to_string();
+
         Ok(InitializeResult {
             protocol_version: "2024-11-05".to_string(),
             capabilities: ServerCapabilities {
@@ -450,7 +480,7 @@ impl Backend for RealBackend {
                 name: self.server_name.clone(),
                 version: self.server_version.clone(),
             },
-            instructions: Some("VectorHawk runner — governed AI platform.".to_string()),
+            instructions: Some(instructions),
         })
     }
 
