@@ -473,9 +473,17 @@ fn is_vectorhawk_configured(path: &std::path::Path, mcp_key: &str) -> bool {
     let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
         return false;
     };
-    json.get(mcp_key)
-        .and_then(|v| v.get(MCP_SERVER_NAME))
-        .is_some()
+    let Some(entry) = json.get(mcp_key).and_then(|v| v.get(MCP_SERVER_NAME)) else {
+        return false;
+    };
+    // If the entry exists but uses a bare command name (not an absolute path),
+    // treat it as not configured so mcp setup rewrites it with the absolute path.
+    let command_is_absolute = entry
+        .get("command")
+        .and_then(|c| c.as_str())
+        .map(|s| std::path::Path::new(s).is_absolute())
+        .unwrap_or(false);
+    command_is_absolute
 }
 
 // ── Unmanaged server detection (GAP-06) ───────────────────────────────────────
