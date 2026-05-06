@@ -148,8 +148,10 @@ tar -xzf "${TMPDIR}/${TARBALL}" -C "${TMPDIR}"
 mkdir -p "${INSTALL_DIR}"
 
 for _bin in vectorhawk vectorhawkd vectorhawkd-shim; do
-    _src="${TMPDIR}/${_bin}"
-    if [ ! -f "${_src}" ]; then
+    # Support both flat tarballs (./binary) and subdirectoried ones
+    # (vectorhawk-VERSION-TRIPLE/binary) by searching after extraction.
+    _src="$(find "${TMPDIR}" -name "${_bin}" -type f | head -1)"
+    if [ -z "${_src}" ]; then
         log_error "Expected binary not in tarball: ${_bin}"
         exit 1
     fi
