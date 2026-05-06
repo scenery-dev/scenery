@@ -4,6 +4,7 @@
 #![allow(clippy::unwrap_used)]
 
 use std::sync::Arc;
+use tokio::sync::broadcast;
 use vectorhawkd_mcp::{
     aggregator::{BackendEntry, BackendRegistry, BackendTransport, ToolDefinition, ToolVisibility},
     backend::RealBackend,
@@ -30,10 +31,12 @@ fn make_ctx() -> DaemonContext {
         consecutive_errors: 0,
         unhealthy: false,
     });
+    let (list_changed_tx, _) = broadcast::channel(16);
     DaemonContext {
         backend: Arc::new(RealBackend::new(registry)),
         oauth_state: Arc::new(OAuthState::new()),
         listener_port: Some(39127),
+        list_changed_tx,
     }
 }
 
@@ -156,10 +159,12 @@ async fn dispatch_auth_get_oauth_listener_port_returns_port() {
 #[tokio::test]
 async fn dispatch_auth_get_oauth_listener_port_when_none() {
     let registry = Arc::new(BackendRegistry::new());
+    let (list_changed_tx, _) = broadcast::channel(16);
     let ctx = DaemonContext {
         backend: Arc::new(RealBackend::new(registry)),
         oauth_state: Arc::new(OAuthState::new()),
         listener_port: None,
+        list_changed_tx,
     };
     let resp = dispatch(
         &ctx,
