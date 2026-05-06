@@ -347,6 +347,55 @@ pub fn build_tool_list(state: &AppState, registry_url: &Option<String>) -> Vec<T
         });
     }
 
+    // Plugin export/import tools — always available (local operations, no auth required)
+    tools.push(ToolDefinition {
+        name: "vectorhawk_plugin_export".to_string(),
+        description: "Export a VectorHawk plugin to Claude Code plugin or .mcpb Desktop Extension \
+            format for distribution. Use 'mcpb' to produce a ZIP archive for Claude Desktop \
+            one-click install with enterprise allowlist support."
+            .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path to the VectorHawk plugin directory"
+                },
+                "format": {
+                    "type": "string",
+                    "enum": ["claude-code", "mcpb"],
+                    "description": "Export format: 'claude-code' for a Claude Code plugin directory, 'mcpb' for a Desktop Extension archive"
+                },
+                "output_dir": {
+                    "type": "string",
+                    "description": "Output directory where the exported artifact will be written (default: current directory)"
+                }
+            },
+            "required": ["path", "format"]
+        }),
+    });
+
+    tools.push(ToolDefinition {
+        name: "vectorhawk_plugin_import".to_string(),
+        description: "Import a Claude Code plugin directory or .mcpb Desktop Extension into \
+            VectorHawk plugin format. Auto-detects the external format and converts it."
+            .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path to the Claude Code plugin directory or .mcpb file"
+                },
+                "output_dir": {
+                    "type": "string",
+                    "description": "Output directory for the converted plugin (default: current directory)"
+                }
+            },
+            "required": ["path"]
+        }),
+    });
+
     tools
 }
 
@@ -435,6 +484,8 @@ pub fn handle_tool_call(
         "vectorhawk_mcp_uninstall" => handle_mcp_uninstall(arguments, registry_url, aggregator),
         "vectorhawk_uninstall" => handle_uninstall(arguments, state),
         "vectorhawk_update" => handle_update(arguments, state, registry_url),
+        "vectorhawk_plugin_export" => handle_plugin_export(arguments),
+        "vectorhawk_plugin_import" => handle_plugin_import(arguments),
         _ => handle_skill_run(
             name,
             arguments,
@@ -1509,6 +1560,103 @@ fn maybe_build_update_prompt(skill_id: &str, cache: &UpdateCheckCache) -> Option
     )))
 }
 
+// ── Plugin export handler ─────────────────────────────────────────────────────
+
+fn handle_plugin_export(arguments: &serde_json::Value) -> ToolCallResult {
+    use vectorhawkd_core::plugin_export;
+
+    let path = match arguments.get("path").and_then(|v| v.as_str()) {
+        Some(p) => p,
+        None => return ToolCallResult::error_result("Missing required parameter: path"),
+    };
+
+    let format = match arguments.get("format").and_then(|v| v.as_str()) {
+        Some(f) => f,
+        None => return ToolCallResult::error_result("Missing required parameter: format"),
+    };
+
+    let output_dir = arguments
+        .get("output_dir")
+        .and_then(|v| v.as_str())
+        .unwrap_or(".");
+
+    let plugin_path = camino::Utf8Path::new(path);
+    let out_path = camino::Utf8Path::new(output_dir);
+
+    let result = match format {
+        "claude-code" => plugin_export::export_claude_code(plugin_path, out_path),
+        "mcpb" => plugin_export::export_mcpb(plugin_path, out_path),
+        other => {
+            return ToolCallResult::error_result(format!(
+                "Unsupported format '{other}'. Use 'claude-code' or 'mcpb'."
+            ))
+        }
+    };
+
+    match result {
+        Ok(exported_path) => {
+            ToolCallResult::success(format!("Plugin exported successfully to: {exported_path}"))
+        }
+        Err(e) => ToolCallResult::error_result(format!("Export failed: {e}")),
+    }
+}
+
+// ── Plugin import handler ─────────────────────────────────────────────────────
+
+fn handle_plugin_import(arguments: &serde_json::Value) -> ToolCallResult {
+    use vectorhawkd_core::plugin_import;
+
+    let path = match arguments.get("path").and_then(|v| v.as_str()) {
+        Some(p) => camino::Utf8PathBuf::from(p),
+        None => return ToolCallResult::error_result("Missing required parameter: path"),
+    };
+
+    let output_dir = arguments
+        .get("output_dir")
+        .and_then(|v| v.as_str())
+        .unwrap_or(".");
+    let out = camino::Utf8PathBuf::from(output_dir);
+
+    let format = match plugin_import::detect_plugin_format(&path) {
+        Some(f) => f,
+        None => {
+            return ToolCallResult::error_result(format!(
+                "Could not detect plugin format at '{}'. \
+             Expected a Claude Code plugin directory (with .claude-plugin/) or a .mcpb file.",
+                path
+            ))
+        }
+    };
+
+    let format_label = format!("{:?}", format);
+
+    let result = match format {
+        plugin_import::ExternalPluginFormat::ClaudeCode => {
+            plugin_import::import_claude_code_plugin(&path, &out)
+        }
+        plugin_import::ExternalPluginFormat::Mcpb => plugin_import::import_mcpb(&path, &out),
+    };
+
+    match result {
+        Ok(p) => {
+            let payload = serde_json::json!({
+                "status": "imported",
+                "format": format_label,
+                "output_path": p.as_str(),
+                "next_steps": format!(
+                    "Plugin converted to VectorHawk format at '{p}'.\n\
+                     Next: run 'vectorhawk plugin validate {p}' to validate the bundle."
+                ),
+            });
+            ToolCallResult::success(
+                serde_json::to_string_pretty(&payload)
+                    .unwrap_or_else(|_| format!("Imported to {p}")),
+            )
+        }
+        Err(e) => ToolCallResult::error_result(format!("Import failed: {e}")),
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1944,5 +2092,67 @@ mod tests {
 
         let _ = fs::remove_dir_all(&state_root);
         let _ = fs::remove_dir_all(&skill_root);
+    }
+
+    // ── plugin export/import tool handler tests ───────────────────────────────
+
+    #[test]
+    fn handle_plugin_export_requires_path() {
+        let result = handle_plugin_export(&serde_json::json!({"format": "mcpb"}));
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content[0].text.contains("path"));
+    }
+
+    #[test]
+    fn handle_plugin_export_requires_format() {
+        let result = handle_plugin_export(&serde_json::json!({"path": "/some/plugin"}));
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content[0].text.contains("format"));
+    }
+
+    #[test]
+    fn handle_plugin_export_rejects_unknown_format() {
+        let result = handle_plugin_export(
+            &serde_json::json!({"path": "/some/plugin", "format": "tarball"}),
+        );
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content[0].text.contains("Unsupported format"));
+    }
+
+    #[test]
+    fn handle_plugin_import_requires_path() {
+        let result = handle_plugin_import(&serde_json::json!({}));
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content[0].text.contains("path"));
+    }
+
+    #[test]
+    fn handle_plugin_import_unknown_format() {
+        let root = temp_root("pi-unknown");
+        fs::create_dir_all(&root).unwrap();
+        // A plain directory with no recognized format markers
+        let result = handle_plugin_import(
+            &serde_json::json!({"path": root.to_string()}),
+        );
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content[0].text.contains("Could not detect plugin format"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn build_tool_list_includes_plugin_tools() {
+        let state_root = temp_root("tool-list-plugin");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+        let tools = build_tool_list(&state, &None);
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            names.contains(&"vectorhawk_plugin_export"),
+            "tool list should include vectorhawk_plugin_export"
+        );
+        assert!(
+            names.contains(&"vectorhawk_plugin_import"),
+            "tool list should include vectorhawk_plugin_import"
+        );
+        let _ = fs::remove_dir_all(&state_root);
     }
 }

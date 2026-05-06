@@ -310,6 +310,86 @@ fn unknown_command_fails() {
 /// AC5 (M3): `vectorhawk doctor` must emit an `OAuth listener:` line.
 ///
 /// When the daemon is not running the line reads "not running".  The test
+// ── plugin subcommands ────────────────────────────────────────────────────────
+
+#[test]
+fn plugin_export_default_format_parses() {
+    use super::{Command, PluginCommand};
+    match parse(&["plugin", "export", "/some/plugin"]).command {
+        Command::Plugin(PluginCommand::Export {
+            path,
+            format,
+            output_dir,
+        }) => {
+            assert_eq!(path.as_str(), "/some/plugin");
+            assert_eq!(format, "mcpb");
+            assert!(output_dir.is_none());
+        }
+        other => panic!("expected Plugin::Export, got {other:?}"),
+    }
+}
+
+#[test]
+fn plugin_export_with_format_and_output_dir_parses() {
+    use super::{Command, PluginCommand};
+    match parse(&[
+        "plugin",
+        "export",
+        "/some/plugin",
+        "--format",
+        "claude-code",
+        "--output-dir",
+        "./dist",
+    ])
+    .command
+    {
+        Command::Plugin(PluginCommand::Export {
+            path,
+            format,
+            output_dir,
+        }) => {
+            assert_eq!(path.as_str(), "/some/plugin");
+            assert_eq!(format, "claude-code");
+            assert_eq!(output_dir.as_deref().map(|p| p.as_str()), Some("./dist"));
+        }
+        other => panic!("expected Plugin::Export, got {other:?}"),
+    }
+}
+
+#[test]
+fn plugin_import_parses() {
+    use super::{Command, PluginCommand};
+    match parse(&["plugin", "import", "/some/extension.mcpb"]).command {
+        Command::Plugin(PluginCommand::Import { path, output_dir }) => {
+            assert_eq!(path.as_str(), "/some/extension.mcpb");
+            assert!(output_dir.is_none());
+        }
+        other => panic!("expected Plugin::Import, got {other:?}"),
+    }
+}
+
+#[test]
+fn plugin_import_with_output_dir_parses() {
+    use super::{Command, PluginCommand};
+    match parse(&[
+        "plugin",
+        "import",
+        "/some/extension.mcpb",
+        "--output-dir",
+        "./out",
+    ])
+    .command
+    {
+        Command::Plugin(PluginCommand::Import { path, output_dir }) => {
+            assert_eq!(path.as_str(), "/some/extension.mcpb");
+            assert_eq!(output_dir.as_deref().map(|p| p.as_str()), Some("./out"));
+        }
+        other => panic!("expected Plugin::Import, got {other:?}"),
+    }
+}
+
+// ── doctor output check ───────────────────────────────────────────────────────
+
 /// exercises the output label — not the daemon state — so it does not require
 /// a live daemon.
 ///

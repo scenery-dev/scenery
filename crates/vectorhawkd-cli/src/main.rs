@@ -9,6 +9,8 @@
 //! vectorhawk skill info <id>
 //! vectorhawk skill run <id> --input <file> [--stub]
 //! vectorhawk skill import <path>
+//! vectorhawk plugin export <path> --format <fmt> [--output-dir <dir>]
+//! vectorhawk plugin import <path> [--output-dir <dir>]
 //! vectorhawk skill validate <path>
 //! vectorhawk auth login [--registry-url <url>]
 //! vectorhawk auth logout [--registry-url <url>]
@@ -70,6 +72,10 @@ pub enum Command {
     /// Daemon lifecycle subcommands.
     #[command(subcommand)]
     Daemon(DaemonCommand),
+
+    /// Plugin management subcommands (.mcpb / Claude Code plugin format).
+    #[command(subcommand)]
+    Plugin(PluginCommand),
 }
 
 #[derive(Debug, Subcommand)]
@@ -204,6 +210,39 @@ pub enum DaemonCommand {
     Uninstall,
 }
 
+#[derive(Debug, Subcommand)]
+pub enum PluginCommand {
+    /// Export a VectorHawk plugin to Claude Code plugin or .mcpb Desktop Extension format.
+    ///
+    /// Use `--format mcpb` to produce a ZIP archive for Claude Desktop one-click install.
+    /// Use `--format claude-code` to produce a Claude Code plugin directory.
+    Export {
+        /// Path to the VectorHawk plugin directory.
+        path: camino::Utf8PathBuf,
+
+        /// Export format: 'mcpb' for Desktop Extension archive, 'claude-code' for Claude Code plugin directory.
+        #[arg(long, default_value = "mcpb")]
+        format: String,
+
+        /// Output directory where the exported artifact will be written (default: current directory).
+        #[arg(long, value_name = "DIR")]
+        output_dir: Option<camino::Utf8PathBuf>,
+    },
+
+    /// Import a Claude Code plugin directory or .mcpb Desktop Extension into VectorHawk plugin format.
+    ///
+    /// Auto-detects whether the input is a Claude Code plugin (directory with .claude-plugin/)
+    /// or a .mcpb archive. Writes a VectorHawk plugin.json to the output directory.
+    Import {
+        /// Path to the Claude Code plugin directory or .mcpb file.
+        path: camino::Utf8PathBuf,
+
+        /// Output directory for the converted plugin (default: current directory).
+        #[arg(long, value_name = "DIR")]
+        output_dir: Option<camino::Utf8PathBuf>,
+    },
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() {
@@ -261,6 +300,15 @@ async fn run(cli: Cli) -> Result<()> {
         }) => cmd_daemon_run(registry_url).await,
         Command::Daemon(DaemonCommand::Install) => cmd_daemon_install().await,
         Command::Daemon(DaemonCommand::Uninstall) => cmd_daemon_uninstall().await,
+
+        Command::Plugin(PluginCommand::Export {
+            path,
+            format,
+            output_dir,
+        }) => cmd_plugin_export(path, format, output_dir).await,
+        Command::Plugin(PluginCommand::Import { path, output_dir }) => {
+            cmd_plugin_import(path, output_dir).await
+        }
     }
 }
 
@@ -1200,6 +1248,68 @@ async fn wait_for_daemon_socket(timeout_ms: u64) {
 #[cfg(not(unix))]
 async fn wait_for_daemon_socket(_timeout_ms: u64) {
     // No-op on platforms without Unix sockets.
+}
+
+// ── plugin export / import ────────────────────────────────────────────────────
+
+async fn cmd_plugin_export(
+    path: camino::Utf8PathBuf,
+    format: String,
+    output_dir: Option<camino::Utf8PathBuf>,
+) -> Result<()> {
+    use vectorhawkd_core::plugin_export;
+
+    let out = output_dir
+        .as_deref()
+        .unwrap_or_else(|| camino::Utf8Path::new("."));
+
+    let result = match format.as_str() {
+        "claude-code" => plugin_export::export_claude_code(&path, out)
+            .with_context(|| format!("failed to export plugin at {path} as claude-code"))?,
+        "mcpb" => plugin_export::export_mcpb(&path, out)
+            .with_context(|| format!("failed to export plugin at {path} as mcpb"))?,
+        other => {
+            anyhow::bail!(
+                "unsupported format '{}'. Use 'claude-code' or 'mcpb'",
+                other
+            );
+        }
+    };
+
+    println!("Exported to {result}");
+    Ok(())
+}
+
+async fn cmd_plugin_import(
+    path: camino::Utf8PathBuf,
+    output_dir: Option<camino::Utf8PathBuf>,
+) -> Result<()> {
+    use vectorhawkd_core::plugin_import;
+
+    let out = output_dir
+        .as_deref()
+        .unwrap_or_else(|| camino::Utf8Path::new("."));
+
+    let format = plugin_import::detect_plugin_format(&path).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Could not detect plugin format at '{}'. \
+             Expected a Claude Code plugin directory (with .claude-plugin/) or a .mcpb file.",
+            path
+        )
+    })?;
+
+    let result = match format {
+        plugin_import::ExternalPluginFormat::ClaudeCode => {
+            plugin_import::import_claude_code_plugin(&path, out)
+                .with_context(|| format!("failed to import Claude Code plugin at {path}"))?
+        }
+        plugin_import::ExternalPluginFormat::Mcpb => plugin_import::import_mcpb(&path, out)
+            .with_context(|| format!("failed to import .mcpb at {path}"))?,
+    };
+
+    println!("Imported to {result}");
+    println!("Next: vectorhawk skill validate {result}");
+    Ok(())
 }
 
 // ── mcp sync / backends (deferred — M1.4) ────────────────────────────────────
