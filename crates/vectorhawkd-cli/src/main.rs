@@ -679,7 +679,7 @@ async fn cmd_skill_install(skill_ref: &str, link: bool, registry_url: Option<&st
         use vectorhawkd_core::registry::RegistryClient;
         use vectorhawkd_core::updater::install_from_registry;
 
-        let url = registry_url.unwrap_or("https://registry.vectorhawk.ai");
+        let url = registry_url.unwrap_or("https://app.vectorhawk.ai");
         let registry = RegistryClient::new(url);
 
         // install_from_registry issues blocking HTTP + SQLite calls; run on a
@@ -1480,7 +1480,7 @@ async fn cmd_mcp_sync() -> Result<()> {
 
     let state = AppState::bootstrap().context("failed to bootstrap state")?;
     let registry_url = std::env::var("VECTORHAWK_REGISTRY_URL")
-        .unwrap_or_else(|_| "https://registry.vectorhawk.ai".to_string());
+        .unwrap_or_else(|_| "https://app.vectorhawk.ai".to_string());
 
     let registry = Arc::new(RegistryClient::new(&registry_url));
     let audit = Arc::new(SqliteAuditBuffer::new(Arc::clone(&registry), &state));

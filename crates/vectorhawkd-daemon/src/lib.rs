@@ -116,8 +116,8 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     let registry_url = opts
         .registry_url
         .clone()
-        .or_else(|| std::env::var("SKILLCLUB_REGISTRY_URL").ok())
-        .unwrap_or_else(|| "https://registry.vectorhawk.ai".to_string());
+        .or_else(|| std::env::var("VECTORHAWK_REGISTRY_URL").ok())
+        .unwrap_or_else(|| "https://app.vectorhawk.ai".to_string());
 
     info!(registry_url, "connecting to registry");
 
