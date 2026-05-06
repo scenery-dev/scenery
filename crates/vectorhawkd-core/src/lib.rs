@@ -44,3 +44,7 @@ pub mod updater;
 // Some of these helpers will migrate onto `RegistryClient` proper as M1.4's
 // trait expansion settles.
 pub mod mcp_governance;
+
+// GAP-11: .mcpb Desktop Extension export/import.
+pub mod plugin_export;
+pub mod plugin_import;
