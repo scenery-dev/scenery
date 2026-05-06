@@ -234,10 +234,7 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
         );
     }
 
-    let registry_url_opt: Option<String> = opts
-        .registry_url
-        .clone()
-        .or_else(|| std::env::var("SKILLCLUB_REGISTRY_URL").ok());
+    let registry_url_opt: Option<String> = Some(registry_url.clone());
 
     let policy_client: Arc<dyn vectorhawkd_core::policy::PolicyClient + Send + Sync> =
         Arc::new(vectorhawkd_core::policy::MockPolicyClient::new());

@@ -29,8 +29,15 @@ pub const MCP_ARGS: &[&str] = &["mcp", "serve"];
 
 /// Build the JSON value for a single AI client's MCP server config entry.
 pub fn build_mcp_entry() -> serde_json::Value {
+    // Use the absolute path to the current binary so AI clients that spawn
+    // processes with a non-login shell (no Linuxbrew/Homebrew on PATH) can
+    // still find the executable.
+    let command = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(|s| s.to_string()))
+        .unwrap_or_else(|| MCP_COMMAND.to_string());
     serde_json::json!({
-        "command": MCP_COMMAND,
+        "command": command,
         "args": MCP_ARGS,
     })
 }
