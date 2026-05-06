@@ -64,6 +64,7 @@ use std::{os::unix::fs::PermissionsExt, sync::Arc};
 use tokio::{
     net::UnixListener,
     signal::unix::{signal, SignalKind},
+    sync::broadcast,
 };
 use tracing::{error, info, warn};
 use vectorhawkd_core::{
@@ -123,6 +124,12 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     let registry = Arc::new(RegistryClient::new(&registry_url));
     let audit_buffer = Arc::new(SqliteAuditBuffer::new(Arc::clone(&registry), &state));
 
+    // Broadcast channel for `notifications/tools/list_changed`.
+    // Capacity 16: if a subscriber falls behind by 16 messages it will receive
+    // a `RecvError::Lagged` and coalesce (send one notification). This is
+    // safe because list_changed is idempotent.
+    let (list_changed_tx, _list_changed_rx_seed) = broadcast::channel::<()>(16);
+
     // Spawn the registry sync loop (300 s interval).
     // All synchronous I/O happens inside spawn_blocking so the current-thread
     // Tokio executor is never blocked by HTTP or SQLite calls.
@@ -130,6 +137,7 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     let sync_audit = Arc::clone(&audit_buffer);
     let sync_db_path = state.db_path.clone();
     let sync_root_dir = state.root_dir.clone();
+    let sync_list_changed_tx = list_changed_tx.clone();
     tokio::spawn(async move {
         let mut interval =
             tokio::time::interval(std::time::Duration::from_secs(SYNC_INTERVAL_SECS));
@@ -148,7 +156,13 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
                 tokio::task::spawn_blocking(move || run_sync_tick(&reg, &aud, &db, &root)).await;
 
             match result {
-                Ok(Ok(())) => {}
+                Ok(Ok(changed)) => {
+                    if changed {
+                        // Sync updated the tool set — notify all connected shims.
+                        // Ignore errors: no receivers means no connected shims.
+                        let _ = sync_list_changed_tx.send(());
+                    }
+                }
                 Ok(Err(e)) => {
                     warn!(error = %e, "registry sync tick failed; will retry on next interval");
                 }
@@ -308,6 +322,7 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
                             backend: Arc::clone(&backend),
                             oauth_state: Arc::clone(&oauth_state),
                             listener_port,
+                            list_changed_tx: list_changed_tx.clone(),
                         };
                         tokio::spawn(socket_dispatch::serve_connection(stream, ctx));
                     }
@@ -446,12 +461,18 @@ pub fn refresh_one_tick(state: &AppState, registry_url: &str) -> Result<()> {
 ///
 /// Each step failure logs at WARN and continues; only a total inability to
 /// open the database returns `Err`.
-fn run_sync_tick(
+///
+/// Returns `true` if the sync detected changes to the approved-server list or
+/// skill set that might alter the tool list visible to connected shims.  The
+/// caller broadcasts `list_changed` when this returns `true`.
+pub(crate) fn run_sync_tick(
     registry: &RegistryClient,
     audit: &SqliteAuditBuffer,
     db_path: &camino::Utf8PathBuf,
     root_dir: &camino::Utf8PathBuf,
-) -> Result<()> {
+) -> Result<bool> {
+    let mut changed = false;
+
     // ── 1. Audit flush ────────────────────────────────────────────────────────
     let state_view = AppState {
         root_dir: root_dir.clone(),
@@ -464,12 +485,17 @@ fn run_sync_tick(
     }
 
     // ── 2. Approved-server list refresh ──────────────────────────────────────
+    // Any successful server-list refresh may have added or removed backends,
+    // so treat a successful non-empty response as a potential tool-set change.
     match registry.fetch_approved_servers() {
         Ok(resp) => {
             info!(
                 count = resp.servers.len(),
                 "sync: approved server list refreshed"
             );
+            if !resp.servers.is_empty() {
+                changed = true;
+            }
         }
         Err(e) => {
             warn!(error = %e, "sync: failed to refresh approved server list");
@@ -481,12 +507,12 @@ fn run_sync_tick(
         Ok(ids) => ids,
         Err(e) => {
             warn!(error = %e, "sync: failed to read installed skills");
-            return Ok(());
+            return Ok(changed);
         }
     };
 
     if skill_ids.is_empty() {
-        return Ok(());
+        return Ok(changed);
     }
 
     match registry.check_skill_status(&skill_ids) {
@@ -496,6 +522,11 @@ fn run_sync_tick(
                 unknown_count = status_resp.unknown.len(),
                 "sync: skill lifecycle status refreshed"
             );
+            // If any skills moved to an unknown state they may have been
+            // decommissioned; treat this as a potential tool-set change.
+            if !status_resp.unknown.is_empty() {
+                changed = true;
+            }
         }
         Err(e) => {
             warn!(
@@ -505,7 +536,7 @@ fn run_sync_tick(
         }
     }
 
-    Ok(())
+    Ok(changed)
 }
 
 /// Construct the M0 stub `BackendRegistry`.

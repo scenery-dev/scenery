@@ -25,16 +25,32 @@
 //!
 //! `SqliteAuditBuffer::record` opens a `rusqlite::Connection` synchronously.
 //! Running it on the executor thread serializes all concurrent tool calls.
+//!
+//! # `notifications/tools/list_changed` (GAP-03)
+//!
+//! After any `tools/call` whose tool name is one of the mutating management
+//! tools (`vectorhawk_install`, `vectorhawk_uninstall`, `vectorhawk_update`,
+//! `vectorhawk_import`, `vectorhawk_mcp_install`, `vectorhawk_mcp_uninstall`),
+//! the dispatch loop:
+//!
+//! 1. Writes a framed `notifications/tools/list_changed` frame to **this**
+//!    connection's writer immediately after the response.
+//! 2. Fires `DaemonContext::list_changed_tx` so that every other currently-
+//!    connected shim connection also writes the same notification.
+//!
+//! Each `serve_connection` task subscribes to `list_changed_tx` at start via
+//! a `broadcast::Receiver<()>`.  A dedicated sub-task inside `run_loop` polls
+//! the receiver and writes the notification frame whenever the channel fires.
 
 use anyhow::Result;
 use std::sync::Arc;
-use tokio::net::UnixStream;
+use tokio::{net::UnixStream, sync::broadcast};
 use tracing::{debug, error, info, warn};
 use vectorhawkd_mcp::{
     backend::{read_framed, write_framed, Backend, RealBackend},
     protocol::{
-        JsonRpcRequest, JsonRpcResponse, ToolCallParams, INTERNAL_ERROR, INVALID_PARAMS,
-        METHOD_NOT_FOUND, PARSE_ERROR,
+        JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, ToolCallParams, INTERNAL_ERROR,
+        INVALID_PARAMS, METHOD_NOT_FOUND, PARSE_ERROR,
     },
 };
 
@@ -42,6 +58,16 @@ use crate::{
     auth_dispatch::{handle_get_oauth_listener_port, handle_wait_for_callback},
     oauth_state::OAuthState,
 };
+
+/// Tool names whose successful dispatch should trigger `list_changed`.
+const MUTATING_TOOLS: &[&str] = &[
+    "vectorhawk_install",
+    "vectorhawk_uninstall",
+    "vectorhawk_update",
+    "vectorhawk_import",
+    "vectorhawk_mcp_install",
+    "vectorhawk_mcp_uninstall",
+];
 
 /// Shared daemon context passed to every per-connection handler.
 ///
@@ -56,6 +82,12 @@ pub struct DaemonContext {
     pub oauth_state: Arc<OAuthState>,
     /// Bound port of the HTTP callback listener, or `None` if it failed to start.
     pub listener_port: Option<u16>,
+    /// Broadcast channel used to notify **all** connected shims that the tool
+    /// set has changed.  Fired after any mutating management tool call and after
+    /// successful background sync ticks.  Each `serve_connection` task
+    /// subscribes at start; sending `()` triggers every subscriber to write a
+    /// `notifications/tools/list_changed` frame to its client.
+    pub list_changed_tx: broadcast::Sender<()>,
 }
 
 /// Drive a single shim connection to completion.
@@ -69,52 +101,102 @@ pub async fn serve_connection(stream: UnixStream, ctx: DaemonContext) {
         .unwrap_or_else(|_| "unknown".to_string());
     info!(peer = %peer, "shim connected");
 
-    if let Err(e) = run_loop(stream, ctx).await {
+    // Subscribe to the list_changed broadcast before entering the loop so we
+    // don't miss any notifications fired during this session.
+    let list_changed_rx = ctx.list_changed_tx.subscribe();
+
+    if let Err(e) = run_loop(stream, ctx, list_changed_rx).await {
         debug!(peer = %peer, error = %e, "connection loop ended");
     }
 
     info!(peer = %peer, "shim disconnected");
 }
 
-async fn run_loop(stream: UnixStream, ctx: DaemonContext) -> Result<()> {
+async fn run_loop(
+    stream: UnixStream,
+    ctx: DaemonContext,
+    mut list_changed_rx: broadcast::Receiver<()>,
+) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+
     let (mut reader, mut writer) = stream.into_split();
 
     loop {
-        // Read one length-prefixed frame.  Returns None on clean EOF.
-        let raw = match read_framed(&mut reader).await {
-            Ok(Some(bytes)) => bytes,
-            Ok(None) => {
-                debug!("peer closed connection (EOF)");
-                break;
-            }
-            Err(e) => {
-                warn!(error = %e, "read_framed failed");
-                break;
-            }
-        };
+        tokio::select! {
+            // ── Incoming request from shim ─────────────────────────────────
+            read_result = read_framed(&mut reader) => {
+                let raw = match read_result {
+                    Ok(Some(bytes)) => bytes,
+                    Ok(None) => {
+                        debug!("peer closed connection (EOF)");
+                        break;
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "read_framed failed");
+                        break;
+                    }
+                };
 
-        // Parse the JSON-RPC envelope.
-        let request: JsonRpcRequest = match serde_json::from_slice(&raw) {
-            Ok(r) => r,
-            Err(e) => {
-                let response =
-                    JsonRpcResponse::error(None, PARSE_ERROR, format!("invalid JSON: {e}"));
+                // Parse the JSON-RPC envelope.
+                let request: JsonRpcRequest = match serde_json::from_slice(&raw) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let response =
+                            JsonRpcResponse::error(None, PARSE_ERROR, format!("invalid JSON: {e}"));
+                        send_response(&mut writer, &response).await;
+                        continue;
+                    }
+                };
+
+                debug!(method = %request.method, id = ?request.id, "dispatching");
+
+                // Notifications (no id) require no response.
+                if request.id.is_none() {
+                    continue;
+                }
+
+                // Snapshot the tool name before moving `request` into dispatch.
+                let is_mutating = request.method == "tools/call"
+                    && serde_json::from_value::<ToolCallParams>(request.params.clone())
+                        .map(|p| MUTATING_TOOLS.contains(&p.name.as_str()))
+                        .unwrap_or(false);
+
+                let response = dispatch(&ctx, request).await;
                 send_response(&mut writer, &response).await;
-                continue;
+
+                // After a successful (non-JSON-RPC-error) mutating tool call,
+                // send list_changed to this connection and broadcast to others.
+                if is_mutating && response.error.is_none() {
+                    send_list_changed_frame(&mut writer).await;
+                    // Fire the broadcast so all other shims are notified.
+                    // Ignore errors: lagging receivers are dropped automatically.
+                    let _ = ctx.list_changed_tx.send(());
+                }
             }
-        };
 
-        debug!(method = %request.method, id = ?request.id, "dispatching");
-
-        // Notifications (no id) require no response.
-        if request.id.is_none() {
-            continue;
+            // ── Broadcast notification from another connection or sync tick ─
+            broadcast_result = list_changed_rx.recv() => {
+                match broadcast_result {
+                    Ok(()) => {
+                        send_list_changed_frame(&mut writer).await;
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        // Fell behind — drain and send one notification.
+                        debug!(skipped = n, "list_changed broadcast: receiver lagged, coalescing");
+                        send_list_changed_frame(&mut writer).await;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        // Sender dropped — daemon is shutting down. Exit cleanly.
+                        debug!("list_changed broadcast channel closed");
+                        break;
+                    }
+                }
+            }
         }
-
-        let response = dispatch(&ctx, request).await;
-        send_response(&mut writer, &response).await;
     }
 
+    // Flush any pending writes before dropping.
+    let _ = writer.flush().await;
     Ok(())
 }
 
@@ -197,6 +279,29 @@ where
     };
     if let Err(e) = write_framed(writer, &body).await {
         debug!(error = %e, "failed to write response frame");
+    }
+}
+
+/// Write a `notifications/tools/list_changed` JSON-RPC notification as a
+/// length-prefixed frame to the shim connection.
+///
+/// Failures are logged at DEBUG level and do not abort the connection loop —
+/// the worst outcome is a stale tool list on the AI client side, which is
+/// correctable by the user reconnecting.
+async fn send_list_changed_frame<W>(writer: &mut W)
+where
+    W: tokio::io::AsyncWriteExt + Unpin,
+{
+    let notification = JsonRpcNotification::new("notifications/tools/list_changed");
+    let body = match serde_json::to_vec(&notification) {
+        Ok(b) => b,
+        Err(e) => {
+            error!(error = %e, "failed to serialize list_changed notification");
+            return;
+        }
+    };
+    if let Err(e) = write_framed(writer, &body).await {
+        debug!(error = %e, "failed to write list_changed notification frame");
     }
 }
 
