@@ -1081,11 +1081,118 @@ async fn cmd_mcp_serve() -> Result<()> {
 
 async fn cmd_mcp_setup(client: Option<&str>, dry_run: bool) -> Result<()> {
     use vectorhawkd_mcp::setup::{
-        build_mcp_entry, detect_claude_code, write_mcp_entry, MCP_SERVER_NAME,
+        build_mcp_entry, detect_ai_clients, detect_claude_code, install_claude_skills,
+        write_mcp_entry, MCP_SERVER_NAME,
     };
 
-    // Resolve target client. M0: only claude-code supported.
-    let target = client.unwrap_or("claude-code");
+    // Resolve target client.  When no --client flag is given, configure all
+    // detected clients; when a specific client name is given, restrict to that
+    // one (kept for backwards compat / scripted use).
+    let target = client.unwrap_or("auto");
+
+    if target == "auto" {
+        let entry = build_mcp_entry();
+        let block = serde_json::json!({
+            "mcpServers": {
+                MCP_SERVER_NAME: entry
+            }
+        });
+
+        if dry_run {
+            println!("-- dry run: config entry that would be written --");
+            println!("{}", serde_json::to_string_pretty(&block)?);
+            let clients = detect_ai_clients();
+            if clients.is_empty() {
+                println!("\nNo supported AI clients detected.");
+            } else {
+                println!("\nDetected clients:");
+                for c in &clients {
+                    println!("  {} → {}", c.name, c.config_path.display());
+                }
+            }
+            return Ok(());
+        }
+
+        // M2: provision the daemon before writing AI client config.
+        {
+            let install_status = tokio::task::spawn_blocking(install::status)
+                .await
+                .context("install status task panicked")?
+                .context("failed to check daemon install status")?;
+
+            let was_not_running = !matches!(
+                install_status,
+                install::InstallStatus::InstalledAndRunning { .. }
+            );
+
+            if was_not_running {
+                tokio::task::spawn_blocking(install::ensure_installed)
+                    .await
+                    .context("ensure_installed task panicked")?
+                    .context("failed to provision daemon")?;
+
+                wait_for_daemon_socket(5_000).await;
+            }
+        }
+
+        let clients = detect_ai_clients();
+        if clients.is_empty() {
+            anyhow::bail!(
+                "No supported AI clients detected. \
+                 Install Claude Code, Cursor, Windsurf, VS Code, Gemini CLI, or \
+                 Claude Desktop first, or use --dry-run to preview the entry."
+            );
+        }
+
+        let mut wrote_claude_code = false;
+        for config in &clients {
+            if config.already_configured {
+                println!(
+                    "{}: vectorhawk already configured — skipped.",
+                    config.name
+                );
+                continue;
+            }
+            write_mcp_entry(config).with_context(|| {
+                format!(
+                    "failed to write {} config at {}",
+                    config.name,
+                    config.config_path.display()
+                )
+            })?;
+            println!(
+                "{}: wrote vectorhawk MCP entry to {}.",
+                config.name,
+                config.config_path.display()
+            );
+            if config.name == "Claude Code" {
+                wrote_claude_code = true;
+            }
+        }
+
+        // Install slash commands whenever Claude Code is present (configured or not).
+        let has_claude_code = clients.iter().any(|c| c.name == "Claude Code");
+        if has_claude_code || wrote_claude_code {
+            match install_claude_skills() {
+                Ok(installed) if !installed.is_empty() => {
+                    println!(
+                        "Installed {} VectorHawk slash command(s) to ~/.claude/skills/.",
+                        installed.len()
+                    );
+                }
+                Ok(_) => {
+                    println!("VectorHawk slash commands already up to date.");
+                }
+                Err(e) => {
+                    eprintln!("warning: failed to install slash commands: {e:#}");
+                }
+            }
+        }
+
+        return Ok(());
+    }
+
+    // ── Legacy single-client path (--client <name>) ───────────────────────────
 
     match target {
         "claude-code" => {
@@ -1110,10 +1217,7 @@ async fn cmd_mcp_setup(client: Option<&str>, dry_run: bool) -> Result<()> {
                 return Ok(());
             }
 
-            // ── M2: provision the daemon before writing AI client config ──────
-            //
-            // If the daemon is not installed/running, install it now so the
-            // AI client finds it on first use. `ensure_installed` is idempotent.
+            // M2: provision the daemon before writing AI client config.
             {
                 let install_status = tokio::task::spawn_blocking(install::status)
                     .await
@@ -1131,12 +1235,10 @@ async fn cmd_mcp_setup(client: Option<&str>, dry_run: bool) -> Result<()> {
                         .context("ensure_installed task panicked")?
                         .context("failed to provision daemon")?;
 
-                    // Wait up to 5 s for the socket to appear.
                     wait_for_daemon_socket(5_000).await;
                 }
             }
 
-            // Real write path.
             let config = detect_claude_code().ok_or_else(|| {
                 anyhow::anyhow!(
                     "Claude Code not detected (neither ~/.claude nor ~/.claude.json found). \
@@ -1149,21 +1251,33 @@ async fn cmd_mcp_setup(client: Option<&str>, dry_run: bool) -> Result<()> {
                     "vectorhawk is already configured in {} — no changes made.",
                     config.config_path.display()
                 );
-                return Ok(());
+            } else {
+                write_mcp_entry(&config).with_context(|| {
+                    format!("failed to write to {}", config.config_path.display())
+                })?;
+                println!(
+                    "Wrote vectorhawk MCP entry to {}.",
+                    config.config_path.display()
+                );
             }
 
-            write_mcp_entry(&config)
-                .with_context(|| format!("failed to write to {}", config.config_path.display()))?;
-
-            println!(
-                "Wrote vectorhawk MCP entry to {}.",
-                config.config_path.display()
-            );
+            match install_claude_skills() {
+                Ok(installed) if !installed.is_empty() => {
+                    println!(
+                        "Installed {} VectorHawk slash command(s) to ~/.claude/skills/.",
+                        installed.len()
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("warning: failed to install slash commands: {e:#}");
+                }
+            }
         }
         other => {
             eprintln!(
-                "vectorhawk mcp setup: client '{other}' is not yet supported \
-                 (M0 supports only 'claude-code')"
+                "vectorhawk mcp setup: client '{other}' is not yet supported. \
+                 Omit --client to auto-detect all supported clients."
             );
             std::process::exit(2);
         }
