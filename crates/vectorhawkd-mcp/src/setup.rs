@@ -168,6 +168,61 @@ fn is_vectorhawk_configured(path: &std::path::Path, mcp_key: &str) -> bool {
         .is_some()
 }
 
+// ── Unmanaged server detection (GAP-06) ───────────────────────────────────────
+
+/// An MCP server entry found in a client's config file that is NOT managed by VectorHawk.
+#[derive(Debug, Clone)]
+pub struct UnmanagedServer {
+    /// Name/key of the server in the config file (e.g. `"github-mcp"`).
+    pub server_name: String,
+    /// Path of the AI client config file that contained this entry.
+    pub config_path: String,
+    /// Which AI client (e.g. `"Claude Code"`, `"Cursor"`).
+    pub client_name: String,
+}
+
+/// Scan all detected AI client config files and return MCP servers not managed by VectorHawk.
+///
+/// A server is considered managed if its key is `MCP_SERVER_NAME` (`"vectorhawk"`).
+/// Every other server key is reported as unmanaged so IT admins can audit shadow
+/// MCP installations via the `unmanaged_server_detected` audit event stream.
+pub fn detect_unmanaged_servers() -> Vec<UnmanagedServer> {
+    let clients = detect_ai_clients();
+    let mut unmanaged = Vec::new();
+
+    for client in &clients {
+        if !client.config_path.exists() {
+            continue;
+        }
+        let text = match std::fs::read_to_string(&client.config_path) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        let config: serde_json::Value = match serde_json::from_str(&text) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        let servers = match config.get(&client.mcp_key).and_then(|v| v.as_object()) {
+            Some(s) => s,
+            None => continue,
+        };
+
+        for key in servers.keys() {
+            if key == MCP_SERVER_NAME {
+                continue;
+            }
+            unmanaged.push(UnmanagedServer {
+                server_name: key.clone(),
+                config_path: client.config_path.display().to_string(),
+                client_name: client.name.clone(),
+            });
+        }
+    }
+
+    unmanaged
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

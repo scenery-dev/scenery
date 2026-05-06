@@ -749,6 +749,91 @@ impl RegistryClient {
 
         map_submit_response_to_outcome(wire)
     }
+
+    /// Upload a batch of unsynced skill ratings to the registry.
+    ///
+    /// Calls `POST /api/runner/skill-ratings`. Best-effort: callers should log
+    /// on error and continue; the rows remain in SQLite for the next tick.
+    ///
+    /// TODO(registry): add matching POST /api/runner/skill-ratings endpoint.
+    pub fn upload_skill_ratings(
+        &self,
+        ratings: &[crate::ratings::LocalRating],
+    ) -> Result<()> {
+        if ratings.is_empty() {
+            return Ok(());
+        }
+
+        let url = format!("{}/api/runner/skill-ratings", self.base_url.trim_end_matches('/'));
+        debug!(url, count = ratings.len(), "uploading skill ratings");
+
+        let payload: Vec<serde_json::Value> = ratings
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "skill_id":  r.skill_id,
+                    "version":   r.version,
+                    "rating":    r.rating,
+                    "rated_at":  r.rated_at,
+                })
+            })
+            .collect();
+
+        let mut req = self.http.post(&url).json(&payload);
+        if let Some(token) = &self.auth_token {
+            req = req.bearer_auth(token);
+        }
+
+        let resp = req
+            .send()
+            .with_context(|| format!("failed to reach registry at {url}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().unwrap_or_default();
+            anyhow::bail!("skill ratings upload failed (HTTP {status}): {body}");
+        }
+
+        Ok(())
+    }
+
+    /// Upload execution statistics for all tracked skills to the registry.
+    ///
+    /// Calls `POST /api/runner/execution-stats`. Best-effort: callers should log
+    /// on error and continue.
+    ///
+    /// TODO(registry): add matching POST /api/runner/execution-stats endpoint.
+    pub fn upload_execution_stats(
+        &self,
+        stats: &[crate::ratings::ExecutionStats],
+    ) -> Result<()> {
+        if stats.is_empty() {
+            return Ok(());
+        }
+
+        let url = format!(
+            "{}/api/runner/execution-stats",
+            self.base_url.trim_end_matches('/')
+        );
+        debug!(url, count = stats.len(), "uploading execution stats");
+
+        let mut req = self.http.post(&url).json(stats);
+        if let Some(token) = &self.auth_token {
+            req = req.bearer_auth(token);
+        }
+
+        let resp = req
+            .send()
+            .with_context(|| format!("failed to reach registry at {url}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().unwrap_or_default();
+            anyhow::bail!("execution stats upload failed (HTTP {status}): {body}");
+        }
+
+        Ok(())
+    }
 }
 
 // ── Compatibility: SkillPolicyResponse used by tests / M0 consumers ──────────
@@ -834,6 +919,20 @@ impl MockRegistryClient {
             statuses: std::collections::HashMap::new(),
             unknown: vec![],
         })
+    }
+
+    pub fn upload_skill_ratings(
+        &self,
+        _ratings: &[crate::ratings::LocalRating],
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    pub fn upload_execution_stats(
+        &self,
+        _stats: &[crate::ratings::ExecutionStats],
+    ) -> Result<()> {
+        Ok(())
     }
 }
 

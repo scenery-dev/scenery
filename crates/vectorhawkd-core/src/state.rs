@@ -143,6 +143,28 @@ CREATE TABLE IF NOT EXISTS audit_events (
     created_at INTEGER NOT NULL,
     uploaded INTEGER NOT NULL DEFAULT 0
 );
+
+-- GAP-05: per-skill rating storage (synced flag controls registry upload).
+CREATE TABLE IF NOT EXISTS skill_ratings (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    skill_id TEXT NOT NULL,
+    version  TEXT NOT NULL,
+    rating   TEXT NOT NULL CHECK (rating IN ('up', 'down')),
+    rated_at INTEGER NOT NULL,
+    synced   INTEGER NOT NULL DEFAULT 0
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_skill_ratings_one_per_version
+    ON skill_ratings (skill_id, version);
+
+-- GAP-05: per-skill execution counts used for rating-prompt schedule and stats upload.
+CREATE TABLE IF NOT EXISTS skill_execution_counts (
+    skill_id        TEXT NOT NULL,
+    version         TEXT NOT NULL,
+    count           INTEGER NOT NULL DEFAULT 0,
+    total_runs      INTEGER NOT NULL DEFAULT 0,
+    successful_runs INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (skill_id, version)
+);
 "#;
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -184,12 +206,12 @@ mod tests {
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN \
                  ('installed_skills','skill_versions','policy_cache','auth_tokens',\
-                  'execution_history','audit_events')",
+                  'execution_history','audit_events','skill_ratings','skill_execution_counts')",
                 [],
                 |row| row.get(0),
             )
             .expect("should query sqlite_master");
-        assert_eq!(table_count, 6, "all six tables should exist");
+        assert_eq!(table_count, 8, "all eight tables should exist");
 
         cleanup(&state.root_dir);
     }

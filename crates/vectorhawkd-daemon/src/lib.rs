@@ -123,6 +123,12 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     let registry = Arc::new(RegistryClient::new(&registry_url));
     let audit_buffer = Arc::new(SqliteAuditBuffer::new(Arc::clone(&registry), &state));
 
+    // Create the update-check cache before the sync loop so both the sync loop
+    // and RealBackend share the same Arc. The sync loop populates it each tick;
+    // RealBackend reads it when serving tool calls.
+    let update_check_cache: UpdateCheckCache =
+        Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+
     // Spawn the registry sync loop (300 s interval).
     // All synchronous I/O happens inside spawn_blocking so the current-thread
     // Tokio executor is never blocked by HTTP or SQLite calls.
@@ -130,6 +136,7 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     let sync_audit = Arc::clone(&audit_buffer);
     let sync_db_path = state.db_path.clone();
     let sync_root_dir = state.root_dir.clone();
+    let sync_update_cache = Arc::clone(&update_check_cache);
     tokio::spawn(async move {
         let mut interval =
             tokio::time::interval(std::time::Duration::from_secs(SYNC_INTERVAL_SECS));
@@ -143,9 +150,12 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
             let aud = Arc::clone(&sync_audit);
             let db = sync_db_path.clone();
             let root = sync_root_dir.clone();
+            let cache = Arc::clone(&sync_update_cache);
 
-            let result =
-                tokio::task::spawn_blocking(move || run_sync_tick(&reg, &aud, &db, &root)).await;
+            let result = tokio::task::spawn_blocking(move || {
+                run_sync_tick(&reg, &aud, &db, &root, &cache)
+            })
+            .await;
 
             match result {
                 Ok(Ok(())) => {}
@@ -220,10 +230,6 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     // TODO: replace MockPolicyClient with HttpPolicyClient once M1.4 wires the
     // registry-backed policy into the daemon. For now allow-all is correct
     // for the M1 scope.
-
-    let update_check_cache: UpdateCheckCache = Arc::new(std::sync::Mutex::new(
-        std::collections::HashMap::new(),
-    ));
 
     let state_arc = Arc::new(AppState {
         root_dir: state.root_dir.clone(),
@@ -442,21 +448,29 @@ pub fn refresh_one_tick(state: &AppState, registry_url: &str) -> Result<()> {
 /// Steps:
 /// 1. Flush pending audit events to the registry.
 /// 2. Refresh the approved-server list.
-/// 3. Check skill lifecycle status for all installed skills.
+/// 3. Check skill lifecycle status + run version updates for all installed skills,
+///    populating `update_check_cache` with skills that have a newer version available.
+/// 4. Flush unsynced skill ratings to the registry.
+/// 5. Flush execution stats to the registry.
+/// 6. Scan AI client configs for unmanaged MCP servers; buffer audit events.
 ///
 /// Each step failure logs at WARN and continues; only a total inability to
 /// open the database returns `Err`.
-fn run_sync_tick(
+pub fn run_sync_tick(
     registry: &RegistryClient,
     audit: &SqliteAuditBuffer,
     db_path: &camino::Utf8PathBuf,
     root_dir: &camino::Utf8PathBuf,
+    update_cache: &UpdateCheckCache,
 ) -> Result<()> {
-    // ── 1. Audit flush ────────────────────────────────────────────────────────
+    use vectorhawkd_core::policy::MockPolicyClient;
+
     let state_view = AppState {
         root_dir: root_dir.clone(),
         db_path: db_path.clone(),
     };
+
+    // ── 1. Audit flush ────────────────────────────────────────────────────────
     match audit.flush(&state_view) {
         Ok(n) if n > 0 => info!(count = n, "sync: audit flush uploaded events"),
         Ok(_) => {}
@@ -476,33 +490,216 @@ fn run_sync_tick(
         }
     }
 
-    // ── 3. Skill lifecycle + version refresh ─────────────────────────────────
+    // ── 3. Skill lifecycle + version updates + update-check cache population ──
     let skill_ids = match state_view.list_installed_skill_ids() {
         Ok(ids) => ids,
         Err(e) => {
             warn!(error = %e, "sync: failed to read installed skills");
-            return Ok(());
+            // Continue to remaining steps even if skills can't be read.
+            return flush_ratings_and_scan(
+                registry,
+                &state_view,
+                update_cache,
+            );
         }
     };
 
-    if skill_ids.is_empty() {
-        return Ok(());
+    if !skill_ids.is_empty() {
+        // check_skill_updates performs lifecycle enforcement (uninstall unknown,
+        // deactivate unpublished) AND voluntary version updates. It also calls
+        // check_skill_status internally, so there is no separate lifecycle-only call.
+        let policy_client = MockPolicyClient::new();
+        match vectorhawkd_core::updater::check_skill_updates(
+            &state_view,
+            registry,
+            &policy_client,
+        ) {
+            Ok(changes) => {
+                if changes > 0 {
+                    info!(changes, "sync: skill updates applied");
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "sync: skill update check failed");
+            }
+        }
+
+        // Populate the update-check cache so MCP tool handlers can surface
+        // "update available" hints without re-querying the registry per call.
+        populate_update_check_cache(registry, &state_view, update_cache);
     }
 
-    match registry.check_skill_status(&skill_ids) {
-        Ok(status_resp) => {
-            info!(
-                checked = skill_ids.len(),
-                unknown_count = status_resp.unknown.len(),
-                "sync: skill lifecycle status refreshed"
+    flush_ratings_and_scan(registry, &state_view, update_cache)
+}
+
+/// Populate the `UpdateCheckCache` by comparing each installed skill's active
+/// version against the registry's latest version. Runs after `check_skill_updates`
+/// so any just-applied updates are reflected.
+///
+/// Failures per skill are logged at DEBUG and skipped — a stale cache entry is
+/// better than aborting the whole tick.
+fn populate_update_check_cache(
+    registry: &RegistryClient,
+    state: &AppState,
+    cache: &UpdateCheckCache,
+) {
+    use rusqlite::Connection;
+    use semver::Version;
+    use vectorhawkd_mcp::tools::UpdateCheckEntry;
+
+    let conn = match Connection::open(&state.db_path) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "sync: cannot open DB for update-cache population");
+            return;
+        }
+    };
+
+    let mut stmt = match conn.prepare(
+        "SELECT skill_id, active_version FROM installed_skills WHERE current_status = 'active'",
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "sync: failed to prepare installed-skills query for cache");
+            return;
+        }
+    };
+
+    let rows: Vec<(String, String)> = match stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .and_then(|iter| iter.collect::<rusqlite::Result<Vec<_>>>())
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(error = %e, "sync: failed to read active skills for cache");
+            return;
+        }
+    };
+    drop(stmt);
+    drop(conn);
+
+    let now = std::time::Instant::now();
+
+    for (skill_id, active_version) in rows {
+        let installed = match Version::parse(&active_version) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let latest_version = match registry.fetch_skill_detail(&skill_id) {
+            Ok(detail) => detail.latest_version.and_then(|v| Version::parse(&v).ok()),
+            Err(e) => {
+                tracing::debug!(skill_id, error = %e, "sync: cache population: fetch detail failed");
+                continue;
+            }
+        };
+
+        let newer = latest_version.filter(|latest| latest > &installed);
+
+        if let Ok(mut guard) = cache.lock() {
+            guard.insert(
+                skill_id,
+                UpdateCheckEntry {
+                    checked_at: now,
+                    latest_version: newer,
+                },
             );
+        }
+    }
+}
+
+/// Steps 4–6 of `run_sync_tick`: ratings flush, execution-stats flush, and
+/// unmanaged server scan. Split out so the early-return path when skill_ids is
+/// empty still runs these steps.
+fn flush_ratings_and_scan(
+    registry: &RegistryClient,
+    state: &AppState,
+    _update_cache: &UpdateCheckCache,
+) -> Result<()> {
+    use vectorhawkd_core::{
+        audit::AuditEvent,
+        ratings::{get_execution_stats, get_unsynced_ratings, mark_ratings_synced},
+    };
+    use vectorhawkd_mcp::setup::detect_unmanaged_servers;
+
+    // ── 4. Ratings flush ──────────────────────────────────────────────────────
+    match rusqlite::Connection::open(&state.db_path) {
+        Ok(conn) => {
+            match get_unsynced_ratings(&conn) {
+                Ok(ratings) if !ratings.is_empty() => {
+                    match registry.upload_skill_ratings(&ratings) {
+                        Ok(()) => {
+                            let ids: Vec<i64> = ratings.iter().map(|r| r.id).collect();
+                            match mark_ratings_synced(&conn, &ids) {
+                                Ok(()) => info!(count = ids.len(), "sync: skill ratings flushed"),
+                                Err(e) => warn!(error = %e, "sync: failed to mark ratings synced after upload"),
+                            }
+                        }
+                        Err(e) => warn!(error = %e, "sync: ratings upload failed"),
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => warn!(error = %e, "sync: failed to read unsynced ratings"),
+            }
+
+            // ── 5. Execution stats flush ──────────────────────────────────────
+            match get_execution_stats(&conn) {
+                Ok(stats) if !stats.is_empty() => {
+                    match registry.upload_execution_stats(&stats) {
+                        Ok(()) => info!(count = stats.len(), "sync: execution stats flushed"),
+                        Err(e) => warn!(error = %e, "sync: execution stats upload failed"),
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => warn!(error = %e, "sync: failed to read execution stats"),
+            }
         }
         Err(e) => {
-            warn!(
-                error = %e,
-                "sync: skill lifecycle check failed; skipping version updates this tick"
-            );
+            warn!(error = %e, "sync: failed to open DB for ratings/stats flush");
         }
+    }
+
+    // ── 6. Unmanaged MCP server scan ──────────────────────────────────────────
+    // Scan AI client config files for non-vectorhawk MCP servers and buffer an
+    // audit event for each one. IT admins can use this stream to detect shadow
+    // MCP installations that bypass governance.
+    let unmanaged = detect_unmanaged_servers();
+    for server in &unmanaged {
+        let event = AuditEvent {
+            event_type: "unmanaged_server_detected".to_string(),
+            payload: serde_json::json!({
+                "server_name": server.server_name,
+                "config_path": server.config_path,
+                "client_name": server.client_name,
+            }),
+        };
+        // Write directly to SQLite (we're already in spawn_blocking).
+        let conn = match rusqlite::Connection::open(&state.db_path) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(error = %e, server = %server.server_name, "sync: cannot open DB for unmanaged audit event");
+                continue;
+            }
+        };
+        let payload_json = serde_json::to_string(&event.payload).unwrap_or_default();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        if let Err(e) = conn.execute(
+            "INSERT INTO audit_events (event_type, payload, created_at, uploaded) VALUES (?1, ?2, ?3, 0)",
+            rusqlite::params![event.event_type, payload_json, now],
+        ) {
+            warn!(error = %e, server = %server.server_name, "sync: failed to buffer unmanaged audit event");
+        }
+    }
+    if !unmanaged.is_empty() {
+        info!(
+            count = unmanaged.len(),
+            "sync: unmanaged MCP servers detected — audit events buffered"
+        );
     }
 
     Ok(())
@@ -558,3 +755,7 @@ fn build_stub_registry() -> BackendRegistry {
 #[cfg(test)]
 #[path = "refresh_loop_tests.rs"]
 mod refresh_loop_tests;
+
+#[cfg(test)]
+#[path = "sync_tick_tests.rs"]
+mod sync_tick_tests;

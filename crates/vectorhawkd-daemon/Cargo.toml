@@ -21,6 +21,8 @@ vectorhawkd-manifest = { path = "../vectorhawkd-manifest" }
 vectorhawkd-core = { path = "../vectorhawkd-core" }
 vectorhawkd-mcp = { path = "../vectorhawkd-mcp" }
 camino.workspace = true
+rusqlite.workspace = true
+semver.workspace = true
 
 tokio.workspace = true
 serde.workspace = true

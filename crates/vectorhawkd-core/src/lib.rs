@@ -44,3 +44,6 @@ pub mod updater;
 // Some of these helpers will migrate onto `RegistryClient` proper as M1.4's
 // trait expansion settles.
 pub mod mcp_governance;
+
+// GAP-05: ratings + execution-count tracking for registry sync.
+pub mod ratings;
