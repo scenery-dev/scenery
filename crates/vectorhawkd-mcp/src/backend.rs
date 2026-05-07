@@ -267,6 +267,55 @@ impl Backend for EmbeddedBackend {
     }
 }
 
+// ── Notification-aware response reader ───────────────────────────────────────
+
+/// Read frames from `reader`, discarding any JSON-RPC notification frames
+/// (those with a `method` field but no `id`), and return the `result` value
+/// from the first real response frame.
+///
+/// The daemon sends `notifications/tools/list_changed` after any operation
+/// that changes the tool list (e.g. skill install/uninstall). Without this
+/// loop the shim would mistake the notification for the response and fail
+/// schema validation, surfacing a spurious "daemon unreachable" error to the
+/// AI client.
+pub(crate) async fn relay_skip_notifications<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+) -> Result<Value> {
+    loop {
+        let frame = read_framed(reader)
+            .await
+            .context("failed to read framed response")?
+            .ok_or_else(|| anyhow::anyhow!("daemon closed socket unexpectedly"))?;
+
+        // Peek at the raw JSON to detect notifications before strict parsing.
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&frame) {
+            if v.get("method").is_some() && v.get("id").is_none() {
+                tracing::debug!(
+                    notification = v["method"].as_str().unwrap_or("?"),
+                    "shim: skipping daemon notification while awaiting response"
+                );
+                continue;
+            }
+        }
+
+        let response: DaemonResponse = serde_json::from_slice(&frame).with_context(|| {
+            let preview: String = String::from_utf8_lossy(&frame).chars().take(200).collect();
+            format!(
+                "daemon response failed schema validation (unknown or missing fields): {}",
+                preview
+            )
+        })?;
+
+        if let Some(err) = response.error {
+            anyhow::bail!("daemon returned error {}: {}", err.code, err.message);
+        }
+
+        return response
+            .result
+            .ok_or_else(|| anyhow::anyhow!("daemon response has no result"));
+    }
+}
+
 // ── SocketBackend ─────────────────────────────────────────────────────────────
 //
 // Unix-only (macOS + Linux). Windows support deferred to M2/M3.
@@ -320,9 +369,9 @@ impl SocketBackend {
 
     /// Send a JSON-RPC request over the socket and await the result value.
     ///
-    /// Uses `DaemonResponse` (which applies `deny_unknown_fields`) so that
-    /// unexpected fields in the daemon response surface as a clear
-    /// deserialization error rather than silently mapping to INTERNAL_ERROR.
+    /// The daemon may emit spontaneous notification frames (e.g.
+    /// `notifications/tools/list_changed`) between a request and its response.
+    /// This method discards those frames and loops until a real response arrives.
     async fn relay(&self, method: &str, params: Value) -> Result<Value> {
         let request = serde_json::json!({
             "jsonrpc": "2.0",
@@ -343,29 +392,7 @@ impl SocketBackend {
             .await
             .context("failed to write framed request")?;
 
-        let frame = read_framed(&mut reader)
-            .await
-            .context("failed to read framed response")?
-            .ok_or_else(|| anyhow::anyhow!("daemon closed socket unexpectedly"))?;
-
-        // Use the strict response type: unknown fields are surfaced as a
-        // deserialization error rather than silently swallowed.
-        let response: DaemonResponse = serde_json::from_slice(&frame).with_context(|| {
-            // Include the raw frame text (truncated) to aid debugging.
-            let preview: String = String::from_utf8_lossy(&frame).chars().take(200).collect();
-            format!(
-                "daemon response failed schema validation (unknown or missing fields): {}",
-                preview
-            )
-        })?;
-
-        if let Some(err) = response.error {
-            anyhow::bail!("daemon returned error {}: {}", err.code, err.message);
-        }
-
-        response
-            .result
-            .ok_or_else(|| anyhow::anyhow!("daemon response has no result"))
+        relay_skip_notifications(&mut reader).await
     }
 }
 
@@ -919,5 +946,37 @@ mod tests {
 
         let frame = read_framed(&mut server_half).await.unwrap().unwrap();
         assert_eq!(frame, payload);
+    }
+
+    /// The daemon may send spontaneous `notifications/tools/list_changed` frames
+    /// (no `id`) between the shim's request and the actual response. This test
+    /// drives `relay_skip_notifications` directly to confirm the shim discards
+    /// those frames and still returns the correct result.
+    #[tokio::test]
+    async fn relay_skips_notification_frames_before_response() {
+        use tokio::io::duplex;
+
+        let notification = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/tools/list_changed",
+        });
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"tools": []},
+        });
+
+        // Write: notification frame, then response frame.
+        let (mut daemon_side, client_side) = duplex(4096);
+        let notification_bytes = serde_json::to_vec(&notification).unwrap();
+        let response_bytes = serde_json::to_vec(&response).unwrap();
+        write_framed(&mut daemon_side, &notification_bytes).await.unwrap();
+        write_framed(&mut daemon_side, &response_bytes).await.unwrap();
+        drop(daemon_side);
+
+        // relay_skip_notifications reads from the client side.
+        let (mut r, _w) = tokio::io::split(client_side);
+        let result = relay_skip_notifications(&mut r).await.unwrap();
+        assert_eq!(result, serde_json::json!({"tools": []}));
     }
 }
