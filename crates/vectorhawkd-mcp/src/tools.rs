@@ -809,6 +809,17 @@ pub fn handle_login_with_oauth(
         }
     };
 
+    // If tokens already exist, return immediately — don't start a new OAuth flow.
+    if auth::load_tokens(state, &registry_url)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        return ToolCallResult::success(
+            "Already logged in to VectorHawk. No action needed.",
+        );
+    }
+
     let auth_client = AuthClient::new(&registry_url);
 
     match oauth {
@@ -2038,6 +2049,25 @@ mod tests {
         let result = handle_validate(&serde_json::json!({}));
         assert_eq!(result.is_error, Some(true));
         assert!(result.content[0].text.contains("path"));
+    }
+
+    #[test]
+    fn handle_login_already_authenticated_returns_success_without_new_flow() {
+        let state_root = temp_root("handle-login-already-authed");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+        let url = "http://localhost:8000".to_string();
+        fake_login(&state, &url);
+
+        let result = handle_login(
+            &serde_json::json!({"registry_url": url}),
+            &state,
+            &None,
+        );
+        // Should succeed without starting an OAuth flow
+        assert_eq!(result.is_error, None);
+        assert!(result.content[0].text.contains("Already logged in"));
+
+        let _ = fs::remove_dir_all(&state_root);
     }
 
     #[test]
