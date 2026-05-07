@@ -55,3 +55,11 @@ bytes.workspace = true
 reqwest.workspace = true
 url.workspace = true
 dirs = "5"
+
+[dev-dependencies]
+mockito = "1"
+flate2 = "1"
+sha2 = "0.10"
+tar = "0.4"
+hex = "0.4"
+tempfile = "3"

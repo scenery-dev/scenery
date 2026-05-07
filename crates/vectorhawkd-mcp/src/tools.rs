@@ -624,7 +624,7 @@ fn handle_install(
                 }
             };
             let version = arguments.get("version").and_then(|v| v.as_str());
-            match mcp_governance::install_from_registry(url, id, version) {
+            match mcp_governance::install_from_registry(state, url, id, version) {
                 Ok(installed_ver) => ToolCallResult::success(format!(
                     "Successfully installed {id}@{installed_ver} from registry."
                 )),
@@ -1997,6 +1997,71 @@ mod tests {
         assert!(result.content[0].text.contains("registry"));
 
         let _ = fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn handle_install_from_registry_downloads_and_installs() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use mockito::Server;
+        use sha2::{Digest, Sha256};
+
+        let state_root = temp_root("handle-install-registry-ok");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+
+        // Build a minimal skill bundle in memory as a tar.gz.
+        let bundle_dir = temp_root("handle-install-registry-bundle");
+        write_test_skill(&bundle_dir);
+        let mut archive_bytes = Vec::new();
+        {
+            let enc = GzEncoder::new(&mut archive_bytes, Compression::default());
+            let mut tar = tar::Builder::new(enc);
+            tar.append_dir_all(".", bundle_dir.as_std_path()).unwrap();
+            let gz = tar.into_inner().unwrap();
+            gz.finish().unwrap();
+        }
+        let sha256 = hex::encode(Sha256::digest(&archive_bytes));
+
+        let mut server = Server::new();
+        let url = server.url();
+        let download_path = "/download/test-skill-0.1.0.cskill";
+
+        let _detail_mock = server
+            .mock("GET", "/portal/skills/test-skill")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"skill_id":"test-skill","name":"Test Skill","latest_version":"0.1.0","publisher_name":"vectorhawk","description":"A test skill."}"#)
+            .create();
+
+        let _meta_mock = server
+            .mock("GET", "/skills/test-skill/versions/0.1.0")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"{{"skill_id":"test-skill","version":"0.1.0","download_url":"{url}{download_path}","sha256":"{sha256}","size_bytes":{}}}"#,
+                archive_bytes.len()
+            ))
+            .create();
+
+        let _download_mock = server
+            .mock("GET", download_path)
+            .with_status(200)
+            .with_header("content-type", "application/octet-stream")
+            .with_body(archive_bytes)
+            .create();
+
+        let result = handle_install(
+            &serde_json::json!({"skill_id": "test-skill"}),
+            &state,
+            &Some(url),
+        );
+
+        assert_eq!(result.is_error, None, "expected success: {:?}", result.content);
+        assert!(result.content[0].text.contains("test-skill"));
+        assert!(result.content[0].text.contains("0.1.0"));
+
+        let _ = fs::remove_dir_all(&state_root);
+        let _ = fs::remove_dir_all(&bundle_dir);
     }
 
     #[test]

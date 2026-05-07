@@ -359,17 +359,21 @@ pub fn search_skills(base_url: &str, query: &str) -> Result<Vec<serde_json::Valu
 
 /// Install a skill from the registry by ID and optional version.
 /// Returns the installed version string.
-///
-/// M1.4 note: this will move to `updater.rs` once `HttpRegistryClient` gains
-/// `download_artifact`. For now it's stubbed with a clear error.
 pub fn install_from_registry(
-    _base_url: &str,
-    _skill_id: &str,
-    _version: Option<&str>,
+    state: &AppState,
+    base_url: &str,
+    skill_id: &str,
+    version: Option<&str>,
 ) -> Result<String> {
-    anyhow::bail!(
-        "M1.4 — registry install not yet implemented (pending HttpRegistryClient expansion)"
-    )
+    use crate::auth;
+    use crate::registry::RegistryClient;
+    use crate::updater;
+
+    let mut registry = RegistryClient::new(base_url);
+    if let Ok(Some(tokens)) = auth::load_tokens(state, base_url) {
+        registry.set_auth(&tokens.access_token);
+    }
+    updater::install_from_registry(state, &registry, skill_id, version)
 }
 
 // ── Logging helpers ───────────────────────────────────────────────────────────
