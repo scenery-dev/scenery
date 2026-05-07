@@ -264,6 +264,10 @@ impl AuthClient {
     /// returns `true` conservatively — it is safer to attempt a refresh than
     /// to use a potentially-expired token.
     pub fn needs_refresh(access_token: &str) -> bool {
+        // PATs are long-lived credentials revoked via the portal — never expire via JWT mechanism.
+        if access_token.starts_with("vh_pat_") {
+            return false;
+        }
         match decode_jwt_exp(access_token) {
             Some(exp) => {
                 let now = std::time::SystemTime::now()

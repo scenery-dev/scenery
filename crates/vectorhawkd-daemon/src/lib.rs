@@ -155,6 +155,20 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
 
     info!(registry_url, "connecting to registry");
 
+    // Headless / CI auth: if VECTORHAWK_TOKEN is set and looks like a PAT,
+    // save it to state.db so the daemon can make authenticated registry calls
+    // without a browser-based OAuth flow (openclaw, CI pipelines, etc.).
+    if let Ok(pat) = std::env::var("VECTORHAWK_TOKEN") {
+        if pat.starts_with("vh_pat_") {
+            match vectorhawkd_core::auth::save_tokens(&state, &registry_url, &pat, &pat) {
+                Ok(()) => info!("VECTORHAWK_TOKEN: PAT saved for {registry_url}"),
+                Err(e) => warn!(error = %e, "VECTORHAWK_TOKEN: failed to save PAT to state DB"),
+            }
+        } else {
+            warn!("VECTORHAWK_TOKEN is set but does not start with 'vh_pat_' — ignoring");
+        }
+    }
+
     let registry = Arc::new(RegistryClient::new(&registry_url));
     let audit_buffer = Arc::new(SqliteAuditBuffer::new(Arc::clone(&registry), &state));
 

@@ -168,6 +168,24 @@ pub enum AuthCommand {
         )]
         registry_url: String,
     },
+
+    /// Save a Personal Access Token for headless / CI environments.
+    ///
+    /// Creates a vh_pat_... token in the VectorHawk portal, then run:
+    ///   vectorhawk auth token <vh_pat_...>
+    ///
+    /// Or set VECTORHAWK_TOKEN=<vh_pat_...> and restart the daemon.
+    Token {
+        /// The Personal Access Token to save (must start with vh_pat_).
+        token: String,
+
+        #[arg(
+            long,
+            env = "VECTORHAWK_REGISTRY_URL",
+            default_value = "https://app.vectorhawk.ai"
+        )]
+        registry_url: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -297,6 +315,9 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Auth(AuthCommand::Login { registry_url }) => cmd_auth_login(&registry_url).await,
         Command::Auth(AuthCommand::Logout { registry_url }) => cmd_auth_logout(&registry_url).await,
         Command::Auth(AuthCommand::Status { registry_url }) => cmd_auth_status(&registry_url).await,
+        Command::Auth(AuthCommand::Token { token, registry_url }) => {
+            cmd_auth_token(&token, &registry_url).await
+        }
 
         Command::Mcp(McpCommand::Serve) => cmd_mcp_serve().await,
         Command::Mcp(McpCommand::Setup { client, dry_run }) => {
@@ -1150,6 +1171,40 @@ async fn cmd_auth_status(registry_url: &str) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+// ── auth token ────────────────────────────────────────────────────────────────
+
+async fn cmd_auth_token(token: &str, registry_url: &str) -> Result<()> {
+    use vectorhawkd_core::{
+        auth::{save_tokens, AuthClient},
+        state::AppState,
+    };
+
+    if !token.starts_with("vh_pat_") {
+        anyhow::bail!(
+            "token must start with 'vh_pat_'. \
+             Create one in the VectorHawk portal under Settings → Access Tokens."
+        );
+    }
+
+    let state = AppState::bootstrap().context("failed to bootstrap application state")?;
+
+    let token_owned = token.to_string();
+    let reg_url = registry_url.to_string();
+    let user = tokio::task::spawn_blocking(move || {
+        AuthClient::new(&reg_url).me(&token_owned)
+    })
+    .await
+    .context("validation task panicked")?
+    .context("token validation failed — check that the token is valid and not revoked")?;
+
+    save_tokens(&state, registry_url, token, token)
+        .context("failed to save token to local state")?;
+
+    println!("Authenticated as {} ({}).", user.display_name, user.email);
+    println!("Token saved for {}.", registry_url);
     Ok(())
 }
 
