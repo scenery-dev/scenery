@@ -82,6 +82,40 @@ use vectorhawkd_mcp::{
 pub use oauth_state::OAuthState;
 pub use socket_dispatch::DaemonContext;
 
+/// Bridges `OAuthState` (daemon crate) to `OAuthSubscriber` (MCP crate) so
+/// that `tools::handle_login_with_oauth` can await browser callbacks without
+/// introducing a direct dependency on the daemon crate from the MCP crate.
+struct OAuthStateSubscriber(Arc<OAuthState>);
+
+impl vectorhawkd_mcp::oauth::OAuthSubscriber for OAuthStateSubscriber {
+    fn wait_for_code(
+        &self,
+        state: String,
+        timeout_secs: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>> {
+        let oauth_state = Arc::clone(&self.0);
+        Box::pin(async move {
+            let rx = match oauth_state.subscribe(state).await {
+                Ok(rx) => rx,
+                Err(e) => {
+                    warn!(error = %e, "OAuthStateSubscriber: subscribe failed");
+                    return None;
+                }
+            };
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(timeout_secs),
+                rx,
+            )
+            .await
+            {
+                Ok(Ok((code, _state))) => Some(code),
+                Ok(Err(_)) => None, // channel closed — daemon shutting down
+                Err(_) => None,     // timeout elapsed
+            }
+        })
+    }
+}
+
 /// Configuration for the daemon entry point.
 ///
 /// The binary's `main.rs` populates these from environment variables; the CLI
@@ -247,21 +281,6 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
         db_path: state.db_path.clone(),
     });
 
-    let backend = Arc::new(RealBackend::with_full_context(
-        Arc::clone(&vh_registry),
-        Arc::clone(&audit_buffer) as Arc<dyn AuditBuffer>,
-        managed_config,
-        state_arc,
-        registry_url_opt,
-        policy_client,
-        None, // model_client: wire OllamaClient / HybridModelClient in a future stream
-        update_check_cache,
-    ));
-    info!(
-        "backend registry ready ({} backends)",
-        vh_registry.backend_count()
-    );
-
     // Build the OAuth notification hub.
     let oauth_state = Arc::new(OAuthState::new());
 
@@ -284,6 +303,32 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
             (None, None)
         }
     };
+
+    let mut backend = RealBackend::with_full_context(
+        Arc::clone(&vh_registry),
+        Arc::clone(&audit_buffer) as Arc<dyn AuditBuffer>,
+        managed_config,
+        state_arc,
+        registry_url_opt,
+        policy_client,
+        None, // model_client: wire OllamaClient / HybridModelClient in a future stream
+        update_check_cache,
+    );
+
+    // Wire the OAuth callback port + subscriber so vectorhawk_login can
+    // complete the PKCE flow automatically after the browser redirects.
+    if let Some(port) = listener_port {
+        backend = backend.with_oauth(
+            port,
+            std::sync::Arc::new(OAuthStateSubscriber(Arc::clone(&oauth_state))),
+        );
+    }
+
+    let backend = Arc::new(backend);
+    info!(
+        "backend registry ready ({} backends)",
+        vh_registry.backend_count()
+    );
 
     let socket_path = opts
         .socket_path_override

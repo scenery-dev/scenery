@@ -39,6 +39,8 @@ pub mod stdio_process;
 #[cfg(feature = "daemon")]
 pub mod instructions;
 #[cfg(feature = "daemon")]
+pub mod oauth;
+#[cfg(feature = "daemon")]
 pub mod sampling;
 #[cfg(feature = "daemon")]
 pub mod tools;

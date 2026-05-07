@@ -781,12 +781,20 @@ fn auth_elicitation_prompt(registry_url: &str) -> ToolCallResult {
 
 // ── Auth tool handlers ────────────────────────────────────────────────────────
 
-fn handle_login(
+/// Login handler with optional OAuth completion support.
+///
+/// When `oauth` is `Some`, initiates a PKCE flow with the daemon's callback
+/// port as the `redirect_uri`, then spawns a background task to await the
+/// browser callback, exchange the code, and save the resulting tokens.
+///
+/// When `oauth` is `None` (shim fallback / test), falls back to the legacy
+/// no-redirect URL and returns a hint that login cannot complete automatically.
+pub fn handle_login_with_oauth(
     arguments: &serde_json::Value,
-    _state: &AppState,
+    state: &AppState,
     server_registry_url: &Option<String>,
+    oauth: Option<&crate::oauth::OAuthContext>,
 ) -> ToolCallResult {
-    // registry_url from arguments takes precedence; fall back to server's configured URL
     let registry_url_arg = arguments
         .get("registry_url")
         .and_then(|v| v.as_str())
@@ -803,19 +811,101 @@ fn handle_login(
 
     let auth_client = AuthClient::new(&registry_url);
 
-    match auth_client.initiate_oauth_flow() {
-        Ok(initiation) => {
-            // Store code_verifier and state for the callback. For M1 the
-            // callback exchange is stubbed — M3 completes the PKCE flow.
-            // We return the auth URL so the CLI can open it in the browser.
-            ToolCallResult::success(format!(
-                "Open this URL in your browser to log in:\n{}\n\n\
-                 After authorizing, the runner will complete the login automatically.",
-                initiation.auth_url
-            ))
+    match oauth {
+        Some(ctx) => {
+            let redirect_uri =
+                format!("http://127.0.0.1:{}/oauth/cli/callback", ctx.listener_port);
+            match auth_client.initiate_oauth_flow_with_redirect(&redirect_uri) {
+                Ok(initiation) => {
+                    // Clone everything the background task needs before we move
+                    // ownership into the async block.
+                    let code_verifier = initiation.code_verifier.clone();
+                    let oauth_state_val = initiation.state.clone();
+                    let subscriber = std::sync::Arc::clone(&ctx.subscriber);
+                    let reg_url = registry_url.clone();
+                    let task_state = AppState {
+                        root_dir: state.root_dir.clone(),
+                        db_path: state.db_path.clone(),
+                    };
+
+                    // Fire-and-forget: await browser callback → exchange code → save tokens.
+                    // The AI client already has the URL; this completes silently in the background.
+                    tokio::runtime::Handle::current().spawn(async move {
+                        let code = match subscriber
+                            .wait_for_code(oauth_state_val, 300)
+                            .await
+                        {
+                            Some(c) => c,
+                            None => {
+                                tracing::warn!(
+                                    "vectorhawk_login: OAuth callback timed out or daemon shut down"
+                                );
+                                return;
+                            }
+                        };
+
+                        let result = tokio::task::spawn_blocking(move || {
+                            let client = AuthClient::new(&reg_url);
+                            let tokens = client.exchange_oauth_code(&code, &code_verifier)?;
+                            auth::save_tokens(
+                                &task_state,
+                                &reg_url,
+                                &tokens.access_token,
+                                &tokens.refresh_token,
+                            )?;
+                            Ok::<(), anyhow::Error>(())
+                        })
+                        .await;
+
+                        match result {
+                            Ok(Ok(())) => {
+                                tracing::info!("vectorhawk_login: PKCE complete, tokens saved")
+                            }
+                            Ok(Err(e)) => tracing::warn!(
+                                error = %e,
+                                "vectorhawk_login: token exchange/save failed"
+                            ),
+                            Err(e) => tracing::warn!(
+                                error = %e,
+                                "vectorhawk_login: background task panicked"
+                            ),
+                        }
+                    });
+
+                    ToolCallResult::success(format!(
+                        "Open this URL in your browser to log in:\n{}\n\n\
+                         After logging in, VectorHawk will automatically complete \
+                         authentication. The `vectorhawk_login` tool will no longer \
+                         appear once you are logged in.",
+                        initiation.auth_url
+                    ))
+                }
+                Err(e) => ToolCallResult::error_result(format!("Failed to initiate login: {e}")),
+            }
         }
-        Err(e) => ToolCallResult::error_result(format!("Failed to initiate login: {e}")),
+        None => {
+            // No OAuth callback listener available (shim fallback mode or no listener port).
+            match auth_client.initiate_oauth_flow() {
+                Ok(initiation) => ToolCallResult::success(format!(
+                    "Open this URL in your browser to log in:\n{}\n\n\
+                     Note: automatic completion is unavailable (daemon not running or \
+                     OAuth listener failed to bind). After logging in, restart the \
+                     VectorHawk daemon.",
+                    initiation.auth_url
+                )),
+                Err(e) => ToolCallResult::error_result(format!("Failed to initiate login: {e}")),
+            }
+        }
     }
+}
+
+fn handle_login(
+    arguments: &serde_json::Value,
+    state: &AppState,
+    server_registry_url: &Option<String>,
+) -> ToolCallResult {
+    // Delegate to the OAuth-aware handler with no OAuth context (legacy / shim fallback).
+    handle_login_with_oauth(arguments, state, server_registry_url, None)
 }
 
 fn handle_logout(state: &AppState, server_registry_url: &Option<String>) -> ToolCallResult {

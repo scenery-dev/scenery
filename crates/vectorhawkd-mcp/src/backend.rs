@@ -436,6 +436,13 @@ pub struct RealBackend {
     /// Per-skill update-check cache shared between all tool call invocations.
     #[cfg(feature = "daemon")]
     update_check_cache: Option<UpdateCheckCache>,
+    /// Port the OAuth callback HTTP listener is bound to. `None` means no
+    /// listener is running (ports exhausted or unsupported context).
+    #[cfg(feature = "daemon")]
+    oauth_listener_port: Option<u16>,
+    /// Pub/sub hub for receiving authorization codes from the browser callback.
+    #[cfg(feature = "daemon")]
+    oauth_subscriber: Option<std::sync::Arc<dyn crate::oauth::OAuthSubscriber>>,
 }
 
 impl RealBackend {
@@ -458,6 +465,10 @@ impl RealBackend {
             model_client: None,
             #[cfg(feature = "daemon")]
             update_check_cache: None,
+            #[cfg(feature = "daemon")]
+            oauth_listener_port: None,
+            #[cfg(feature = "daemon")]
+            oauth_subscriber: None,
         }
     }
 
@@ -479,6 +490,8 @@ impl RealBackend {
             policy_client: None,
             model_client: None,
             update_check_cache: None,
+            oauth_listener_port: None,
+            oauth_subscriber: None,
         }
     }
 
@@ -502,6 +515,8 @@ impl RealBackend {
             policy_client: None,
             model_client: None,
             update_check_cache: None,
+            oauth_listener_port: None,
+            oauth_subscriber: None,
         }
     }
 
@@ -535,7 +550,28 @@ impl RealBackend {
             policy_client: Some(policy_client),
             model_client,
             update_check_cache: Some(update_check_cache),
+            oauth_listener_port: None,
+            oauth_subscriber: None,
         }
+    }
+
+    /// Attach the OAuth callback port and subscriber to this backend.
+    ///
+    /// Call this after any of the constructors above. Enables `vectorhawk_login`
+    /// to complete the PKCE flow automatically after the browser redirects.
+    ///
+    /// When not called (or when the listener failed to bind), `vectorhawk_login`
+    /// falls back to the legacy no-redirect URL and instructs the user to restart
+    /// the daemon manually.
+    #[cfg(feature = "daemon")]
+    pub fn with_oauth(
+        mut self,
+        listener_port: u16,
+        subscriber: std::sync::Arc<dyn crate::oauth::OAuthSubscriber>,
+    ) -> Self {
+        self.oauth_listener_port = Some(listener_port);
+        self.oauth_subscriber = Some(subscriber);
+        self
     }
 }
 
@@ -612,6 +648,54 @@ impl Backend for RealBackend {
         // straight to the BackendRegistry.
         #[cfg(feature = "daemon")]
         if let Some(state) = &self.state {
+            // Intercept vectorhawk_login first so it receives an OAuthContext
+            // when the daemon's callback listener is running. Falls through to
+            // handle_tool_call (which calls the legacy handle_login) only when
+            // state is absent — which cannot happen here.
+            if params.name == "vectorhawk_login" {
+                let oauth_ctx = match (self.oauth_listener_port, self.oauth_subscriber.as_ref()) {
+                    (Some(port), Some(sub)) => Some(crate::oauth::OAuthContext {
+                        listener_port: port,
+                        subscriber: std::sync::Arc::clone(sub),
+                    }),
+                    _ => None,
+                };
+                let tool_result = crate::tools::handle_login_with_oauth(
+                    &params.arguments,
+                    state,
+                    &self.registry_url,
+                    oauth_ctx.as_ref(),
+                );
+
+                let latency_ms = started.elapsed().as_millis() as u64;
+                let status = if tool_result.is_error == Some(true) {
+                    "tool_error"
+                } else {
+                    "ok"
+                };
+
+                if let Some(audit) = &self.audit {
+                    let audit = Arc::clone(audit);
+                    let event = vectorhawkd_core::audit::AuditEvent {
+                        event_type: "tool_called".to_string(),
+                        payload: serde_json::json!({
+                            "tool": params.name,
+                            "status": status,
+                            "latency_ms": latency_ms,
+                        }),
+                    };
+                    tokio::task::spawn_blocking(move || {
+                        if let Err(e) = audit.record(&event) {
+                            tracing::warn!(error = %e, "failed to record audit event");
+                        }
+                    });
+                }
+                let _ = latency_ms;
+                let _ = status;
+
+                return Ok(tool_result);
+            }
+
             let is_management_tool = params.name.starts_with("vectorhawk_");
             let is_backend_tool = params.name.contains("__");
 
