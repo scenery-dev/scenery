@@ -162,6 +162,16 @@ pub struct EmbeddedBackend {
     registry: Arc<BackendRegistry>,
     server_name: String,
     server_version: String,
+    /// Optional model client for skill LLM steps. When `Some`, skill
+    /// executions triggered via `vectorhawk_run` can call the local
+    /// Ollama backend and/or gateway. When `None`, LLM steps surface a
+    /// "no model client" error.
+    ///
+    /// Gated behind `daemon` feature: constructing with a model client
+    /// requires `vectorhawkd-core` types (`ModelClient`, `OllamaClient`,
+    /// `GatewayModelClient`, `HybridModelClient`).
+    #[cfg(feature = "daemon")]
+    model_client: Option<Arc<dyn vectorhawkd_core::model::ModelClient>>,
 }
 
 impl EmbeddedBackend {
@@ -171,6 +181,8 @@ impl EmbeddedBackend {
             registry,
             server_name: "vectorhawkd".to_string(),
             server_version: env!("CARGO_PKG_VERSION").to_string(),
+            #[cfg(feature = "daemon")]
+            model_client: None,
         }
     }
 
@@ -198,6 +210,23 @@ impl EmbeddedBackend {
             unhealthy: false,
         });
         Self::new(registry)
+    }
+
+    /// Attach a model client to this backend.
+    ///
+    /// Used by test scaffolding and by the shim when it falls back to
+    /// in-process execution, to wire up Ollama + gateway inference.
+    /// The `HybridModelClient` (owned `Box<dyn ModelClient>`) is the
+    /// canonical value to pass here.
+    ///
+    /// Has no effect when compiled without the `daemon` feature.
+    #[cfg(feature = "daemon")]
+    pub fn with_model_client(
+        mut self,
+        client: Arc<dyn vectorhawkd_core::model::ModelClient>,
+    ) -> Self {
+        self.model_client = Some(client);
+        self
     }
 }
 

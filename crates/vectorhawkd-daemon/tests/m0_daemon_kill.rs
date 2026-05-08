@@ -313,3 +313,63 @@ fn ac4_daemon_kill_shim_returns_daemon_required_error_within_3s() {
     drop(stdin);
     kill_child(&mut shim);
 }
+
+// ── M6.5: EmbeddedBackend + HybridModelClient wiring ─────────────────────────
+
+/// Verify that `EmbeddedBackend::with_model_client` accepts a
+/// `HybridModelClient` built from owned `Box<dyn ModelClient>` values.
+///
+/// This is a unit-level smoke test: it does not spawn any process but
+/// confirms that the M6.2 generification (removing the `'a` lifetime from
+/// `HybridModelClient`) works end-to-end with the `EmbeddedBackend` builder.
+///
+/// Not marked `#[ignore]` — runs without any external binaries.
+#[tokio::test]
+async fn embedded_backend_accepts_hybrid_model_client() {
+    use std::io::Cursor;
+    use std::sync::Arc;
+    use vectorhawkd_core::model::{MockModelClient, ModelClient};
+    use vectorhawkd_mcp::{
+        backend::{Backend, EmbeddedBackend},
+        sampling::{HybridModelClient, McpSamplingClient},
+    };
+
+    // Build a McpSamplingClient that immediately returns an EOF so that if
+    // any sampling request is ever attempted it fails cleanly rather than
+    // blocking the test.
+    let reader = Box::new(Cursor::new(Vec::<u8>::new()));
+    let writer = Box::new(Vec::<u8>::new());
+    let sampling = McpSamplingClient::new(writer, reader);
+
+    // Ollama mock returns a fixed response.
+    let ollama_mock = MockModelClient::new("mock local response");
+
+    let hybrid = HybridModelClient::new(
+        Some(Box::new(ollama_mock) as Box<dyn ModelClient>),
+        Box::new(sampling) as Box<dyn ModelClient>,
+    );
+
+    let backend = EmbeddedBackend::with_stub_backend("stub", &[("stub__echo", "Echo stub tool")])
+        .with_model_client(Arc::new(hybrid) as Arc<dyn ModelClient>);
+
+    // EmbeddedBackend::initialize must succeed and return the correct protocol version.
+    let init = backend
+        .initialize(serde_json::json!({}))
+        .await
+        .expect("initialize should succeed");
+    assert_eq!(
+        init.protocol_version, "2024-11-05",
+        "expected MCP protocol version"
+    );
+
+    // EmbeddedBackend::list_tools must return at least the stub tool.
+    let list = backend
+        .list_tools(serde_json::json!({}))
+        .await
+        .expect("list_tools should succeed");
+    let names: Vec<&str> = list.tools.iter().map(|t| t.name.as_str()).collect();
+    assert!(
+        names.iter().any(|n| n.contains("echo")),
+        "expected echo tool in tool list; got: {names:?}"
+    );
+}
