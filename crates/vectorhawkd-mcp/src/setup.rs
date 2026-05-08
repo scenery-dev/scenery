@@ -51,12 +51,14 @@ pub fn build_mcp_servers_block() -> serde_json::Value {
 
 /// Detect Claude Code installation and return config info.
 ///
-/// Claude Code is identified by the presence of `~/.claude` or `~/.claude.json`.
+/// Detected by `~/.claude`, `~/.claude.json`, or the presence of the app bundle
+/// (so fresh machines without a prior Claude launch are still configured).
 pub fn detect_claude_code() -> Option<ClientConfig> {
     let home = home_dir()?;
     let claude_config = home.join(".claude.json");
     let claude_dir = home.join(".claude");
-    if !claude_dir.exists() && !claude_config.exists() {
+    let app_present = claude_code_app_present(std::path::Path::new("/"));
+    if !claude_dir.exists() && !claude_config.exists() && !app_present {
         return None;
     }
     let already = is_vectorhawk_configured(&claude_config, "mcpServers");
@@ -72,22 +74,27 @@ pub fn detect_claude_code() -> Option<ClientConfig> {
 /// Cursor, Windsurf, VS Code, Gemini CLI).
 pub fn detect_ai_clients() -> Vec<ClientConfig> {
     match home_dir() {
-        Some(home) => detect_ai_clients_in(&home),
+        Some(home) => detect_ai_clients_in(&home, std::path::Path::new("/")),
         None => Vec::new(),
     }
 }
 
-/// Inner detection that accepts an explicit home directory.
+/// Inner detection that accepts an explicit home directory and system root.
 ///
-/// Separated from `detect_ai_clients` so tests can supply a temp-dir home
-/// without racing on the process-global HOME environment variable.
-fn detect_ai_clients_in(home: &std::path::Path) -> Vec<ClientConfig> {
+/// Separated from `detect_ai_clients` so tests can supply temp-dir paths
+/// without racing on the process-global HOME environment variable, and to
+/// allow simulating app bundle presence in tests.
+fn detect_ai_clients_in(
+    home: &std::path::Path,
+    system_root: &std::path::Path,
+) -> Vec<ClientConfig> {
     let mut clients = Vec::new();
 
-    // Claude Code — ~/.claude.json or ~/.claude dir
+    // Claude Code — ~/.claude.json or ~/.claude dir, or app bundle present
+    // (covers fresh machines where Claude has never been launched yet).
     let claude_config = home.join(".claude.json");
     let claude_dir = home.join(".claude");
-    if claude_dir.exists() || claude_config.exists() {
+    if claude_dir.exists() || claude_config.exists() || claude_code_app_present(system_root) {
         let already = is_vectorhawk_configured(&claude_config, "mcpServers");
         clients.push(ClientConfig {
             name: "Claude Code".to_string(),
@@ -410,6 +417,34 @@ fn home_dir() -> Option<PathBuf> {
     std::env::var("HOME").ok().map(PathBuf::from)
 }
 
+/// Returns `true` if the Claude Code app is installed on this machine,
+/// regardless of whether it has ever been launched (no `~/.claude` yet).
+///
+/// `system_root` is `/` in production; tests pass a temp dir so they can
+/// create a fake app bundle without touching the real filesystem.
+fn claude_code_app_present(system_root: &std::path::Path) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        system_root
+            .join("Applications")
+            .join("Claude.app")
+            .exists()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // Claude Code on Linux is distributed as a .deb/.rpm package; the
+        // binary lands at /usr/bin/claude or /usr/local/bin/claude.
+        system_root.join("usr/local/bin/claude").exists()
+            || system_root.join("usr/bin/claude").exists()
+            || system_root.join("opt/Claude/claude").exists()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = system_root;
+        false
+    }
+}
+
 /// Return the Claude Desktop config path for the current OS.
 fn claude_desktop_config_path(home: &std::path::Path) -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
@@ -639,10 +674,53 @@ mod tests {
         let tmp = temp_root("detect-cc");
         fs::create_dir_all(tmp.join(".claude")).unwrap();
 
-        let clients = detect_ai_clients_in(&tmp);
+        let clients = detect_ai_clients_in(&tmp, &tmp);
         let found = clients.iter().find(|c| c.name == "Claude Code");
         assert!(found.is_some(), "Claude Code should be detected");
         assert_eq!(found.unwrap().mcp_key, "mcpServers");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn detect_claude_code_via_app_bundle_on_fresh_machine() {
+        let tmp = temp_root("detect-cc-app");
+        let home = tmp.join("home");
+        let sys = tmp.join("sys");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(sys.join("Applications").join("Claude.app")).unwrap();
+
+        // Home has no .claude dir or .claude.json — simulates a machine where
+        // Claude is installed but has never been launched.
+        assert!(!home.join(".claude").exists());
+        assert!(!home.join(".claude.json").exists());
+
+        let clients = detect_ai_clients_in(&home, &sys);
+        let found = clients.iter().find(|c| c.name == "Claude Code");
+        assert!(found.is_some(), "Claude Code must be detected via app bundle");
+        assert_eq!(found.unwrap().config_path, home.join(".claude.json"));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn detect_claude_code_via_app_bundle_on_fresh_machine() {
+        let tmp = temp_root("detect-cc-app");
+        let home = tmp.join("home");
+        let sys = tmp.join("sys");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(sys.join("usr/local/bin")).unwrap();
+        fs::write(sys.join("usr/local/bin/claude"), b"").unwrap();
+
+        assert!(!home.join(".claude").exists());
+        assert!(!home.join(".claude.json").exists());
+
+        let clients = detect_ai_clients_in(&home, &sys);
+        let found = clients.iter().find(|c| c.name == "Claude Code");
+        assert!(found.is_some(), "Claude Code must be detected via binary");
+        assert_eq!(found.unwrap().config_path, home.join(".claude.json"));
 
         let _ = fs::remove_dir_all(&tmp);
     }
@@ -652,7 +730,7 @@ mod tests {
         let tmp = temp_root("detect-cursor");
         fs::create_dir_all(tmp.join(".cursor")).unwrap();
 
-        let clients = detect_ai_clients_in(&tmp);
+        let clients = detect_ai_clients_in(&tmp, &tmp);
         let found = clients.iter().find(|c| c.name == "Cursor");
         assert!(found.is_some(), "Cursor should be detected");
         assert_eq!(found.unwrap().mcp_key, "mcpServers");
@@ -665,7 +743,7 @@ mod tests {
         let tmp = temp_root("detect-windsurf");
         fs::create_dir_all(tmp.join(".codeium").join("windsurf")).unwrap();
 
-        let clients = detect_ai_clients_in(&tmp);
+        let clients = detect_ai_clients_in(&tmp, &tmp);
         let found = clients.iter().find(|c| c.name == "Windsurf");
         assert!(found.is_some(), "Windsurf should be detected");
         assert_eq!(found.unwrap().mcp_key, "mcpServers");
@@ -691,7 +769,7 @@ mod tests {
 
         fs::create_dir_all(&desktop_dir).unwrap();
 
-        let clients = detect_ai_clients_in(&tmp);
+        let clients = detect_ai_clients_in(&tmp, &tmp);
         let found = clients.iter().find(|c| c.name == "Claude Desktop");
         assert!(found.is_some(), "Claude Desktop should be detected");
         assert_eq!(found.unwrap().mcp_key, "mcpServers");
@@ -718,7 +796,7 @@ mod tests {
 
         fs::create_dir_all(&vscode_dir).unwrap();
 
-        let clients = detect_ai_clients_in(&tmp);
+        let clients = detect_ai_clients_in(&tmp, &tmp);
         let found = clients.iter().find(|c| c.name == "VS Code");
         assert!(found.is_some(), "VS Code should be detected");
         assert_eq!(found.unwrap().mcp_key, "mcpServers");
@@ -731,7 +809,7 @@ mod tests {
         let tmp = temp_root("detect-gemini");
         fs::create_dir_all(tmp.join(".gemini")).unwrap();
 
-        let clients = detect_ai_clients_in(&tmp);
+        let clients = detect_ai_clients_in(&tmp, &tmp);
         let found = clients.iter().find(|c| c.name == "Gemini CLI");
         assert!(found.is_some(), "Gemini CLI should be detected");
         assert_eq!(found.unwrap().mcp_key, "mcpServers");
@@ -776,7 +854,7 @@ mod tests {
         #[cfg(target_os = "linux")]
         fs::create_dir_all(tmp.join(".config").join("Code").join("User")).unwrap();
 
-        let clients = detect_ai_clients_in(&tmp);
+        let clients = detect_ai_clients_in(&tmp, &tmp);
         assert_eq!(
             clients.len(),
             6,

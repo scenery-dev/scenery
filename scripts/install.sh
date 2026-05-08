@@ -210,7 +210,8 @@ if [ "${NO_SETUP}" = "0" ]; then
     }
 
     log ""
-    log "Done. Open your AI client and use the vectorhawk_login tool to authenticate."
+    log "Done. Restart Claude Code (or your AI client), then call the"
+    log "vectorhawk_login tool to authenticate."
 else
     log "Skipped daemon install and mcp setup (--no-setup)."
     log "Run when ready:"
