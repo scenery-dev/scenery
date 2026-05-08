@@ -84,7 +84,7 @@ fn daemon_socket_path() -> PathBuf {
 /// Wait up to `timeout` for the socket file to appear on disk.
 ///
 /// Returns `true` if the socket appeared within the deadline.
-fn wait_for_socket(path: &PathBuf, timeout: Duration) -> bool {
+fn wait_for_socket(path: &std::path::Path, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if path.exists() {

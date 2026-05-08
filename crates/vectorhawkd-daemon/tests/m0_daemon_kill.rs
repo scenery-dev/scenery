@@ -75,7 +75,7 @@ fn daemon_socket_path() -> PathBuf {
     data_dir.join("VectorHawk").join("agent.sock")
 }
 
-fn wait_for_socket(path: &PathBuf, timeout: Duration) -> bool {
+fn wait_for_socket(path: &std::path::Path, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if path.exists() {

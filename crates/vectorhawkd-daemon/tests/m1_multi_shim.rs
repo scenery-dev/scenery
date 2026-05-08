@@ -12,9 +12,7 @@
 //! 3. Each shim performs: `initialize` + `tools/list` + 3 × `tools/call` (9 total).
 //! 4. Asserts all shims see the same sorted tool list.
 //! 5. Asserts all 9 tool calls succeed.
-//! 6. Queries the SQLite `audit_events` table after all shims close and asserts
-//!    >= 9 rows (one per tool call at minimum). Importantly: no "database is
-//!    locked" errors occur during the run, proving the single-writer invariant.
+//! 6. Queries `audit_events` after all shims close: asserts >= 9 rows, no SQLite contention.
 //!
 //! # Running
 //!
@@ -65,7 +63,7 @@ fn daemon_db_path() -> PathBuf {
     data_dir.join("VectorHawk").join("state.db")
 }
 
-fn wait_for_socket(path: &PathBuf, timeout: Duration) -> bool {
+fn wait_for_socket(path: &std::path::Path, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if path.exists() {

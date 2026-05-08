@@ -4,7 +4,7 @@
 //!
 //! Validates M2 acceptance criteria 1, 3, and 4 on Linux:
 //! - AC2: `vectorhawk daemon install` writes the systemd user unit and daemon
-//!        is reachable on the socket.
+//!   is reachable on the socket.
 //! - AC3: `vectorhawk daemon uninstall` stops the agent and removes the unit.
 //! - AC4: Running `daemon install` twice is idempotent (exits 0 both times).
 //!

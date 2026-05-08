@@ -4,7 +4,7 @@
 //!
 //! Validates M2 acceptance criteria 1, 3, and 4 on macOS:
 //! - AC1: `vectorhawk daemon install` writes the plist and daemon is reachable
-//!        on the socket within 5 s.
+//!   on the socket within 5 s.
 //! - AC3: `vectorhawk daemon uninstall` stops the agent and removes the plist.
 //! - AC4: Running `daemon install` twice is idempotent (exits 0 both times).
 //!
@@ -60,7 +60,7 @@ fn socket_path() -> PathBuf {
 
 /// Poll until the path exists (or doesn't, when `expect_present` is false).
 /// Returns true if the condition was met before the timeout.
-fn wait_for_path(path: &PathBuf, expect_present: bool, timeout: Duration) -> bool {
+fn wait_for_path(path: &std::path::Path, expect_present: bool, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if path.exists() == expect_present {

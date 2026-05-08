@@ -160,23 +160,27 @@ impl ModelClient for McpSamplingClient {
 
 /// A `ModelClient` that tries the local Ollama model first and falls back to
 /// MCP sampling delegation if Ollama is unavailable or fails.
-pub struct HybridModelClient<'a> {
-    ollama: Option<&'a dyn ModelClient>,
-    sampling: &'a McpSamplingClient,
+///
+/// Both the optional Ollama client and the sampling client are owned
+/// (`Box<dyn ModelClient>`) so that `HybridModelClient` can be stored in an
+/// `Arc` or moved into a `spawn_blocking` closure without lifetime parameters.
+pub struct HybridModelClient {
+    ollama: Option<Box<dyn ModelClient>>,
+    sampling: Box<dyn ModelClient>,
 }
 
-impl<'a> HybridModelClient<'a> {
-    pub fn new(ollama: Option<&'a dyn ModelClient>, sampling: &'a McpSamplingClient) -> Self {
+impl HybridModelClient {
+    pub fn new(ollama: Option<Box<dyn ModelClient>>, sampling: Box<dyn ModelClient>) -> Self {
         Self { ollama, sampling }
     }
 }
 
-impl ModelClient for HybridModelClient<'_> {
+impl ModelClient for HybridModelClient {
     fn generate(&self, request: ModelRequest) -> Result<ModelResponse> {
         // prefer_local=true:  try Ollama → fall back to MCP sampling
         // prefer_local=false: try MCP sampling → fall back to Ollama
         if request.prefer_local {
-            if let Some(ollama) = self.ollama {
+            if let Some(ollama) = self.ollama.as_deref() {
                 if local_model_compatible(ollama, &request.recommended_models) {
                     match ollama.generate(request.clone()) {
                         Ok(response) => return Ok(response),
@@ -214,7 +218,7 @@ impl ModelClient for HybridModelClient<'_> {
         match self.sampling.generate(request.clone()) {
             Ok(response) => Ok(response),
             Err(sampling_err) => {
-                if let Some(ollama) = self.ollama {
+                if let Some(ollama) = self.ollama.as_deref() {
                     tracing::warn!(
                         "MCP sampling unavailable, falling back to local model: {sampling_err}"
                     );
@@ -320,7 +324,7 @@ mod tests {
         let writer = Box::new(Vec::<u8>::new());
         let sampling = McpSamplingClient::new(writer, reader);
 
-        let hybrid = HybridModelClient::new(Some(&mock), &sampling);
+        let hybrid = HybridModelClient::new(Some(Box::new(mock)), Box::new(sampling));
         let result = hybrid
             .generate(ModelRequest {
                 system_prompt: "test".to_string(),
@@ -347,7 +351,7 @@ mod tests {
         let writer = Box::new(Vec::<u8>::new());
         let sampling = McpSamplingClient::new(writer, reader);
 
-        let hybrid = HybridModelClient::new(Some(&mock), &sampling);
+        let hybrid = HybridModelClient::new(Some(Box::new(mock)), Box::new(sampling));
         let result = hybrid
             .generate(ModelRequest {
                 system_prompt: "test".to_string(),
@@ -370,7 +374,6 @@ mod tests {
             }
         }
 
-        let failing = FailingClient;
         let response_json = serde_json::json!({
             "jsonrpc": "2.0", "id": 1000,
             "result": {"role": "assistant", "content": {"type": "text", "text": "fallback response"}}
@@ -381,7 +384,7 @@ mod tests {
         let writer = Box::new(Vec::<u8>::new());
         let sampling = McpSamplingClient::new(writer, reader);
 
-        let hybrid = HybridModelClient::new(Some(&failing), &sampling);
+        let hybrid = HybridModelClient::new(Some(Box::new(FailingClient)), Box::new(sampling));
         let result = hybrid
             .generate(ModelRequest {
                 system_prompt: "test".to_string(),
@@ -434,7 +437,7 @@ mod tests {
         let writer = Box::new(Vec::<u8>::new());
         let sampling = McpSamplingClient::new(writer, reader);
 
-        let hybrid = HybridModelClient::new(Some(&local), &sampling);
+        let hybrid = HybridModelClient::new(Some(Box::new(local)), Box::new(sampling));
         let result = hybrid
             .generate(ModelRequest {
                 prefer_local: true,
@@ -464,7 +467,7 @@ mod tests {
         let writer = Box::new(Vec::<u8>::new());
         let sampling = McpSamplingClient::new(writer, reader);
 
-        let hybrid = HybridModelClient::new(Some(&local), &sampling);
+        let hybrid = HybridModelClient::new(Some(Box::new(local)), Box::new(sampling));
         let result = hybrid
             .generate(ModelRequest {
                 prefer_local: true,
@@ -489,7 +492,7 @@ mod tests {
         let writer = Box::new(Vec::<u8>::new());
         let sampling = McpSamplingClient::new(writer, reader);
 
-        let hybrid = HybridModelClient::new(Some(&local), &sampling);
+        let hybrid = HybridModelClient::new(Some(Box::new(local)), Box::new(sampling));
         let err = hybrid
             .generate(ModelRequest {
                 prefer_local: true,
@@ -509,7 +512,7 @@ mod tests {
         let writer = Box::new(Vec::<u8>::new());
         let sampling = McpSamplingClient::new(writer, reader);
 
-        let hybrid = HybridModelClient::new(None, &sampling);
+        let hybrid = HybridModelClient::new(None, Box::new(sampling));
         let err = hybrid
             .generate(ModelRequest {
                 prefer_local: true,

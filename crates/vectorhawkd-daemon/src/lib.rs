@@ -70,11 +70,13 @@ use tracing::{error, info, warn};
 use vectorhawkd_core::{
     audit::{AuditBuffer, SqliteAuditBuffer},
     auth::{load_all_tokens, save_tokens, AuthClient},
+    gateway_model::GatewayModelClient,
     model::ModelClient,
     ollama::OllamaClient,
     registry::RegistryClient,
     state::AppState,
 };
+use vectorhawkd_mcp::sampling::HybridModelClient;
 use vectorhawkd_mcp::{
     aggregator::{BackendEntry, BackendRegistry, BackendTransport, ToolDefinition, ToolVisibility},
     backend::{Backend, RealBackend},
@@ -317,7 +319,26 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
         );
     }
 
-    let model_client: Option<Arc<dyn ModelClient>> = Some(Arc::new(ollama) as Arc<dyn ModelClient>);
+    // Build a GatewayModelClient pointing at the same registry URL so that
+    // LLM steps can fall through to the cloud gateway when a local Ollama
+    // model is not available or not preferred.
+    let gateway = GatewayModelClient::new(
+        registry_url.clone(),
+        Arc::new(AppState {
+            root_dir: state.root_dir.clone(),
+            db_path: state.db_path.clone(),
+        }),
+    );
+
+    // Wire HybridModelClient: Ollama (optional local) → GatewayModelClient.
+    // The sampling fallback (McpSamplingClient) is handled at the per-shim
+    // connection level in server.rs; the daemon-level client provides the
+    // Ollama + gateway tier only.
+    let hybrid = HybridModelClient::new(
+        Some(Box::new(ollama) as Box<dyn ModelClient>),
+        Box::new(gateway) as Box<dyn ModelClient>,
+    );
+    let model_client: Option<Arc<dyn ModelClient>> = Some(Arc::new(hybrid) as Arc<dyn ModelClient>);
 
     let vh_registry = Arc::new(build_stub_registry());
     if let Some(ref m) = managed_config {
