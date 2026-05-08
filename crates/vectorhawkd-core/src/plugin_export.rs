@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
-use vectorhawkd_manifest::PluginPackage;
 use std::{fs, io::Write as IoWrite};
+use vectorhawkd_manifest::PluginPackage;
 use zip::{write::SimpleFileOptions, ZipWriter};
 
 /// Export a VectorHawk plugin to the Claude Code plugin format.

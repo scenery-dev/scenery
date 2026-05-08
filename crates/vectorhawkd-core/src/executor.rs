@@ -1,5 +1,5 @@
 use crate::{
-    model::{ModelClient, ModelRequest, ModelSource},
+    model::{model_source_str, ModelClient, ModelRequest, ModelSource},
     policy::PolicyClient,
     resolver::{resolve_skill, ResolveOutcome},
     state::AppState,
@@ -23,6 +23,9 @@ pub struct StepResult {
     pub completion_tokens: Option<u64>,
     pub latency_ms: Option<u64>,
     pub model_source: Option<ModelSource>,
+    /// Cost in USD charged by the inference backend for this step. `None` for
+    /// non-LLM steps; `Some(0.0)` for local/free backends.
+    pub cost_usd: Option<f64>,
 }
 
 #[derive(Debug)]
@@ -33,6 +36,11 @@ pub struct RunResult {
     pub total_prompt_tokens: u64,
     pub total_completion_tokens: u64,
     pub total_latency_ms: u64,
+    /// Sum of `cost_usd` across all steps that reported a cost.
+    pub total_cost_usd: f64,
+    /// String representation of the first step's `model_source` that is `Some`.
+    /// `None` when no LLM steps ran (stub mode or non-LLM workflow).
+    pub model_source: Option<String>,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -106,15 +114,24 @@ pub fn run_skill_with_scope(
     let total_latency_ms = wall_start.elapsed().as_millis() as u64;
     let total_prompt_tokens: u64 = steps.iter().filter_map(|s| s.prompt_tokens).sum();
     let total_completion_tokens: u64 = steps.iter().filter_map(|s| s.completion_tokens).sum();
+    let total_cost_usd: f64 = steps.iter().filter_map(|s| s.cost_usd).sum();
+    let run_model_source: Option<String> = steps
+        .iter()
+        .find_map(|s| s.model_source.as_ref())
+        .map(model_source_str);
 
     // 6. Record execution history.
     record_execution(
         state,
-        skill_id,
-        &version,
-        total_prompt_tokens,
-        total_completion_tokens,
-        total_latency_ms,
+        ExecutionRecord {
+            skill_id,
+            version: &version,
+            prompt_tokens: total_prompt_tokens,
+            completion_tokens: total_completion_tokens,
+            latency_ms: total_latency_ms,
+            model_source: run_model_source.as_deref().unwrap_or(""),
+            cost_usd: total_cost_usd,
+        },
     )?;
 
     Ok(RunResult {
@@ -124,6 +141,8 @@ pub fn run_skill_with_scope(
         total_prompt_tokens,
         total_completion_tokens,
         total_latency_ms,
+        total_cost_usd,
+        model_source: run_model_source,
     })
 }
 
@@ -197,6 +216,7 @@ fn execute_tool_step(
                 completion_tokens: None,
                 latency_ms: None,
                 model_source: None,
+                cost_usd: None,
             })
         }
         other => anyhow::bail!("tool step '{id}': unknown built-in tool '{other}'"),
@@ -236,6 +256,7 @@ fn execute_transform_step(
         completion_tokens: None,
         latency_ms: None,
         model_source: None,
+        cost_usd: None,
     })
 }
 
@@ -269,6 +290,7 @@ fn execute_validate_step(
         completion_tokens: None,
         latency_ms: None,
         model_source: None,
+        cost_usd: None,
     })
 }
 
@@ -364,6 +386,7 @@ fn execute_llm_step(pkg: &SkillPackage, p: LlmStepParams<'_>) -> Result<StepResu
         completion_tokens: Some(response.completion_tokens),
         latency_ms: Some(response.latency_ms),
         model_source: Some(response.source),
+        cost_usd: Some(response.cost_usd),
     })
 }
 
@@ -453,6 +476,7 @@ fn stub_step(step: &WorkflowStep) -> StepResult {
         completion_tokens: None,
         latency_ms: None,
         model_source: None,
+        cost_usd: None,
     }
 }
 
@@ -495,20 +519,32 @@ fn validate_output(
 
 // ── Execution history ─────────────────────────────────────────────────────────
 
-fn record_execution(
-    state: &AppState,
-    skill_id: &str,
-    version: &str,
+struct ExecutionRecord<'a> {
+    skill_id: &'a str,
+    version: &'a str,
     prompt_tokens: u64,
     completion_tokens: u64,
     latency_ms: u64,
-) -> Result<()> {
+    model_source: &'a str,
+    cost_usd: f64,
+}
+
+fn record_execution(state: &AppState, rec: ExecutionRecord<'_>) -> Result<()> {
     let conn =
         Connection::open(&state.db_path).context("failed to open state DB to record execution")?;
     conn.execute(
-        "INSERT INTO execution_history (skill_id, version, status, prompt_tokens, completion_tokens, latency_ms)
-         VALUES (?1, ?2, 'completed', ?3, ?4, ?5)",
-        rusqlite::params![skill_id, version, prompt_tokens, completion_tokens, latency_ms],
+        "INSERT INTO execution_history \
+         (skill_id, version, status, prompt_tokens, completion_tokens, latency_ms, model_source, cost_usd) \
+         VALUES (?1, ?2, 'completed', ?3, ?4, ?5, ?6, ?7)",
+        rusqlite::params![
+            rec.skill_id,
+            rec.version,
+            rec.prompt_tokens,
+            rec.completion_tokens,
+            rec.latency_ms,
+            if rec.model_source.is_empty() { None } else { Some(rec.model_source) },
+            rec.cost_usd,
+        ],
     )
     .context("failed to insert execution_history row")?;
     Ok(())

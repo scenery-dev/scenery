@@ -16,8 +16,12 @@ async fn main() {
         .init();
 
     let opts = DaemonOpts {
-        registry_url: std::env::var("SKILLCLUB_REGISTRY_URL").ok(),
+        registry_url: std::env::var("VECTORHAWK_REGISTRY_URL")
+            .ok()
+            .or_else(|| std::env::var("SKILLCLUB_REGISTRY_URL").ok()),
         socket_path_override: None,
+        ollama_url: std::env::var("VECTORHAWK_OLLAMA_URL").ok(),
+        ollama_model: std::env::var("VECTORHAWK_OLLAMA_MODEL").ok(),
     };
 
     if let Err(e) = run_daemon(opts).await {

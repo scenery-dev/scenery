@@ -31,6 +31,8 @@
 //! implemented in `tokio::io`, same convention used by many language servers
 //! and wire protocols.
 
+#[cfg(feature = "daemon")]
+use crate::tools::UpdateCheckCache;
 use crate::{
     aggregator::{BackendEntry, BackendRegistry, BackendTransport, ToolDefinition, ToolVisibility},
     protocol::{
@@ -46,8 +48,6 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(unix)]
 use tokio::net::UnixStream;
-#[cfg(feature = "daemon")]
-use crate::tools::UpdateCheckCache;
 
 // ── Strict daemon response type ───────────────────────────────────────────────
 
@@ -727,39 +727,51 @@ impl Backend for RealBackend {
             let is_backend_tool = params.name.contains("__");
 
             if is_management_tool || !is_backend_tool {
-                use vectorhawkd_core::policy::MockPolicyClient;
-                let empty_cache = std::sync::Arc::new(std::sync::Mutex::new(
-                    std::collections::HashMap::new(),
-                ));
-                let cache = self
-                    .update_check_cache
-                    .as_ref()
-                    .unwrap_or(&empty_cache);
+                let empty_cache =
+                    std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+                let cache = Arc::clone(self.update_check_cache.as_ref().unwrap_or(&empty_cache));
 
-                let tool_result = if let Some(pc) = &self.policy_client {
-                    crate::tools::handle_tool_call(
-                        &params.name,
-                        &params.arguments,
-                        state,
-                        pc.as_ref(),
-                        self.model_client.as_deref(),
-                        &self.registry_url,
-                        cache,
-                        Some(&*self.registry),
-                    )
-                } else {
-                    let mock_policy = MockPolicyClient::new();
-                    crate::tools::handle_tool_call(
-                        &params.name,
-                        &params.arguments,
-                        state,
-                        &mock_policy,
-                        self.model_client.as_deref(),
-                        &self.registry_url,
-                        cache,
-                        Some(&*self.registry),
-                    )
-                };
+                // Clone everything that must cross the spawn_blocking boundary.
+                let tool_name = params.name.clone();
+                let tool_args = params.arguments.clone();
+                let state_arc = Arc::clone(state);
+                let registry_arc = Arc::clone(&self.registry);
+                let registry_url = self.registry_url.clone();
+                let model_client = self.model_client.clone();
+                let policy_client = self.policy_client.clone();
+
+                let tool_result = tokio::task::spawn_blocking(move || {
+                    if let Some(pc) = policy_client {
+                        crate::tools::handle_tool_call(
+                            &tool_name,
+                            &tool_args,
+                            &state_arc,
+                            pc.as_ref(),
+                            model_client.as_deref(),
+                            &registry_url,
+                            &cache,
+                            Some(&*registry_arc),
+                        )
+                    } else {
+                        let mock_policy = vectorhawkd_core::policy::MockPolicyClient::new();
+                        crate::tools::handle_tool_call(
+                            &tool_name,
+                            &tool_args,
+                            &state_arc,
+                            &mock_policy,
+                            model_client.as_deref(),
+                            &registry_url,
+                            &cache,
+                            Some(&*registry_arc),
+                        )
+                    }
+                })
+                .await
+                .unwrap_or_else(|join_err| {
+                    crate::protocol::ToolCallResult::error_result(format!(
+                        "tool handler panicked: {join_err}"
+                    ))
+                });
 
                 let latency_ms = started.elapsed().as_millis() as u64;
                 let status = if tool_result.is_error == Some(true) {
@@ -970,8 +982,12 @@ mod tests {
         let (mut daemon_side, client_side) = duplex(4096);
         let notification_bytes = serde_json::to_vec(&notification).unwrap();
         let response_bytes = serde_json::to_vec(&response).unwrap();
-        write_framed(&mut daemon_side, &notification_bytes).await.unwrap();
-        write_framed(&mut daemon_side, &response_bytes).await.unwrap();
+        write_framed(&mut daemon_side, &notification_bytes)
+            .await
+            .unwrap();
+        write_framed(&mut daemon_side, &response_bytes)
+            .await
+            .unwrap();
         drop(daemon_side);
 
         // relay_skip_notifications reads from the client side.

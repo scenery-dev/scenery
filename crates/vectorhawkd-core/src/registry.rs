@@ -756,15 +756,15 @@ impl RegistryClient {
     /// on error and continue; the rows remain in SQLite for the next tick.
     ///
     /// TODO(registry): add matching POST /api/runner/skill-ratings endpoint.
-    pub fn upload_skill_ratings(
-        &self,
-        ratings: &[crate::ratings::LocalRating],
-    ) -> Result<()> {
+    pub fn upload_skill_ratings(&self, ratings: &[crate::ratings::LocalRating]) -> Result<()> {
         if ratings.is_empty() {
             return Ok(());
         }
 
-        let url = format!("{}/api/runner/skill-ratings", self.base_url.trim_end_matches('/'));
+        let url = format!(
+            "{}/api/runner/skill-ratings",
+            self.base_url.trim_end_matches('/')
+        );
         debug!(url, count = ratings.len(), "uploading skill ratings");
 
         let payload: Vec<serde_json::Value> = ratings
@@ -803,10 +803,7 @@ impl RegistryClient {
     /// on error and continue.
     ///
     /// TODO(registry): add matching POST /api/runner/execution-stats endpoint.
-    pub fn upload_execution_stats(
-        &self,
-        stats: &[crate::ratings::ExecutionStats],
-    ) -> Result<()> {
+    pub fn upload_execution_stats(&self, stats: &[crate::ratings::ExecutionStats]) -> Result<()> {
         if stats.is_empty() {
             return Ok(());
         }
@@ -921,17 +918,11 @@ impl MockRegistryClient {
         })
     }
 
-    pub fn upload_skill_ratings(
-        &self,
-        _ratings: &[crate::ratings::LocalRating],
-    ) -> Result<()> {
+    pub fn upload_skill_ratings(&self, _ratings: &[crate::ratings::LocalRating]) -> Result<()> {
         Ok(())
     }
 
-    pub fn upload_execution_stats(
-        &self,
-        _stats: &[crate::ratings::ExecutionStats],
-    ) -> Result<()> {
+    pub fn upload_execution_stats(&self, _stats: &[crate::ratings::ExecutionStats]) -> Result<()> {
         Ok(())
     }
 }

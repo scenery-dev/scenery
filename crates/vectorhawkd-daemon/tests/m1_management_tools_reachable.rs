@@ -183,10 +183,7 @@ fn gap01_management_tools_present_and_callable() {
         .as_array()
         .expect("tools/list must return a tools array");
 
-    let tool_names: Vec<&str> = tools
-        .iter()
-        .filter_map(|t| t["name"].as_str())
-        .collect();
+    let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
 
     // GAP-01: all management tools must be present
     let required_tools = [

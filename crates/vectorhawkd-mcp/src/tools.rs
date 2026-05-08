@@ -815,17 +815,14 @@ pub fn handle_login_with_oauth(
         .flatten()
         .is_some()
     {
-        return ToolCallResult::success(
-            "Already logged in to VectorHawk. No action needed.",
-        );
+        return ToolCallResult::success("Already logged in to VectorHawk. No action needed.");
     }
 
     let auth_client = AuthClient::new(&registry_url);
 
     match oauth {
         Some(ctx) => {
-            let redirect_uri =
-                format!("http://127.0.0.1:{}/oauth/cli/callback", ctx.listener_port);
+            let redirect_uri = format!("http://127.0.0.1:{}/oauth/cli/callback", ctx.listener_port);
             match auth_client.initiate_oauth_flow_with_redirect(&redirect_uri) {
                 Ok(initiation) => {
                     // Clone everything the background task needs before we move
@@ -842,10 +839,7 @@ pub fn handle_login_with_oauth(
                     // Fire-and-forget: await browser callback → exchange code → save tokens.
                     // The AI client already has the URL; this completes silently in the background.
                     tokio::runtime::Handle::current().spawn(async move {
-                        let code = match subscriber
-                            .wait_for_code(oauth_state_val, 300)
-                            .await
-                        {
+                        let code = match subscriber.wait_for_code(oauth_state_val, 300).await {
                             Some(c) => c,
                             None => {
                                 tracing::warn!(
@@ -1461,9 +1455,7 @@ fn handle_uninstall(arguments: &serde_json::Value, state: &AppState) -> ToolCall
         Ok(Some(version)) => {
             ToolCallResult::success(format!("Successfully uninstalled {skill_id}@{version}."))
         }
-        Ok(None) => {
-            ToolCallResult::error_result(format!("Skill '{skill_id}' is not installed."))
-        }
+        Ok(None) => ToolCallResult::error_result(format!("Skill '{skill_id}' is not installed.")),
         Err(e) => ToolCallResult::error_result(format!("Failed to uninstall '{skill_id}': {e}")),
     }
 }
@@ -1481,9 +1473,7 @@ fn handle_update(
     let url = match registry_url {
         Some(u) => u,
         None => {
-            return ToolCallResult::error_result(
-                "No registry configured — cannot update skills",
-            )
+            return ToolCallResult::error_result("No registry configured — cannot update skills")
         }
     };
 
@@ -2056,7 +2046,11 @@ mod tests {
             &Some(url),
         );
 
-        assert_eq!(result.is_error, None, "expected success: {:?}", result.content);
+        assert_eq!(
+            result.is_error, None,
+            "expected success: {:?}",
+            result.content
+        );
         assert!(result.content[0].text.contains("test-skill"));
         assert!(result.content[0].text.contains("0.1.0"));
 
@@ -2123,11 +2117,7 @@ mod tests {
         let url = "http://localhost:8000".to_string();
         fake_login(&state, &url);
 
-        let result = handle_login(
-            &serde_json::json!({"registry_url": url}),
-            &state,
-            &None,
-        );
+        let result = handle_login(&serde_json::json!({"registry_url": url}), &state, &None);
         // Should succeed without starting an OAuth flow
         assert_eq!(result.is_error, None);
         assert!(result.content[0].text.contains("Already logged in"));
@@ -2297,9 +2287,8 @@ mod tests {
 
     #[test]
     fn handle_plugin_export_rejects_unknown_format() {
-        let result = handle_plugin_export(
-            &serde_json::json!({"path": "/some/plugin", "format": "tarball"}),
-        );
+        let result =
+            handle_plugin_export(&serde_json::json!({"path": "/some/plugin", "format": "tarball"}));
         assert_eq!(result.is_error, Some(true));
         assert!(result.content[0].text.contains("Unsupported format"));
     }
@@ -2316,11 +2305,11 @@ mod tests {
         let root = temp_root("pi-unknown");
         fs::create_dir_all(&root).unwrap();
         // A plain directory with no recognized format markers
-        let result = handle_plugin_import(
-            &serde_json::json!({"path": root.to_string()}),
-        );
+        let result = handle_plugin_import(&serde_json::json!({"path": root.to_string()}));
         assert_eq!(result.is_error, Some(true));
-        assert!(result.content[0].text.contains("Could not detect plugin format"));
+        assert!(result.content[0]
+            .text
+            .contains("Could not detect plugin format"));
         let _ = fs::remove_dir_all(&root);
     }
 

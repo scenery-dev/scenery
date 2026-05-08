@@ -70,6 +70,8 @@ use tracing::{error, info, warn};
 use vectorhawkd_core::{
     audit::{AuditBuffer, SqliteAuditBuffer},
     auth::{load_all_tokens, save_tokens, AuthClient},
+    model::ModelClient,
+    ollama::OllamaClient,
     registry::RegistryClient,
     state::AppState,
 };
@@ -102,12 +104,7 @@ impl vectorhawkd_mcp::oauth::OAuthSubscriber for OAuthStateSubscriber {
                     return None;
                 }
             };
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(timeout_secs),
-                rx,
-            )
-            .await
-            {
+            match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx).await {
                 Ok(Ok((code, _state))) => Some(code),
                 Ok(Err(_)) => None, // channel closed — daemon shutting down
                 Err(_) => None,     // timeout elapsed
@@ -123,11 +120,21 @@ impl vectorhawkd_mcp::oauth::OAuthSubscriber for OAuthStateSubscriber {
 #[derive(Debug, Default, Clone)]
 pub struct DaemonOpts {
     /// Override the registry URL. If `None`, falls back to env
-    /// (`SKILLCLUB_REGISTRY_URL`) or registry-driven defaults.
+    /// (`VECTORHAWK_REGISTRY_URL`) or registry-driven defaults.
     pub registry_url: Option<String>,
 
     /// Override the socket path. If `None`, uses `AppState::socket_path()`.
     pub socket_path_override: Option<camino::Utf8PathBuf>,
+
+    /// Override the Ollama base URL. If `None`, falls back to env
+    /// (`VECTORHAWK_OLLAMA_URL`) then managed config then the default
+    /// `http://127.0.0.1:11434`.
+    pub ollama_url: Option<String>,
+
+    /// Override the Ollama model tag. If `None`, falls back to env
+    /// (`VECTORHAWK_OLLAMA_MODEL`) then managed config then an empty string
+    /// (resolved at call time via `resolve_model`).
+    pub ollama_model: Option<String>,
 }
 
 /// How often (in seconds) the background sync loop ticks.
@@ -208,10 +215,9 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
             let root = sync_root_dir.clone();
             let cache = Arc::clone(&sync_update_cache);
 
-            let result = tokio::task::spawn_blocking(move || {
-                run_sync_tick(&reg, &aud, &db, &root, &cache)
-            })
-            .await;
+            let result =
+                tokio::task::spawn_blocking(move || run_sync_tick(&reg, &aud, &db, &root, &cache))
+                    .await;
 
             match result {
                 Ok(Ok(changed)) => {
@@ -272,8 +278,48 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
         }
     });
 
-    let vh_registry = Arc::new(build_stub_registry());
     let managed_config = vectorhawkd_core::managed::load_managed_config(&state);
+
+    // Resolve Ollama URL (priority: CLI opt → env var → managed config → default).
+    let resolved_ollama_url = opts
+        .ollama_url
+        .clone()
+        .or_else(|| std::env::var("VECTORHAWK_OLLAMA_URL").ok())
+        .or_else(|| managed_config.as_ref().and_then(|c| c.ollama_url.clone()))
+        .unwrap_or_else(|| "http://127.0.0.1:11434".to_string());
+
+    // Resolve Ollama model (priority: CLI opt → env var → managed config → empty string).
+    let resolved_ollama_model = opts
+        .ollama_model
+        .clone()
+        .or_else(|| std::env::var("VECTORHAWK_OLLAMA_MODEL").ok())
+        .or_else(|| managed_config.as_ref().and_then(|c| c.ollama_model.clone()))
+        .unwrap_or_default();
+
+    let ollama = OllamaClient::new(resolved_ollama_url.clone(), resolved_ollama_model.clone());
+
+    // Report Ollama health at startup.
+    let health = ollama.health_check();
+    if health.reachable {
+        info!(
+            url = %resolved_ollama_url,
+            model = %resolved_ollama_model,
+            "Ollama reachable — local LLM execution enabled"
+        );
+        if let Ok(models) = ollama.list_models() {
+            let names: Vec<&str> = models.iter().map(|m| m.name.as_str()).collect();
+            info!(available_models = ?names, "Ollama models available");
+        }
+    } else {
+        warn!(
+            url = %resolved_ollama_url,
+            "Ollama not reachable — LLM steps will fail without a model client"
+        );
+    }
+
+    let model_client: Option<Arc<dyn ModelClient>> = Some(Arc::new(ollama) as Arc<dyn ModelClient>);
+
+    let vh_registry = Arc::new(build_stub_registry());
     if let Some(ref m) = managed_config {
         info!(
             org = m.org.as_deref().unwrap_or("(unspecified)"),
@@ -325,7 +371,7 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
         state_arc,
         registry_url_opt,
         policy_client,
-        None, // model_client: wire OllamaClient / HybridModelClient in a future stream
+        model_client,
         update_check_cache,
     );
 
@@ -588,11 +634,8 @@ pub fn run_sync_tick(
         // deactivate unpublished) AND voluntary version updates. It also calls
         // check_skill_status internally, so there is no separate lifecycle-only call.
         let policy_client = MockPolicyClient::new();
-        match vectorhawkd_core::updater::check_skill_updates(
-            &state_view,
-            registry,
-            &policy_client,
-        ) {
+        match vectorhawkd_core::updater::check_skill_updates(&state_view, registry, &policy_client)
+        {
             Ok(changes) => {
                 if changes > 0 {
                     info!(changes, "sync: skill updates applied");
@@ -715,7 +758,9 @@ fn flush_ratings_and_scan(
                             let ids: Vec<i64> = ratings.iter().map(|r| r.id).collect();
                             match mark_ratings_synced(&conn, &ids) {
                                 Ok(()) => info!(count = ids.len(), "sync: skill ratings flushed"),
-                                Err(e) => warn!(error = %e, "sync: failed to mark ratings synced after upload"),
+                                Err(e) => {
+                                    warn!(error = %e, "sync: failed to mark ratings synced after upload")
+                                }
                             }
                         }
                         Err(e) => warn!(error = %e, "sync: ratings upload failed"),
@@ -727,12 +772,10 @@ fn flush_ratings_and_scan(
 
             // ── 5. Execution stats flush ──────────────────────────────────────
             match get_execution_stats(&conn) {
-                Ok(stats) if !stats.is_empty() => {
-                    match registry.upload_execution_stats(&stats) {
-                        Ok(()) => info!(count = stats.len(), "sync: execution stats flushed"),
-                        Err(e) => warn!(error = %e, "sync: execution stats upload failed"),
-                    }
-                }
+                Ok(stats) if !stats.is_empty() => match registry.upload_execution_stats(&stats) {
+                    Ok(()) => info!(count = stats.len(), "sync: execution stats flushed"),
+                    Err(e) => warn!(error = %e, "sync: execution stats upload failed"),
+                },
                 Ok(_) => {}
                 Err(e) => warn!(error = %e, "sync: failed to read execution stats"),
             }

@@ -127,7 +127,9 @@ fn skill_install_link_flag_parses() {
     use super::{Command, SkillCommand};
     unsafe { std::env::remove_var("VECTORHAWK_REGISTRY_URL") };
     match parse(&["skill", "install", "./my-skill", "--link"]).command {
-        Command::Skill(SkillCommand::Install { skill_ref: _, link, .. }) => {
+        Command::Skill(SkillCommand::Install {
+            skill_ref: _, link, ..
+        }) => {
             assert!(link);
         }
         other => panic!("expected Skill(Install), got {other:?}"),
@@ -323,6 +325,7 @@ fn daemon_run_with_registry_url_parses() {
         Command::Daemon(DaemonCommand::Run {
             foreground,
             registry_url,
+            ..
         }) => {
             assert!(foreground);
             assert_eq!(registry_url.as_deref(), Some("http://localhost:8000"));

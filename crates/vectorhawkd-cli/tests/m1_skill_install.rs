@@ -24,10 +24,8 @@ fn temp_root(label: &str) -> Utf8PathBuf {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    Utf8PathBuf::from_path_buf(
-        std::env::temp_dir().join(format!("vh-install-cli-{label}-{nanos}")),
-    )
-    .unwrap()
+    Utf8PathBuf::from_path_buf(std::env::temp_dir().join(format!("vh-install-cli-{label}-{nanos}")))
+        .unwrap()
 }
 
 fn write_skill_bundle(root: &Utf8PathBuf, name_suffix: &str, version: &str) {
@@ -189,7 +187,10 @@ fn registry_id_install_fails_gracefully_when_unreachable() {
 
     let registry = RegistryClient::new("http://127.0.0.1:1");
     let result = install_from_registry(&state, &registry, "some-skill", None);
-    assert!(result.is_err(), "must return Err when registry is unreachable");
+    assert!(
+        result.is_err(),
+        "must return Err when registry is unreachable"
+    );
 
     let _ = fs::remove_dir_all(&state_root);
 }

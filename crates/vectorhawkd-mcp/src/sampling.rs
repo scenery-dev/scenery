@@ -153,6 +153,7 @@ impl ModelClient for McpSamplingClient {
             completion_tokens: 0,
             latency_ms,
             source: ModelSource::McpSampling,
+            cost_usd: 0.0,
         })
     }
 }
@@ -412,6 +413,7 @@ mod tests {
                 completion_tokens: 0,
                 latency_ms: 1,
                 source: ModelSource::Local(self.name.clone()),
+                cost_usd: 0.0,
             })
         }
     }

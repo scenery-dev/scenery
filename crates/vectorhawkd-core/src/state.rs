@@ -49,6 +49,18 @@ impl AppState {
         conn.execute_batch(SCHEMA_SQL)
             .context("failed to apply database schema")?;
 
+        // Idempotent column additions — these fail silently if the column
+        // already exists (SQLITE_ERROR extended code 1 from the "duplicate column"
+        // error). Any other error is a real problem and propagates.
+        add_column_if_missing(
+            &conn,
+            "ALTER TABLE execution_history ADD COLUMN model_source TEXT",
+        )?;
+        add_column_if_missing(
+            &conn,
+            "ALTER TABLE execution_history ADD COLUMN cost_usd REAL DEFAULT 0.0",
+        )?;
+
         Ok(Self { root_dir, db_path })
     }
 
@@ -87,6 +99,26 @@ impl AppState {
         }
         // macOS and fallback: socket lives in the data dir alongside state.db
         self.root_dir.join("agent.sock")
+    }
+}
+
+// ── Schema helpers ────────────────────────────────────────────────────────────
+
+/// Execute an `ALTER TABLE … ADD COLUMN …` statement, ignoring the error if
+/// the column already exists.
+///
+/// SQLite surfaces duplicate-column errors as `SQLITE_ERROR` (extended code 1)
+/// with message text containing "duplicate column name". We check the extended
+/// code and swallow exactly that case; all other errors propagate.
+fn add_column_if_missing(conn: &Connection, sql: &str) -> Result<()> {
+    match conn.execute(sql, []) {
+        Ok(_) => Ok(()),
+        Err(rusqlite::Error::SqliteFailure(err, _)) if err.extended_code == 1 => {
+            // Extended code 1 = SQLITE_ERROR, which SQLite emits for
+            // "duplicate column name: <col>". Safe to ignore.
+            Ok(())
+        }
+        Err(e) => Err(e).with_context(|| format!("failed to execute: {sql}")),
     }
 }
 

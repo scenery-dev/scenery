@@ -107,12 +107,7 @@ fn detect_ai_clients_in(
     // Claude Desktop — platform-specific path
     if let Some(desktop_config) = claude_desktop_config_path(home) {
         let desktop_dir = desktop_config.parent().map(|p| p.to_path_buf());
-        if desktop_dir
-            .as_ref()
-            .map(|d| d.exists())
-            .unwrap_or(false)
-            || desktop_config.exists()
-        {
+        if desktop_dir.as_ref().map(|d| d.exists()).unwrap_or(false) || desktop_config.exists() {
             let already = is_vectorhawk_configured(&desktop_config, "mcpServers");
             clients.push(ClientConfig {
                 name: "Claude Desktop".to_string(),
@@ -152,9 +147,7 @@ fn detect_ai_clients_in(
     // VS Code — platform-specific settings.json
     if let Some(vscode_config) = vscode_settings_path(home) {
         let vscode_dir = vscode_config.parent().map(|p| p.to_path_buf());
-        if vscode_dir.as_ref().map(|d| d.exists()).unwrap_or(false)
-            || vscode_config.exists()
-        {
+        if vscode_dir.as_ref().map(|d| d.exists()).unwrap_or(false) || vscode_config.exists() {
             let already = is_vectorhawk_configured(&vscode_config, "mcpServers");
             clients.push(ClientConfig {
                 name: "VS Code".to_string(),
@@ -381,8 +374,7 @@ Show the publish result and the skill's registry URL.
 /// giving users clean top-level slash commands in Claude Code.
 /// Skips writing if the skill file already exists with identical content.
 pub fn install_claude_skills() -> Result<Vec<String>> {
-    let home =
-        home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
+    let home = home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
     install_claude_skills_in(&home)
 }
 
@@ -425,10 +417,7 @@ fn home_dir() -> Option<PathBuf> {
 fn claude_code_app_present(system_root: &std::path::Path) -> bool {
     #[cfg(target_os = "macos")]
     {
-        system_root
-            .join("Applications")
-            .join("Claude.app")
-            .exists()
+        system_root.join("Applications").join("Claude.app").exists()
     }
     #[cfg(target_os = "linux")]
     {
@@ -646,7 +635,11 @@ mod tests {
                 "other-tool": {"command": "other", "args": []}
             }
         });
-        fs::write(&config_path, serde_json::to_string_pretty(&existing).unwrap()).unwrap();
+        fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&existing).unwrap(),
+        )
+        .unwrap();
 
         let config = ClientConfig {
             name: "Test Client".to_string(),
@@ -698,7 +691,10 @@ mod tests {
 
         let clients = detect_ai_clients_in(&home, &sys);
         let found = clients.iter().find(|c| c.name == "Claude Code");
-        assert!(found.is_some(), "Claude Code must be detected via app bundle");
+        assert!(
+            found.is_some(),
+            "Claude Code must be detected via app bundle"
+        );
         assert_eq!(found.unwrap().config_path, home.join(".claude.json"));
 
         let _ = fs::remove_dir_all(&tmp);

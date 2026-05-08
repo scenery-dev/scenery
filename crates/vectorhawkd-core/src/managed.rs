@@ -23,6 +23,10 @@ pub struct ManagedConfig {
     /// Whether to show governance messaging at all. Defaults to true.
     #[serde(default = "default_true")]
     pub governance_message_enabled: bool,
+    /// Override the Ollama base URL (e.g. `http://127.0.0.1:11434`).
+    pub ollama_url: Option<String>,
+    /// Override the Ollama model tag to use for LLM steps.
+    pub ollama_model: Option<String>,
 }
 
 fn default_true() -> bool {

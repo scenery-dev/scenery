@@ -170,6 +170,7 @@ impl ModelClient for OllamaClient {
             completion_tokens: ollama_resp.eval_count,
             latency_ms,
             source: ModelSource::Local(self.model.clone()),
+            cost_usd: 0.0,
         })
     }
 }

@@ -71,6 +71,8 @@ mod tests {
             allow_user_installs: true,
             governance_message: custom_msg.map(str::to_string),
             governance_message_enabled: msg_enabled,
+            ollama_url: None,
+            ollama_model: None,
         }
     }
 

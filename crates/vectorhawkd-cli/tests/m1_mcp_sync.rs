@@ -69,8 +69,10 @@ fn mcp_sync_succeeds_when_registry_unreachable() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let root =
-        camino::Utf8PathBuf::from_path_buf(std::env::temp_dir().join(format!("vh-sync-test-{nanos}"))).unwrap();
+    let root = camino::Utf8PathBuf::from_path_buf(
+        std::env::temp_dir().join(format!("vh-sync-test-{nanos}")),
+    )
+    .unwrap();
     let state = AppState::bootstrap_in(root.clone()).unwrap();
 
     // Point at an unreachable port — all HTTP calls must fail gracefully.
@@ -79,7 +81,13 @@ fn mcp_sync_succeeds_when_registry_unreachable() {
 
     let update_cache: vectorhawkd_mcp::tools::UpdateCheckCache =
         Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-    let result = run_sync_tick(&registry, &audit, &state.db_path, &state.root_dir, &update_cache);
+    let result = run_sync_tick(
+        &registry,
+        &audit,
+        &state.db_path,
+        &state.root_dir,
+        &update_cache,
+    );
     assert!(
         result.is_ok(),
         "run_sync_tick must return Ok even when the registry is unreachable: {result:?}"
@@ -130,7 +138,13 @@ fn mcp_sync_calls_registry_endpoints_when_reachable() {
 
     let update_cache: vectorhawkd_mcp::tools::UpdateCheckCache =
         Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-    let result = run_sync_tick(&registry, &audit, &state.db_path, &state.root_dir, &update_cache);
+    let result = run_sync_tick(
+        &registry,
+        &audit,
+        &state.db_path,
+        &state.root_dir,
+        &update_cache,
+    );
     assert!(result.is_ok(), "run_sync_tick must succeed: {result:?}");
 
     // The approved-servers endpoint must have been called.

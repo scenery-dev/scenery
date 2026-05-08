@@ -226,6 +226,14 @@ pub enum DaemonCommand {
         /// Override the registry URL for this daemon session.
         #[arg(long, env = "VECTORHAWK_REGISTRY_URL")]
         registry_url: Option<String>,
+
+        /// Override the Ollama base URL for local LLM inference.
+        #[arg(long, env = "VECTORHAWK_OLLAMA_URL")]
+        ollama_url: Option<String>,
+
+        /// Override the Ollama model tag to use for LLM steps.
+        #[arg(long, env = "VECTORHAWK_OLLAMA_MODEL")]
+        ollama_model: Option<String>,
     },
 
     /// Install the vectorhawkd LaunchAgent (macOS) or systemd user unit (Linux).
@@ -315,9 +323,10 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Auth(AuthCommand::Login { registry_url }) => cmd_auth_login(&registry_url).await,
         Command::Auth(AuthCommand::Logout { registry_url }) => cmd_auth_logout(&registry_url).await,
         Command::Auth(AuthCommand::Status { registry_url }) => cmd_auth_status(&registry_url).await,
-        Command::Auth(AuthCommand::Token { token, registry_url }) => {
-            cmd_auth_token(&token, &registry_url).await
-        }
+        Command::Auth(AuthCommand::Token {
+            token,
+            registry_url,
+        }) => cmd_auth_token(&token, &registry_url).await,
 
         Command::Mcp(McpCommand::Serve) => cmd_mcp_serve().await,
         Command::Mcp(McpCommand::Setup { client, dry_run }) => {
@@ -329,7 +338,9 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Daemon(DaemonCommand::Run {
             foreground: _,
             registry_url,
-        }) => cmd_daemon_run(registry_url).await,
+            ollama_url,
+            ollama_model,
+        }) => cmd_daemon_run(registry_url, ollama_url, ollama_model).await,
         Command::Daemon(DaemonCommand::Install) => cmd_daemon_install().await,
         Command::Daemon(DaemonCommand::Uninstall) => cmd_daemon_uninstall().await,
 
@@ -855,6 +866,8 @@ async fn cmd_skill_run(id: &str, input_path: camino::Utf8PathBuf, stub: bool) ->
             use vectorhawkd_core::model::ModelSource;
             let label = match source {
                 ModelSource::Local(name) => format!("local Ollama ({name})"),
+                ModelSource::Internal(name) => format!("internal VectorHawk model ({name})"),
+                ModelSource::Provider(name) => format!("cloud provider ({name})"),
                 ModelSource::McpSampling => "MCP sampling (delegated to AI client)".to_string(),
             };
             println!("    model:  {label}");
@@ -1193,12 +1206,10 @@ async fn cmd_auth_token(token: &str, registry_url: &str) -> Result<()> {
 
     let token_owned = token.to_string();
     let reg_url = registry_url.to_string();
-    let user = tokio::task::spawn_blocking(move || {
-        AuthClient::new(&reg_url).me(&token_owned)
-    })
-    .await
-    .context("validation task panicked")?
-    .context("token validation failed — check that the token is valid and not revoked")?;
+    let user = tokio::task::spawn_blocking(move || AuthClient::new(&reg_url).me(&token_owned))
+        .await
+        .context("validation task panicked")?
+        .context("token validation failed — check that the token is valid and not revoked")?;
 
     save_tokens(&state, registry_url, token, token)
         .context("failed to save token to local state")?;
@@ -1286,10 +1297,7 @@ async fn cmd_mcp_setup(client: Option<&str>, dry_run: bool) -> Result<()> {
         let mut wrote_claude_code = false;
         for config in &clients {
             if config.already_configured {
-                println!(
-                    "{}: vectorhawk already configured — skipped.",
-                    config.name
-                );
+                println!("{}: vectorhawk already configured — skipped.", config.name);
                 continue;
             }
             write_mcp_entry(config).with_context(|| {
@@ -1527,9 +1535,7 @@ async fn cmd_plugin_import(
 /// SQLite state independently.
 async fn cmd_mcp_sync() -> Result<()> {
     use std::sync::Arc;
-    use vectorhawkd_core::{
-        audit::SqliteAuditBuffer, registry::RegistryClient, state::AppState,
-    };
+    use vectorhawkd_core::{audit::SqliteAuditBuffer, registry::RegistryClient, state::AppState};
     use vectorhawkd_daemon::run_sync_tick;
     use vectorhawkd_mcp::tools::UpdateCheckCache;
 
@@ -1547,9 +1553,9 @@ async fn cmd_mcp_sync() -> Result<()> {
     tokio::task::spawn_blocking(move || {
         run_sync_tick(&registry, &audit, &db_path, &root_dir, &update_cache)
     })
-        .await
-        .context("sync task panicked")?
-        .context("registry sync failed")?;
+    .await
+    .context("sync task panicked")?
+    .context("registry sync failed")?;
 
     println!("Registry sync complete.");
     Ok(())
@@ -1577,7 +1583,10 @@ async fn cmd_mcp_backends() -> Result<()> {
     println!("{}", "-".repeat(60));
     for b in &backends {
         let status = if b.unhealthy { "unhealthy" } else { "healthy" };
-        println!("{:<20} {:<20} {:<8} {status}", b.server_id, b.name, b.tool_count);
+        println!(
+            "{:<20} {:<20} {:<8} {status}",
+            b.server_id, b.name, b.tool_count
+        );
     }
 
     Ok(())
@@ -1585,12 +1594,18 @@ async fn cmd_mcp_backends() -> Result<()> {
 
 // ── daemon subcommands ────────────────────────────────────────────────────────
 
-async fn cmd_daemon_run(registry_url: Option<String>) -> Result<()> {
+async fn cmd_daemon_run(
+    registry_url: Option<String>,
+    ollama_url: Option<String>,
+    ollama_model: Option<String>,
+) -> Result<()> {
     use vectorhawkd_daemon::{run_daemon, DaemonOpts};
 
     let opts = DaemonOpts {
         registry_url,
         socket_path_override: None,
+        ollama_url,
+        ollama_model,
     };
 
     run_daemon(opts).await

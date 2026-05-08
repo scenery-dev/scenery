@@ -29,8 +29,27 @@ pub struct ModelRequest {
 pub enum ModelSource {
     /// A locally-running Ollama instance. Contains the resolved model name.
     Local(String),
+    /// An internally-hosted model (VectorHawk managed). Contains the model name.
+    Internal(String),
+    /// A third-party cloud provider routed through the gateway. Contains the provider name.
+    Provider(String),
     /// The AI client handled the request via MCP `sampling/createMessage`.
     McpSampling,
+}
+
+/// Convert a `ModelSource` to its canonical string representation for storage.
+///
+/// - `Local(m)`    → `"local:{m}"`
+/// - `Internal(m)` → `"internal:{m}"`
+/// - `Provider(p)` → `"provider:{p}"`
+/// - `McpSampling` → `"mcp_sampling"`
+pub fn model_source_str(source: &ModelSource) -> String {
+    match source {
+        ModelSource::Local(m) => format!("local:{m}"),
+        ModelSource::Internal(m) => format!("internal:{m}"),
+        ModelSource::Provider(p) => format!("provider:{p}"),
+        ModelSource::McpSampling => "mcp_sampling".to_string(),
+    }
 }
 
 /// The raw response returned by a model backend, including accounting data.
@@ -46,6 +65,8 @@ pub struct ModelResponse {
     pub latency_ms: u64,
     /// Which backend produced this response.
     pub source: ModelSource,
+    /// Cost in USD for this inference call. `0.0` for local/free backends.
+    pub cost_usd: f64,
 }
 
 /// Abstraction over any text-generation backend.
@@ -93,6 +114,7 @@ impl ModelClient for MockModelClient {
             completion_tokens: self.completion_tokens,
             latency_ms: 1,
             source: ModelSource::Local("mock-model".to_string()),
+            cost_usd: 0.0,
         })
     }
 }

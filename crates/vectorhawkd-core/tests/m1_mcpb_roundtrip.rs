@@ -61,8 +61,8 @@ fn mcpb_export_then_import_preserves_server_config() {
     fs::create_dir_all(&import_dir).expect("create import dir");
 
     // Export to .mcpb
-    let archive_path = plugin_export::export_mcpb(&plugin_dir, &export_dir)
-        .expect("export_mcpb should succeed");
+    let archive_path =
+        plugin_export::export_mcpb(&plugin_dir, &export_dir).expect("export_mcpb should succeed");
 
     assert!(archive_path.exists(), ".mcpb archive should exist");
     assert_eq!(
@@ -72,8 +72,8 @@ fn mcpb_export_then_import_preserves_server_config() {
     );
 
     // Import back from .mcpb
-    let out_dir = plugin_import::import_mcpb(&archive_path, &import_dir)
-        .expect("import_mcpb should succeed");
+    let out_dir =
+        plugin_import::import_mcpb(&archive_path, &import_dir).expect("import_mcpb should succeed");
 
     assert!(out_dir.exists(), "output plugin directory should exist");
 
@@ -120,8 +120,8 @@ fn detect_format_recognizes_mcpb_extension() {
     let mcpb_file = root.join("my-extension.mcpb");
     // Minimal valid ZIP end-of-central-directory record
     let eocd: &[u8] = &[
-        0x50, 0x4B, 0x05, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x50, 0x4B, 0x05, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     ];
     fs::write(&mcpb_file, eocd).expect("write fake .mcpb");
 

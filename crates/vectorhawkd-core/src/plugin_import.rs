@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
-use vectorhawkd_manifest::{PluginCommand, PluginMcpServer, PluginUserConfigEntry};
 use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
+use vectorhawkd_manifest::{PluginCommand, PluginMcpServer, PluginUserConfigEntry};
 
 /// Recognized external plugin formats that can be imported.
 #[derive(Debug, PartialEq)]

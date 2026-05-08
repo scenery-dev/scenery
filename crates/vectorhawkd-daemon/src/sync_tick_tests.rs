@@ -32,10 +32,8 @@ fn temp_root(label: &str) -> Utf8PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("clock")
         .as_nanos();
-    Utf8PathBuf::from_path_buf(
-        std::env::temp_dir().join(format!("vh-daemon-sync-{label}-{nanos}")),
-    )
-    .expect("temp path utf-8")
+    Utf8PathBuf::from_path_buf(std::env::temp_dir().join(format!("vh-daemon-sync-{label}-{nanos}")))
+        .expect("temp path utf-8")
 }
 
 fn empty_cache() -> UpdateCheckCache {
@@ -295,7 +293,11 @@ fn gap06_unmanaged_server_buffered_as_audit_event() {
             "shadow-tool": {"command": "npx", "args": ["-y", "shadow-mcp-server"]}
         }
     });
-    std::fs::write(&claude_json_path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+    std::fs::write(
+        &claude_json_path,
+        serde_json::to_string_pretty(&config).unwrap(),
+    )
+    .unwrap();
 
     // Redirect HOME so detect_ai_clients() finds the fake config.
     // Hold HOME_MUTEX for the entire test body to prevent races with the other
@@ -382,7 +384,11 @@ fn gap06_no_events_when_all_servers_managed() {
             "vectorhawk": {"command": "vectorhawk", "args": ["mcp", "serve"]}
         }
     });
-    std::fs::write(&claude_json_path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+    std::fs::write(
+        &claude_json_path,
+        serde_json::to_string_pretty(&config).unwrap(),
+    )
+    .unwrap();
 
     let _home_guard = HOME_MUTEX.lock().unwrap();
     let original_home = std::env::var("HOME").ok();
