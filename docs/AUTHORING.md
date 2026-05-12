@@ -109,14 +109,21 @@ When omitted, the runtime generates a single `llm` step from the Markdown body.
 
 ### `vh_model`
 
-Override the default model selection:
+By default (when `vh_model` is omitted), the runner uses MCP sampling — the AI
+client's own model (Claude Sonnet, GPT-4o, etc.). Only set `vh_model` when the
+skill requires local inference, e.g. for sensitive data that must not leave the
+machine:
 
 ```yaml
 vh_model:
   provider: ollama        # ollama | mcp-sampling
   name: llama3.2
+  prefer_local: true      # try Ollama first, fall back to MCP sampling
   min_context_tokens: 8192
 ```
+
+`prefer_local: false` (the default) means: try MCP sampling first, fall back to
+Ollama if the client has no sampling capability.
 
 ### `vh_schemas`
 
