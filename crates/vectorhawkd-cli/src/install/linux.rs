@@ -164,14 +164,46 @@ fn install_systemd(bin_path: &std::path::Path) -> Result<()> {
     systemctl_user(&["daemon-reload"]).context("systemctl daemon-reload failed")?;
 
     // ── 4. enable --now ───────────────────────────────────────────────────────
-    systemctl_user(&["enable", "--now", SERVICE_NAME])
-        .context("failed to enable and start systemd unit")?;
+    // This starts the daemon immediately when a D-Bus user session is present
+    // (normal interactive login). In Homebrew post_install or headless SSH
+    // contexts, XDG_RUNTIME_DIR may be absent and systemctl --user will fail.
+    // We ignore that error and fall back to spawning the daemon directly.
+    let started_via_systemd = systemctl_user(&["enable", "--now", SERVICE_NAME]).is_ok();
 
-    println!("Systemd user unit enabled and started ({SERVICE_NAME}).");
-    println!(
-        "Note: on headless servers without an active user session, you may need to run \
-         `sudo loginctl enable-linger $USER` so the agent starts without a graphical login."
-    );
+    // ── 5. Verify socket reachable; spawn directly if systemd didn't start it ─
+    let socket_path = daemon_socket_path();
+    if !socket_is_reachable(&socket_path, 1500) {
+        // systemctl didn't start the daemon (no D-Bus session, CI, post_install
+        // sandbox). Spawn it directly so the user doesn't have to log out and in.
+        let _ = std::process::Command::new(&bin_path)
+            .args(["daemon", "run", "--foreground"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+
+        // Give it a moment to bind the socket.
+        std::thread::sleep(std::time::Duration::from_millis(800));
+
+        if socket_is_reachable(&socket_path, 1000) {
+            println!("VectorHawk daemon started (direct spawn fallback).");
+        } else {
+            println!(
+                "VectorHawk daemon unit installed. Start it now with:\n  \
+                 systemctl --user start {SERVICE_NAME}"
+            );
+        }
+    } else {
+        if started_via_systemd {
+            println!("Systemd user unit enabled and started ({SERVICE_NAME}).");
+        } else {
+            println!("VectorHawk daemon is running.");
+        }
+        println!(
+            "Note: on headless servers without an active user session, run \
+             `sudo loginctl enable-linger $USER` so the agent starts without a graphical login."
+        );
+    }
     Ok(())
 }
 
