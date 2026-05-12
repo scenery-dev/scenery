@@ -136,6 +136,15 @@ pub enum SkillCommand {
         /// and you have reviewed the findings.
         #[arg(long, default_value_t = false)]
         confirm_risky: bool,
+
+        /// Automatically apply recommended metadata (vh_triggers, vh_model) when
+        /// any recommended fields are missing, without prompting.
+        #[arg(long, default_value_t = false)]
+        accept_suggestions: bool,
+
+        /// Skip the recommendation prompt entirely; do not add missing metadata.
+        #[arg(long, default_value_t = false)]
+        skip_metadata: bool,
     },
 
     /// Validate a skill bundle directory.
@@ -170,6 +179,33 @@ pub enum SkillCommand {
         /// Path to the legacy bundle directory (must contain manifest.json).
         path: camino::Utf8PathBuf,
         /// Output directory for the new SKILL.md tree (default: <path>-skill-md/).
+        #[arg(long)]
+        output_dir: Option<camino::Utf8PathBuf>,
+    },
+
+    /// Author a new skill interactively, with heuristic recommendations.
+    ///
+    /// Prompts for skill name and system prompt if not provided as flags.
+    /// Runs the heuristic engine and presents recommendations for permissions,
+    /// model sizing, execution constraints, and trigger phrases.
+    Author {
+        /// Skill name (becomes directory name and frontmatter `name` field).
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Path to a file containing the system prompt text.
+        #[arg(long, value_name = "FILE")]
+        prompt_file: Option<camino::Utf8PathBuf>,
+
+        /// Automatically apply all recommendations without interactive prompts.
+        #[arg(long, default_value_t = false)]
+        accept_suggestions: bool,
+
+        /// Skip all metadata recommendations; scaffold with hardcoded defaults.
+        #[arg(long, default_value_t = false)]
+        skip_metadata: bool,
+
+        /// Target parent directory (default: current directory).
         #[arg(long)]
         output_dir: Option<camino::Utf8PathBuf>,
     },
@@ -362,7 +398,18 @@ async fn run(cli: Cli) -> Result<()> {
             path,
             registry_url,
             confirm_risky,
-        }) => cmd_skill_import(path, registry_url.as_deref(), confirm_risky).await,
+            accept_suggestions,
+            skip_metadata,
+        }) => {
+            cmd_skill_import(
+                path,
+                registry_url.as_deref(),
+                confirm_risky,
+                accept_suggestions,
+                skip_metadata,
+            )
+            .await
+        }
         Command::Skill(SkillCommand::Validate { path }) => cmd_skill_validate(path).await,
         Command::Skill(SkillCommand::Init { name, output_dir }) => {
             cmd_skill_init(&name, output_dir.as_deref()).await
@@ -374,6 +421,22 @@ async fn run(cli: Cli) -> Result<()> {
         }) => cmd_skill_publish(path, &registry_url, dry_run).await,
         Command::Skill(SkillCommand::Convert { path, output_dir }) => {
             cmd_skill_convert(path, output_dir.as_deref()).await
+        }
+        Command::Skill(SkillCommand::Author {
+            name,
+            prompt_file,
+            accept_suggestions,
+            skip_metadata,
+            output_dir,
+        }) => {
+            cmd_skill_author(
+                name.as_deref(),
+                prompt_file.as_deref(),
+                accept_suggestions,
+                skip_metadata,
+                output_dir.as_deref(),
+            )
+            .await
         }
 
         Command::Auth(AuthCommand::Login { registry_url }) => cmd_auth_login(&registry_url).await,
@@ -982,6 +1045,8 @@ async fn cmd_skill_import(
     path: camino::Utf8PathBuf,
     registry_url: Option<&str>,
     confirm_risky: bool,
+    accept_suggestions: bool,
+    skip_metadata: bool,
 ) -> Result<()> {
     use vectorhawkd_core::{
         auth::load_tokens,
@@ -1042,7 +1107,143 @@ async fn cmd_skill_import(
         println!("  {f}");
     }
 
+    // ── AUTH2d: recommendation enrichment for missing vh_triggers / vh_model ──
+
+    if !skip_metadata {
+        let skill_md_path = bundle.output_dir.join("SKILL.md");
+        maybe_enrich_skill_md(&skill_md_path, accept_suggestions)?;
+    }
+
     Ok(())
+}
+
+/// Read a SKILL.md back from disk after import and, if `vh_triggers` or
+/// `vh_model` are absent, offer to add them via the recommendation engine.
+///
+/// Runs interactively unless `accept_suggestions` is true.
+fn maybe_enrich_skill_md(
+    skill_md_path: &camino::Utf8PathBuf,
+    accept_suggestions: bool,
+) -> Result<()> {
+    use std::io::{self, Write};
+    use vectorhawkd_core::recommend::recommend_from_prompt;
+
+    let content = match std::fs::read_to_string(skill_md_path) {
+        Ok(c) => c,
+        Err(_) => return Ok(()), // best-effort — do not fail import
+    };
+
+    // Detect whether vh_triggers and/or vh_model are present in the frontmatter.
+    let missing_triggers = !content.contains("vh_triggers:");
+    let missing_model = !content.contains("vh_model:");
+
+    if !missing_triggers && !missing_model {
+        return Ok(());
+    }
+
+    // Report which fields are missing.
+    let mut missing_fields: Vec<&str> = Vec::new();
+    if missing_triggers {
+        missing_fields.push("vh_triggers");
+    }
+    if missing_model {
+        missing_fields.push("vh_model");
+    }
+    let fields_str = missing_fields.join(", ");
+    println!("Missing recommended fields detected: {fields_str}");
+
+    let should_apply = if accept_suggestions {
+        true
+    } else {
+        print!("Run recommendation engine to fill these? [Y/n]: ");
+        io::stdout().flush().ok();
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer).ok();
+        let answer = answer.trim().to_lowercase();
+        answer.is_empty() || answer == "y" || answer == "yes"
+    };
+
+    if !should_apply {
+        return Ok(());
+    }
+
+    // Extract the body (system prompt) from the SKILL.md.
+    let body = extract_skill_md_body(&content).unwrap_or_default();
+    let rec = recommend_from_prompt("", "", &body);
+
+    // Build the YAML lines to inject before the closing `---`.
+    let mut additions = String::new();
+
+    if missing_model {
+        let recommended_yaml = rec
+            .model
+            .recommended
+            .iter()
+            .map(|m| format!("  - {m}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        additions.push_str(&format!(
+            "vh_model:\n  min_params_b: {}\n  recommended:\n{recommended_yaml}\n  fallback: {}\n",
+            rec.model.min_params_b, rec.model.fallback
+        ));
+    }
+
+    if missing_triggers && !rec.triggers.is_empty() {
+        let items = rec
+            .triggers
+            .iter()
+            .map(|t| format!("  - {t}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        additions.push_str(&format!("vh_triggers:\n{items}\n"));
+    }
+
+    if additions.is_empty() {
+        return Ok(());
+    }
+
+    // Insert the additions before the closing `---` line of the frontmatter.
+    let enriched = insert_before_closing_fence(&content, &additions);
+    std::fs::write(skill_md_path, enriched)
+        .with_context(|| format!("failed to write enriched SKILL.md at {skill_md_path}"))?;
+
+    let mut added: Vec<&str> = Vec::new();
+    if missing_model {
+        added.push("vh_model");
+    }
+    if missing_triggers && !rec.triggers.is_empty() {
+        added.push("vh_triggers");
+    }
+    println!("Added: {}", added.join(", "));
+
+    Ok(())
+}
+
+/// Extract the Markdown body (after the closing `---` frontmatter fence).
+fn extract_skill_md_body(content: &str) -> Option<String> {
+    let after_open = content.strip_prefix("---\n")?;
+    let close = after_open.find("\n---\n")?;
+    let body = &after_open[close + 5..];
+    Some(body.trim().to_string())
+}
+
+/// Insert `additions` text immediately before the closing `\n---\n` frontmatter fence.
+///
+/// Returns the original content unchanged if no frontmatter fence is found.
+fn insert_before_closing_fence(content: &str, additions: &str) -> String {
+    let after_open = match content.strip_prefix("---\n") {
+        Some(s) => s,
+        None => return content.to_string(),
+    };
+    let close_offset = match after_open.find("\n---\n") {
+        Some(o) => o,
+        None => return content.to_string(),
+    };
+    // close_offset is byte offset in after_open where `\n---\n` starts.
+    // In original content that is 4 (len of "---\n") + close_offset.
+    let split_at = 4 + close_offset + 1; // +1 to include the '\n' that precedes ---
+    let (front, back) = content.split_at(split_at);
+    format!("{front}{additions}{back}")
 }
 
 // ── skill validate ────────────────────────────────────────────────────────────
@@ -1128,6 +1329,489 @@ You should: TODO
     println!("  3. vectorhawk skill publish {skill_dir}/ --registry-url <url>");
 
     Ok(())
+}
+
+// ── skill author ─────────────────────────────────────────────────────────────
+
+async fn cmd_skill_author(
+    name: Option<&str>,
+    prompt_file: Option<&camino::Utf8Path>,
+    accept_suggestions: bool,
+    skip_metadata: bool,
+    output_dir: Option<&camino::Utf8Path>,
+) -> Result<()> {
+    use std::fs;
+    use std::io::{self, BufRead, Write};
+    use vectorhawkd_core::recommend::recommend_from_prompt;
+
+    // ── Step 1: Resolve skill name ────────────────────────────────────────────
+
+    let skill_name = match name {
+        Some(n) => n.to_string(),
+        None => {
+            print!("Skill name: ");
+            io::stdout().flush().ok();
+            let mut line = String::new();
+            io::stdin()
+                .lock()
+                .read_line(&mut line)
+                .context("failed to read skill name from stdin")?;
+            let trimmed = line.trim().to_string();
+            if trimmed.is_empty() {
+                anyhow::bail!("skill name must not be empty");
+            }
+            trimmed
+        }
+    };
+
+    // ── Step 2: Resolve system prompt ─────────────────────────────────────────
+
+    let prompt_text = match prompt_file {
+        Some(p) => {
+            fs::read_to_string(p).with_context(|| format!("failed to read prompt file '{p}'"))?
+        }
+        None => {
+            print!("System prompt file path: ");
+            io::stdout().flush().ok();
+            let mut line = String::new();
+            io::stdin()
+                .lock()
+                .read_line(&mut line)
+                .context("failed to read prompt file path from stdin")?;
+            let file_path = line.trim();
+            if file_path.is_empty() {
+                anyhow::bail!("prompt file path must not be empty");
+            }
+            fs::read_to_string(file_path)
+                .with_context(|| format!("failed to read prompt file '{file_path}'"))?
+        }
+    };
+
+    // ── Step 3: Run recommendation engine ────────────────────────────────────
+
+    let rec = recommend_from_prompt(&skill_name, "", &prompt_text);
+
+    // ── Step 4: Determine final metadata values ───────────────────────────────
+
+    // Normalize the skill ID from the name.
+    let skill_id = skill_name
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<&str>>()
+        .join("-")
+        .replace('_', "-");
+
+    let base = output_dir
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| camino::Utf8PathBuf::from("."));
+
+    if skip_metadata {
+        // Scaffold with hardcoded defaults.
+        scaffold_with_defaults(&skill_id, &prompt_text, &base)?;
+        println!("Created skill at {}/{}/SKILL.md", base, skill_id);
+        println!();
+        println!("Next steps:");
+        println!(
+            "  1. Edit {}/{}/SKILL.md — fill in description and publisher",
+            base, skill_id
+        );
+        println!("  2. vectorhawk skill validate {}/{}/", base, skill_id);
+        return Ok(());
+    }
+
+    if accept_suggestions {
+        // Scaffold with recommendations applied.
+        scaffold_with_recommendations(&skill_id, &prompt_text, &base, &rec)?;
+        let confidence_str = format!("{:?}", rec.confidence).to_lowercase();
+        println!("Created skill at {}/{}/SKILL.md", base, skill_id);
+        println!("Applied recommendations (confidence: {confidence_str}):");
+        println!("  network:      {}", rec.permissions.network);
+        println!("  filesystem:   {}", rec.permissions.filesystem);
+        println!("  min_params_b: {}", rec.model.min_params_b);
+        println!("  timeout_ms:   {}", rec.execution.timeout_ms);
+        println!("  sandbox:      {}", rec.execution.sandbox);
+        println!("  triggers:     {}", rec.triggers.join(", "));
+        println!();
+        println!("Next: vectorhawk skill validate {}/{}/", base, skill_id);
+        return Ok(());
+    }
+
+    // ── Interactive mode: show each group and prompt [Y/n/edit] ───────────────
+
+    let confidence_str = format!("{:?}", rec.confidence).to_lowercase();
+    println!();
+    println!("Recommendations (confidence: {confidence_str}):");
+    println!();
+
+    // Permissions group.
+    println!(
+        "Permissions: network={}, filesystem={}, clipboard={}",
+        rec.permissions.network, rec.permissions.filesystem, rec.permissions.clipboard
+    );
+    let (net, fs_perm, clip) = prompt_field_group_permissions(
+        rec.permissions.network,
+        rec.permissions.filesystem,
+        rec.permissions.clipboard,
+    )?;
+
+    // Model group.
+    println!(
+        "Model: min_params_b={}, recommended={}, fallback={}",
+        rec.model.min_params_b,
+        rec.model.recommended.join(","),
+        rec.model.fallback
+    );
+    let (min_params_b, recommended_models, fallback) = prompt_field_group_model(
+        rec.model.min_params_b,
+        &rec.model.recommended,
+        rec.model.fallback,
+    )?;
+
+    // Execution group.
+    println!(
+        "Execution: timeout_ms={}, memory_mb={}, sandbox={}",
+        rec.execution.timeout_ms, rec.execution.memory_mb, rec.execution.sandbox
+    );
+    let (timeout_ms, memory_mb, sandbox) = prompt_field_group_execution(
+        rec.execution.timeout_ms,
+        rec.execution.memory_mb,
+        rec.execution.sandbox,
+    )?;
+
+    // Triggers group.
+    println!("Triggers: {}", rec.triggers.join(", "));
+    let triggers = prompt_field_group_triggers(&rec.triggers)?;
+
+    // ── Scaffold with confirmed values ────────────────────────────────────────
+
+    let skill_dir = base.join(&skill_id);
+    if skill_dir.exists() {
+        anyhow::bail!("directory '{}' already exists", skill_dir);
+    }
+    fs::create_dir_all(&skill_dir)
+        .with_context(|| format!("failed to create directory '{skill_dir}'"))?;
+
+    let triggers_yaml = if triggers.is_empty() {
+        String::new()
+    } else {
+        let items = triggers
+            .iter()
+            .map(|t| format!("  - {t}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("vh_triggers:\n{items}\n")
+    };
+
+    let recommended_yaml = recommended_models
+        .iter()
+        .map(|m| format!("  - {m}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let skill_name_display = skill_id.replace('-', " ");
+    let skill_md = format!(
+        "---\nname: {skill_name_display}\ndescription: \"TODO: describe what this skill does\"\nlicense: Apache-2.0\nvh_version: 0.1.0\nvh_publisher: YOUR_PUBLISHER_ID\nvh_permissions:\n  network: {net}\n  filesystem: {fs_perm}\n  clipboard: {clip}\nvh_execution:\n  timeout_ms: {timeout_ms}\n  memory_mb: {memory_mb}\n  sandbox: {sandbox}\nvh_model:\n  min_params_b: {min_params_b}\n  recommended:\n{recommended_yaml}\n  fallback: {fallback}\n{triggers_yaml}---\n\n{prompt_text}\n"
+    );
+
+    fs::write(skill_dir.join("SKILL.md"), &skill_md).context("failed to write SKILL.md")?;
+
+    println!();
+    println!("Created skill at {skill_dir}/SKILL.md");
+    println!();
+    println!("Next steps:");
+    println!("  1. Edit {skill_dir}/SKILL.md — fill in description and publisher");
+    println!("  2. vectorhawk skill validate {skill_dir}/");
+
+    Ok(())
+}
+
+/// Scaffold a skill with hardcoded minimal defaults (no recommendations).
+fn scaffold_with_defaults(
+    skill_id: &str,
+    prompt_text: &str,
+    base: &camino::Utf8Path,
+) -> Result<()> {
+    use std::fs;
+
+    let skill_dir = base.join(skill_id);
+    if skill_dir.exists() {
+        anyhow::bail!("directory '{}' already exists", skill_dir);
+    }
+    fs::create_dir_all(&skill_dir)
+        .with_context(|| format!("failed to create directory '{skill_dir}'"))?;
+
+    let skill_name_display = skill_id.replace('-', " ");
+    let skill_md = format!(
+        "---\nname: {skill_name_display}\ndescription: \"TODO: describe what this skill does\"\nlicense: Apache-2.0\nvh_version: 0.1.0\nvh_publisher: YOUR_PUBLISHER_ID\nvh_permissions:\n  network: none\n  filesystem: none\n  clipboard: none\nvh_execution:\n  timeout_ms: 30000\n  memory_mb: 256\n  sandbox: strict\n---\n\n{prompt_text}\n"
+    );
+
+    fs::write(skill_dir.join("SKILL.md"), &skill_md).context("failed to write SKILL.md")
+}
+
+/// Scaffold a skill using the provided recommendation output.
+fn scaffold_with_recommendations(
+    skill_id: &str,
+    prompt_text: &str,
+    base: &camino::Utf8Path,
+    rec: &vectorhawkd_core::recommend::Recommendations,
+) -> Result<()> {
+    use std::fs;
+
+    let skill_dir = base.join(skill_id);
+    if skill_dir.exists() {
+        anyhow::bail!("directory '{}' already exists", skill_dir);
+    }
+    fs::create_dir_all(&skill_dir)
+        .with_context(|| format!("failed to create directory '{skill_dir}'"))?;
+
+    let triggers_yaml = if rec.triggers.is_empty() {
+        String::new()
+    } else {
+        let items = rec
+            .triggers
+            .iter()
+            .map(|t| format!("  - {t}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("vh_triggers:\n{items}\n")
+    };
+
+    let recommended_yaml = rec
+        .model
+        .recommended
+        .iter()
+        .map(|m| format!("  - {m}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let skill_name_display = skill_id.replace('-', " ");
+    let skill_md = format!(
+        "---\nname: {skill_name_display}\ndescription: \"TODO: describe what this skill does\"\nlicense: Apache-2.0\nvh_version: 0.1.0\nvh_publisher: YOUR_PUBLISHER_ID\nvh_permissions:\n  network: {net}\n  filesystem: {fs_perm}\n  clipboard: {clip}\nvh_execution:\n  timeout_ms: {timeout_ms}\n  memory_mb: {memory_mb}\n  sandbox: {sandbox}\nvh_model:\n  min_params_b: {min_params_b}\n  recommended:\n{recommended_yaml}\n  fallback: {fallback}\n{triggers_yaml}---\n\n{prompt_text}\n",
+        net = rec.permissions.network,
+        fs_perm = rec.permissions.filesystem,
+        clip = rec.permissions.clipboard,
+        timeout_ms = rec.execution.timeout_ms,
+        memory_mb = rec.execution.memory_mb,
+        sandbox = rec.execution.sandbox,
+        min_params_b = rec.model.min_params_b,
+        fallback = rec.model.fallback,
+    );
+
+    fs::write(skill_dir.join("SKILL.md"), &skill_md).context("failed to write SKILL.md")
+}
+
+// ── Interactive field-group prompt helpers ────────────────────────────────────
+
+/// Prompt for the permissions field group. Returns (network, filesystem, clipboard).
+fn prompt_field_group_permissions(
+    net_rec: &str,
+    fs_rec: &str,
+    clip_rec: &str,
+) -> Result<(String, String, String)> {
+    use std::io::{self, BufRead, Write};
+
+    print!("[Y/n/edit]: ");
+    io::stdout().flush().ok();
+    let mut answer = String::new();
+    io::stdin().lock().read_line(&mut answer).ok();
+    let answer = answer.trim().to_lowercase();
+
+    if answer.is_empty() || answer == "y" || answer == "yes" {
+        return Ok((
+            net_rec.to_string(),
+            fs_rec.to_string(),
+            clip_rec.to_string(),
+        ));
+    }
+
+    if answer == "n" || answer == "no" {
+        return Ok(("none".to_string(), "none".to_string(), "none".to_string()));
+    }
+
+    // Edit mode.
+    print!("  network [{net_rec}]: ");
+    io::stdout().flush().ok();
+    let mut net = String::new();
+    io::stdin().lock().read_line(&mut net).ok();
+    let net = net.trim();
+    let net = if net.is_empty() { net_rec } else { net };
+
+    print!("  filesystem [{fs_rec}]: ");
+    io::stdout().flush().ok();
+    let mut fs_val = String::new();
+    io::stdin().lock().read_line(&mut fs_val).ok();
+    let fs_val = fs_val.trim();
+    let fs_val = if fs_val.is_empty() { fs_rec } else { fs_val };
+
+    print!("  clipboard [{clip_rec}]: ");
+    io::stdout().flush().ok();
+    let mut clip = String::new();
+    io::stdin().lock().read_line(&mut clip).ok();
+    let clip = clip.trim();
+    let clip = if clip.is_empty() { clip_rec } else { clip };
+
+    Ok((net.to_string(), fs_val.to_string(), clip.to_string()))
+}
+
+/// Prompt for the model field group. Returns (min_params_b, recommended, fallback).
+fn prompt_field_group_model(
+    min_b_rec: f32,
+    models_rec: &[String],
+    fallback_rec: &str,
+) -> Result<(f32, Vec<String>, String)> {
+    use std::io::{self, BufRead, Write};
+
+    print!("[Y/n/edit]: ");
+    io::stdout().flush().ok();
+    let mut answer = String::new();
+    io::stdin().lock().read_line(&mut answer).ok();
+    let answer = answer.trim().to_lowercase();
+
+    if answer.is_empty() || answer == "y" || answer == "yes" {
+        return Ok((min_b_rec, models_rec.to_vec(), fallback_rec.to_string()));
+    }
+
+    if answer == "n" || answer == "no" {
+        return Ok((1.0, vec!["gemma3:2b".to_string()], "error".to_string()));
+    }
+
+    // Edit mode.
+    let models_str = models_rec.join(",");
+    print!("  min_params_b [{min_b_rec}]: ");
+    io::stdout().flush().ok();
+    let mut min_b = String::new();
+    io::stdin().lock().read_line(&mut min_b).ok();
+    let min_b = min_b.trim();
+    let min_b: f32 = if min_b.is_empty() {
+        min_b_rec
+    } else {
+        min_b.parse().unwrap_or(min_b_rec)
+    };
+
+    print!("  recommended [{models_str}]: ");
+    io::stdout().flush().ok();
+    let mut models_input = String::new();
+    io::stdin().lock().read_line(&mut models_input).ok();
+    let models_input = models_input.trim();
+    let models: Vec<String> = if models_input.is_empty() {
+        models_rec.to_vec()
+    } else {
+        models_input
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    };
+
+    print!("  fallback [{fallback_rec}]: ");
+    io::stdout().flush().ok();
+    let mut fallback = String::new();
+    io::stdin().lock().read_line(&mut fallback).ok();
+    let fallback = fallback.trim();
+    let fallback = if fallback.is_empty() {
+        fallback_rec
+    } else {
+        fallback
+    };
+
+    Ok((min_b, models, fallback.to_string()))
+}
+
+/// Prompt for the execution field group. Returns (timeout_ms, memory_mb, sandbox).
+fn prompt_field_group_execution(
+    timeout_rec: u32,
+    memory_rec: u32,
+    sandbox_rec: &str,
+) -> Result<(u32, u32, String)> {
+    use std::io::{self, BufRead, Write};
+
+    print!("[Y/n/edit]: ");
+    io::stdout().flush().ok();
+    let mut answer = String::new();
+    io::stdin().lock().read_line(&mut answer).ok();
+    let answer = answer.trim().to_lowercase();
+
+    if answer.is_empty() || answer == "y" || answer == "yes" {
+        return Ok((timeout_rec, memory_rec, sandbox_rec.to_string()));
+    }
+
+    if answer == "n" || answer == "no" {
+        return Ok((30000, 256, "strict".to_string()));
+    }
+
+    // Edit mode.
+    print!("  timeout_ms [{timeout_rec}]: ");
+    io::stdout().flush().ok();
+    let mut timeout = String::new();
+    io::stdin().lock().read_line(&mut timeout).ok();
+    let timeout = timeout.trim();
+    let timeout: u32 = if timeout.is_empty() {
+        timeout_rec
+    } else {
+        timeout.parse().unwrap_or(timeout_rec)
+    };
+
+    print!("  memory_mb [{memory_rec}]: ");
+    io::stdout().flush().ok();
+    let mut memory = String::new();
+    io::stdin().lock().read_line(&mut memory).ok();
+    let memory = memory.trim();
+    let memory: u32 = if memory.is_empty() {
+        memory_rec
+    } else {
+        memory.parse().unwrap_or(memory_rec)
+    };
+
+    print!("  sandbox [{sandbox_rec}]: ");
+    io::stdout().flush().ok();
+    let mut sandbox = String::new();
+    io::stdin().lock().read_line(&mut sandbox).ok();
+    let sandbox = sandbox.trim();
+    let sandbox = if sandbox.is_empty() {
+        sandbox_rec
+    } else {
+        sandbox
+    };
+
+    Ok((timeout, memory, sandbox.to_string()))
+}
+
+/// Prompt for the triggers field group. Returns the chosen trigger list.
+fn prompt_field_group_triggers(triggers_rec: &[String]) -> Result<Vec<String>> {
+    use std::io::{self, BufRead, Write};
+
+    print!("[Y/n/edit]: ");
+    io::stdout().flush().ok();
+    let mut answer = String::new();
+    io::stdin().lock().read_line(&mut answer).ok();
+    let answer = answer.trim().to_lowercase();
+
+    if answer.is_empty() || answer == "y" || answer == "yes" {
+        return Ok(triggers_rec.to_vec());
+    }
+
+    if answer == "n" || answer == "no" {
+        return Ok(Vec::new());
+    }
+
+    // Edit mode: show current and read new comma-separated list.
+    let current = triggers_rec.join(", ");
+    print!("  triggers [{current}]: ");
+    io::stdout().flush().ok();
+    let mut input = String::new();
+    io::stdin().lock().read_line(&mut input).ok();
+    let input = input.trim();
+    if input.is_empty() {
+        return Ok(triggers_rec.to_vec());
+    }
+
+    let triggers: Vec<String> = input
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| s.len() >= 3)
+        .collect();
+
+    Ok(triggers)
 }
 
 // ── skill publish ─────────────────────────────────────────────────────────────

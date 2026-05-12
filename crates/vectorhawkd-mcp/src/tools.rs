@@ -29,7 +29,7 @@ use crate::{
     aggregator::{sanitize_id, BackendRegistry},
     protocol::{ToolCallResult, ToolDefinition},
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rusqlite::Connection;
 use semver::Version;
 use std::collections::HashMap;
@@ -424,6 +424,108 @@ pub fn build_tool_list(state: &AppState, registry_url: &Option<String>) -> Vec<T
         }),
     });
 
+    // AUTH2c: skill authoring tools — always available (local operations)
+    tools.push(ToolDefinition {
+        name: "skillclub_author".to_string(),
+        description: "Author a new VectorHawk skill from a name and system prompt. \
+            In interactive mode (default) returns recommendations for you to review. \
+            Pass mode='accept_suggestions' to apply recommendations automatically. \
+            Pass mode='skip_metadata' to scaffold immediately with defaults."
+            .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Skill name (e.g. 'contract-compare')"
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Brief description of what the skill does"
+                },
+                "system_prompt": {
+                    "type": "string",
+                    "description": "The system prompt text for the skill"
+                },
+                "triggers": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional list of trigger phrases for the skill"
+                },
+                "output_dir": {
+                    "type": "string",
+                    "description": "Output directory path (default: current directory)"
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["interactive", "accept_suggestions", "skip_metadata"],
+                    "description": "Authoring mode (default: interactive)"
+                }
+            },
+            "required": ["name", "system_prompt"]
+        }),
+    });
+
+    tools.push(ToolDefinition {
+        name: "skillclub_author_confirm".to_string(),
+        description: "Confirm and scaffold a skill after reviewing recommendations from \
+            skillclub_author. Provide the final vh_* values to create the SKILL.md."
+            .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "skill_id": {
+                    "type": "string",
+                    "description": "The skill ID to create (e.g. 'contract-compare')"
+                },
+                "system_prompt": {
+                    "type": "string",
+                    "description": "The system prompt text for the skill"
+                },
+                "output_dir": {
+                    "type": "string",
+                    "description": "Output directory path (default: current directory)"
+                },
+                "vh_triggers": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Trigger phrases for the skill"
+                },
+                "vh_permissions": {
+                    "type": "object",
+                    "properties": {
+                        "network": {"type": "string"},
+                        "filesystem": {"type": "string"},
+                        "clipboard": {"type": "string"}
+                    },
+                    "description": "Permission settings (network, filesystem, clipboard)"
+                },
+                "vh_model": {
+                    "type": "object",
+                    "properties": {
+                        "min_params_b": {"type": "number"},
+                        "recommended": {
+                            "type": "array",
+                            "items": {"type": "string"}
+                        },
+                        "fallback": {"type": "string"}
+                    },
+                    "description": "Model requirements"
+                },
+                "vh_execution": {
+                    "type": "object",
+                    "properties": {
+                        "timeout_ms": {"type": "integer"},
+                        "memory_mb": {"type": "integer"},
+                        "sandbox": {"type": "string"}
+                    },
+                    "description": "Execution constraints"
+                }
+            },
+            "required": ["skill_id", "system_prompt"]
+        }),
+    });
+
     tools
 }
 
@@ -515,6 +617,8 @@ pub fn handle_tool_call(
         "vectorhawk_update" => handle_update(arguments, state, registry_url),
         "vectorhawk_plugin_export" => handle_plugin_export(arguments),
         "vectorhawk_plugin_import" => handle_plugin_import(arguments),
+        "skillclub_author" => handle_author(arguments),
+        "skillclub_author_confirm" => handle_author_confirm(arguments),
         _ => handle_skill_run(
             name,
             arguments,
@@ -1837,6 +1941,362 @@ fn handle_plugin_import(arguments: &serde_json::Value) -> ToolCallResult {
             )
         }
         Err(e) => ToolCallResult::error_result(format!("Import failed: {e}")),
+    }
+}
+
+// ── skillclub_author / skillclub_author_confirm handlers ─────────────────────
+
+/// Derive a skill directory name and display name from a raw skill ID or name.
+///
+/// Converts spaces to hyphens and lowercases the result so the directory
+/// matches the convention used by `vectorhawk skill init`.
+fn normalize_skill_id(raw: &str) -> String {
+    raw.to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<&str>>()
+        .join("-")
+        .replace('_', "-")
+}
+
+/// Parameters for `scaffold_skill_md`. Groups the SKILL.md fields to keep the
+/// function signature within clippy's argument-count limit.
+struct SkillMdParams<'a> {
+    skill_id: &'a str,
+    system_prompt: &'a str,
+    output_dir: &'a str,
+    triggers: &'a [String],
+    network: &'a str,
+    filesystem: &'a str,
+    clipboard: &'a str,
+    min_params_b: f32,
+    recommended_models: &'a [String],
+    fallback: &'a str,
+    timeout_ms: u32,
+    memory_mb: u32,
+    sandbox: &'a str,
+}
+
+/// Scaffold a SKILL.md in `output_dir/<skill_id>/` with the provided values.
+///
+/// Returns the path that was written on success.
+fn scaffold_skill_md(params: SkillMdParams<'_>) -> Result<String> {
+    let SkillMdParams {
+        skill_id,
+        system_prompt,
+        output_dir,
+        triggers,
+        network,
+        filesystem,
+        clipboard,
+        min_params_b,
+        recommended_models,
+        fallback,
+        timeout_ms,
+        memory_mb,
+        sandbox,
+    } = params;
+    use std::fs;
+
+    let base = camino::Utf8PathBuf::from(output_dir);
+    let skill_dir = base.join(skill_id);
+
+    if skill_dir.exists() {
+        anyhow::bail!("directory '{}' already exists", skill_dir);
+    }
+
+    fs::create_dir_all(&skill_dir)
+        .with_context(|| format!("failed to create directory '{skill_dir}'"))?;
+
+    // Produce the vh_triggers YAML block.
+    let triggers_yaml = if triggers.is_empty() {
+        String::new()
+    } else {
+        let items = triggers
+            .iter()
+            .map(|t| format!("  - {t}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("vh_triggers:\n{items}\n")
+    };
+
+    // Produce the vh_model YAML block.
+    let recommended_yaml = recommended_models
+        .iter()
+        .map(|m| format!("  - {m}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let skill_name = skill_id.replace('-', " ");
+    let skill_md = format!(
+        "---\nname: {skill_name}\ndescription: \"TODO: describe what this skill does\"\nlicense: Apache-2.0\nvh_version: 0.1.0\nvh_publisher: YOUR_PUBLISHER_ID\nvh_permissions:\n  network: {network}\n  filesystem: {filesystem}\n  clipboard: {clipboard}\nvh_execution:\n  timeout_ms: {timeout_ms}\n  memory_mb: {memory_mb}\n  sandbox: {sandbox}\nvh_model:\n  min_params_b: {min_params_b}\n  recommended:\n{recommended_yaml}\n  fallback: {fallback}\n{triggers_yaml}---\n\n{system_prompt}\n"
+    );
+
+    let skill_md_path = skill_dir.join("SKILL.md");
+    fs::write(&skill_md_path, &skill_md)
+        .with_context(|| format!("failed to write {skill_md_path}"))?;
+
+    Ok(skill_dir.to_string())
+}
+
+fn handle_author(arguments: &serde_json::Value) -> ToolCallResult {
+    use vectorhawkd_core::recommend::recommend_from_prompt;
+
+    let name = match arguments.get("name").and_then(|v| v.as_str()) {
+        Some(n) if !n.is_empty() => n,
+        _ => return ToolCallResult::error_result("Missing required parameter: name"),
+    };
+
+    let system_prompt = match arguments.get("system_prompt").and_then(|v| v.as_str()) {
+        Some(p) if !p.is_empty() => p,
+        _ => return ToolCallResult::error_result("Missing required parameter: system_prompt"),
+    };
+
+    let description = arguments
+        .get("description")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    let mode = arguments
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("interactive");
+
+    let output_dir = arguments
+        .get("output_dir")
+        .and_then(|v| v.as_str())
+        .unwrap_or(".");
+
+    let skill_id = normalize_skill_id(name);
+
+    match mode {
+        "skip_metadata" => {
+            // Scaffold immediately with hardcoded defaults.
+            let explicit_triggers: Vec<String> = arguments
+                .get("triggers")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            match scaffold_skill_md(SkillMdParams {
+                skill_id: &skill_id,
+                system_prompt,
+                output_dir,
+                triggers: &explicit_triggers,
+                network: "none",
+                filesystem: "none",
+                clipboard: "none",
+                min_params_b: 1.0,
+                recommended_models: &["gemma3:2b".to_string()],
+                fallback: "error",
+                timeout_ms: 30000,
+                memory_mb: 256,
+                sandbox: "strict",
+            }) {
+                Ok(path) => ToolCallResult::success(format!(
+                    "Skill '{skill_id}' created at {path}/SKILL.md\n\
+                     Next: vectorhawk skill validate {path}/"
+                )),
+                Err(e) => ToolCallResult::error_result(format!("Failed to scaffold skill: {e}")),
+            }
+        }
+
+        "accept_suggestions" => {
+            // Run recommendations and scaffold immediately.
+            let rec = recommend_from_prompt(name, description, system_prompt);
+
+            match scaffold_skill_md(SkillMdParams {
+                skill_id: &skill_id,
+                system_prompt,
+                output_dir,
+                triggers: &rec.triggers,
+                network: rec.permissions.network,
+                filesystem: rec.permissions.filesystem,
+                clipboard: rec.permissions.clipboard,
+                min_params_b: rec.model.min_params_b,
+                recommended_models: &rec.model.recommended,
+                fallback: rec.model.fallback,
+                timeout_ms: rec.execution.timeout_ms,
+                memory_mb: rec.execution.memory_mb,
+                sandbox: rec.execution.sandbox,
+            }) {
+                Ok(path) => {
+                    let confidence = format!("{:?}", rec.confidence).to_lowercase();
+                    ToolCallResult::success(format!(
+                        "Skill '{skill_id}' created at {path}/SKILL.md\n\
+                         Applied recommendations (confidence: {confidence}):\n\
+                         - network: {}\n\
+                         - filesystem: {}\n\
+                         - min_params_b: {}\n\
+                         - timeout_ms: {}\n\
+                         - sandbox: {}\n\
+                         Next: vectorhawk skill validate {path}/",
+                        rec.permissions.network,
+                        rec.permissions.filesystem,
+                        rec.model.min_params_b,
+                        rec.execution.timeout_ms,
+                        rec.execution.sandbox,
+                    ))
+                }
+                Err(e) => ToolCallResult::error_result(format!("Failed to scaffold skill: {e}")),
+            }
+        }
+
+        // "interactive" is the default — return structured recommendations without scaffolding.
+        _ => {
+            let rec = recommend_from_prompt(name, description, system_prompt);
+            let confidence_str = format!("{:?}", rec.confidence).to_lowercase();
+
+            let recommended_models: Vec<serde_json::Value> = rec
+                .model
+                .recommended
+                .iter()
+                .map(|m| serde_json::json!(m))
+                .collect();
+
+            let triggers_json: Vec<serde_json::Value> =
+                rec.triggers.iter().map(|t| serde_json::json!(t)).collect();
+
+            let payload = serde_json::json!({
+                "status": "recommendations_ready",
+                "skill_id": skill_id,
+                "recommendations": {
+                    "vh_triggers": triggers_json,
+                    "vh_permissions": {
+                        "network": rec.permissions.network,
+                        "filesystem": rec.permissions.filesystem,
+                        "clipboard": rec.permissions.clipboard
+                    },
+                    "vh_model": {
+                        "min_params_b": rec.model.min_params_b,
+                        "recommended": recommended_models,
+                        "fallback": rec.model.fallback
+                    },
+                    "vh_execution": {
+                        "timeout_ms": rec.execution.timeout_ms,
+                        "memory_mb": rec.execution.memory_mb,
+                        "sandbox": rec.execution.sandbox
+                    }
+                },
+                "confidence": confidence_str,
+                "message": "Recommendations ready. Review and call skillclub_author_confirm with your final values, or pass accept_suggestions: true to apply these directly."
+            });
+
+            match serde_json::to_string_pretty(&payload) {
+                Ok(text) => ToolCallResult::success(text),
+                Err(e) => ToolCallResult::error_result(format!("Failed to serialize: {e}")),
+            }
+        }
+    }
+}
+
+fn handle_author_confirm(arguments: &serde_json::Value) -> ToolCallResult {
+    let skill_id = match arguments.get("skill_id").and_then(|v| v.as_str()) {
+        Some(id) if !id.is_empty() => id,
+        _ => return ToolCallResult::error_result("Missing required parameter: skill_id"),
+    };
+
+    let system_prompt = match arguments.get("system_prompt").and_then(|v| v.as_str()) {
+        Some(p) if !p.is_empty() => p,
+        _ => return ToolCallResult::error_result("Missing required parameter: system_prompt"),
+    };
+
+    let output_dir = arguments
+        .get("output_dir")
+        .and_then(|v| v.as_str())
+        .unwrap_or(".");
+
+    // Extract vh_triggers.
+    let triggers: Vec<String> = arguments
+        .get("vh_triggers")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Extract vh_permissions with defaults.
+    let perms = arguments.get("vh_permissions");
+    let network = perms
+        .and_then(|p| p.get("network"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("none")
+        .to_string();
+    let filesystem = perms
+        .and_then(|p| p.get("filesystem"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("none")
+        .to_string();
+    let clipboard = perms
+        .and_then(|p| p.get("clipboard"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("none")
+        .to_string();
+
+    // Extract vh_model with defaults.
+    let model = arguments.get("vh_model");
+    let min_params_b = model
+        .and_then(|m| m.get("min_params_b"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(1.0) as f32;
+    let recommended_models: Vec<String> = model
+        .and_then(|m| m.get("recommended"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_else(|| vec!["gemma3:2b".to_string()]);
+    let fallback = model
+        .and_then(|m| m.get("fallback"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("error")
+        .to_string();
+
+    // Extract vh_execution with defaults.
+    let exec = arguments.get("vh_execution");
+    let timeout_ms = exec
+        .and_then(|e| e.get("timeout_ms"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(30000) as u32;
+    let memory_mb = exec
+        .and_then(|e| e.get("memory_mb"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(256) as u32;
+    let sandbox = exec
+        .and_then(|e| e.get("sandbox"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("strict")
+        .to_string();
+
+    let normalized_id = normalize_skill_id(skill_id);
+
+    match scaffold_skill_md(SkillMdParams {
+        skill_id: &normalized_id,
+        system_prompt,
+        output_dir,
+        triggers: &triggers,
+        network: &network,
+        filesystem: &filesystem,
+        clipboard: &clipboard,
+        min_params_b,
+        recommended_models: &recommended_models,
+        fallback: &fallback,
+        timeout_ms,
+        memory_mb,
+        sandbox: &sandbox,
+    }) {
+        Ok(path) => ToolCallResult::success(format!(
+            "Skill '{normalized_id}' created at {path}/SKILL.md\n\
+             Next: vectorhawk skill validate {path}/"
+        )),
+        Err(e) => ToolCallResult::error_result(format!("Failed to scaffold skill: {e}")),
     }
 }
 

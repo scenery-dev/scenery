@@ -55,3 +55,6 @@ pub mod ratings;
 
 // SEC3: scan client — `POST /runner/scan` verdict fetch with fail-open semantics.
 pub mod scan;
+
+// AUTH2b: heuristic recommendation engine for SKILL.md authoring.
+pub mod recommend;
