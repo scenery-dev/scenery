@@ -1094,7 +1094,7 @@ async fn cmd_skill_init(name: &str, output_dir: Option<&camino::Utf8Path>) -> Re
     let skill_md = format!(
         r#"---
 name: {name}
-description: TODO: describe what this skill does
+description: "TODO: describe what this skill does"
 license: Apache-2.0
 vh_version: 0.1.0
 vh_publisher: YOUR_PUBLISHER_ID
@@ -1258,10 +1258,12 @@ async fn cmd_skill_convert(
         .as_deref()
         .unwrap_or("TODO: add description");
 
+    // Escape any double-quotes in description before embedding in YAML string literal.
+    let description_escaped = description.replace('"', "\\\"");
     let mut fm = format!(
         r#"---
 name: {name}
-description: {description}
+description: "{description_escaped}"
 license: {license}
 vh_version: {version}
 vh_publisher: {publisher}
@@ -1275,7 +1277,7 @@ vh_execution:
   sandbox: {sandbox}
 "#,
         name = manifest.name,
-        description = description,
+        description_escaped = description_escaped,
         license = license,
         version = manifest.version,
         publisher = manifest.publisher,
@@ -1295,9 +1297,12 @@ vh_execution:
     fm.push_str(&format!("# {}\n\n", manifest.name));
     fm.push_str(&prompt_body);
 
+    // Strip any trailing slash before appending the suffix so that
+    // `skill convert ./foo/` produces `./foo-skill-md/` not `./foo/-skill-md/`.
+    let path_no_trailing = path.as_str().trim_end_matches('/');
     let dest = output_dir
         .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| camino::Utf8PathBuf::from(format!("{}-skill-md", path)));
+        .unwrap_or_else(|| camino::Utf8PathBuf::from(format!("{path_no_trailing}-skill-md")));
 
     if dest.exists() {
         anyhow::bail!("output directory '{}' already exists", dest);
