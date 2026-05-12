@@ -83,14 +83,32 @@ X-GNOME-Autostart-enabled=true
     ))
 }
 
-/// Run a `systemctl --user` command, capturing stderr, and return a descriptive
-/// error on non-zero exit.
+/// Return the XDG_RUNTIME_DIR to use for this user, preferring the env var
+/// but falling back to the canonical `/run/user/<uid>` path.
+fn xdg_runtime_dir() -> String {
+    if let Ok(v) = std::env::var("XDG_RUNTIME_DIR") {
+        if !v.is_empty() {
+            return v;
+        }
+    }
+    let uid = unsafe { libc::getuid() };
+    format!("/run/user/{uid}")
+}
+
+/// Run a `systemctl --user` command with an explicit XDG_RUNTIME_DIR so it
+/// works from Homebrew post_install and other contexts where the env var may
+/// be absent.
 fn systemctl_user(args: &[&str]) -> Result<()> {
     let mut full_args = vec!["--user"];
     full_args.extend_from_slice(args);
 
+    let xdg = xdg_runtime_dir();
+    let bus = format!("unix:path={xdg}/bus");
+
     let output = Command::new("systemctl")
         .args(&full_args)
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .env("DBUS_SESSION_BUS_ADDRESS", &bus)
         .output()
         .context("failed to spawn systemctl")?;
 
@@ -171,26 +189,54 @@ fn install_systemd(bin_path: &std::path::Path) -> Result<()> {
     let started_via_systemd = systemctl_user(&["enable", "--now", SERVICE_NAME]).is_ok();
 
     // ── 5. Verify socket reachable; spawn directly if systemd didn't start it ─
-    let socket_path = daemon_socket_path();
-    if !socket_is_reachable(&socket_path, 1500) {
-        // systemctl didn't start the daemon (no D-Bus session, CI, post_install
-        // sandbox). Spawn it directly so the user doesn't have to log out and in.
-        let _ = std::process::Command::new(&bin_path)
-            .args(["daemon", "run", "--foreground"])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
+    // Use the canonical XDG path so the socket check agrees with where the
+    // daemon will bind regardless of whether XDG_RUNTIME_DIR is in the env.
+    let xdg = xdg_runtime_dir();
+    let xdg_sock = format!("{xdg}/vectorhawk/agent.sock");
 
-        // Give it a moment to bind the socket.
-        std::thread::sleep(std::time::Duration::from_millis(800));
+    if !socket_is_reachable(&xdg_sock, 1500) {
+        // systemctl didn't start the daemon (no D-Bus session or systemd user
+        // session not yet created). Spawn the daemon directly, detached from
+        // the current session (setsid) so it survives post_install exit.
+        use std::os::unix::process::CommandExt;
+        let xdg_clone = xdg.clone();
+        let _ = unsafe {
+            std::process::Command::new(&bin_path)
+                .args(["daemon", "run", "--foreground"])
+                .env("XDG_RUNTIME_DIR", &xdg_clone)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .pre_exec(|| {
+                    // Create a new session so SIGHUP on parent exit doesn't
+                    // reach the daemon.
+                    libc::setsid();
+                    Ok(())
+                })
+                .spawn()
+        };
 
-        if socket_is_reachable(&socket_path, 1000) {
+        // Give it up to 2 s to bind the socket.
+        for _ in 0..4 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            if socket_is_reachable(&xdg_sock, 500) {
+                break;
+            }
+        }
+
+        if socket_is_reachable(&xdg_sock, 500) {
             println!("VectorHawk daemon started (direct spawn fallback).");
+            println!(
+                "Note: the daemon is managed by systemd on next login. For \
+                 permanent auto-start without a graphical session, run:\n  \
+                 sudo loginctl enable-linger $USER"
+            );
         } else {
             println!(
                 "VectorHawk daemon unit installed. Start it now with:\n  \
-                 systemctl --user start {SERVICE_NAME}"
+                 XDG_RUNTIME_DIR={xdg} systemctl --user start {SERVICE_NAME}\n  \
+                 or: {bin_str} daemon run --foreground &",
+                bin_str = bin_path.display(),
             );
         }
     } else {
@@ -199,10 +245,6 @@ fn install_systemd(bin_path: &std::path::Path) -> Result<()> {
         } else {
             println!("VectorHawk daemon is running.");
         }
-        println!(
-            "Note: on headless servers without an active user session, run \
-             `sudo loginctl enable-linger $USER` so the agent starts without a graphical login."
-        );
     }
     Ok(())
 }
