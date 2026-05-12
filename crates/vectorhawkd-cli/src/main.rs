@@ -143,6 +143,36 @@ pub enum SkillCommand {
         /// Path to the skill bundle directory.
         path: camino::Utf8PathBuf,
     },
+
+    /// Scaffold a new SKILL.md-rooted skill.
+    Init {
+        /// Skill name (becomes the directory and the `name` frontmatter field).
+        name: String,
+        /// Target parent directory (default: current directory).
+        #[arg(long)]
+        output_dir: Option<camino::Utf8PathBuf>,
+    },
+
+    /// Publish a SKILL.md-rooted skill to the registry.
+    Publish {
+        /// Path to the skill directory (must contain SKILL.md).
+        path: camino::Utf8PathBuf,
+        /// Registry base URL.
+        #[arg(long, env = "VECTORHAWK_REGISTRY_URL")]
+        registry_url: String,
+        /// Compile and validate without creating a registry entry.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
+
+    /// Convert a legacy skill bundle to SKILL.md format.
+    Convert {
+        /// Path to the legacy bundle directory (must contain manifest.json).
+        path: camino::Utf8PathBuf,
+        /// Output directory for the new SKILL.md tree (default: <path>-skill-md/).
+        #[arg(long)]
+        output_dir: Option<camino::Utf8PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -334,6 +364,17 @@ async fn run(cli: Cli) -> Result<()> {
             confirm_risky,
         }) => cmd_skill_import(path, registry_url.as_deref(), confirm_risky).await,
         Command::Skill(SkillCommand::Validate { path }) => cmd_skill_validate(path).await,
+        Command::Skill(SkillCommand::Init { name, output_dir }) => {
+            cmd_skill_init(&name, output_dir.as_deref()).await
+        }
+        Command::Skill(SkillCommand::Publish {
+            path,
+            registry_url,
+            dry_run,
+        }) => cmd_skill_publish(path, &registry_url, dry_run).await,
+        Command::Skill(SkillCommand::Convert { path, output_dir }) => {
+            cmd_skill_convert(path, output_dir.as_deref()).await
+        }
 
         Command::Auth(AuthCommand::Login { registry_url }) => cmd_auth_login(&registry_url).await,
         Command::Auth(AuthCommand::Logout { registry_url }) => cmd_auth_logout(&registry_url).await,
@@ -1030,6 +1071,273 @@ async fn cmd_skill_validate(path: camino::Utf8PathBuf) -> Result<()> {
     } else {
         anyhow::bail!("validation failed — see checks above")
     }
+}
+
+// ── skill init ────────────────────────────────────────────────────────────────
+
+async fn cmd_skill_init(name: &str, output_dir: Option<&camino::Utf8Path>) -> Result<()> {
+    use std::fs;
+
+    let base = output_dir
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| camino::Utf8PathBuf::from("."));
+    let skill_dir = base.join(name);
+
+    if skill_dir.exists() {
+        anyhow::bail!("directory '{}' already exists", skill_dir);
+    }
+
+    fs::create_dir_all(&skill_dir)
+        .with_context(|| format!("failed to create directory '{skill_dir}'"))?;
+    fs::create_dir(skill_dir.join("prompts")).context("failed to create prompts/ directory")?;
+
+    let skill_md = format!(
+        r#"---
+name: {name}
+description: TODO: describe what this skill does
+license: Apache-2.0
+vh_version: 0.1.0
+vh_publisher: YOUR_PUBLISHER_ID
+vh_permissions:
+  network: none
+  filesystem: none
+  clipboard: none
+vh_execution:
+  timeout_ms: 30000
+  memory_mb: 256
+  sandbox: strict
+---
+
+# {name}
+
+TODO: Write your system prompt here.
+
+The user will provide: TODO
+
+You should: TODO
+"#
+    );
+
+    fs::write(skill_dir.join("SKILL.md"), &skill_md).context("failed to write SKILL.md")?;
+
+    println!("Created skill at {skill_dir}/SKILL.md");
+    println!();
+    println!("Next steps:");
+    println!("  1. Edit {skill_dir}/SKILL.md — fill in description, publisher, and prompt");
+    println!("  2. vectorhawk skill validate {skill_dir}/");
+    println!("  3. vectorhawk skill publish {skill_dir}/ --registry-url <url>");
+
+    Ok(())
+}
+
+// ── skill publish ─────────────────────────────────────────────────────────────
+
+async fn cmd_skill_publish(
+    path: camino::Utf8PathBuf,
+    registry_url: &str,
+    dry_run: bool,
+) -> Result<()> {
+    use flate2::{write::GzEncoder, Compression};
+    use tar::Builder;
+    use vectorhawkd_core::{auth::load_tokens, registry::RegistryClient, state::AppState};
+
+    if !path.join("SKILL.md").exists() {
+        anyhow::bail!(
+            "no SKILL.md found at '{}' — run 'vectorhawk skill init' to create one",
+            path
+        );
+    }
+
+    let state = AppState::bootstrap().context("failed to bootstrap state")?;
+    let tokens = load_tokens(&state, registry_url)
+        .context("failed to load auth tokens")?
+        .ok_or_else(|| anyhow::anyhow!("not authenticated — run 'vectorhawk auth login' first"))?;
+
+    // Pack the skill directory into an in-memory tar.gz.
+    let mut gz_buf: Vec<u8> = Vec::new();
+    {
+        let enc = GzEncoder::new(&mut gz_buf, Compression::default());
+        let mut tar = Builder::new(enc);
+        tar.append_dir_all(".", &path)
+            .with_context(|| format!("failed to pack skill directory '{path}'"))?;
+        tar.into_inner()
+            .context("failed to finalize tar")?
+            .finish()
+            .context("failed to finalize gzip")?;
+    }
+
+    println!(
+        "Packed {} ({} bytes) — uploading to {}...",
+        path,
+        gz_buf.len(),
+        registry_url
+    );
+
+    if dry_run {
+        println!("(dry run — skipping registry upload)");
+        return Ok(());
+    }
+
+    let registry = RegistryClient::new(registry_url).with_auth(tokens.access_token);
+    let resp = tokio::task::spawn_blocking(move || registry.compile_and_publish(gz_buf))
+        .await
+        .context("publish task panicked")?
+        .context("publish failed")?;
+
+    println!(
+        "Published '{}' v{}",
+        resp.frontmatter.name,
+        resp.frontmatter.vh_version.as_deref().unwrap_or("?")
+    );
+    println!("Content hash: {}", resp.content_hash);
+    if !resp.warnings.is_empty() {
+        println!("Warnings:");
+        for w in &resp.warnings {
+            println!("  ! {w}");
+        }
+    }
+
+    Ok(())
+}
+
+// ── skill convert ─────────────────────────────────────────────────────────────
+
+async fn cmd_skill_convert(
+    path: camino::Utf8PathBuf,
+    output_dir: Option<&camino::Utf8Path>,
+) -> Result<()> {
+    use std::fs;
+    use vectorhawkd_manifest::Manifest;
+
+    let manifest_path = path.join("manifest.json");
+    if !manifest_path.exists() {
+        anyhow::bail!(
+            "no manifest.json found at '{}' — this doesn't look like a legacy bundle",
+            path
+        );
+    }
+
+    let manifest_bytes = fs::read(&manifest_path).context("failed to read manifest.json")?;
+    let manifest: Manifest =
+        serde_json::from_slice(&manifest_bytes).context("failed to parse manifest.json")?;
+
+    // Read system prompt from prompts/system.txt if it exists.
+    let prompt_body = {
+        let system_txt = path.join("prompts").join("system.txt");
+        if system_txt.exists() {
+            fs::read_to_string(&system_txt).context("failed to read prompts/system.txt")?
+        } else {
+            "TODO: write your system prompt here.\n".to_string()
+        }
+    };
+
+    // Read workflow.yaml if it exists (for workflow_ref).
+    let has_workflow_yaml = path.join("workflow.yaml").exists();
+
+    // Build the SKILL.md frontmatter.
+    let network = manifest.permissions.network.as_str();
+    let filesystem = match manifest.permissions.filesystem {
+        vectorhawkd_manifest::FilesystemAccess::None => "none",
+        vectorhawkd_manifest::FilesystemAccess::ReadOnly => "read-only",
+        vectorhawkd_manifest::FilesystemAccess::Full => "full",
+    };
+    let clipboard = match manifest.permissions.clipboard {
+        vectorhawkd_manifest::ClipboardAccess::None => "none",
+        vectorhawkd_manifest::ClipboardAccess::Read => "read",
+        vectorhawkd_manifest::ClipboardAccess::Write => "write",
+        vectorhawkd_manifest::ClipboardAccess::Full => "full",
+    };
+    let sandbox = match manifest.execution.sandbox {
+        vectorhawkd_manifest::SandboxProfile::Strict => "strict",
+        vectorhawkd_manifest::SandboxProfile::Relaxed => "relaxed",
+        vectorhawkd_manifest::SandboxProfile::Unrestricted => "unrestricted",
+    };
+    let license = manifest.license.as_deref().unwrap_or("Apache-2.0");
+    let description = manifest
+        .description
+        .as_deref()
+        .unwrap_or("TODO: add description");
+
+    let mut fm = format!(
+        r#"---
+name: {name}
+description: {description}
+license: {license}
+vh_version: {version}
+vh_publisher: {publisher}
+vh_permissions:
+  network: {network}
+  filesystem: {filesystem}
+  clipboard: {clipboard}
+vh_execution:
+  timeout_ms: {timeout_ms}
+  memory_mb: {memory_mb}
+  sandbox: {sandbox}
+"#,
+        name = manifest.name,
+        description = description,
+        license = license,
+        version = manifest.version,
+        publisher = manifest.publisher,
+        network = network,
+        filesystem = filesystem,
+        clipboard = clipboard,
+        timeout_ms = manifest.execution.timeout_ms,
+        memory_mb = manifest.execution.memory_mb,
+        sandbox = sandbox,
+    );
+
+    if has_workflow_yaml {
+        fm.push_str("vh_workflow_ref: ./workflow.yaml\n");
+    }
+
+    fm.push_str("---\n\n");
+    fm.push_str(&format!("# {}\n\n", manifest.name));
+    fm.push_str(&prompt_body);
+
+    let dest = output_dir
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| camino::Utf8PathBuf::from(format!("{}-skill-md", path)));
+
+    if dest.exists() {
+        anyhow::bail!("output directory '{}' already exists", dest);
+    }
+    fs::create_dir_all(&dest)
+        .with_context(|| format!("failed to create output directory '{dest}'"))?;
+
+    fs::write(dest.join("SKILL.md"), &fm).context("failed to write SKILL.md")?;
+
+    // Copy prompts/ if it exists.
+    if path.join("prompts").exists() {
+        let dest_prompts = dest.join("prompts");
+        fs::create_dir_all(&dest_prompts).context("failed to create prompts/")?;
+        for entry in fs::read_dir(path.join("prompts"))
+            .context("failed to read prompts/")?
+            .flatten()
+        {
+            let fname = entry.file_name();
+            fs::copy(
+                entry.path(),
+                dest_prompts.join(fname.to_string_lossy().as_ref()),
+            )
+            .context("failed to copy prompt file")?;
+        }
+    }
+
+    // Copy workflow.yaml if present.
+    if has_workflow_yaml {
+        fs::copy(path.join("workflow.yaml"), dest.join("workflow.yaml"))
+            .context("failed to copy workflow.yaml")?;
+    }
+
+    println!("Converted to {dest}/SKILL.md");
+    println!();
+    println!("Next steps:");
+    println!("  1. Review the generated SKILL.md");
+    println!("  2. vectorhawk skill validate {dest}/");
+    println!("  3. vectorhawk skill publish {dest}/ --registry-url <url>");
+
+    Ok(())
 }
 
 // ── auth login ────────────────────────────────────────────────────────────────

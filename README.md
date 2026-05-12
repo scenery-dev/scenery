@@ -49,6 +49,31 @@ cargo test
 cargo clippy
 ```
 
+## Authoring Skills
+
+Skills are Markdown files with YAML frontmatter (`SKILL.md`). The body becomes the system prompt; frontmatter controls metadata, permissions, and execution settings.
+
+```bash
+# Scaffold a new skill
+vectorhawk skill init my-skill
+
+# Edit the scaffold, then validate
+vectorhawk skill validate my-skill/
+
+# Publish to the registry
+vectorhawk skill publish my-skill/ --registry-url https://app.vectorhawk.ai
+```
+
+See [`docs/AUTHORING.md`](docs/AUTHORING.md) for the full authoring guide and
+[`crates/vectorhawkd-manifest/schemas/skill_md_frontmatter.json`](crates/vectorhawkd-manifest/schemas/skill_md_frontmatter.json)
+for the JSON Schema.
+
+Example skills are in [`examples/skills/`](examples/skills/):
+- `minimal/` — bare minimum (name + description + prompt body)
+- `medium/` — permissions, execution limits, triggers
+- `complex/` — multi-step workflow with external prompt files
+- `contract-compare/` — production-grade skill with schemas
+
 ## Install
 
 ### Homebrew (macOS)

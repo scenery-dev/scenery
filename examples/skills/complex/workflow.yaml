@@ -1,0 +1,6 @@
+steps:
+  - name: triage
+    type: llm
+    params:
+      prompt_file: prompts/system.txt
+      output_schema: schemas/output.json
