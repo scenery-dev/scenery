@@ -1,7 +1,9 @@
+use crate::scan::{ScanClient, ScanVerdict};
 use anyhow::{Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use serde::Deserialize;
 use std::fs;
+use tracing::warn;
 use vectorhawkd_manifest::to_skill_id;
 
 /// Files written when scaffolding a bundle from a SKILL.md.
@@ -37,6 +39,19 @@ struct SkillMdFrontmatter {
     publisher: Option<String>,
     license: Option<String>,
 }
+
+// ── ImportResult ──────────────────────────────────────────────────────────────
+
+/// Outcome of `import_local_skill_md_with_scan`, combining the scaffolded bundle
+/// with an optional security verdict.
+#[derive(Debug)]
+pub struct ImportResult {
+    pub bundle: ScaffoldedBundle,
+    /// `None` when no scanner was provided (offline / unauthenticated mode).
+    pub scan_verdict: Option<ScanVerdict>,
+}
+
+// ── Public import functions ───────────────────────────────────────────────────
 
 /// Read a SKILL.md, parse its frontmatter and body, and scaffold a complete
 /// bundle directory next to the source file.
@@ -75,6 +90,43 @@ pub fn import_local_skill_md(skill_md_path: &Utf8Path) -> Result<ScaffoldedBundl
         id,
         output_dir,
         files,
+    })
+}
+
+/// Read a SKILL.md, optionally scan its contents for security threats, then
+/// scaffold a complete bundle directory next to the source file.
+///
+/// When `scanner` is `Some`, calls `scanner.scan(...)` on the raw file bytes
+/// before scaffolding. The scan is always **fail-open**: if the scanner returns
+/// an error it is logged and `scan_verdict` is set to `None` so the import still
+/// proceeds.
+///
+/// The original `import_local_skill_md` function is unchanged and still works
+/// without a scanner.
+pub fn import_local_skill_md_with_scan(
+    skill_md_path: &Utf8Path,
+    scanner: Option<&dyn ScanClient>,
+) -> Result<ImportResult> {
+    let raw_bytes =
+        fs::read(skill_md_path).with_context(|| format!("failed to read {skill_md_path}"))?;
+
+    // Perform the scan (fail-open: errors become None).
+    let scan_verdict = match scanner {
+        None => None,
+        Some(sc) => match sc.scan(&raw_bytes, "skill_md") {
+            Ok(verdict) => Some(verdict),
+            Err(e) => {
+                warn!(error = %e, path = %skill_md_path, "scan returned error — proceeding without verdict");
+                None
+            }
+        },
+    };
+
+    let bundle = import_local_skill_md(skill_md_path)?;
+
+    Ok(ImportResult {
+        bundle,
+        scan_verdict,
     })
 }
 
@@ -206,6 +258,7 @@ const OUTPUT_SCHEMA: &str = r#"{
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scan::{ScanVerdict, Severity};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir(label: &str) -> Utf8PathBuf {
@@ -307,6 +360,90 @@ It can span multiple lines.
 
         let err = import_local_skill_md(&path).expect_err("missing frontmatter should fail");
         assert!(err.to_string().contains("frontmatter"), "got: {err}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── import_local_skill_md_with_scan ───────────────────────────────────────
+
+    #[test]
+    fn with_scan_none_scanner_matches_original_output() {
+        let dir = temp_dir("scan-none");
+        let path = write_skill_md(&dir, SAMPLE_SKILL_MD);
+
+        let plain = import_local_skill_md(&path).expect("plain import should succeed");
+        let with_scan =
+            import_local_skill_md_with_scan(&path, None).expect("with_scan import should succeed");
+
+        // Same bundle results.
+        assert_eq!(plain.id, with_scan.bundle.id);
+        assert_eq!(plain.output_dir, with_scan.bundle.output_dir);
+        assert_eq!(plain.files.len(), with_scan.bundle.files.len());
+
+        // No scan verdict when no scanner provided.
+        assert!(with_scan.scan_verdict.is_none());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn with_scan_mock_high_scanner_includes_verdict() {
+        struct HighScanner;
+        impl crate::scan::ScanClient for HighScanner {
+            fn scan(&self, _content: &[u8], _content_type: &str) -> anyhow::Result<ScanVerdict> {
+                Ok(ScanVerdict {
+                    verdict: Severity::High,
+                    max_severity: Some("high".to_string()),
+                    findings: vec![crate::scan::ScanFinding {
+                        rule_id: Some("TEST001".to_string()),
+                        severity: "high".to_string(),
+                        title: Some("test finding".to_string()),
+                        description: None,
+                    }],
+                    scanner_version: Some("0.0.0-test".to_string()),
+                    cached: false,
+                    content_hash: "sha256:test".to_string(),
+                })
+            }
+        }
+
+        let dir = temp_dir("scan-high");
+        let path = write_skill_md(&dir, SAMPLE_SKILL_MD);
+
+        let result = import_local_skill_md_with_scan(&path, Some(&HighScanner))
+            .expect("import should succeed");
+
+        let verdict = result.scan_verdict.expect("verdict should be present");
+        assert_eq!(verdict.verdict, Severity::High);
+        assert!(verdict.is_risky());
+        assert!(verdict.requires_confirmation());
+        assert_eq!(verdict.findings.len(), 1);
+        assert_eq!(verdict.findings[0].rule_id.as_deref(), Some("TEST001"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn with_scan_fail_open_when_scanner_errors() {
+        struct ErrorScanner;
+        impl crate::scan::ScanClient for ErrorScanner {
+            fn scan(&self, _content: &[u8], _content_type: &str) -> anyhow::Result<ScanVerdict> {
+                anyhow::bail!("simulated scan failure")
+            }
+        }
+
+        let dir = temp_dir("scan-error");
+        let path = write_skill_md(&dir, SAMPLE_SKILL_MD);
+
+        // Should NOT return Err — fail-open means verdict is None, import succeeds.
+        let result = import_local_skill_md_with_scan(&path, Some(&ErrorScanner))
+            .expect("import should succeed even when scanner errors");
+
+        assert!(
+            result.scan_verdict.is_none(),
+            "verdict should be None when scanner errors"
+        );
+        assert_eq!(result.bundle.id, "my-skill");
 
         let _ = fs::remove_dir_all(&dir);
     }

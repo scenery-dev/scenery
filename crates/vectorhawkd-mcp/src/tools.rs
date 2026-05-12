@@ -44,6 +44,7 @@ use vectorhawkd_core::{
     model::{ModelClient, ModelSource},
     policy::PolicyClient,
     registry::RegistryClient,
+    scan::{HttpScanClient, ScanClient},
     state::AppState,
     updater::install_from_registry,
     validator::validate_bundle,
@@ -347,6 +348,33 @@ pub fn build_tool_list(state: &AppState, registry_url: &Option<String>) -> Vec<T
         });
     }
 
+    // Scan tool — available whenever a registry URL is configured (auth loaded lazily in handler)
+    if registry_url.is_some() {
+        tools.push(ToolDefinition {
+            name: "vectorhawk_scan".to_string(),
+            description: "Scan arbitrary content (SKILL.md, MCP JSON config, or package name) \
+                for security threats using VectorHawk's AI scanner. Returns a verdict with \
+                color-coded severity and findings. Use this before importing or installing \
+                untrusted content."
+                .to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "description": "Content to scan (SKILL.md text, JSON config, or package name/URL)"
+                    },
+                    "content_type": {
+                        "type": "string",
+                        "enum": ["skill_md", "mcp_json", "other"],
+                        "description": "Hint about what the content is (default: other)"
+                    }
+                },
+                "required": ["content"]
+            }),
+        });
+    }
+
     // Plugin export/import tools — always available (local operations, no auth required)
     tools.push(ToolDefinition {
         name: "vectorhawk_plugin_export".to_string(),
@@ -475,6 +503,7 @@ pub fn handle_tool_call(
         "vectorhawk_info" => handle_info(arguments, state),
         "vectorhawk_validate" => handle_validate(arguments),
         "vectorhawk_import" => handle_import(arguments, state, registry_url),
+        "vectorhawk_scan" => handle_scan(arguments, state, registry_url),
         "vectorhawk_login" => handle_login(arguments, state, registry_url),
         "vectorhawk_logout" => handle_logout(state, registry_url),
         "vectorhawk_mcp_catalog" => handle_mcp_catalog(state, registry_url),
@@ -1016,6 +1045,69 @@ fn handle_import(
             }
         }
     }
+}
+
+// ── vectorhawk_scan handler ───────────────────────────────────────────────────
+
+fn handle_scan(
+    arguments: &serde_json::Value,
+    state: &AppState,
+    registry_url: &Option<String>,
+) -> ToolCallResult {
+    let url = match registry_url {
+        Some(u) => u,
+        None => {
+            return ToolCallResult::error_result(
+                "No registry URL configured — scan requires a registry connection.",
+            )
+        }
+    };
+
+    let content = match arguments.get("content").and_then(|v| v.as_str()) {
+        Some(c) if !c.is_empty() => c,
+        _ => return ToolCallResult::error_result("Missing required parameter: content"),
+    };
+
+    let content_type = arguments
+        .get("content_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("other");
+
+    let access_token = match ensure_auth(state, url) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+
+    let client = HttpScanClient::new(url, access_token);
+    let verdict = match client.scan(content.as_bytes(), content_type) {
+        Ok(v) => v,
+        Err(e) => return ToolCallResult::error_result(format!("Scan failed unexpectedly: {e}")),
+    };
+
+    let label = verdict.verdict.badge_label();
+    let cached_note = if verdict.cached { " (cached)" } else { "" };
+    let version_note = verdict
+        .scanner_version
+        .as_deref()
+        .map(|v| format!(" scanner v{v}"))
+        .unwrap_or_default();
+
+    let mut output = format!("Verdict: {label}{cached_note}{version_note}\n");
+
+    let findings_text = verdict.format_findings();
+    if !findings_text.is_empty() {
+        output.push('\n');
+        output.push_str(&findings_text);
+    }
+
+    if verdict.requires_confirmation() {
+        output.push_str(
+            "\nWARNING: This content has been flagged as risky. \
+             Review the findings above before importing or installing.",
+        );
+    }
+
+    ToolCallResult::success(output)
 }
 
 fn format_import_preview(preview: &serde_json::Value) -> String {

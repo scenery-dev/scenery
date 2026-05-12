@@ -52,3 +52,6 @@ pub mod plugin_import;
 
 // GAP-05: ratings + execution-count tracking for registry sync.
 pub mod ratings;
+
+// SEC3: scan client — `POST /runner/scan` verdict fetch with fail-open semantics.
+pub mod scan;

@@ -125,6 +125,17 @@ pub enum SkillCommand {
     Import {
         /// Path to the SKILL.md file.
         path: camino::Utf8PathBuf,
+
+        /// Registry base URL used to call the scan endpoint.
+        /// When omitted, scanning is skipped (offline / unauthenticated mode).
+        #[arg(long, env = "VECTORHAWK_REGISTRY_URL")]
+        registry_url: Option<String>,
+
+        /// Bypass the scan warning and proceed even when the verdict is risky
+        /// (Medium / High / Critical). Required when the scan flags a concern
+        /// and you have reviewed the findings.
+        #[arg(long, default_value_t = false)]
+        confirm_risky: bool,
     },
 
     /// Validate a skill bundle directory.
@@ -317,7 +328,11 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Skill(SkillCommand::Run { id, input, stub }) => {
             cmd_skill_run(&id, input, stub).await
         }
-        Command::Skill(SkillCommand::Import { path }) => cmd_skill_import(path).await,
+        Command::Skill(SkillCommand::Import {
+            path,
+            registry_url,
+            confirm_risky,
+        }) => cmd_skill_import(path, registry_url.as_deref(), confirm_risky).await,
         Command::Skill(SkillCommand::Validate { path }) => cmd_skill_validate(path).await,
 
         Command::Auth(AuthCommand::Login { registry_url }) => cmd_auth_login(&registry_url).await,
@@ -416,6 +431,10 @@ async fn cmd_doctor(registry_url: Option<&str>) -> Result<()> {
             // M3: OAuth listener status — query the running daemon.
             let oauth_status = probe_oauth_listener_port(socket_path.as_str()).await;
             println!("OAuth listener:  {oauth_status}");
+
+            // SEC3: scan endpoint reachability.
+            let scan_status = probe_scan_endpoint(effective_registry).await;
+            println!("Scan endpoint:   {scan_status}");
         }
         Err(e) => {
             eprintln!("warning: could not bootstrap state directory: {e:#}");
@@ -427,6 +446,7 @@ async fn cmd_doctor(registry_url: Option<&str>) -> Result<()> {
             println!("Audit queue:     unknown");
             println!("Last sync:       unknown");
             println!("OAuth listener:  not running");
+            println!("Scan endpoint:   unknown");
         }
     }
 
@@ -564,6 +584,38 @@ async fn probe_registry(base_url: &str) -> String {
         Ok(Ok(resp)) => format!("reachable (HTTP {})", resp.status()),
         Ok(Err(e)) => format!("unreachable ({e})"),
         Err(_) => "unreachable (timeout)".to_string(),
+    }
+}
+
+/// Probe the registry's scan endpoint with a HEAD-style GET and a 2 s timeout.
+///
+/// The endpoint requires auth but we only need to confirm it's reachable;
+/// any HTTP status other than 5xx or connection failure counts as reachable.
+/// Returns a human-readable status string.
+async fn probe_scan_endpoint(base_url: &str) -> String {
+    use tokio::time::{timeout, Duration};
+
+    let url = format!("{}/runner/scan", base_url.trim_end_matches('/'));
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(1))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return format!("unreachable (client build error: {e})"),
+    };
+
+    match timeout(Duration::from_secs(2), client.get(&url).send()).await {
+        Ok(Ok(resp)) => {
+            let status = resp.status();
+            if status.is_server_error() {
+                format!("unreachable (scan endpoint returned HTTP {status})")
+            } else {
+                // 200, 401, 404, 405 etc all mean the server is listening.
+                "reachable (verdict cache active)".to_string()
+            }
+        }
+        Ok(Err(e)) => format!("unreachable ({e})"),
+        Err(_) => "unreachable (scan warnings disabled — offline mode)".to_string(),
     }
 }
 
@@ -885,12 +937,63 @@ async fn cmd_skill_run(id: &str, input_path: camino::Utf8PathBuf, stub: bool) ->
 
 // ── skill import ──────────────────────────────────────────────────────────────
 
-async fn cmd_skill_import(path: camino::Utf8PathBuf) -> Result<()> {
-    use vectorhawkd_core::importer::import_local_skill_md;
+async fn cmd_skill_import(
+    path: camino::Utf8PathBuf,
+    registry_url: Option<&str>,
+    confirm_risky: bool,
+) -> Result<()> {
+    use vectorhawkd_core::{
+        auth::load_tokens,
+        importer::import_local_skill_md_with_scan,
+        scan::{HttpScanClient, NoOpScanClient, ScanClient},
+        state::AppState,
+    };
 
-    let bundle = import_local_skill_md(&path)
+    // Attempt to build a scan client when we have both a registry URL and a
+    // valid auth token. Fall back to the NoOp client (prints nothing, no HTTP
+    // call) when either is missing — keeps the import path clean even offline.
+    let effective_registry = registry_url.unwrap_or("https://app.vectorhawk.ai");
+    let state = AppState::bootstrap().context("failed to bootstrap state")?;
+
+    let scan_client: Box<dyn ScanClient> =
+        match load_tokens(&state, effective_registry).ok().flatten() {
+            Some(tokens) if registry_url.is_some() => {
+                Box::new(HttpScanClient::new(effective_registry, tokens.access_token))
+            }
+            _ => Box::new(NoOpScanClient),
+        };
+
+    let result = import_local_skill_md_with_scan(&path, Some(scan_client.as_ref()))
         .with_context(|| format!("failed to import SKILL.md at {path}"))?;
 
+    // ── Display scan verdict badge ────────────────────────────────────────────
+
+    if let Some(verdict) = &result.scan_verdict {
+        let reset = "\x1b[0m";
+        let color = verdict.verdict.ansi_color();
+        let label = verdict.verdict.badge_label();
+        println!("Scan: {color}{label}{reset}");
+
+        if verdict.is_risky() {
+            println!();
+            let findings_text = verdict.format_findings();
+            if !findings_text.is_empty() {
+                print!("{findings_text}");
+            }
+        }
+
+        if verdict.requires_confirmation() && !confirm_risky {
+            anyhow::bail!(
+                "Import blocked: verdict is {:?}. \
+                 Review findings above and re-run with --confirm-risky to override.",
+                verdict.verdict
+            );
+        }
+    }
+
+    // ── Display success ───────────────────────────────────────────────────────
+
+    let bundle = &result.bundle;
     println!("Imported skill '{}'.", bundle.id);
     println!("Bundle created at: {}", bundle.output_dir);
     println!("Files written:");

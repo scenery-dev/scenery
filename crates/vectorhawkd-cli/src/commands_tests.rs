@@ -184,7 +184,11 @@ fn skill_run_stub_parses() {
 fn skill_import_parses() {
     use super::{Command, SkillCommand};
     match parse(&["skill", "import", "SKILL.md"]).command {
-        Command::Skill(SkillCommand::Import { path }) => {
+        Command::Skill(SkillCommand::Import {
+            path,
+            registry_url: _,
+            confirm_risky: _,
+        }) => {
             assert_eq!(path.as_str(), "SKILL.md");
         }
         other => panic!("expected Skill(Import), got {other:?}"),
