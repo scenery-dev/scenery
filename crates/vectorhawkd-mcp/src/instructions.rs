@@ -11,21 +11,37 @@ use vectorhawkd_core::managed::ManagedConfig;
 /// `mode_label` is appended verbatim and lets the caller distinguish the
 /// daemon ("daemon") vs the embedded fallback path ("in-process fallback")
 /// without repeating phrasing in two places.
-pub fn build_instructions(managed: Option<&ManagedConfig>, mode_label: &str) -> String {
+///
+/// `logged_in` should be `true` when the user has valid auth tokens for the
+/// configured registry. When `false` and a registry URL is present, a nudge
+/// to call `vectorhawk_login` is prepended so Claude surfaces it immediately.
+pub fn build_instructions(
+    managed: Option<&ManagedConfig>,
+    mode_label: &str,
+    logged_in: bool,
+) -> String {
     let mode_suffix = match mode_label {
         "" => String::new(),
         s => format!(" ({s})"),
     };
 
+    let login_nudge = if !logged_in {
+        "⚠️ You are not logged in to the VectorHawk registry. \
+         Call `vectorhawk_login` to authenticate — this unlocks skill search, \
+         install, publish, and governance features. "
+    } else {
+        ""
+    };
+
     let Some(managed) = managed else {
         return format!(
-            "VectorHawk runner — governed AI platform{mode_suffix}. \
+            "{login_nudge}VectorHawk runner — governed AI platform{mode_suffix}. \
              Use vectorhawk_list to show installed skills, vectorhawk_search to \
              find more, and vectorhawk_mcp_catalog to browse approved MCP servers."
         );
     };
 
-    let mut out = String::new();
+    let mut out = login_nudge.to_string();
 
     match managed.org.as_deref() {
         Some(org) => out.push_str(&format!(
@@ -78,7 +94,7 @@ mod tests {
 
     #[test]
     fn unmanaged_returns_generic_copy() {
-        let s = build_instructions(None, "daemon");
+        let s = build_instructions(None, "daemon", true);
         assert!(s.contains("governed AI platform"), "got: {s}");
         assert!(s.contains("(daemon)"), "got: {s}");
         assert!(!s.contains("managed by"), "got: {s}");
@@ -87,7 +103,7 @@ mod tests {
     #[test]
     fn managed_without_org_uses_managed_deployment_phrase() {
         let m = cfg(None, None, true);
-        let s = build_instructions(Some(&m), "daemon");
+        let s = build_instructions(Some(&m), "daemon", true);
         assert!(s.contains("managed deployment"), "got: {s}");
         assert!(s.contains("vectorhawk_mcp_request"), "got: {s}");
     }
@@ -95,7 +111,7 @@ mod tests {
     #[test]
     fn managed_with_org_names_org() {
         let m = cfg(Some("Acme Corp"), None, true);
-        let s = build_instructions(Some(&m), "daemon");
+        let s = build_instructions(Some(&m), "daemon", true);
         assert!(s.contains("managed by Acme Corp"), "got: {s}");
     }
 
@@ -106,7 +122,7 @@ mod tests {
             Some("Contact security@acme.com for tool requests."),
             true,
         );
-        let s = build_instructions(Some(&m), "daemon");
+        let s = build_instructions(Some(&m), "daemon", true);
         assert!(s.contains("Contact security@acme.com"), "got: {s}");
         assert!(
             !s.contains("Use vectorhawk_mcp_request to request a new MCP server"),
@@ -117,7 +133,7 @@ mod tests {
     #[test]
     fn governance_message_disabled_omits_governance_block() {
         let m = cfg(Some("Acme Corp"), Some("Contact security."), false);
-        let s = build_instructions(Some(&m), "daemon");
+        let s = build_instructions(Some(&m), "daemon", true);
         assert!(s.contains("managed by Acme Corp"), "got: {s}");
         assert!(!s.contains("Contact security."), "got: {s}");
         assert!(
@@ -128,13 +144,27 @@ mod tests {
 
     #[test]
     fn embedded_mode_label_renders() {
-        let s = build_instructions(None, "in-process fallback");
+        let s = build_instructions(None, "in-process fallback", true);
         assert!(s.contains("(in-process fallback)"), "got: {s}");
     }
 
     #[test]
     fn empty_mode_label_omits_suffix() {
-        let s = build_instructions(None, "");
+        let s = build_instructions(None, "", true);
         assert!(!s.contains('('), "got: {s}");
+    }
+
+    #[test]
+    fn not_logged_in_prepends_nudge() {
+        let s = build_instructions(None, "daemon", false);
+        assert!(s.contains("vectorhawk_login"), "got: {s}");
+        assert!(s.contains("not logged in"), "got: {s}");
+    }
+
+    #[test]
+    fn logged_in_omits_nudge() {
+        let s = build_instructions(None, "daemon", true);
+        assert!(!s.contains("not logged in"), "got: {s}");
+        assert!(!s.contains("vectorhawk_login"), "got: {s}");
     }
 }

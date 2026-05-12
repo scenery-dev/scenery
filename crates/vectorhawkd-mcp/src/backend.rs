@@ -635,7 +635,15 @@ impl RealBackend {
 impl Backend for RealBackend {
     async fn initialize(&self, _params: Value) -> Result<InitializeResult> {
         #[cfg(feature = "daemon")]
-        let instructions = crate::instructions::build_instructions(self.managed.as_ref(), "daemon");
+        let instructions = {
+            let logged_in = self.state.as_ref().map_or(false, |state| {
+                self.registry_url
+                    .as_ref()
+                    .and_then(|url| vectorhawkd_core::auth::load_tokens(state, url).ok().flatten())
+                    .is_some()
+            });
+            crate::instructions::build_instructions(self.managed.as_ref(), "daemon", logged_in)
+        };
         #[cfg(not(feature = "daemon"))]
         let instructions = "VectorHawk runner — governed AI platform.".to_string();
 
