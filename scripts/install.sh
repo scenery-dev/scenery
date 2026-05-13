@@ -200,6 +200,12 @@ log ""
 
 if [ "${NO_SETUP}" = "0" ]; then
     log "Starting daemon..."
+    # On upgrade, restart the daemon so it picks up the new binary.
+    if command -v systemctl >/dev/null 2>&1; then
+        XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+        export XDG_RUNTIME_DIR
+        systemctl --user restart vectorhawk-agent.service 2>/dev/null || true
+    fi
     "${VH_BIN}" daemon install || {
         log "  (daemon start deferred — run 'vectorhawk daemon install' after logging in)"
     }
