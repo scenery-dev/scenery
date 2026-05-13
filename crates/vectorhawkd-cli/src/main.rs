@@ -1494,6 +1494,52 @@ fn derive_publisher_slug(display_name: &str) -> String {
         .to_string()
 }
 
+/// Return true if the SKILL.md frontmatter has no `publisher:` line or uses the placeholder.
+fn needs_publisher(skill_md: &str) -> bool {
+    let placeholder = "YOUR_PUBLISHER_ID";
+    for line in skill_md.lines() {
+        if let Some(rest) = line.strip_prefix("publisher:") {
+            let val = rest.trim();
+            return val.is_empty() || val == placeholder;
+        }
+    }
+    true // no publisher line at all
+}
+
+/// Replace (or insert) the `publisher:` frontmatter line with `publisher: <slug>`.
+fn inject_publisher_field(skill_md: &str, slug: &str) -> String {
+    let placeholder = "YOUR_PUBLISHER_ID";
+    // Replace existing placeholder line.
+    if skill_md.contains(&format!("publisher: {placeholder}"))
+        || skill_md.contains("publisher: ")
+    {
+        return skill_md
+            .lines()
+            .map(|line| {
+                if let Some(rest) = line.strip_prefix("publisher:") {
+                    let val = rest.trim();
+                    if val.is_empty() || val == placeholder {
+                        return format!("publisher: {slug}");
+                    }
+                }
+                line.to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + if skill_md.ends_with('\n') { "\n" } else { "" };
+    }
+    // No publisher line — insert after `description:` or after the opening `---`.
+    let mut lines: Vec<String> = skill_md.lines().map(|l| l.to_string()).collect();
+    let insert_after = lines
+        .iter()
+        .position(|l| l.starts_with("description:"))
+        .or_else(|| lines.iter().position(|l| l == "---"))
+        .map(|i| i + 1)
+        .unwrap_or(1);
+    lines.insert(insert_after, format!("publisher: {slug}"));
+    lines.join("\n") + if skill_md.ends_with('\n') { "\n" } else { "" }
+}
+
 /// Try to look up the logged-in user's publisher slug from auth state.
 ///
 /// Returns `None` silently on any failure (no tokens, network error, etc.).
@@ -2129,8 +2175,13 @@ async fn cmd_skill_publish(
     dry_run: bool,
 ) -> Result<()> {
     use flate2::{write::GzEncoder, Compression};
+    use std::fs;
     use tar::Builder;
-    use vectorhawkd_core::{auth::load_tokens, registry::RegistryClient, state::AppState};
+    use vectorhawkd_core::{
+        auth::{load_tokens, AuthClient},
+        registry::RegistryClient,
+        state::AppState,
+    };
 
     if !path.join("SKILL.md").exists() {
         anyhow::bail!(
@@ -2142,15 +2193,53 @@ async fn cmd_skill_publish(
     let state = AppState::bootstrap().context("failed to bootstrap state")?;
     let tokens = load_tokens(&state, registry_url)
         .context("failed to load auth tokens")?
-        .ok_or_else(|| anyhow::anyhow!("not authenticated — run 'vectorhawk auth login' first"))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "not authenticated — run 'vectorhawk auth login' first, then retry publish"
+            )
+        })?;
+
+    // Read SKILL.md and auto-inject publisher if it is missing or is the placeholder.
+    let skill_md_path = path.join("SKILL.md");
+    let skill_md_text = fs::read_to_string(&skill_md_path)
+        .with_context(|| format!("failed to read {skill_md_path}"))?;
+
+    let (skill_md_to_pack, injected_publisher) = if needs_publisher(&skill_md_text) {
+        let client = AuthClient::new(registry_url);
+        let user = client
+            .me(&tokens.access_token)
+            .context("failed to look up your publisher ID — try 'vectorhawk auth login'")?;
+        let slug = derive_publisher_slug(&user.display_name);
+        let patched = inject_publisher_field(&skill_md_text, &slug);
+        (patched, Some(slug))
+    } else {
+        (skill_md_text, None)
+    };
+
+    if let Some(ref slug) = injected_publisher {
+        println!("Publisher not set — using '{slug}' from your logged-in account.");
+    }
 
     // Pack the skill directory into an in-memory tar.gz.
+    // Build the tar manually so we can substitute the (possibly patched) SKILL.md.
     let mut gz_buf: Vec<u8> = Vec::new();
     {
         let enc = GzEncoder::new(&mut gz_buf, Compression::default());
         let mut tar = Builder::new(enc);
+
+        // Add all directory contents except SKILL.md.
         tar.append_dir_all(".", &path)
             .with_context(|| format!("failed to pack skill directory '{path}'"))?;
+
+        // Override SKILL.md with the (possibly patched) content.
+        let skill_md_bytes = skill_md_to_pack.as_bytes();
+        let mut header = tar::Header::new_gnu();
+        header.set_size(skill_md_bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, "SKILL.md", skill_md_bytes)
+            .context("failed to append patched SKILL.md to archive")?;
+
         tar.into_inner()
             .context("failed to finalize tar")?
             .finish()
@@ -2603,7 +2692,9 @@ async fn cmd_auth_status(registry_url: &str) -> Result<()> {
             let client = AuthClient::new(registry_url);
             match client.me(&stored.access_token) {
                 Ok(user) => {
+                    let slug = derive_publisher_slug(&user.display_name);
                     println!("Logged in as {} ({}).", user.display_name, user.email);
+                    println!("Publisher ID: {slug}");
                     println!("Registry: {registry_url}");
                 }
                 Err(e) => {

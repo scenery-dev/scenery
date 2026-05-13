@@ -489,3 +489,41 @@ fn doctor_output_contains_oauth_listener_line() {
         "doctor output must contain 'OAuth listener:' line; got:\n{stdout}"
     );
 }
+
+// ── publish helper unit tests ─────────────────────────────────────────────────
+
+#[test]
+fn needs_publisher_returns_true_when_missing() {
+    let md = "---\nname: foo\ndescription: bar\nversion: 0.1.0\n---\n\nPrompt.\n";
+    assert!(super::needs_publisher(md));
+}
+
+#[test]
+fn needs_publisher_returns_true_for_placeholder() {
+    let md = "---\nname: foo\ndescription: bar\nversion: 0.1.0\npublisher: YOUR_PUBLISHER_ID\n---\n";
+    assert!(super::needs_publisher(md));
+}
+
+#[test]
+fn needs_publisher_returns_false_when_set() {
+    let md = "---\nname: foo\ndescription: bar\nversion: 0.1.0\npublisher: acme-corp\n---\n";
+    assert!(!super::needs_publisher(md));
+}
+
+#[test]
+fn inject_publisher_field_replaces_placeholder() {
+    let md = "---\nname: foo\ndescription: bar\npublisher: YOUR_PUBLISHER_ID\n---\n";
+    let patched = super::inject_publisher_field(md, "acme-corp");
+    assert!(patched.contains("publisher: acme-corp"));
+    assert!(!patched.contains("YOUR_PUBLISHER_ID"));
+}
+
+#[test]
+fn inject_publisher_field_inserts_after_description_when_missing() {
+    let md = "---\nname: foo\ndescription: bar\nversion: 0.1.0\n---\n";
+    let patched = super::inject_publisher_field(md, "acme-corp");
+    assert!(patched.contains("publisher: acme-corp"));
+    let desc_pos = patched.find("description:").unwrap();
+    let pub_pos = patched.find("publisher:").unwrap();
+    assert!(pub_pos > desc_pos, "publisher should appear after description");
+}
