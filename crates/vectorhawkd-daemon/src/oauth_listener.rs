@@ -89,13 +89,14 @@ async fn handle_callback(
         }
     };
 
-    // Notify the waiting CLI subscriber.  If there is no subscriber (orphaned
-    // callback), log a warning but still return 200 to the browser.
-    if let Err(e) = app.oauth_state.notify(state, code).await {
-        warn!(error = %e, "callback received but no CLI subscriber was waiting");
+    // Notify the waiting CLI subscriber.
+    match app.oauth_state.notify(state, code).await {
+        Ok(()) => Html(build_success_page()).into_response(),
+        Err(e) => {
+            warn!(error = %e, "callback received but no CLI subscriber was waiting");
+            Html(build_orphaned_page()).into_response()
+        }
     }
-
-    Html(build_success_page()).into_response()
 }
 
 /// Attempt to bind the listener on the first available port in the range.
@@ -167,6 +168,26 @@ fn build_success_page() -> String {
 <h2>VectorHawk login complete.</h2>
 <p>You can close this window.</p>
 <script>window.close();</script>
+</body>
+</html>"#
+        .to_string()
+}
+
+/// HTML page shown when the callback arrives but the daemon was restarted
+/// mid-flow so no subscriber is waiting for the code.
+fn build_orphaned_page() -> String {
+    r#"<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>VectorHawk Login – Retry Required</title></head>
+<body>
+<h2>Almost there — please start the login again.</h2>
+<p>Your browser completed authorization, but the VectorHawk daemon was
+restarted before the confirmation could be delivered.  This can happen
+when the daemon is upgraded mid-flow.</p>
+<p>Run <code>vectorhawk auth login</code> (or call the
+<code>vectorhawk_login</code> tool) again — it will complete instantly
+this time because you are already authorized.</p>
+<p>You can close this window.</p>
 </body>
 </html>"#
         .to_string()

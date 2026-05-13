@@ -119,6 +119,7 @@ log_verbose "Install directory: ${INSTALL_DIR}"
 
 VH_BIN="${INSTALL_DIR}/vectorhawk"
 
+_PREV_VERSION=""
 if [ -x "${VH_BIN}" ]; then
     _CURRENT="$("${VH_BIN}" --version 2>/dev/null | grep -o '[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*' | head -1 || true)"
     if [ "${_CURRENT}" = "${VERSION}" ]; then
@@ -130,6 +131,7 @@ if [ -x "${VH_BIN}" ]; then
         fi
         exit 0
     fi
+    _PREV_VERSION="${_CURRENT}"
 fi
 
 # ---------------------------------------------------------------------------
@@ -200,8 +202,10 @@ log ""
 
 if [ "${NO_SETUP}" = "0" ]; then
     log "Starting daemon..."
-    # On upgrade, restart the daemon so it picks up the new binary.
-    if command -v systemctl >/dev/null 2>&1; then
+    # On upgrade (binary version changed), restart the daemon so it picks up
+    # the new binary. Skip the restart on a fresh install — daemon install
+    # handles that path. Never restart if _PREV_VERSION is empty (fresh install).
+    if [ -n "${_PREV_VERSION}" ] && [ "${_PREV_VERSION}" != "${VERSION}" ] && command -v systemctl >/dev/null 2>&1; then
         XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
         export XDG_RUNTIME_DIR
         systemctl --user restart vectorhawk-agent.service 2>/dev/null || true
