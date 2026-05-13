@@ -2224,7 +2224,7 @@ async fn cmd_auth_login(registry_url: &str) -> Result<()> {
         println!("  Keep the tunnel open until login completes.");
         println!();
         println!("Option B — Personal Access Token (no tunnel needed):");
-        println!("  1. Open https://app.vectorhawk.ai/portal/settings/tokens in your browser.");
+        println!("  1. Open https://app.vectorhawk.ai/portal/settings in your browser.");
         println!("  2. Create a token (starts with vh_pat_...).");
         println!("  3. Run:  vectorhawk auth token <vh_pat_...>");
         println!();

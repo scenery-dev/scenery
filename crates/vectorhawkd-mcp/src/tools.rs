@@ -1029,7 +1029,7 @@ pub fn handle_login_with_oauth(
                              ```\nssh -L {port}:localhost:{port} {hostname}\n```\
                              Then open the URL above. Keep the tunnel open until done.\n\n\
                              **Option B — Personal Access Token (easier for SSH):**\n\
-                             1. Open https://app.vectorhawk.ai/portal/settings/tokens\n\
+                             1. Open https://app.vectorhawk.ai/portal/settings\n\
                              2. Create a token (starts with `vh_pat_`)\n\
                              3. Run: `vectorhawk auth token <vh_pat_...>`"
                         )
