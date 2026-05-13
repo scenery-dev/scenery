@@ -1010,12 +1010,13 @@ pub fn handle_login_with_oauth(
                         }
                     });
 
-                    let is_ssh = std::env::var_os("SSH_CLIENT").is_some()
-                        || std::env::var_os("SSH_TTY").is_some()
-                        || std::env::var_os("SSH_CONNECTION").is_some();
+                    let port = ctx.listener_port;
 
-                    let msg = if is_ssh {
-                        let port = ctx.listener_port;
+                    // On Linux the daemon runs as a systemd service without a display.
+                    // Always include SSH tunnel instructions — they're harmless on
+                    // desktop and essential for headless/SSH use.
+                    #[cfg(target_os = "linux")]
+                    let ssh_note = {
                         let hostname = std::env::var("HOSTNAME")
                             .or_else(|_| {
                                 std::fs::read_to_string("/etc/hostname")
@@ -1023,25 +1024,22 @@ pub fn handle_login_with_oauth(
                             })
                             .unwrap_or_else(|_| "<this-machine>".to_string());
                         format!(
-                            "⚠️ SSH session detected. The OAuth callback runs on this machine \
-                             at port {port}. You must forward that port before opening the URL.\n\n\
-                             **Step 1** — Run this in a new terminal on your LOCAL machine:\n\
-                             ```\nssh -L {port}:localhost:{port} {hostname}\n```\n\n\
-                             **Step 2** — Open this URL in your browser:\n{}\n\n\
-                             Keep the tunnel open until login completes. VectorHawk will \
-                             complete authentication automatically.",
-                            initiation.auth_url
-                        )
-                    } else {
-                        format!(
-                            "Open this URL in your browser to log in:\n{}\n\n\
-                             After logging in, VectorHawk will automatically complete \
-                             authentication. The `vectorhawk_login` tool will no longer \
-                             appear once you are logged in.",
-                            initiation.auth_url
+                            "\n\n**If accessing this machine remotely over SSH**, \
+                             forward the callback port first in a new local terminal:\n\
+                             ```\nssh -L {port}:localhost:{port} {hostname}\n```\n\
+                             Keep the tunnel open until login completes."
                         )
                     };
-                    ToolCallResult::success(msg)
+                    #[cfg(not(target_os = "linux"))]
+                    let ssh_note = String::new();
+
+                    ToolCallResult::success(format!(
+                        "Open this URL in your browser to log in:\n{}{ssh_note}\n\n\
+                         After logging in, VectorHawk will automatically complete \
+                         authentication. The `vectorhawk_login` tool will no longer \
+                         appear once you are logged in.",
+                        initiation.auth_url
+                    ))
                 }
                 Err(e) => ToolCallResult::error_result(format!("Failed to initiate login: {e}")),
             }
