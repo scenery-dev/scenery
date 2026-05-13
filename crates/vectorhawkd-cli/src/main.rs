@@ -218,6 +218,10 @@ pub enum SkillCommand {
         /// Target parent directory (default: current directory).
         #[arg(long)]
         output_dir: Option<camino::Utf8PathBuf>,
+
+        /// Registry URL used to look up your publisher ID (defaults to production).
+        #[arg(long, env = "VECTORHAWK_REGISTRY_URL")]
+        registry_url: Option<String>,
     },
 }
 
@@ -442,6 +446,7 @@ async fn run(cli: Cli) -> Result<()> {
             accept_suggestions,
             skip_metadata,
             output_dir,
+            registry_url,
         }) => {
             cmd_skill_author(
                 name.as_deref(),
@@ -449,6 +454,7 @@ async fn run(cli: Cli) -> Result<()> {
                 accept_suggestions,
                 skip_metadata,
                 output_dir.as_deref(),
+                registry_url.as_deref(),
             )
             .await
         }
@@ -1386,12 +1392,53 @@ You should: TODO
 
 // ── skill author ─────────────────────────────────────────────────────────────
 
+/// Format milliseconds as a human-readable duration string.
+fn format_duration_ms(ms: u32) -> String {
+    if ms < 60_000 {
+        format!("{}s", ms / 1000)
+    } else {
+        format!("{} min", ms / 60_000)
+    }
+}
+
+/// Derive a publisher slug from a display name: lowercase, spaces → hyphens, strip non-alnum.
+fn derive_publisher_slug(display_name: &str) -> String {
+    let slug: String = display_name
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join("-");
+    slug.chars()
+        .filter(|c| c.is_alphanumeric() || *c == '-')
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string()
+}
+
+/// Try to look up the logged-in user's publisher slug from auth state.
+///
+/// Returns `None` silently on any failure (no tokens, network error, etc.).
+async fn try_infer_publisher_id(registry_url: &str) -> Option<String> {
+    use vectorhawkd_core::{auth::{load_tokens, AuthClient}, state::AppState};
+
+    let state = AppState::bootstrap().ok()?;
+    let tokens = load_tokens(&state, registry_url).ok().flatten()?;
+    let client = AuthClient::new(registry_url);
+    let user_info = tokio::task::spawn_blocking(move || client.me(&tokens.access_token))
+        .await
+        .ok()?
+        .ok()?;
+    let slug = derive_publisher_slug(&user_info.display_name);
+    if slug.is_empty() { None } else { Some(slug) }
+}
+
 async fn cmd_skill_author(
     name: Option<&str>,
     prompt_file: Option<&camino::Utf8Path>,
     accept_suggestions: bool,
     skip_metadata: bool,
     output_dir: Option<&camino::Utf8Path>,
+    registry_url: Option<&str>,
 ) -> Result<()> {
     use std::fs;
     use std::io::{self, BufRead, Write};
@@ -1458,15 +1505,25 @@ async fn cmd_skill_author(
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| camino::Utf8PathBuf::from("."));
 
+    // Try to infer publisher from logged-in account.
+    let effective_registry = registry_url.unwrap_or("https://app.vectorhawk.ai");
+    let publisher_id = try_infer_publisher_id(effective_registry).await
+        .unwrap_or_else(|| "YOUR_PUBLISHER_ID".to_string());
+
     if skip_metadata {
         // Scaffold with hardcoded defaults.
-        scaffold_with_defaults(&skill_id, &prompt_text, &base)?;
+        scaffold_with_defaults(&skill_id, &prompt_text, &base, &publisher_id)?;
         println!("Created skill at {}/{}/SKILL.md", base, skill_id);
         println!();
         println!("Next steps:");
+        let publisher_note = if publisher_id == "YOUR_PUBLISHER_ID" {
+            " and publisher ID".to_string()
+        } else {
+            format!(" (publisher: {publisher_id} — verify at app.vectorhawk.ai/portal)")
+        };
         println!(
-            "  1. Edit {}/{}/SKILL.md — fill in description and publisher",
-            base, skill_id
+            "  1. Edit {}/{}/SKILL.md — fill in description{}",
+            base, skill_id, publisher_note
         );
         println!("  2. vectorhawk skill validate {}/{}/", base, skill_id);
         return Ok(());
@@ -1474,16 +1531,25 @@ async fn cmd_skill_author(
 
     if accept_suggestions {
         // Scaffold with recommendations applied.
-        scaffold_with_recommendations(&skill_id, &prompt_text, &base, &rec)?;
+        scaffold_with_recommendations(&skill_id, &prompt_text, &base, &rec, &publisher_id)?;
         let confidence_str = format!("{:?}", rec.confidence).to_lowercase();
         println!("Created skill at {}/{}/SKILL.md", base, skill_id);
         println!("Applied recommendations (confidence: {confidence_str}):");
-        println!("  network:      {}", rec.permissions.network);
-        println!("  filesystem:   {}", rec.permissions.filesystem);
-        println!("  min_params_b: {}", rec.model.min_params_b);
-        println!("  timeout_ms:   {}", rec.execution.timeout_ms);
-        println!("  sandbox:      {}", rec.execution.sandbox);
-        println!("  triggers:     {}", rec.triggers.join(", "));
+        println!("  Network: {}", rec.permissions.network);
+        println!("  Filesystem: {}", rec.permissions.filesystem);
+        let model_primary = rec.model.recommended.first().map(|s| s.as_str()).unwrap_or("gemma3:2b");
+        let fallback_note = if rec.model.fallback == "mcp_sampling" {
+            "falls back to AI client"
+        } else {
+            "no fallback"
+        };
+        println!("  Offline model: {model_primary} ({})", fallback_note);
+        println!("  Timeout: {}", format_duration_ms(rec.execution.timeout_ms));
+        println!("  Sandbox: {}", rec.execution.sandbox);
+        println!("  Triggers: {}", rec.triggers.join(", "));
+        if publisher_id != "YOUR_PUBLISHER_ID" {
+            println!("  Publisher: {publisher_id}");
+        }
         println!();
         println!("Next: vectorhawk skill validate {}/{}/", base, skill_id);
         return Ok(());
@@ -1498,7 +1564,7 @@ async fn cmd_skill_author(
 
     // Permissions group.
     println!(
-        "Permissions: network={}, filesystem={}, clipboard={}",
+        "Network: {}  |  Filesystem: {}  |  Clipboard: {}",
         rec.permissions.network, rec.permissions.filesystem, rec.permissions.clipboard
     );
     let (net, fs_perm, clip) = prompt_field_group_permissions(
@@ -1508,11 +1574,15 @@ async fn cmd_skill_author(
     )?;
 
     // Model group.
+    let model_primary = rec.model.recommended.first().map(|s| s.as_str()).unwrap_or("gemma3:2b");
+    let fallback_desc = if rec.model.fallback == "mcp_sampling" {
+        "falls back to your AI client if unavailable"
+    } else {
+        "returns an error if unavailable"
+    };
     println!(
-        "Model: min_params_b={}, recommended={}, fallback={}",
-        rec.model.min_params_b,
-        rec.model.recommended.join(","),
-        rec.model.fallback
+        "Offline model: {} (needs ≥{}B params) — {}",
+        model_primary, rec.model.min_params_b, fallback_desc
     );
     let (min_params_b, recommended_models, fallback) = prompt_field_group_model(
         rec.model.min_params_b,
@@ -1522,8 +1592,10 @@ async fn cmd_skill_author(
 
     // Execution group.
     println!(
-        "Execution: timeout_ms={}, memory_mb={}, sandbox={}",
-        rec.execution.timeout_ms, rec.execution.memory_mb, rec.execution.sandbox
+        "Timeout: {}  |  Memory: {} MB  |  Sandbox: {}",
+        format_duration_ms(rec.execution.timeout_ms),
+        rec.execution.memory_mb,
+        rec.execution.sandbox
     );
     let (timeout_ms, memory_mb, sandbox) = prompt_field_group_execution(
         rec.execution.timeout_ms,
@@ -1532,7 +1604,7 @@ async fn cmd_skill_author(
     )?;
 
     // Triggers group.
-    println!("Triggers: {}", rec.triggers.join(", "));
+    println!("Suggested triggers: {}", rec.triggers.join(", "));
     let triggers = prompt_field_group_triggers(&rec.triggers)?;
 
     // ── Scaffold with confirmed values ────────────────────────────────────────
@@ -1563,7 +1635,7 @@ async fn cmd_skill_author(
 
     let skill_name_display = skill_id.replace('-', " ");
     let skill_md = format!(
-        "---\nname: {skill_name_display}\ndescription: \"TODO: describe what this skill does\"\nlicense: Apache-2.0\nvh_version: 0.1.0\nvh_publisher: YOUR_PUBLISHER_ID\nvh_permissions:\n  network: {net}\n  filesystem: {fs_perm}\n  clipboard: {clip}\nvh_execution:\n  timeout_ms: {timeout_ms}\n  memory_mb: {memory_mb}\n  sandbox: {sandbox}\nvh_model:\n  min_params_b: {min_params_b}\n  recommended:\n{recommended_yaml}\n  fallback: {fallback}\n{triggers_yaml}---\n\n{prompt_text}\n"
+        "---\nname: {skill_name_display}\ndescription: \"TODO: describe what this skill does\"\nlicense: Apache-2.0\nvh_version: 0.1.0\nvh_publisher: {publisher_id}\nvh_permissions:\n  network: {net}\n  filesystem: {fs_perm}\n  clipboard: {clip}\nvh_execution:\n  timeout_ms: {timeout_ms}\n  memory_mb: {memory_mb}\n  sandbox: {sandbox}\nvh_model:\n  min_params_b: {min_params_b}\n  recommended:\n{recommended_yaml}\n  fallback: {fallback}\n{triggers_yaml}---\n\n{prompt_text}\n"
     );
 
     fs::write(skill_dir.join("SKILL.md"), &skill_md).context("failed to write SKILL.md")?;
@@ -1572,7 +1644,12 @@ async fn cmd_skill_author(
     println!("Created skill at {skill_dir}/SKILL.md");
     println!();
     println!("Next steps:");
-    println!("  1. Edit {skill_dir}/SKILL.md — fill in description and publisher");
+    let publisher_note = if publisher_id == "YOUR_PUBLISHER_ID" {
+        " — fill in description and publisher ID".to_string()
+    } else {
+        format!(" — fill in description (publisher: {publisher_id})")
+    };
+    println!("  1. Edit {skill_dir}/SKILL.md{publisher_note}");
     println!("  2. vectorhawk skill validate {skill_dir}/");
 
     Ok(())
@@ -1583,6 +1660,7 @@ fn scaffold_with_defaults(
     skill_id: &str,
     prompt_text: &str,
     base: &camino::Utf8Path,
+    publisher_id: &str,
 ) -> Result<()> {
     use std::fs;
 
@@ -1595,7 +1673,7 @@ fn scaffold_with_defaults(
 
     let skill_name_display = skill_id.replace('-', " ");
     let skill_md = format!(
-        "---\nname: {skill_name_display}\ndescription: \"TODO: describe what this skill does\"\nlicense: Apache-2.0\nvh_version: 0.1.0\nvh_publisher: YOUR_PUBLISHER_ID\nvh_permissions:\n  network: none\n  filesystem: none\n  clipboard: none\nvh_execution:\n  timeout_ms: 30000\n  memory_mb: 256\n  sandbox: strict\n---\n\n{prompt_text}\n"
+        "---\nname: {skill_name_display}\ndescription: \"TODO: describe what this skill does\"\nlicense: Apache-2.0\nvh_version: 0.1.0\nvh_publisher: {publisher_id}\nvh_permissions:\n  network: none\n  filesystem: none\n  clipboard: none\nvh_execution:\n  timeout_ms: 30000\n  memory_mb: 256\n  sandbox: strict\n---\n\n{prompt_text}\n"
     );
 
     fs::write(skill_dir.join("SKILL.md"), &skill_md).context("failed to write SKILL.md")
@@ -1607,6 +1685,7 @@ fn scaffold_with_recommendations(
     prompt_text: &str,
     base: &camino::Utf8Path,
     rec: &vectorhawkd_core::recommend::Recommendations,
+    publisher_id: &str,
 ) -> Result<()> {
     use std::fs;
 
@@ -1639,7 +1718,7 @@ fn scaffold_with_recommendations(
 
     let skill_name_display = skill_id.replace('-', " ");
     let skill_md = format!(
-        "---\nname: {skill_name_display}\ndescription: \"TODO: describe what this skill does\"\nlicense: Apache-2.0\nvh_version: 0.1.0\nvh_publisher: YOUR_PUBLISHER_ID\nvh_permissions:\n  network: {net}\n  filesystem: {fs_perm}\n  clipboard: {clip}\nvh_execution:\n  timeout_ms: {timeout_ms}\n  memory_mb: {memory_mb}\n  sandbox: {sandbox}\nvh_model:\n  min_params_b: {min_params_b}\n  recommended:\n{recommended_yaml}\n  fallback: {fallback}\n{triggers_yaml}---\n\n{prompt_text}\n",
+        "---\nname: {skill_name_display}\ndescription: \"TODO: describe what this skill does\"\nlicense: Apache-2.0\nvh_version: 0.1.0\nvh_publisher: {publisher_id}\nvh_permissions:\n  network: {net}\n  filesystem: {fs_perm}\n  clipboard: {clip}\nvh_execution:\n  timeout_ms: {timeout_ms}\n  memory_mb: {memory_mb}\n  sandbox: {sandbox}\nvh_model:\n  min_params_b: {min_params_b}\n  recommended:\n{recommended_yaml}\n  fallback: {fallback}\n{triggers_yaml}---\n\n{prompt_text}\n",
         net = rec.permissions.network,
         fs_perm = rec.permissions.filesystem,
         clip = rec.permissions.clipboard,

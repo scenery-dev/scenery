@@ -188,6 +188,8 @@ fn skill_import_parses() {
             path,
             registry_url: _,
             confirm_risky: _,
+            accept_suggestions: _,
+            skip_metadata: _,
         }) => {
             assert_eq!(path.as_str(), "SKILL.md");
         }

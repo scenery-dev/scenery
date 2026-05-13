@@ -617,8 +617,8 @@ pub fn handle_tool_call(
         "vectorhawk_update" => handle_update(arguments, state, registry_url),
         "vectorhawk_plugin_export" => handle_plugin_export(arguments),
         "vectorhawk_plugin_import" => handle_plugin_import(arguments),
-        "skillclub_author" => handle_author(arguments),
-        "skillclub_author_confirm" => handle_author_confirm(arguments),
+        "skillclub_author" => handle_author(arguments, state, registry_url.as_deref()),
+        "skillclub_author_confirm" => handle_author_confirm(arguments, state, registry_url.as_deref()),
         _ => handle_skill_run(
             name,
             arguments,
@@ -1991,6 +1991,7 @@ struct SkillMdParams<'a> {
     skill_id: &'a str,
     system_prompt: &'a str,
     output_dir: &'a str,
+    publisher_id: &'a str,
     triggers: &'a [String],
     network: &'a str,
     filesystem: &'a str,
@@ -2011,6 +2012,7 @@ fn scaffold_skill_md(params: SkillMdParams<'_>) -> Result<String> {
         skill_id,
         system_prompt,
         output_dir,
+        publisher_id,
         triggers,
         network,
         filesystem,
@@ -2055,7 +2057,7 @@ fn scaffold_skill_md(params: SkillMdParams<'_>) -> Result<String> {
 
     let skill_name = skill_id.replace('-', " ");
     let skill_md = format!(
-        "---\nname: {skill_name}\ndescription: \"TODO: describe what this skill does\"\nlicense: Apache-2.0\nvh_version: 0.1.0\nvh_publisher: YOUR_PUBLISHER_ID\nvh_permissions:\n  network: {network}\n  filesystem: {filesystem}\n  clipboard: {clipboard}\nvh_execution:\n  timeout_ms: {timeout_ms}\n  memory_mb: {memory_mb}\n  sandbox: {sandbox}\nvh_model:\n  min_params_b: {min_params_b}\n  recommended:\n{recommended_yaml}\n  fallback: {fallback}\n{triggers_yaml}---\n\n{system_prompt}\n"
+        "---\nname: {skill_name}\ndescription: \"TODO: describe what this skill does\"\nlicense: Apache-2.0\nvh_version: 0.1.0\nvh_publisher: {publisher_id}\nvh_permissions:\n  network: {network}\n  filesystem: {filesystem}\n  clipboard: {clipboard}\nvh_execution:\n  timeout_ms: {timeout_ms}\n  memory_mb: {memory_mb}\n  sandbox: {sandbox}\nvh_model:\n  min_params_b: {min_params_b}\n  recommended:\n{recommended_yaml}\n  fallback: {fallback}\n{triggers_yaml}---\n\n{system_prompt}\n"
     );
 
     let skill_md_path = skill_dir.join("SKILL.md");
@@ -2065,7 +2067,48 @@ fn scaffold_skill_md(params: SkillMdParams<'_>) -> Result<String> {
     Ok(skill_dir.to_string())
 }
 
-fn handle_author(arguments: &serde_json::Value) -> ToolCallResult {
+/// Derive a publisher slug from a display name: lowercase + hyphenate.
+fn derive_publisher_slug(display_name: &str) -> String {
+    let slug: String = display_name
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join("-");
+    slug.chars()
+        .filter(|c| c.is_alphanumeric() || *c == '-')
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string()
+}
+
+/// Try to look up the logged-in user's publisher slug from auth state.
+///
+/// Returns `None` silently on any failure.
+fn try_infer_publisher_id(state: &AppState, registry_url: Option<&str>) -> Option<String> {
+    use vectorhawkd_core::auth::{load_tokens, AuthClient};
+
+    let url = registry_url.unwrap_or("https://app.vectorhawk.ai");
+    let tokens = load_tokens(state, url).ok().flatten()?;
+    let client = AuthClient::new(url);
+    let user_info = client.me(&tokens.access_token).ok()?;
+    let slug = derive_publisher_slug(&user_info.display_name);
+    if slug.is_empty() { None } else { Some(slug) }
+}
+
+/// Format milliseconds as a human-readable duration string.
+fn format_duration_ms(ms: u32) -> String {
+    if ms < 60_000 {
+        format!("{}s", ms / 1000)
+    } else {
+        format!("{} min", ms / 60_000)
+    }
+}
+
+fn handle_author(
+    arguments: &serde_json::Value,
+    state: &AppState,
+    registry_url: Option<&str>,
+) -> ToolCallResult {
     use vectorhawkd_core::recommend::recommend_from_prompt;
 
     let name = match arguments.get("name").and_then(|v| v.as_str()) {
@@ -2094,6 +2137,8 @@ fn handle_author(arguments: &serde_json::Value) -> ToolCallResult {
         .unwrap_or(".");
 
     let skill_id = normalize_skill_id(name);
+    let publisher_id = try_infer_publisher_id(state, registry_url)
+        .unwrap_or_else(|| "YOUR_PUBLISHER_ID".to_string());
 
     match mode {
         "skip_metadata" => {
@@ -2112,6 +2157,7 @@ fn handle_author(arguments: &serde_json::Value) -> ToolCallResult {
                 skill_id: &skill_id,
                 system_prompt,
                 output_dir,
+                publisher_id: &publisher_id,
                 triggers: &explicit_triggers,
                 network: "none",
                 filesystem: "none",
@@ -2139,6 +2185,7 @@ fn handle_author(arguments: &serde_json::Value) -> ToolCallResult {
                 skill_id: &skill_id,
                 system_prompt,
                 output_dir,
+                publisher_id: &publisher_id,
                 triggers: &rec.triggers,
                 network: rec.permissions.network,
                 filesystem: rec.permissions.filesystem,
@@ -2152,19 +2199,29 @@ fn handle_author(arguments: &serde_json::Value) -> ToolCallResult {
             }) {
                 Ok(path) => {
                     let confidence = format!("{:?}", rec.confidence).to_lowercase();
+                    let model_primary = rec.model.recommended.first().map(|s| s.as_str()).unwrap_or("gemma3:2b");
+                    let fallback_note = if rec.model.fallback == "mcp_sampling" {
+                        "falls back to AI client"
+                    } else {
+                        "no fallback"
+                    };
+                    let publisher_note = if publisher_id == "YOUR_PUBLISHER_ID" {
+                        String::new()
+                    } else {
+                        format!("\n- Publisher: {publisher_id}")
+                    };
                     ToolCallResult::success(format!(
                         "Skill '{skill_id}' created at {path}/SKILL.md\n\
                          Applied recommendations (confidence: {confidence}):\n\
-                         - network: {}\n\
-                         - filesystem: {}\n\
-                         - min_params_b: {}\n\
-                         - timeout_ms: {}\n\
-                         - sandbox: {}\n\
+                         - Network: {}\n\
+                         - Filesystem: {}\n\
+                         - Offline model: {model_primary} ({fallback_note})\n\
+                         - Timeout: {}\n\
+                         - Sandbox: {}{publisher_note}\n\
                          Next: vectorhawk skill validate {path}/",
                         rec.permissions.network,
                         rec.permissions.filesystem,
-                        rec.model.min_params_b,
-                        rec.execution.timeout_ms,
+                        format_duration_ms(rec.execution.timeout_ms),
                         rec.execution.sandbox,
                     ))
                 }
@@ -2187,10 +2244,26 @@ fn handle_author(arguments: &serde_json::Value) -> ToolCallResult {
             let triggers_json: Vec<serde_json::Value> =
                 rec.triggers.iter().map(|t| serde_json::json!(t)).collect();
 
+            let model_primary = rec.model.recommended.first().map(|s| s.as_str()).unwrap_or("gemma3:2b");
+            let fallback_note = if rec.model.fallback == "mcp_sampling" {
+                "falls back to your AI client if unavailable"
+            } else {
+                "returns an error if unavailable"
+            };
+
             let payload = serde_json::json!({
                 "status": "recommendations_ready",
                 "skill_id": skill_id,
-                "recommendations": {
+                "publisher_id": publisher_id,
+                "summary": {
+                    "network": rec.permissions.network,
+                    "filesystem": rec.permissions.filesystem,
+                    "offline_model": format!("{model_primary} (≥{}B params) — {fallback_note}", rec.model.min_params_b),
+                    "timeout": format_duration_ms(rec.execution.timeout_ms),
+                    "sandbox": rec.execution.sandbox,
+                    "triggers": triggers_json,
+                },
+                "raw": {
                     "vh_triggers": triggers_json,
                     "vh_permissions": {
                         "network": rec.permissions.network,
@@ -2209,7 +2282,7 @@ fn handle_author(arguments: &serde_json::Value) -> ToolCallResult {
                     }
                 },
                 "confidence": confidence_str,
-                "message": "Recommendations ready. Review and call skillclub_author_confirm with your final values, or pass accept_suggestions: true to apply these directly."
+                "message": "Recommendations ready. Review the summary above and call skillclub_author_confirm with your final values, or pass mode: accept_suggestions to apply these directly."
             });
 
             match serde_json::to_string_pretty(&payload) {
@@ -2220,7 +2293,11 @@ fn handle_author(arguments: &serde_json::Value) -> ToolCallResult {
     }
 }
 
-fn handle_author_confirm(arguments: &serde_json::Value) -> ToolCallResult {
+fn handle_author_confirm(
+    arguments: &serde_json::Value,
+    state: &AppState,
+    registry_url: Option<&str>,
+) -> ToolCallResult {
     let skill_id = match arguments.get("skill_id").and_then(|v| v.as_str()) {
         Some(id) if !id.is_empty() => id,
         _ => return ToolCallResult::error_result("Missing required parameter: skill_id"),
@@ -2304,10 +2381,19 @@ fn handle_author_confirm(arguments: &serde_json::Value) -> ToolCallResult {
 
     let normalized_id = normalize_skill_id(skill_id);
 
+    // Publisher ID: use explicit arg if provided, otherwise infer from auth.
+    let publisher_id = arguments
+        .get("publisher_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| try_infer_publisher_id(state, registry_url))
+        .unwrap_or_else(|| "YOUR_PUBLISHER_ID".to_string());
+
     match scaffold_skill_md(SkillMdParams {
         skill_id: &normalized_id,
         system_prompt,
         output_dir,
+        publisher_id: &publisher_id,
         triggers: &triggers,
         network: &network,
         filesystem: &filesystem,
