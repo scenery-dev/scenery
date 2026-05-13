@@ -1024,10 +1024,14 @@ pub fn handle_login_with_oauth(
                             })
                             .unwrap_or_else(|_| "<this-machine>".to_string());
                         format!(
-                            "\n\n**If accessing this machine remotely over SSH**, \
-                             forward the callback port first in a new local terminal:\n\
-                             ```\nssh -L {port}:localhost:{port} {hostname}\n```\n\
-                             Keep the tunnel open until login completes."
+                            "\n\n**Option A — browser login (SSH tunnel required):**\n\
+                             First run this in a new local terminal:\n\
+                             ```\nssh -L {port}:localhost:{port} {hostname}\n```\
+                             Then open the URL above. Keep the tunnel open until done.\n\n\
+                             **Option B — Personal Access Token (easier for SSH):**\n\
+                             1. Open https://app.vectorhawk.ai/portal/settings/tokens\n\
+                             2. Create a token (starts with `vh_pat_`)\n\
+                             3. Run: `vectorhawk auth token <vh_pat_...>`"
                         )
                     };
                     #[cfg(not(target_os = "linux"))]

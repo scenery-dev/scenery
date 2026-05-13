@@ -2210,23 +2210,24 @@ async fn cmd_auth_login(registry_url: &str) -> Result<()> {
     if is_ssh {
         println!("SSH session detected.");
         println!();
-        println!("The OAuth callback listener is on THIS machine at port {port}.");
-        println!("To complete login, forward that port to your local machine first.");
+        println!("Option A — SSH tunnel (browser login):");
         println!();
-        println!("Step 1 — run this in a NEW terminal on your local machine:");
-        println!();
-        if let Ok(hostname) = std::env::var("HOSTNAME")
+        println!("  Step 1: In a NEW terminal on your LOCAL machine, run:");
+        let hostname = std::env::var("HOSTNAME")
             .or_else(|_| std::fs::read_to_string("/etc/hostname").map(|s| s.trim().to_string()))
-        {
-            println!("  ssh -L {port}:localhost:{port} {hostname}");
-        } else {
-            println!("  ssh -L {port}:localhost:{port} <this-machine>");
-        }
+            .unwrap_or_else(|_| "<this-machine>".to_string());
+        println!("    ssh -L {port}:localhost:{port} {hostname}");
         println!();
-        println!("Step 2 — open this URL in your browser:");
-        println!("  {}", init.auth_url);
+        println!("  Step 2: Open this URL in your browser:");
+        println!("    {}", init.auth_url);
         println!();
-        println!("The tunnel must stay open until login completes.");
+        println!("  Keep the tunnel open until login completes.");
+        println!();
+        println!("Option B — Personal Access Token (no tunnel needed):");
+        println!("  1. Open https://app.vectorhawk.ai/portal/settings/tokens in your browser.");
+        println!("  2. Create a token (starts with vh_pat_...).");
+        println!("  3. Run:  vectorhawk auth token <vh_pat_...>");
+        println!();
     } else {
         println!("Opening browser for VectorHawk login...");
         println!();
