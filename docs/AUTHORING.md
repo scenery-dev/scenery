@@ -26,9 +26,8 @@ vectorhawk skill publish my-skill/ --registry-url https://app.vectorhawk.ai
 ---
 name: my-skill
 description: One sentence describing what this skill does.
-license: Apache-2.0
-vh_version: 0.1.0
-vh_publisher: your-publisher-id
+version: 0.1.0
+publisher: your-publisher-id
 vh_permissions:
   network: none
   filesystem: none

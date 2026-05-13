@@ -240,9 +240,8 @@ mod tests {
             "---\n\
              name: My Skill\n\
              description: Does the thing\n\
-             license: Apache-2.0\n\
-             vh_version: 0.1.0\n\
-             vh_publisher: test\n\
+             version: 0.1.0\n\
+             publisher: test\n\
              vh_permissions:\n\
                filesystem: none\n\
                network: none\n\

@@ -2076,7 +2076,7 @@ fn scaffold_skill_md(params: SkillMdParams<'_>) -> Result<String> {
     let body_block = indent_block(system_prompt, 8);
     let skill_md = format!(
         "---\nname: {skill_id}\ndescription: \"TODO: describe what this skill does\"\n\
-         license: Apache-2.0\nvh_version: 0.1.0\nvh_publisher: {publisher_id}\n\
+         version: 0.1.0\npublisher: {publisher_id}\n\
          vh_permissions:\n  network: {network}\n  filesystem: {filesystem}\n  clipboard: {clipboard}\n\
          vh_execution:\n  timeout_ms: {timeout_ms}\n  memory_mb: {memory_mb}\n  sandbox: {sandbox}\n\
          vh_model:\n  min_params_b: {min_params_b}\n  recommended:\n{recommended_yaml}\n  fallback: {fallback}\n\
@@ -2469,9 +2469,8 @@ mod tests {
             "---\n\
              name: Test Skill\n\
              description: A test skill for MCP testing\n\
-             license: Apache-2.0\n\
-             vh_version: 0.1.0\n\
-             vh_publisher: vectorhawk\n\
+             version: 0.1.0\n\
+             publisher: vectorhawk\n\
              vh_permissions:\n  \
                network: none\n  \
                filesystem: none\n  \

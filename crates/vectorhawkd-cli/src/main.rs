@@ -1435,9 +1435,8 @@ async fn cmd_skill_init(name: &str, output_dir: Option<&camino::Utf8Path>) -> Re
         r#"---
 name: {name}
 description: "TODO: describe what this skill does"
-license: Apache-2.0
-vh_version: 0.1.0
-vh_publisher: YOUR_PUBLISHER_ID
+version: 0.1.0
+publisher: YOUR_PUBLISHER_ID
 vh_permissions:
   network: none
   filesystem: none
@@ -1765,7 +1764,7 @@ async fn cmd_skill_author(
     let body_block = indent_block(&prompt_text, 8);
     let skill_md = format!(
         "---\nname: {skill_name}\ndescription: \"TODO: describe what this skill does\"\n\
-         license: Apache-2.0\nvh_version: 0.1.0\nvh_publisher: {publisher_id}\n\
+         version: 0.1.0\npublisher: {publisher_id}\n\
          vh_permissions:\n  network: {net}\n  filesystem: {fs_perm}\n  clipboard: {clip}\n\
          vh_execution:\n  timeout_ms: {timeout_ms}\n  memory_mb: {memory_mb}\n  sandbox: {sandbox}\n\
          vh_model:\n  min_params_b: {min_params_b}\n  recommended:\n{recommended_yaml}\n  fallback: {fallback}\n\
@@ -1831,7 +1830,7 @@ fn scaffold_with_defaults(
     let body_block = indent_block(prompt_text, 8);
     let skill_md = format!(
         "---\nname: {skill_name}\ndescription: \"TODO: describe what this skill does\"\n\
-         license: Apache-2.0\nvh_version: 0.1.0\nvh_publisher: {publisher_id}\n\
+         version: 0.1.0\npublisher: {publisher_id}\n\
          vh_permissions:\n  network: none\n  filesystem: none\n  clipboard: none\n\
          vh_execution:\n  timeout_ms: 30000\n  memory_mb: 256\n  sandbox: strict\n\
          vh_workflow:\n  - id: run\n    type: llm\n    prompt:\n      kind: inline\n      body: |\n\
@@ -1885,7 +1884,7 @@ fn scaffold_with_recommendations(
     let body_block = indent_block(prompt_text, 8);
     let skill_md = format!(
         "---\nname: {skill_name}\ndescription: \"TODO: describe what this skill does\"\n\
-         license: Apache-2.0\nvh_version: 0.1.0\nvh_publisher: {publisher_id}\n\
+         version: 0.1.0\npublisher: {publisher_id}\n\
          vh_permissions:\n  network: {net}\n  filesystem: {fs_perm}\n  clipboard: {clip}\n\
          vh_execution:\n  timeout_ms: {timeout_ms}\n  memory_mb: {memory_mb}\n  sandbox: {sandbox}\n\
          vh_model:\n  min_params_b: {min_params_b}\n  recommended:\n{recommended_yaml}\n  fallback: {fallback}\n\
@@ -2244,7 +2243,6 @@ async fn cmd_skill_convert(
         vectorhawkd_manifest::SandboxProfile::Relaxed => "relaxed",
         vectorhawkd_manifest::SandboxProfile::Unrestricted => "unrestricted",
     };
-    let license = manifest.license.as_deref().unwrap_or("Apache-2.0");
     let description = manifest
         .description
         .as_deref()
@@ -2256,9 +2254,8 @@ async fn cmd_skill_convert(
         r#"---
 name: {name}
 description: "{description_escaped}"
-license: {license}
-vh_version: {version}
-vh_publisher: {publisher}
+version: {version}
+publisher: {publisher}
 vh_permissions:
   network: {network}
   filesystem: {filesystem}
@@ -2270,7 +2267,6 @@ vh_execution:
 "#,
         name = manifest.name,
         description_escaped = description_escaped,
-        license = license,
         version = manifest.version,
         publisher = manifest.publisher,
         network = network,

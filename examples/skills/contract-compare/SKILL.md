@@ -1,9 +1,8 @@
 ---
 name: contract-compare
 description: Compare two contracts, summarize changes, and assess risk level.
-license: Apache-2.0
-vh_version: 0.3.0
-vh_publisher: skillclub
+version: 0.3.0
+publisher: skillclub
 vh_permissions:
   network: none
   filesystem: read-only

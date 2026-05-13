@@ -25,15 +25,14 @@ use std::fs;
 /// for unknown `vh_*` keys after deserialization.
 #[derive(Debug, Deserialize)]
 struct SkillMdFrontmatter {
-    // ── Standard Anthropic Agent Skills fields (required) ────────────────────
+    // ── Standard fields (required) ───────────────────────────────────────────
     name: String,
     description: String,
-    license: String,
 
     // ── VectorHawk core metadata ─────────────────────────────────────────────
-    #[serde(default)]
+    #[serde(default, rename = "version")]
     vh_version: Option<String>,
-    #[serde(default)]
+    #[serde(default, rename = "publisher")]
     vh_publisher: Option<String>,
 
     // ── VectorHawk optional blocks ───────────────────────────────────────────
@@ -170,7 +169,7 @@ pub(crate) fn load_from_skill_md_dir(root: Utf8PathBuf) -> Result<SkillPackage, 
         version,
         publisher,
         description: Some(frontmatter.description.clone()),
-        license: Some(frontmatter.license.clone()),
+        license: None,
         entrypoint,
         inputs_schema,
         outputs_schema,
@@ -210,8 +209,6 @@ fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
 /// explicit allowlist. This mirrors the JSON Schema's `patternProperties` guard.
 fn reject_unknown_vh_keys(yaml_str: &str) -> Result<(), ManifestError> {
     const ALLOWED_VH_KEYS: &[&str] = &[
-        "vh_version",
-        "vh_publisher",
         "vh_permissions",
         "vh_execution",
         "vh_model",
@@ -249,11 +246,6 @@ fn validate_frontmatter_basics(fm: &SkillMdFrontmatter) -> Result<(), ManifestEr
     if fm.description.trim().is_empty() {
         return Err(ManifestError::Invalid(
             "SKILL.md 'description' field must be non-empty".to_string(),
-        ));
-    }
-    if fm.license.trim().is_empty() {
-        return Err(ManifestError::Invalid(
-            "SKILL.md 'license' field must be non-empty".to_string(),
         ));
     }
     if fm.vh_workflow.is_some() && fm.vh_workflow_ref.is_some() {
@@ -448,7 +440,7 @@ mod tests {
     /// Minimal valid SKILL.md body (no triggers).
     fn minimal_skill_md(extra_frontmatter: &str) -> String {
         format!(
-            "---\nname: test-skill\ndescription: A test skill.\nlicense: MIT\n{extra_frontmatter}---\n\nDo the thing.\n"
+            "---\nname: test-skill\ndescription: A test skill.\n{extra_frontmatter}---\n\nDo the thing.\n"
         )
     }
 

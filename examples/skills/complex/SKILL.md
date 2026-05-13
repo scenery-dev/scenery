@@ -1,9 +1,8 @@
 ---
 name: incident-triage
 description: Triage a production incident — classify severity, extract affected systems, and draft an initial incident report.
-license: Apache-2.0
-vh_version: 1.0.0
-vh_publisher: vectorhawk-examples
+version: 1.0.0
+publisher: vectorhawk-examples
 vh_permissions:
   network: none
   filesystem: none

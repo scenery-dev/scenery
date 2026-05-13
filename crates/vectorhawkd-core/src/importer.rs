@@ -37,7 +37,6 @@ struct SkillMdFrontmatter {
     id: Option<String>,
     description: Option<String>,
     publisher: Option<String>,
-    license: Option<String>,
 }
 
 // ── ImportResult ──────────────────────────────────────────────────────────────
@@ -198,16 +197,14 @@ fn build_skill_md(display_name: &str, fm: &SkillMdFrontmatter, body: &str) -> St
     } else {
         description.to_string()
     };
-    let license = fm.license.as_deref().unwrap_or("Apache-2.0");
     let publisher = fm.publisher.as_deref().unwrap_or("local");
 
     format!(
         "---\n\
          name: {display_name}\n\
          description: {description}\n\
-         license: {license}\n\
-         vh_version: 0.1.0\n\
-         vh_publisher: {publisher}\n\
+         version: 0.1.0\n\
+         publisher: {publisher}\n\
          vh_permissions:\n  \
            network: none\n  \
            filesystem: none\n  \
@@ -283,7 +280,6 @@ mod tests {
 ---
 name: my-skill
 description: Does something cool.
-license: MIT
 ---
 
 This is the system prompt body.
@@ -331,7 +327,6 @@ It can span multiple lines.
         let skill_md_text = fs::read_to_string(result.output_dir.join("SKILL.md")).expect("read");
         assert!(skill_md_text.contains("name: my-skill"));
         assert!(skill_md_text.contains("description: Does something cool."));
-        assert!(skill_md_text.contains("license: MIT"));
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -1,9 +1,8 @@
 ---
 name: pr-summary
 description: Summarize a GitHub pull request diff into a concise plain-English description.
-license: Apache-2.0
-vh_version: 0.2.0
-vh_publisher: vectorhawk-examples
+version: 0.2.0
+publisher: vectorhawk-examples
 vh_permissions:
   network: none
   filesystem: none

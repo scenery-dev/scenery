@@ -490,7 +490,7 @@ mod tests {
 
         fs::write(
             root.join("SKILL.md"),
-            "---\nname: Contract Compare\ndescription: Compare two contracts and summarize changes.\nlicense: MIT\nvh_version: 0.1.0\nvh_publisher: forge\nvh_permissions:\n  filesystem: read-only\n  network: none\n  clipboard: none\nvh_execution:\n  sandbox: strict\n  timeout_ms: 90000\n  memory_mb: 1024\nvh_workflow_ref: ./workflow.yaml\nvh_schemas:\n  inputs:\n    type: object\n  outputs:\n    type: object\n---\n\nCompare the contracts.\n",
+            "---\nname: Contract Compare\ndescription: Compare two contracts and summarize changes.\nversion: 0.1.0\npublisher: forge\nvh_permissions:\n  filesystem: read-only\n  network: none\n  clipboard: none\nvh_execution:\n  sandbox: strict\n  timeout_ms: 90000\n  memory_mb: 1024\nvh_workflow_ref: ./workflow.yaml\nvh_schemas:\n  inputs:\n    type: object\n  outputs:\n    type: object\n---\n\nCompare the contracts.\n",
         )
         .expect("SKILL.md should be written");
         fs::write(
@@ -815,7 +815,7 @@ steps:
         fs::create_dir_all(root).expect("root dir should be created");
         fs::write(
             root.join("SKILL.md"),
-            "---\nname: hello-world\ndescription: A greeter skill.\nlicense: MIT\nvh_version: 0.1.0\nvh_publisher: test\n---\n\nYou are a greeter.\n",
+            "---\nname: hello-world\ndescription: A greeter skill.\nversion: 0.1.0\npublisher: test\n---\n\nYou are a greeter.\n",
         )
         .expect("SKILL.md should be written");
     }
@@ -828,9 +828,8 @@ steps:
             r#"---
 name: passage-analyzer
 description: Analyzes a passage and summarizes it.
-license: Apache-2.0
-vh_version: 1.0.0
-vh_publisher: vectorhawk
+version: 1.0.0
+publisher: vectorhawk
 vh_permissions:
   network: none
   filesystem: read-only
@@ -885,7 +884,7 @@ You are an expert text analyst.
             pkg.manifest.description.as_deref(),
             Some("A greeter skill.")
         );
-        assert_eq!(pkg.manifest.license.as_deref(), Some("MIT"));
+        assert!(pkg.manifest.license.is_none());
         // No schemas declared — both should be None.
         assert!(pkg.manifest.inputs_schema.is_none());
         assert!(pkg.manifest.outputs_schema.is_none());

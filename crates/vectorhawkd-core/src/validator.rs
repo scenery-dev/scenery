@@ -123,7 +123,7 @@ mod tests {
         fs::create_dir_all(root.join("prompts")).expect("create prompts dir");
         fs::write(
             root.join("SKILL.md"),
-            "---\nname: Test Skill\ndescription: A test skill.\nlicense: MIT\nvh_version: 0.1.0\nvh_publisher: skillclub\nvh_permissions:\n  filesystem: none\n  network: none\n  clipboard: none\nvh_execution:\n  sandbox: strict\n  timeout_ms: 30000\n  memory_mb: 256\nvh_workflow_ref: ./workflow.yaml\n---\n\nDo the thing.\n",
+            "---\nname: Test Skill\ndescription: A test skill.\nversion: 0.1.0\npublisher: skillclub\nvh_permissions:\n  filesystem: none\n  network: none\n  clipboard: none\nvh_execution:\n  sandbox: strict\n  timeout_ms: 30000\n  memory_mb: 256\nvh_workflow_ref: ./workflow.yaml\n---\n\nDo the thing.\n",
         )
         .expect("write SKILL.md");
         fs::write(
@@ -175,7 +175,7 @@ mod tests {
         fs::create_dir_all(dir.join("prompts")).expect("create prompts dir");
         fs::write(
             dir.join("SKILL.md"),
-            "---\nname: Test Skill\ndescription: Test.\nlicense: MIT\nvh_execution:\n  sandbox: strict\n  timeout_ms: 30000\n  memory_mb: 256\nvh_schemas:\n  outputs:\n    type: 42\nvh_workflow_ref: ./workflow.yaml\n---\n\nDo the thing.\n",
+            "---\nname: Test Skill\ndescription: Test.\nvh_execution:\n  sandbox: strict\n  timeout_ms: 30000\n  memory_mb: 256\nvh_schemas:\n  outputs:\n    type: 42\nvh_workflow_ref: ./workflow.yaml\n---\n\nDo the thing.\n",
         )
         .expect("write SKILL.md");
         fs::write(
