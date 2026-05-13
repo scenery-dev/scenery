@@ -101,6 +101,16 @@ pub enum SkillCommand {
         registry_url: Option<String>,
     },
 
+    /// Search the skill registry for available skills.
+    Search {
+        /// Search query (keyword or partial skill name).
+        query: String,
+
+        /// Registry base URL.
+        #[arg(long, env = "VECTORHAWK_REGISTRY_URL", default_value = "https://app.vectorhawk.ai")]
+        registry_url: Option<String>,
+    },
+
     /// Show detailed information about an installed skill.
     Info {
         /// Skill ID to inspect.
@@ -390,6 +400,10 @@ async fn run(cli: Cli) -> Result<()> {
             link,
             registry_url,
         }) => cmd_skill_install(&skill_ref, link, registry_url.as_deref()).await,
+        Command::Skill(SkillCommand::Search {
+            query,
+            registry_url,
+        }) => cmd_skill_search(&query, registry_url.as_deref()).await,
         Command::Skill(SkillCommand::Info { id }) => cmd_skill_info(&id).await,
         Command::Skill(SkillCommand::Run { id, input, stub }) => {
             cmd_skill_run(&id, input, stub).await
@@ -830,6 +844,45 @@ async fn cmd_skill_list() -> Result<()> {
         );
     }
 
+    Ok(())
+}
+
+// ── skill search ─────────────────────────────────────────────────────────────
+
+async fn cmd_skill_search(query: &str, registry_url: Option<&str>) -> Result<()> {
+    use vectorhawkd_core::registry::RegistryClient;
+
+    let url = registry_url.unwrap_or("https://app.vectorhawk.ai");
+    let registry = RegistryClient::new(url);
+    let q = query.to_string();
+
+    let results = tokio::task::spawn_blocking(move || registry.search_skills(&q))
+        .await
+        .context("search task panicked")?
+        .context("skill search failed")?;
+
+    if results.is_empty() {
+        println!("No skills found matching '{query}'.");
+        return Ok(());
+    }
+
+    println!("{:<35} {:<12} {}", "SKILL ID", "VERSION", "DESCRIPTION");
+    println!("{}", "-".repeat(85));
+    for r in &results {
+        let desc = r.description.as_deref().unwrap_or("");
+        let truncated = if desc.len() > 50 {
+            format!("{}…", &desc[..49])
+        } else {
+            desc.to_string()
+        };
+        println!(
+            "{:<35} {:<12} {}",
+            r.skill_id,
+            r.latest_version.as_deref().unwrap_or("-"),
+            truncated
+        );
+    }
+    println!("\n{} result(s). Run `vectorhawk skill install <skill-id>` to install.", results.len());
     Ok(())
 }
 
