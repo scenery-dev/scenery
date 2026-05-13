@@ -89,6 +89,22 @@ pub fn run_skill_with_scope(
 
     // 2. Load the skill package from the active install path.
     let pkg_path = Utf8PathBuf::from(&install_path);
+
+    // Bug #9: distinguish "never installed" from "registered but files missing".
+    // resolve_skill already confirmed a state.db row exists (Active branch above),
+    // so if the directory is absent the install is corrupted/incomplete — surface
+    // an actionable message rather than a generic load error.
+    if !pkg_path.exists() {
+        anyhow::bail!(
+            "Skill '{}' is registered in state.db but its install directory is missing or corrupt.\n\
+             Run: vectorhawk skill install {}  (to reinstall from the registry)\n\
+              or: vectorhawk skill install ./path/to/{}  (to reinstall from source)",
+            skill_id,
+            skill_id,
+            skill_id,
+        );
+    }
+
     let pkg = SkillPackage::load_from_dir(&pkg_path)
         .with_context(|| format!("failed to load skill package at {pkg_path}"))?;
 
@@ -646,6 +662,62 @@ mod tests {
             .expect_err("uninstalled skill should fail");
 
         assert!(err.to_string().contains("not installed"), "got: {err}");
+
+        let _ = fs::remove_dir_all(&state_root);
+    }
+
+    // ── Bug #9 regression test ──────────────────────────────────────────────
+    // When state.db has a record for a skill but the install directory on disk
+    // is missing (e.g. corrupted install, manual rm), `skill run` previously
+    // surfaced a generic "failed to load skill package" error that gave no hint
+    // about what went wrong or how to fix it.  The fix must return a message
+    // that mentions state.db and suggests a reinstall command.
+    #[test]
+    fn run_errors_with_actionable_message_when_db_record_exists_but_dir_missing() {
+        use rusqlite::params;
+        use rusqlite::Connection;
+
+        let state_root = temp_root("run-corrupt-install");
+        let state = AppState::bootstrap_in(state_root.clone()).expect("bootstrap");
+
+        // Seed state.db with an installed_skills row whose install_root points
+        // at a directory that we deliberately do NOT create on disk.
+        let phantom_install_root = state_root.join("skills").join("phantom-skill");
+        let conn = Connection::open(&state.db_path).expect("open db");
+        conn.execute(
+            "INSERT INTO installed_skills \
+             (skill_id, active_version, install_root, channel, current_status) \
+             VALUES (?1, ?2, ?3, 'stable', 'active')",
+            params![
+                "phantom-skill",
+                "1.0.0",
+                phantom_install_root.as_str()
+            ],
+        )
+        .expect("seed row should insert");
+        drop(conn);
+
+        let client = MockPolicyClient::new();
+        let err = run_skill(&state, &client, "phantom-skill", &serde_json::json!({}), None)
+            .expect_err("corrupt install should produce an error");
+
+        let msg = err.to_string();
+        // Must mention state.db so the user understands what is inconsistent.
+        assert!(
+            msg.contains("state.db") || msg.contains("registered"),
+            "error should mention state.db or 'registered'; got: {msg}"
+        );
+        // Must suggest a remediation path.
+        assert!(
+            msg.contains("reinstall") || msg.contains("install"),
+            "error should suggest reinstall; got: {msg}"
+        );
+        // Must NOT look like a plain "not installed" message (that's misleading
+        // when the DB record exists but files are missing).
+        assert!(
+            !msg.contains("is not installed"),
+            "should not use the generic 'not installed' message for a corrupt install; got: {msg}"
+        );
 
         let _ = fs::remove_dir_all(&state_root);
     }

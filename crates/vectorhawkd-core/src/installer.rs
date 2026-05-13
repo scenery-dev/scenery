@@ -30,7 +30,12 @@ pub fn install_unpacked_skill(
     let source_type = install_with_mode(&skill.root, &version_dir, mode)?;
 
     let active_dir = install_root.join("active");
-    if active_dir.exists() {
+    // Use `.exists() || .is_symlink()` so that a dangling symlink (e.g. from a
+    // previous --link install whose source was moved) is also cleaned up.
+    // `.exists()` alone returns false for dangling symlinks, which would leave a
+    // stale symlink entry and cause the following `symlink()` call to fail with
+    // EEXIST on a re-install.
+    if active_dir.exists() || active_dir.is_symlink() {
         fs::remove_file(&active_dir)
             .or_else(|_| fs::remove_dir_all(&active_dir))
             .ok();
@@ -469,5 +474,112 @@ mod tests {
         let changed = reactivate_skill(&state, "ghost-skill").expect("reactivate should not error");
         assert!(!changed, "should return false for non-existent skill");
         let _ = fs::remove_dir_all(&state.root_dir);
+    }
+
+    // ── Bug #6 regression test ──────────────────────────────────────────────
+    // When `--link` mode is used and the source directory is edited (or
+    // temporarily removed), the `active/` symlink becomes dangling.  A
+    // subsequent re-install with `--link` must succeed even though the dangling
+    // symlink still exists on disk.  The previous code used `active_dir.exists()`
+    // which returns `false` for dangling symlinks, so the cleanup was skipped and
+    // the following `symlink()` call failed with EEXIST.
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn symlink_install_survives_dangling_active_symlink_on_reinstall() {
+        let root = temp_root("link-reinstall");
+        let state = AppState::bootstrap_in(root.clone()).expect("state bootstrap should succeed");
+
+        // Use a temp source directory we control so we can make the symlink dangle.
+        let source_dir = temp_root("link-reinstall-source");
+        fs::create_dir_all(&source_dir).expect("create source dir");
+
+        // Copy the example skill files into our controlled source dir so we get
+        // a valid SkillPackage.
+        let example = example_skill_path();
+        for entry in fs::read_dir(&example).expect("read example dir") {
+            let entry = entry.expect("read entry");
+            let dest = source_dir.join(entry.file_name().to_string_lossy().as_ref());
+            if entry.file_type().expect("file type").is_dir() {
+                // shallow copy — sub-dirs are not needed for this test
+                continue;
+            }
+            fs::copy(entry.path(), &dest).expect("copy file");
+        }
+        // Copy sub-directories too (prompts/, schemas/).
+        for entry in fs::read_dir(&example).expect("read example dir") {
+            let entry = entry.expect("read entry");
+            if entry.file_type().expect("file type").is_dir() {
+                let src_sub = entry.path();
+                let dst_sub = source_dir.join(entry.file_name().to_string_lossy().as_ref());
+                copy_dir_all(&src_sub, &dst_sub).expect("copy sub-dir");
+            }
+        }
+
+        let pkg =
+            SkillPackage::load_from_dir(source_dir.clone()).expect("source skill should load");
+        let skill_id = pkg.manifest.id.clone();
+
+        // First install with --link.
+        install_unpacked_skill(&state, &pkg, InstallMode::Symlink)
+            .expect("first symlink install should succeed");
+
+        let install_root = state.root_dir.join("skills").join(&skill_id);
+        let active_dir = install_root.join("active");
+
+        // Confirm the active/ symlink is healthy after first install.
+        assert!(
+            active_dir.exists(),
+            "active dir should exist after first install"
+        );
+
+        // Simulate "source edited": remove the source directory to make the
+        // versions/{ver}/ → source chain dangle, then recreate it.
+        fs::remove_dir_all(&source_dir).expect("remove source to simulate edit");
+
+        // The active/ symlink now points through versions/{ver}/ which points at
+        // the gone source — it is dangling and `active_dir.exists()` returns false.
+        assert!(
+            !active_dir.exists(),
+            "active dir should appear absent when source is gone (dangling symlink)"
+        );
+        assert!(
+            active_dir.is_symlink(),
+            "but active dir IS a symlink (dangling) — this is the bug trigger condition"
+        );
+
+        // Recreate source and reinstall with --link — this must not error.
+        fs::create_dir_all(&source_dir).expect("recreate source dir");
+        for entry in fs::read_dir(&example).expect("read example dir") {
+            let entry = entry.expect("read entry");
+            let dest = source_dir.join(entry.file_name().to_string_lossy().as_ref());
+            if entry.file_type().expect("file type").is_dir() {
+                continue;
+            }
+            fs::copy(entry.path(), &dest).expect("copy file");
+        }
+        for entry in fs::read_dir(&example).expect("read example dir") {
+            let entry = entry.expect("read entry");
+            if entry.file_type().expect("file type").is_dir() {
+                let src_sub = entry.path();
+                let dst_sub = source_dir.join(entry.file_name().to_string_lossy().as_ref());
+                copy_dir_all(&src_sub, &dst_sub).expect("copy sub-dir");
+            }
+        }
+
+        let pkg2 =
+            SkillPackage::load_from_dir(source_dir.clone()).expect("recreated source should load");
+
+        // This is the call that previously failed with EEXIST due to the dangling symlink.
+        install_unpacked_skill(&state, &pkg2, InstallMode::Symlink)
+            .expect("second symlink install should succeed despite prior dangling active symlink");
+
+        // After reinstall the active/ symlink must be healthy again.
+        assert!(
+            active_dir.exists(),
+            "active dir should resolve after successful reinstall"
+        );
+
+        let _ = fs::remove_dir_all(&state.root_dir);
+        let _ = fs::remove_dir_all(&source_dir);
     }
 }
