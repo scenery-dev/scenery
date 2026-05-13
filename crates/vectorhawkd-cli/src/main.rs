@@ -2203,13 +2203,38 @@ async fn cmd_auth_login(registry_url: &str) -> Result<()> {
 
     // ── Step 4: open browser ──────────────────────────────────────────────────
 
-    println!("Opening browser for VectorHawk login...");
-    println!();
-    println!("If your browser does not open automatically, visit:");
-    println!("  {}", init.auth_url);
-    println!();
+    let is_ssh = std::env::var_os("SSH_CLIENT").is_some()
+        || std::env::var_os("SSH_TTY").is_some()
+        || std::env::var_os("SSH_CONNECTION").is_some();
 
-    open_browser(&init.auth_url);
+    if is_ssh {
+        println!("SSH session detected.");
+        println!();
+        println!("The OAuth callback listener is on THIS machine at port {port}.");
+        println!("To complete login, forward that port to your local machine first.");
+        println!();
+        println!("Step 1 — run this in a NEW terminal on your local machine:");
+        println!();
+        if let Ok(hostname) = std::env::var("HOSTNAME")
+            .or_else(|_| std::fs::read_to_string("/etc/hostname").map(|s| s.trim().to_string()))
+        {
+            println!("  ssh -L {port}:localhost:{port} {hostname}");
+        } else {
+            println!("  ssh -L {port}:localhost:{port} <this-machine>");
+        }
+        println!();
+        println!("Step 2 — open this URL in your browser:");
+        println!("  {}", init.auth_url);
+        println!();
+        println!("The tunnel must stay open until login completes.");
+    } else {
+        println!("Opening browser for VectorHawk login...");
+        println!();
+        println!("If your browser does not open automatically, visit:");
+        println!("  {}", init.auth_url);
+        open_browser(&init.auth_url);
+    }
+    println!();
 
     // ── Step 5: wait for callback via daemon ──────────────────────────────────
 
