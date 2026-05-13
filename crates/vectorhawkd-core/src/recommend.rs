@@ -301,10 +301,11 @@ fn generate_triggers(name: &str, description: &str) -> Vec<String> {
     let name_phrase = name.to_lowercase().replace(['-', '_'], " ");
     candidates.push(name_phrase.trim().to_string());
 
-    // Reversed word order variant (reads better for some skill names like
-    // "contract-compare" → "compare contracts").
+    // Reversed word order variant (reads better for 2-word skill names like
+    // "contract-compare" → "compare contracts"). Skip 3+ word names where
+    // reversal produces nonsense phrases.
     let words: Vec<&str> = name_phrase.split_whitespace().collect();
-    if words.len() >= 2 {
+    if words.len() == 2 {
         let mut reversed = words.clone();
         reversed.reverse();
         candidates.push(reversed.join(" "));

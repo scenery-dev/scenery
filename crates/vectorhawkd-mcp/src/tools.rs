@@ -2004,6 +2004,23 @@ struct SkillMdParams<'a> {
     sandbox: &'a str,
 }
 
+/// Indent each line of `text` by `spaces` spaces, returning the result with a trailing newline.
+/// Used to embed system prompts as YAML block scalars.
+fn indent_block(text: &str, spaces: usize) -> String {
+    let prefix = " ".repeat(spaces);
+    let mut out = String::new();
+    for line in text.trim().lines() {
+        out.push_str(&prefix);
+        out.push_str(line);
+        out.push('\n');
+    }
+    if out.is_empty() {
+        out.push_str(&prefix);
+        out.push('\n');
+    }
+    out
+}
+
 /// Scaffold a SKILL.md in `output_dir/<skill_id>/` with the provided values.
 ///
 /// Returns the path that was written on success.
@@ -2055,9 +2072,20 @@ fn scaffold_skill_md(params: SkillMdParams<'_>) -> Result<String> {
         .collect::<Vec<_>>()
         .join("\n");
 
-    let skill_name = skill_id.replace('-', " ");
+    // Use skill_id as the name (the caller normalizes it from the user input).
+    let body_block = indent_block(system_prompt, 8);
     let skill_md = format!(
-        "---\nname: {skill_name}\ndescription: \"TODO: describe what this skill does\"\nlicense: Apache-2.0\nvh_version: 0.1.0\nvh_publisher: {publisher_id}\nvh_permissions:\n  network: {network}\n  filesystem: {filesystem}\n  clipboard: {clipboard}\nvh_execution:\n  timeout_ms: {timeout_ms}\n  memory_mb: {memory_mb}\n  sandbox: {sandbox}\nvh_model:\n  min_params_b: {min_params_b}\n  recommended:\n{recommended_yaml}\n  fallback: {fallback}\n{triggers_yaml}---\n\n{system_prompt}\n"
+        "---\nname: {skill_id}\ndescription: \"TODO: describe what this skill does\"\n\
+         license: Apache-2.0\nvh_version: 0.1.0\nvh_publisher: {publisher_id}\n\
+         vh_permissions:\n  network: {network}\n  filesystem: {filesystem}\n  clipboard: {clipboard}\n\
+         vh_execution:\n  timeout_ms: {timeout_ms}\n  memory_mb: {memory_mb}\n  sandbox: {sandbox}\n\
+         vh_model:\n  min_params_b: {min_params_b}\n  recommended:\n{recommended_yaml}\n  fallback: {fallback}\n\
+         {triggers_yaml}\
+         vh_workflow:\n  - id: run\n    type: llm\n    prompt:\n      kind: inline\n      body: |\n\
+         {body_block}\
+         \n    inputs:\n      text: input.text\n\
+         vh_schemas:\n  inputs:\n    type: object\n    properties:\n      text:\n        type: string\n\
+         \n    required:\n      - text\n---\n"
     );
 
     let skill_md_path = skill_dir.join("SKILL.md");

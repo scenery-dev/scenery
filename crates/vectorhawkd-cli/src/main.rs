@@ -129,6 +129,10 @@ pub enum SkillCommand {
         /// Skip model calls; execute stub outputs only.
         #[arg(long, default_value_t = false)]
         stub: bool,
+
+        /// Model name to use (overrides OLLAMA_MODEL env var and manifest recommendations).
+        #[arg(long)]
+        model: Option<String>,
     },
 
     /// Import a SKILL.md file and scaffold a local bundle directory.
@@ -409,8 +413,8 @@ async fn run(cli: Cli) -> Result<()> {
             registry_url,
         }) => cmd_skill_search(&query, registry_url.as_deref()).await,
         Command::Skill(SkillCommand::Info { id }) => cmd_skill_info(&id).await,
-        Command::Skill(SkillCommand::Run { id, input, stub }) => {
-            cmd_skill_run(&id, input, stub).await
+        Command::Skill(SkillCommand::Run { id, input, stub, model }) => {
+            cmd_skill_run(&id, input, stub, model.as_deref()).await
         }
         Command::Skill(SkillCommand::Import {
             path,
@@ -1034,7 +1038,83 @@ async fn cmd_skill_info(id: &str) -> Result<()> {
 
 // ── skill run ─────────────────────────────────────────────────────────────────
 
-async fn cmd_skill_run(id: &str, input_path: camino::Utf8PathBuf, stub: bool) -> Result<()> {
+/// Select the best available Ollama model for a given skill.
+///
+/// Priority order:
+/// 1. `--model` CLI flag (passed as `explicit_model`)
+/// 2. `OLLAMA_MODEL` env var
+/// 3. Manifest `vh_model.recommended` list matched against locally available models
+/// 4. First available Ollama model (if none of the recommended are present)
+/// 5. First recommended model name (if Ollama is unreachable)
+fn select_model_for_skill(
+    ollama_url: &str,
+    skill_id: &str,
+    state: &vectorhawkd_core::state::AppState,
+    explicit_model: Option<&str>,
+) -> String {
+    use vectorhawkd_core::ollama::OllamaClient;
+    use vectorhawkd_manifest::SkillPackage;
+
+    // Priority 1: explicit CLI flag.
+    if let Some(m) = explicit_model {
+        return m.to_string();
+    }
+
+    // Priority 2: OLLAMA_MODEL env var.
+    if let Ok(m) = std::env::var("OLLAMA_MODEL") {
+        if !m.is_empty() {
+            return m;
+        }
+    }
+
+    // Priority 3+: load manifest recommended models, then query Ollama.
+    let install_root = state.root_dir.join("skills").join(skill_id);
+    let active_path = install_root.join("active");
+    let recommended: Vec<String> = SkillPackage::load_from_dir(&active_path)
+        .ok()
+        .and_then(|pkg| pkg.manifest.model_requirements)
+        .map(|reqs| reqs.recommended)
+        .unwrap_or_default();
+
+    let client = OllamaClient::new(ollama_url, "");
+    let available: Vec<String> = client
+        .list_models()
+        .ok()
+        .map(|models| models.into_iter().map(|m| m.name).collect())
+        .unwrap_or_default();
+
+    if available.is_empty() {
+        // Ollama unreachable — fall back to first recommended or hard default.
+        return recommended
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| "llama3".to_string());
+    }
+
+    if recommended.is_empty() {
+        return available.into_iter().next().unwrap_or_else(|| "llama3".to_string());
+    }
+
+    // Find first recommended model that is available (prefix match).
+    for rec in &recommended {
+        if let Some(found) = available.iter().find(|a| *a == rec || a.starts_with(rec.as_str())) {
+            return found.clone();
+        }
+    }
+
+    // None of the recommended are available — use first available.
+    available
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| recommended[0].clone())
+}
+
+async fn cmd_skill_run(
+    id: &str,
+    input_path: camino::Utf8PathBuf,
+    stub: bool,
+    explicit_model: Option<&str>,
+) -> Result<()> {
     use vectorhawkd_core::{
         executor::run_skill, ollama::OllamaClient, policy::MockPolicyClient, state::AppState,
     };
@@ -1054,7 +1134,7 @@ async fn cmd_skill_run(id: &str, input_path: camino::Utf8PathBuf, stub: bool) ->
         let ollama_url = std::env::var("VECTORHAWK_OLLAMA_URL")
             .or_else(|_| std::env::var("OLLAMA_BASE_URL"))
             .unwrap_or_else(|_| "http://localhost:11434".to_string());
-        let ollama_model = std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "llama3".to_string());
+        let ollama_model = select_model_for_skill(&ollama_url, id, &state, explicit_model);
         let model = OllamaClient::new(ollama_url, ollama_model);
         run_skill(&state, &policy, id, &input, Some(&model))
             .with_context(|| format!("failed to run skill '{id}'"))?
@@ -1489,7 +1569,47 @@ async fn cmd_skill_author(
 
     // ── Step 3: Run recommendation engine ────────────────────────────────────
 
-    let rec = recommend_from_prompt(&skill_name, "", &prompt_text);
+    let mut rec = recommend_from_prompt(&skill_name, "", &prompt_text);
+
+    // ── Step 3b: Detect locally available Ollama models (Fix 2E) ─────────────
+    //
+    // If Ollama is reachable, override the recommended model list with a model
+    // that is actually installed locally. This prevents the common DX failure
+    // where the scaffold recommends a model the user hasn't pulled yet.
+
+    let ollama_url_for_detect = std::env::var("VECTORHAWK_OLLAMA_URL")
+        .or_else(|_| std::env::var("OLLAMA_BASE_URL"))
+        .unwrap_or_else(|_| "http://localhost:11434".to_string());
+
+    let available_ollama: Vec<String> = {
+        use vectorhawkd_core::ollama::OllamaClient;
+        let client = OllamaClient::new(&ollama_url_for_detect, "");
+        if client.health_check().reachable {
+            client
+                .list_models()
+                .ok()
+                .map(|models| models.into_iter().map(|m| m.name).collect())
+                .unwrap_or_default()
+        } else {
+            vec![]
+        }
+    };
+
+    if !available_ollama.is_empty() {
+        // Find the first recommended model present locally (prefix match).
+        let found = rec.model.recommended.iter().find(|rec_model| {
+            available_ollama
+                .iter()
+                .any(|a| a == *rec_model || a.starts_with(rec_model.as_str()))
+        });
+        if let Some(matched) = found {
+            let matched = matched.clone();
+            rec.model.recommended = vec![matched];
+        } else {
+            // None of the recommended models are available — use first available.
+            rec.model.recommended = vec![available_ollama[0].clone()];
+        }
+    }
 
     // ── Step 4: Determine final metadata values ───────────────────────────────
 
@@ -1512,7 +1632,7 @@ async fn cmd_skill_author(
 
     if skip_metadata {
         // Scaffold with hardcoded defaults.
-        scaffold_with_defaults(&skill_id, &prompt_text, &base, &publisher_id)?;
+        scaffold_with_defaults(&skill_name, &skill_id, &prompt_text, &base, &publisher_id)?;
         println!("Created skill at {}/{}/SKILL.md", base, skill_id);
         println!();
         println!("Next steps:");
@@ -1531,19 +1651,21 @@ async fn cmd_skill_author(
 
     if accept_suggestions {
         // Scaffold with recommendations applied.
-        scaffold_with_recommendations(&skill_id, &prompt_text, &base, &rec, &publisher_id)?;
+        scaffold_with_recommendations(&skill_name, &skill_id, &prompt_text, &base, &rec, &publisher_id)?;
         let confidence_str = format!("{:?}", rec.confidence).to_lowercase();
         println!("Created skill at {}/{}/SKILL.md", base, skill_id);
         println!("Applied recommendations (confidence: {confidence_str}):");
         println!("  Network: {}", rec.permissions.network);
         println!("  Filesystem: {}", rec.permissions.filesystem);
         let model_primary = rec.model.recommended.first().map(|s| s.as_str()).unwrap_or("gemma3:2b");
-        let fallback_note = if rec.model.fallback == "mcp_sampling" {
-            "falls back to AI client"
+        let model_status = if available_ollama.iter().any(|a| a == model_primary || a.starts_with(model_primary)) {
+            format!("{model_primary} (installed locally)")
+        } else if available_ollama.is_empty() {
+            format!("{model_primary} (not installed — run: ollama pull {model_primary})")
         } else {
-            "no fallback"
+            format!("{model_primary} (not installed — run: ollama pull {model_primary})")
         };
-        println!("  Offline model: {model_primary} ({})", fallback_note);
+        println!("  Offline model: {model_status}");
         println!("  Timeout: {}", format_duration_ms(rec.execution.timeout_ms));
         println!("  Sandbox: {}", rec.execution.sandbox);
         println!("  Triggers: {}", rec.triggers.join(", "));
@@ -1580,9 +1702,16 @@ async fn cmd_skill_author(
     } else {
         "returns an error if unavailable"
     };
+    let model_install_note = if available_ollama.iter().any(|a| a == model_primary || a.starts_with(model_primary)) {
+        format!("{model_primary} (installed locally)")
+    } else if available_ollama.is_empty() {
+        format!("{model_primary} (not installed — run: ollama pull {model_primary})")
+    } else {
+        format!("{model_primary} (not installed — run: ollama pull {model_primary})")
+    };
     println!(
         "Offline model: {} (needs ≥{}B params) — {}",
-        model_primary, rec.model.min_params_b, fallback_desc
+        model_install_note, rec.model.min_params_b, fallback_desc
     );
     let (min_params_b, recommended_models, fallback) = prompt_field_group_model(
         rec.model.min_params_b,
@@ -1633,9 +1762,19 @@ async fn cmd_skill_author(
         .collect::<Vec<_>>()
         .join("\n");
 
-    let skill_name_display = skill_id.replace('-', " ");
+    let body_block = indent_block(&prompt_text, 8);
     let skill_md = format!(
-        "---\nname: {skill_name_display}\ndescription: \"TODO: describe what this skill does\"\nlicense: Apache-2.0\nvh_version: 0.1.0\nvh_publisher: {publisher_id}\nvh_permissions:\n  network: {net}\n  filesystem: {fs_perm}\n  clipboard: {clip}\nvh_execution:\n  timeout_ms: {timeout_ms}\n  memory_mb: {memory_mb}\n  sandbox: {sandbox}\nvh_model:\n  min_params_b: {min_params_b}\n  recommended:\n{recommended_yaml}\n  fallback: {fallback}\n{triggers_yaml}---\n\n{prompt_text}\n"
+        "---\nname: {skill_name}\ndescription: \"TODO: describe what this skill does\"\n\
+         license: Apache-2.0\nvh_version: 0.1.0\nvh_publisher: {publisher_id}\n\
+         vh_permissions:\n  network: {net}\n  filesystem: {fs_perm}\n  clipboard: {clip}\n\
+         vh_execution:\n  timeout_ms: {timeout_ms}\n  memory_mb: {memory_mb}\n  sandbox: {sandbox}\n\
+         vh_model:\n  min_params_b: {min_params_b}\n  recommended:\n{recommended_yaml}\n  fallback: {fallback}\n\
+         {triggers_yaml}\
+         vh_workflow:\n  - id: run\n    type: llm\n    prompt:\n      kind: inline\n      body: |\n\
+         {body_block}\
+         \n    inputs:\n      text: input.text\n\
+         vh_schemas:\n  inputs:\n    type: object\n    properties:\n      text:\n        type: string\n\
+         \n    required:\n      - text\n---\n"
     );
 
     fs::write(skill_dir.join("SKILL.md"), &skill_md).context("failed to write SKILL.md")?;
@@ -1655,8 +1794,26 @@ async fn cmd_skill_author(
     Ok(())
 }
 
+/// Indent each line of `text` by `spaces` spaces, returning the result with a trailing newline.
+/// Used to embed system prompts as YAML block scalars.
+fn indent_block(text: &str, spaces: usize) -> String {
+    let prefix = " ".repeat(spaces);
+    let mut out = String::new();
+    for line in text.trim().lines() {
+        out.push_str(&prefix);
+        out.push_str(line);
+        out.push('\n');
+    }
+    if out.is_empty() {
+        out.push_str(&prefix);
+        out.push('\n');
+    }
+    out
+}
+
 /// Scaffold a skill with hardcoded minimal defaults (no recommendations).
 fn scaffold_with_defaults(
+    skill_name: &str,
     skill_id: &str,
     prompt_text: &str,
     base: &camino::Utf8Path,
@@ -1671,9 +1828,17 @@ fn scaffold_with_defaults(
     fs::create_dir_all(&skill_dir)
         .with_context(|| format!("failed to create directory '{skill_dir}'"))?;
 
-    let skill_name_display = skill_id.replace('-', " ");
+    let body_block = indent_block(prompt_text, 8);
     let skill_md = format!(
-        "---\nname: {skill_name_display}\ndescription: \"TODO: describe what this skill does\"\nlicense: Apache-2.0\nvh_version: 0.1.0\nvh_publisher: {publisher_id}\nvh_permissions:\n  network: none\n  filesystem: none\n  clipboard: none\nvh_execution:\n  timeout_ms: 30000\n  memory_mb: 256\n  sandbox: strict\n---\n\n{prompt_text}\n"
+        "---\nname: {skill_name}\ndescription: \"TODO: describe what this skill does\"\n\
+         license: Apache-2.0\nvh_version: 0.1.0\nvh_publisher: {publisher_id}\n\
+         vh_permissions:\n  network: none\n  filesystem: none\n  clipboard: none\n\
+         vh_execution:\n  timeout_ms: 30000\n  memory_mb: 256\n  sandbox: strict\n\
+         vh_workflow:\n  - id: run\n    type: llm\n    prompt:\n      kind: inline\n      body: |\n\
+         {body_block}\
+         \n    inputs:\n      text: input.text\n\
+         vh_schemas:\n  inputs:\n    type: object\n    properties:\n      text:\n        type: string\n\
+         \n    required:\n      - text\n---\n"
     );
 
     fs::write(skill_dir.join("SKILL.md"), &skill_md).context("failed to write SKILL.md")
@@ -1681,6 +1846,7 @@ fn scaffold_with_defaults(
 
 /// Scaffold a skill using the provided recommendation output.
 fn scaffold_with_recommendations(
+    skill_name: &str,
     skill_id: &str,
     prompt_text: &str,
     base: &camino::Utf8Path,
@@ -1716,9 +1882,19 @@ fn scaffold_with_recommendations(
         .collect::<Vec<_>>()
         .join("\n");
 
-    let skill_name_display = skill_id.replace('-', " ");
+    let body_block = indent_block(prompt_text, 8);
     let skill_md = format!(
-        "---\nname: {skill_name_display}\ndescription: \"TODO: describe what this skill does\"\nlicense: Apache-2.0\nvh_version: 0.1.0\nvh_publisher: {publisher_id}\nvh_permissions:\n  network: {net}\n  filesystem: {fs_perm}\n  clipboard: {clip}\nvh_execution:\n  timeout_ms: {timeout_ms}\n  memory_mb: {memory_mb}\n  sandbox: {sandbox}\nvh_model:\n  min_params_b: {min_params_b}\n  recommended:\n{recommended_yaml}\n  fallback: {fallback}\n{triggers_yaml}---\n\n{prompt_text}\n",
+        "---\nname: {skill_name}\ndescription: \"TODO: describe what this skill does\"\n\
+         license: Apache-2.0\nvh_version: 0.1.0\nvh_publisher: {publisher_id}\n\
+         vh_permissions:\n  network: {net}\n  filesystem: {fs_perm}\n  clipboard: {clip}\n\
+         vh_execution:\n  timeout_ms: {timeout_ms}\n  memory_mb: {memory_mb}\n  sandbox: {sandbox}\n\
+         vh_model:\n  min_params_b: {min_params_b}\n  recommended:\n{recommended_yaml}\n  fallback: {fallback}\n\
+         {triggers_yaml}\
+         vh_workflow:\n  - id: run\n    type: llm\n    prompt:\n      kind: inline\n      body: |\n\
+         {body_block}\
+         \n    inputs:\n      text: input.text\n\
+         vh_schemas:\n  inputs:\n    type: object\n    properties:\n      text:\n        type: string\n\
+         \n    required:\n      - text\n---\n",
         net = rec.permissions.network,
         fs_perm = rec.permissions.filesystem,
         clip = rec.permissions.clipboard,

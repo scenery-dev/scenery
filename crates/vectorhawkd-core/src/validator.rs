@@ -43,6 +43,17 @@ pub fn validate_bundle(path: &Utf8Path) -> ValidationReport {
     };
 
     if let Some(pkg) = pkg {
+        // Warn if description is still the TODO placeholder.
+        let desc = pkg.manifest.description.as_deref().unwrap_or("").to_lowercase();
+        if desc.starts_with("todo:") || desc == "todo: describe what this skill does" {
+            checks.push(fail(
+                "description",
+                "description is still the TODO placeholder — update it before publishing",
+            ));
+        } else {
+            checks.push(ok("description"));
+        }
+
         checks.push(check_json_schema_value(
             "inputs_schema",
             pkg.manifest.inputs_schema.as_ref(),
@@ -134,7 +145,8 @@ mod tests {
             report.all_passed(),
             "expected all checks to pass: {report:?}"
         );
-        assert_eq!(report.checks.len(), 3);
+        // 1: manifest and workflow, 2: description, 3: inputs_schema, 4: outputs_schema
+        assert_eq!(report.checks.len(), 4);
 
         let _ = fs::remove_dir_all(&dir);
     }

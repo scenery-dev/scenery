@@ -151,10 +151,11 @@ fn skill_info_parses() {
 fn skill_run_parses() {
     use super::{Command, SkillCommand};
     match parse(&["skill", "run", "my-skill", "--input", "input.json"]).command {
-        Command::Skill(SkillCommand::Run { id, input, stub }) => {
+        Command::Skill(SkillCommand::Run { id, input, stub, model }) => {
             assert_eq!(id, "my-skill");
             assert_eq!(input.as_str(), "input.json");
             assert!(!stub);
+            assert!(model.is_none());
         }
         other => panic!("expected Skill(Run), got {other:?}"),
     }
