@@ -2267,7 +2267,9 @@ async fn cmd_skill_publish(
     println!(
         "Published '{}' v{}",
         resp.frontmatter.name,
-        resp.frontmatter.vh_version.as_deref().unwrap_or("?")
+        resp.frontmatter.version.as_deref()
+            .or(resp.frontmatter.vh_version.as_deref())
+            .unwrap_or("?")
     );
     println!("Content hash: {}", resp.content_hash);
     if !resp.warnings.is_empty() {

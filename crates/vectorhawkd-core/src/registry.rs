@@ -76,8 +76,17 @@ pub struct SkillStatusResponse {
 pub struct CompileFrontmatterSummary {
     pub name: String,
     pub description: String,
-    pub license: String,
+    #[serde(default)]
+    pub license: Option<String>,
+    // Canonical names (registry v1.0.18+).
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub publisher: Option<String>,
+    // Legacy names kept for backwards compat with older registry responses.
+    #[serde(default)]
     pub vh_version: Option<String>,
+    #[serde(default)]
     pub vh_publisher: Option<String>,
 }
 
