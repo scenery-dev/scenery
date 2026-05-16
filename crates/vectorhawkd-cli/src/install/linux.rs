@@ -163,7 +163,7 @@ fn install_systemd(bin_path: &std::path::Path) -> Result<()> {
     // Skip only when the unit exists, is enabled, AND the ExecStart path in the
     // unit file matches the current binary. After a brew upgrade the binary path
     // changes (new Cellar directory), so we must rewrite the unit and restart.
-    if unit.exists() && unit_is_enabled() {
+    let is_upgrade = if unit.exists() && unit_is_enabled() {
         let unit_has_current_binary = fs::read_to_string(&unit)
             .ok()
             .map(|s| {
@@ -179,8 +179,10 @@ fn install_systemd(bin_path: &std::path::Path) -> Result<()> {
         }
         // Binary path changed (upgrade): fall through to rewrite + restart.
         println!("VectorHawk daemon binary path changed — updating unit and restarting.");
-        let _ = systemctl_user(&["stop", SERVICE_NAME]);
-    }
+        true
+    } else {
+        false
+    };
 
     // ── 1. Ensure unit dir exists ─────────────────────────────────────────────
     if let Some(parent) = unit.parent() {
@@ -198,18 +200,34 @@ fn install_systemd(bin_path: &std::path::Path) -> Result<()> {
     // ── 3. daemon-reload ──────────────────────────────────────────────────────
     systemctl_user(&["daemon-reload"]).context("systemctl daemon-reload failed")?;
 
-    // ── 4. enable --now ───────────────────────────────────────────────────────
-    // This starts the daemon immediately when a D-Bus user session is present
-    // (normal interactive login). In Homebrew post_install or headless SSH
-    // contexts, XDG_RUNTIME_DIR may be absent and systemctl --user will fail.
-    // We ignore that error and fall back to spawning the daemon directly.
-    let started_via_systemd = systemctl_user(&["enable", "--now", SERVICE_NAME]).is_ok();
-
-    // ── 5. Verify socket reachable; spawn directly if systemd didn't start it ─
-    // Use the canonical XDG path so the socket check agrees with where the
-    // daemon will bind regardless of whether XDG_RUNTIME_DIR is in the env.
+    // ── 4. Start or restart the daemon ────────────────────────────────────────
     let xdg = xdg_runtime_dir();
     let xdg_sock = format!("{xdg}/vectorhawk/agent.sock");
+
+    let started_via_systemd = if is_upgrade {
+        // `restart` atomically stops the old process and starts the new one.
+        // Works when a D-Bus user session is present (interactive login).
+        // In Homebrew post_install the D-Bus session is absent so restart will
+        // fail — we handle that below by killing the old PID directly.
+        systemctl_user(&["restart", SERVICE_NAME]).is_ok()
+    } else {
+        // Fresh install: enable the unit for auto-start and start it now.
+        // Same D-Bus caveat applies; fall back to direct spawn below.
+        systemctl_user(&["enable", "--now", SERVICE_NAME]).is_ok()
+    };
+
+    // ── 5. Verify socket reachable; spawn directly if systemd didn't work ─────
+    // Use the canonical XDG path so the socket check agrees with where the
+    // daemon will bind regardless of whether XDG_RUNTIME_DIR is in the env.
+
+    // On an upgrade where systemctl restart failed (no D-Bus), the old process
+    // is still running from a deleted inode. Kill it so the socket goes away,
+    // then let the direct-spawn path start the new binary.
+    if is_upgrade && !started_via_systemd {
+        kill_daemon_process();
+        // Brief pause for the socket to close after SIGTERM.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
 
     if !socket_is_reachable(&xdg_sock, 1500) {
         // systemctl didn't start the daemon (no D-Bus session or systemd user
@@ -243,11 +261,13 @@ fn install_systemd(bin_path: &std::path::Path) -> Result<()> {
 
         if socket_is_reachable(&xdg_sock, 500) {
             println!("VectorHawk daemon started (direct spawn fallback).");
-            println!(
-                "Note: the daemon is managed by systemd on next login. For \
-                 permanent auto-start without a graphical session, run:\n  \
-                 sudo loginctl enable-linger $USER"
-            );
+            if !is_upgrade {
+                println!(
+                    "Note: the daemon is managed by systemd on next login. For \
+                     permanent auto-start without a graphical session, run:\n  \
+                     sudo loginctl enable-linger $USER"
+                );
+            }
         } else {
             println!(
                 "VectorHawk daemon unit installed. Start it now with:\n  \
@@ -256,14 +276,42 @@ fn install_systemd(bin_path: &std::path::Path) -> Result<()> {
                 bin_str = bin_path.display(),
             );
         }
+    } else if started_via_systemd {
+        println!("Systemd user unit enabled and started ({SERVICE_NAME}).");
     } else {
-        if started_via_systemd {
-            println!("Systemd user unit enabled and started ({SERVICE_NAME}).");
-        } else {
-            println!("VectorHawk daemon is running.");
-        }
+        println!("VectorHawk daemon is running.");
     }
     Ok(())
+}
+
+/// Send SIGTERM to any running `vectorhawk daemon run --foreground` process.
+///
+/// Used during upgrades when `systemctl --user restart` fails (no D-Bus
+/// session in Homebrew post_install). On Linux a process keeps running after
+/// its binary is deleted, so we must explicitly kill it before spawning the
+/// replacement. Non-fatal: errors are silently ignored.
+fn kill_daemon_process() {
+    let Ok(proc_entries) = fs::read_dir("/proc") else {
+        return;
+    };
+    for entry in proc_entries.flatten() {
+        let name = entry.file_name();
+        let pid_str = name.to_string_lossy();
+        if !pid_str.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let cmdline_path = entry.path().join("cmdline");
+        let Ok(raw) = fs::read(&cmdline_path) else {
+            continue;
+        };
+        // cmdline is NUL-separated; check it contains our marker tokens
+        let cmdline = String::from_utf8_lossy(&raw);
+        if cmdline.contains("vectorhawk") && cmdline.contains("daemon") && cmdline.contains("foreground") {
+            if let Ok(pid) = pid_str.parse::<i32>() {
+                unsafe { libc::kill(pid, libc::SIGTERM) };
+            }
+        }
+    }
 }
 
 /// XDG autostart fallback when systemd is not available.
