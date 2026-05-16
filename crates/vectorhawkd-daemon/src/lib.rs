@@ -674,6 +674,10 @@ pub fn run_sync_tick(
     }
 
     flush_ratings_and_scan(registry, &state_view, update_cache)?;
+
+    // Record successful sync time so `vectorhawk doctor` can show it.
+    let _ = state_view.record_sync_time();
+
     Ok(changed)
 }
 

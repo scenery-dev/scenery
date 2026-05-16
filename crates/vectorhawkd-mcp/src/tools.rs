@@ -425,7 +425,7 @@ pub fn build_tool_list(state: &AppState, registry_url: &Option<String>) -> Vec<T
 
     // AUTH2c: skill authoring tools — always available (local operations)
     tools.push(ToolDefinition {
-        name: "skillclub_author".to_string(),
+        name: "vectorhawk_author".to_string(),
         description: "Author a new VectorHawk skill from a name and system prompt. \
             In interactive mode (default) returns recommendations for you to review. \
             Pass mode='accept_suggestions' to apply recommendations automatically. \
@@ -466,9 +466,9 @@ pub fn build_tool_list(state: &AppState, registry_url: &Option<String>) -> Vec<T
     });
 
     tools.push(ToolDefinition {
-        name: "skillclub_author_confirm".to_string(),
+        name: "vectorhawk_author_confirm".to_string(),
         description: "Confirm and scaffold a skill after reviewing recommendations from \
-            skillclub_author. Provide the final vh_* values to create the SKILL.md."
+            vectorhawk_author. Provide the final values to create the SKILL.md."
             .to_string(),
         input_schema: serde_json::json!({
             "type": "object",
@@ -616,8 +616,8 @@ pub fn handle_tool_call(
         "vectorhawk_update" => handle_update(arguments, state, registry_url),
         "vectorhawk_plugin_export" => handle_plugin_export(arguments),
         "vectorhawk_plugin_import" => handle_plugin_import(arguments),
-        "skillclub_author" => handle_author(arguments, state, registry_url.as_deref()),
-        "skillclub_author_confirm" => handle_author_confirm(arguments, state, registry_url.as_deref()),
+        "vectorhawk_author" => handle_author(arguments, state, registry_url.as_deref()),
+        "vectorhawk_author_confirm" => handle_author_confirm(arguments, state, registry_url.as_deref()),
         _ => handle_skill_run(
             name,
             arguments,
@@ -2316,7 +2316,7 @@ fn handle_author(
                     }
                 },
                 "confidence": confidence_str,
-                "message": "Recommendations ready. Review the summary above and call skillclub_author_confirm with your final values, or pass mode: accept_suggestions to apply these directly."
+                "message": "Recommendations ready. Review the summary above and call vectorhawk_author_confirm with your final values, or pass mode: accept_suggestions to apply these directly."
             });
 
             match serde_json::to_string_pretty(&payload) {

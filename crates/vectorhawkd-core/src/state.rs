@@ -68,6 +68,21 @@ impl AppState {
     ///
     /// Used by the daemon sync loop to determine which skills to pass to
     /// `check_skill_status`. Returns an empty vec if no skills are installed.
+    /// Write the current Unix timestamp to the `meta` table as `last_sync_at`.
+    pub fn record_sync_time(&self) -> Result<()> {
+        let conn = Connection::open(&self.db_path).context("failed to open state DB")?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES ('last_sync_at', ?1)",
+            rusqlite::params![now.to_string()],
+        )
+        .context("failed to record sync time")?;
+        Ok(())
+    }
+
     pub fn list_installed_skill_ids(&self) -> Result<Vec<String>> {
         let conn = Connection::open(&self.db_path).context("failed to open state DB")?;
         let mut stmt = conn
@@ -196,6 +211,12 @@ CREATE TABLE IF NOT EXISTS skill_execution_counts (
     total_runs      INTEGER NOT NULL DEFAULT 0,
     successful_runs INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (skill_id, version)
+);
+
+-- Generic key/value store for daemon metadata (e.g. last_sync_at).
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
 );
 "#;
 

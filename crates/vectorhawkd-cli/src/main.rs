@@ -801,15 +801,16 @@ fn query_last_sync_time(db_path: &camino::Utf8PathBuf) -> String {
         Ok(c) => c,
         Err(_) => return "unknown (db open failed)".to_string(),
     };
-    match conn.query_row("SELECT MAX(fetched_at) FROM policy_cache", [], |row| {
-        row.get::<_, Option<i64>>(0)
-    }) {
-        Ok(Some(ts)) => {
-            // Convert unix timestamp to a human-readable UTC string if possible.
-            format_unix_timestamp(ts)
-        }
-        Ok(None) => "never".to_string(),
-        Err(_) => "unknown (query failed)".to_string(),
+    match conn.query_row(
+        "SELECT value FROM meta WHERE key = 'last_sync_at'",
+        [],
+        |row| row.get::<_, String>(0),
+    ) {
+        Ok(val) => match val.parse::<i64>() {
+            Ok(ts) => format_unix_timestamp(ts),
+            Err(_) => "unknown (bad timestamp)".to_string(),
+        },
+        Err(_) => "never".to_string(),
     }
 }
 

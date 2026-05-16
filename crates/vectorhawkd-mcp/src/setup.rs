@@ -346,11 +346,11 @@ Show each skill's name, version, and a brief description.
 name: skill-create
 description: Create a new VectorHawk skill from a name and system prompt
 ---
-Create a new skill. Use the vectorhawk_import tool with the skill description from the arguments, or scaffold a SKILL.md manually and use vectorhawk_validate to check it.
+Create a new skill. Call vectorhawk_author with the skill name and a system prompt from the arguments.
 
 $ARGUMENTS
 
-Walk the user through the result — show the generated bundle path and suggest next steps (validate, test, publish).
+Walk the user through the result — show the generated SKILL.md and suggest next steps (validate, publish).
 "#,
         ),
         (
