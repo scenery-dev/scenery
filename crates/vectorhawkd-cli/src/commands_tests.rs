@@ -209,6 +209,61 @@ fn skill_validate_parses() {
     }
 }
 
+// ── skill update ──────────────────────────────────────────────────────────────
+
+#[test]
+fn skill_update_with_id_parses() {
+    use super::{Command, SkillCommand};
+    unsafe { std::env::remove_var("VECTORHAWK_REGISTRY_URL") };
+    match parse(&["skill", "update", "my-skill"]).command {
+        Command::Skill(SkillCommand::Update { id, all, registry_url }) => {
+            assert_eq!(id.as_deref(), Some("my-skill"));
+            assert!(!all);
+            // Default URL is filled in from the arg default_value.
+            assert_eq!(
+                registry_url.as_deref(),
+                Some("https://app.vectorhawk.ai")
+            );
+        }
+        other => panic!("expected Skill(Update), got {other:?}"),
+    }
+}
+
+#[test]
+fn skill_update_all_parses() {
+    use super::{Command, SkillCommand};
+    unsafe { std::env::remove_var("VECTORHAWK_REGISTRY_URL") };
+    match parse(&["skill", "update", "--all"]).command {
+        Command::Skill(SkillCommand::Update { id, all, .. }) => {
+            assert!(id.is_none());
+            assert!(all);
+        }
+        other => panic!("expected Skill(Update --all), got {other:?}"),
+    }
+}
+
+#[test]
+fn skill_update_with_registry_url_parses() {
+    use super::{Command, SkillCommand};
+    match parse(&[
+        "skill",
+        "update",
+        "my-skill",
+        "--registry-url",
+        "http://localhost:8000",
+    ])
+    .command
+    {
+        Command::Skill(SkillCommand::Update {
+            id, registry_url, ..
+        }) => {
+            assert_eq!(id.as_deref(), Some("my-skill"));
+            assert_eq!(registry_url.as_deref(), Some("http://localhost:8000"));
+        }
+        other => panic!("expected Skill(Update), got {other:?}"),
+    }
+}
+
 // ── auth subcommands ──────────────────────────────────────────────────────────
 
 #[test]

@@ -197,6 +197,27 @@ pub enum SkillCommand {
         output_dir: Option<camino::Utf8PathBuf>,
     },
 
+    /// Update an installed skill to the latest registry version.
+    ///
+    /// With <id>: check the registry for the latest version of that skill
+    /// and install it if newer than what is currently installed.
+    ///
+    /// With --all: do the same for every skill in the state DB with status 'active'.
+    ///
+    /// With neither: print usage.
+    Update {
+        /// Skill ID to update. Mutually exclusive with --all.
+        id: Option<String>,
+
+        /// Update all active installed skills.
+        #[arg(long, default_value_t = false)]
+        all: bool,
+
+        /// Registry base URL.
+        #[arg(long, env = "VECTORHAWK_REGISTRY_URL", default_value = "https://app.vectorhawk.ai")]
+        registry_url: Option<String>,
+    },
+
     /// Author a new skill interactively, with heuristic recommendations.
     ///
     /// Prompts for skill name and system prompt if not provided as flags.
@@ -443,6 +464,13 @@ async fn run(cli: Cli) -> Result<()> {
         }) => cmd_skill_publish(path, &registry_url, dry_run).await,
         Command::Skill(SkillCommand::Convert { path, output_dir }) => {
             cmd_skill_convert(path, output_dir.as_deref()).await
+        }
+        Command::Skill(SkillCommand::Update {
+            id,
+            all,
+            registry_url,
+        }) => {
+            cmd_skill_update(id.as_deref(), all, registry_url.as_deref()).await
         }
         Command::Skill(SkillCommand::Author {
             name,
@@ -785,6 +813,20 @@ fn query_last_sync_time(db_path: &camino::Utf8PathBuf) -> String {
     }
 }
 
+/// Truncate a string to at most `max_chars` Unicode scalar values.
+/// Appends "…" when truncation occurs.
+fn truncate_str(s: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (count, ch) in s.chars().enumerate() {
+        if count >= max_chars {
+            out.push('…');
+            return out;
+        }
+        out.push(ch);
+    }
+    out
+}
+
 /// Convert a Unix timestamp (seconds) to a human-readable UTC string.
 fn format_unix_timestamp(ts: i64) -> String {
     use std::time::{Duration, UNIX_EPOCH};
@@ -842,19 +884,89 @@ async fn cmd_skill_list() -> Result<()> {
         return Ok(());
     }
 
+    // Attempt registry update check — skip silently if offline.
+    // We use the default registry URL; for now `skill list` doesn't take --registry-url.
+    let update_hints = fetch_update_hints_for_list(&state, "https://app.vectorhawk.ai").await;
+
     println!(
         "{:<30} {:<12} {:<12} INSTALLED AT",
         "SKILL ID", "VERSION", "STATUS"
     );
     println!("{}", "-".repeat(75));
-    for r in rows {
+    for r in &rows {
+        let update_suffix = update_hints
+            .get(r.skill_id.as_str())
+            .map(|latest| format!("  (update available: {latest})"))
+            .unwrap_or_default();
         println!(
-            "{:<30} {:<12} {:<12} {}",
-            r.skill_id, r.active_version, r.current_status, r.installed_at
+            "{:<30} {:<12} {:<12} {}{}",
+            r.skill_id, r.active_version, r.current_status, r.installed_at, update_suffix
         );
     }
 
     Ok(())
+}
+
+/// Query the registry for the latest version of each installed skill and return
+/// a map of skill_id → latest_version for skills that have an available update.
+///
+/// Returns an empty map on any error (offline, registry unreachable, etc.).
+async fn fetch_update_hints_for_list(
+    state: &vectorhawkd_core::state::AppState,
+    registry_url: &str,
+) -> std::collections::HashMap<String, String> {
+    use semver::Version;
+    use vectorhawkd_core::registry::RegistryClient;
+
+    let db_path = state.db_path.clone();
+    let registry_url = registry_url.to_string();
+
+    tokio::task::spawn_blocking(move || {
+        let registry = RegistryClient::new(&registry_url);
+        let conn = match rusqlite::Connection::open(&db_path) {
+            Ok(c) => c,
+            Err(_) => return std::collections::HashMap::new(),
+        };
+        let mut stmt = match conn.prepare(
+            "SELECT skill_id, active_version FROM installed_skills WHERE current_status = 'active'",
+        ) {
+            Ok(s) => s,
+            Err(_) => return std::collections::HashMap::new(),
+        };
+        let pairs: Vec<(String, String)> = match stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .and_then(|iter| iter.collect::<rusqlite::Result<Vec<_>>>())
+        {
+            Ok(v) => v,
+            Err(_) => return std::collections::HashMap::new(),
+        };
+
+        let mut hints = std::collections::HashMap::new();
+        for (skill_id, installed_str) in pairs {
+            let installed = match Version::parse(&installed_str) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let detail = match registry.fetch_skill_detail(&skill_id) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            let latest_str = match detail.latest_version {
+                Some(v) => v,
+                None => continue,
+            };
+            let latest = match Version::parse(&latest_str) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if latest > installed {
+                hints.insert(skill_id, latest_str);
+            }
+        }
+        hints
+    })
+    .await
+    .unwrap_or_default()
 }
 
 // ── skill search ─────────────────────────────────────────────────────────────
@@ -872,27 +984,44 @@ async fn cmd_skill_search(query: &str, registry_url: Option<&str>) -> Result<()>
         .context("skill search failed")?;
 
     if results.is_empty() {
-        println!("No skills found matching '{query}'.");
+        println!("No skills found matching \"{query}\".");
         return Ok(());
     }
 
-    println!("{:<35} {:<12} {}", "SKILL ID", "VERSION", "DESCRIPTION");
-    println!("{}", "-".repeat(85));
+    // Compute column widths from actual data.
+    let id_width = results.iter().map(|r| r.skill_id.len()).max().unwrap_or(10);
+    let id_width = id_width.max(10);
+    let ver_width = results
+        .iter()
+        .map(|r| r.latest_version.as_deref().unwrap_or("-").len())
+        .max()
+        .unwrap_or(7);
+    let ver_width = ver_width.max(7);
+    let pub_width = results
+        .iter()
+        .map(|r| r.publisher_name.as_deref().unwrap_or("-").len())
+        .max()
+        .unwrap_or(9);
+    let pub_width = pub_width.max(9);
+
+    println!();
     for r in &results {
-        let desc = r.description.as_deref().unwrap_or("");
-        let truncated = if desc.len() > 50 {
-            format!("{}…", &desc[..49])
-        } else {
-            desc.to_string()
-        };
+        let desc_raw = r.description.as_deref().unwrap_or("");
+        // Truncate description at 60 chars; add ellipsis if needed.
+        let desc = truncate_str(desc_raw, 60);
+        let version = r.latest_version.as_deref().unwrap_or("-");
+        let publisher = r.publisher_name.as_deref().unwrap_or("-");
         println!(
-            "{:<35} {:<12} {}",
-            r.skill_id,
-            r.latest_version.as_deref().unwrap_or("-"),
-            truncated
+            "  {:<id_width$}  {:<ver_width$}  {:<pub_width$}  {desc}",
+            r.skill_id, version, publisher,
         );
     }
-    println!("\n{} result(s). Run `vectorhawk skill install <skill-id>` to install.", results.len());
+    println!();
+
+    let count = results.len();
+    println!(
+        "{count} result(s). Run vectorhawk skill install <id> to install."
+    );
     Ok(())
 }
 
@@ -1388,29 +1517,136 @@ fn insert_before_closing_fence(content: &str, additions: &str) -> String {
 // ── skill validate ────────────────────────────────────────────────────────────
 
 async fn cmd_skill_validate(path: camino::Utf8PathBuf) -> Result<()> {
-    use vectorhawkd_core::validator::validate_bundle;
+    use vectorhawkd_core::validator::{validate_bundle, CheckLevel};
+
+    // Try to detect whether the Ollama model check should run.
+    let ollama_status = check_ollama_for_validate(&path).await;
 
     let report = validate_bundle(&path);
 
-    let mut all_passed = true;
+    // Detect whether stdout is a terminal for ANSI color support.
+    let use_color = atty::is(atty::Stream::Stdout);
+
+    println!("Validating {path}/");
+    println!();
+
+    // Column widths: icon (2), name (14), detail (rest).
     for check in &report.checks {
-        let status = if check.passed { "PASS" } else { "FAIL" };
-        print!("  [{status}] {}", check.name);
-        if let Some(detail) = &check.detail {
-            print!(" — {detail}");
-        }
-        println!();
-        if !check.passed {
-            all_passed = false;
-        }
+        let (icon, color_on, color_off) = match check.level {
+            CheckLevel::Pass => {
+                let on = if use_color { "\x1b[32m" } else { "" };
+                ("✓", on, if use_color { "\x1b[0m" } else { "" })
+            }
+            CheckLevel::Warn => {
+                let on = if use_color { "\x1b[33m" } else { "" };
+                ("⚠", on, if use_color { "\x1b[0m" } else { "" })
+            }
+            CheckLevel::Fail => {
+                let on = if use_color { "\x1b[31m" } else { "" };
+                ("✗", on, if use_color { "\x1b[0m" } else { "" })
+            }
+        };
+        let detail = check.detail.as_deref().unwrap_or("");
+        println!(
+            "  {color_on}{icon}{color_off}  {:<14}  {detail}",
+            check.name
+        );
     }
 
-    if all_passed {
-        println!("Validation passed.");
+    // Append Ollama model availability check.
+    if let Some(ollama_line) = &ollama_status {
+        let (icon, color_on, color_off) = if ollama_line.starts_with("not") {
+            let on = if use_color { "\x1b[33m" } else { "" };
+            ("⚠", on, if use_color { "\x1b[0m" } else { "" })
+        } else {
+            let on = if use_color { "\x1b[32m" } else { "" };
+            ("✓", on, if use_color { "\x1b[0m" } else { "" })
+        };
+        println!(
+            "  {color_on}{icon}{color_off}  {:<14}  {ollama_line}",
+            "model"
+        );
+    }
+
+    println!();
+
+    let fail_count = report.fail_count();
+    let warn_count = report.warn_count();
+
+    // Build the summary line.
+    let mut summary_parts: Vec<String> = Vec::new();
+    if fail_count > 0 {
+        summary_parts.push(format!("{fail_count} failure(s)"));
+    }
+    if warn_count > 0 {
+        summary_parts.push(format!("{warn_count} warning(s)"));
+    }
+    if summary_parts.is_empty() {
+        summary_parts.push("All checks passed.".to_string());
+    }
+    let summary = summary_parts.join(", ");
+
+    let install_hint = format!(
+        "Run vectorhawk skill install {path}/ to install."
+    );
+
+    if fail_count == 0 {
+        println!("{summary} {install_hint}");
         Ok(())
     } else {
+        println!("{summary}");
         anyhow::bail!("validation failed — see checks above")
     }
+}
+
+/// Probe Ollama for model availability, returning a display string or `None` when
+/// the bundle doesn't declare model requirements (nothing useful to show).
+async fn check_ollama_for_validate(path: &camino::Utf8Path) -> Option<String> {
+    use vectorhawkd_core::ollama::OllamaClient;
+    use vectorhawkd_manifest::SkillPackage;
+
+    let pkg = SkillPackage::load_from_dir(path).ok()?;
+    let recommended = pkg
+        .manifest
+        .model_requirements
+        .map(|r| r.recommended)
+        .unwrap_or_default();
+
+    let ollama_url = std::env::var("VECTORHAWK_OLLAMA_URL")
+        .or_else(|_| std::env::var("OLLAMA_BASE_URL"))
+        .unwrap_or_else(|_| "http://localhost:11434".to_string());
+
+    let client = OllamaClient::new(&ollama_url, "");
+
+    // Run the blocking Ollama calls off the async executor.
+    let status = tokio::task::spawn_blocking(move || {
+        if !client.health_check().reachable {
+            return "not running — will use MCP sampling fallback".to_string();
+        }
+        if recommended.is_empty() {
+            return "Ollama running (no model preference declared)".to_string();
+        }
+        let available: Vec<String> = client
+            .list_models()
+            .ok()
+            .map(|models| models.into_iter().map(|m| m.name).collect())
+            .unwrap_or_default();
+
+        for rec in &recommended {
+            if let Some(found) = available
+                .iter()
+                .find(|a| *a == rec || a.starts_with(rec.as_str()))
+            {
+                return format!("{found} available in local Ollama");
+            }
+        }
+        let first = recommended[0].clone();
+        format!("{first} not found in local Ollama — pull it or rely on MCP sampling")
+    })
+    .await
+    .ok()?;
+
+    Some(status)
 }
 
 // ── skill init ────────────────────────────────────────────────────────────────
@@ -1705,8 +1941,6 @@ async fn cmd_skill_author(
         let model_primary = rec.model.recommended.first().map(|s| s.as_str()).unwrap_or("gemma3:2b");
         let model_status = if available_ollama.iter().any(|a| a == model_primary || a.starts_with(model_primary)) {
             format!("{model_primary} (installed locally)")
-        } else if available_ollama.is_empty() {
-            format!("{model_primary} (not installed — run: ollama pull {model_primary})")
         } else {
             format!("{model_primary} (not installed — run: ollama pull {model_primary})")
         };
@@ -1749,8 +1983,6 @@ async fn cmd_skill_author(
     };
     let model_install_note = if available_ollama.iter().any(|a| a == model_primary || a.starts_with(model_primary)) {
         format!("{model_primary} (installed locally)")
-    } else if available_ollama.is_empty() {
-        format!("{model_primary} (not installed — run: ollama pull {model_primary})")
     } else {
         format!("{model_primary} (not installed — run: ollama pull {model_primary})")
     };
@@ -2424,6 +2656,145 @@ vh_execution:
     Ok(())
 }
 
+// ── skill update ─────────────────────────────────────────────────────────────
+
+/// Update one or all active skills from the registry.
+///
+/// For each targeted skill, fetches the latest registry version and installs it
+/// when it is strictly newer than the installed version.  Prints one line per
+/// skill: "Updating X a.b.c → d.e.f... done." or "X is already up to date (a.b.c).".
+async fn cmd_skill_update(
+    id: Option<&str>,
+    all: bool,
+    registry_url: Option<&str>,
+) -> Result<()> {
+    use rusqlite::{Connection, OptionalExtension};
+    use semver::Version;
+    use vectorhawkd_core::{
+        registry::RegistryClient,
+        state::AppState,
+        updater::install_from_registry,
+    };
+
+    if id.is_none() && !all {
+        eprintln!("Usage: vectorhawk skill update <id>  |  vectorhawk skill update --all");
+        std::process::exit(2);
+    }
+
+    let state = AppState::bootstrap().context("failed to bootstrap state")?;
+    let url = registry_url.unwrap_or("https://app.vectorhawk.ai");
+
+    // Collect the list of (skill_id, installed_version) pairs to process.
+    let targets: Vec<(String, String)> = if all {
+        // Open connection and collect into a Vec immediately so conn/stmt drop
+        // before leaving this block — rusqlite MappedRows borrows both.
+        let rows: Vec<(String, String)> = {
+            let conn = Connection::open(&state.db_path).context("failed to open state DB")?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT skill_id, active_version FROM installed_skills \
+                     WHERE current_status = 'active' ORDER BY skill_id",
+                )
+                .context("failed to prepare update query")?;
+            let collected = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .context("failed to execute update query")?
+                .collect::<Result<Vec<_>, _>>()
+                .context("failed to collect skill rows")?;
+            collected
+        };
+        rows
+    } else {
+        // Single skill — look up its installed version.
+        let skill_id = id.expect("id is Some when !all");
+        let installed_ver: Option<String> = {
+            let conn = Connection::open(&state.db_path).context("failed to open state DB")?;
+            conn.query_row(
+                "SELECT active_version FROM installed_skills WHERE skill_id = ?1",
+                [skill_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("failed to query installed_skills")?
+        };
+        let ver = installed_ver
+            .ok_or_else(|| anyhow::anyhow!("skill '{skill_id}' is not installed"))?;
+        vec![(skill_id.to_string(), ver)]
+    };
+
+    if targets.is_empty() {
+        println!("No active skills installed.");
+        return Ok(());
+    }
+
+    let registry_url_owned = url.to_string();
+
+    for (skill_id, installed_str) in targets {
+        let installed = Version::parse(&installed_str)
+            .with_context(|| format!("installed version '{installed_str}' is not valid semver"))?;
+
+        let registry_url_inner = registry_url_owned.clone();
+        let skill_id_inner = skill_id.clone();
+
+        // Fetch latest version from registry (blocking call).
+        let detail = tokio::task::spawn_blocking({
+            let r = registry_url_inner.clone();
+            let s = skill_id_inner.clone();
+            move || {
+                let reg = RegistryClient::new(&r);
+                reg.fetch_skill_detail(&s)
+            }
+        })
+        .await
+        .context("fetch detail task panicked")?
+        .with_context(|| format!("failed to fetch registry info for '{skill_id}'"))?;
+
+        let latest_str = match detail.latest_version {
+            Some(v) => v,
+            None => {
+                println!("{skill_id} — no published versions in registry.");
+                continue;
+            }
+        };
+
+        let latest = Version::parse(&latest_str)
+            .with_context(|| format!("registry returned invalid semver '{latest_str}'"))?;
+
+        if latest <= installed {
+            println!("{skill_id} is already up to date ({installed_str}).");
+            continue;
+        }
+
+        print!("Updating {skill_id} {installed_str} → {latest_str}...");
+        // Flush stdout before the blocking install so the user sees the prefix.
+        use std::io::Write;
+        std::io::stdout().flush().ok();
+
+        let state_db = state.db_path.clone();
+        let state_root = state.root_dir.clone();
+        let url_clone = registry_url_owned.clone();
+        let skill_clone = skill_id.clone();
+        let ver_clone = latest_str.clone();
+
+        tokio::task::spawn_blocking(move || {
+            // Reconstruct a minimal AppState from the paths (no I/O on already-bootstrapped dirs).
+            let install_state = AppState {
+                root_dir: state_root,
+                db_path: state_db,
+            };
+            let registry = RegistryClient::new(&url_clone);
+            install_from_registry(&install_state, &registry, &skill_clone, Some(&ver_clone))
+        })
+        .await
+        .context("install task panicked")?
+        .with_context(|| format!("failed to update '{skill_id}' to {latest_str}"))?;
+
+        println!(" done.");
+    }
+
+    Ok(())
+}
+
 // ── auth login ────────────────────────────────────────────────────────────────
 
 /// Connect to the daemon Unix socket and perform a JSON-RPC auth login flow.
@@ -2571,11 +2942,25 @@ async fn cmd_auth_login(registry_url: &str) -> Result<()> {
         println!("  3. Run:  vectorhawk auth token <vh_pat_...>");
         println!();
     } else {
-        println!("Opening browser for VectorHawk login...");
-        println!();
-        println!("If your browser does not open automatically, visit:");
-        println!("  {}", init.auth_url);
-        open_browser(&init.auth_url);
+        let browser_opened = try_open_browser(&init.auth_url);
+        if browser_opened {
+            println!("Opening browser for VectorHawk login...");
+            println!();
+            println!("If your browser does not open automatically, open this URL:");
+            println!("  {}", init.auth_url);
+        } else {
+            // Could not open browser — headless environment (no DISPLAY, no
+            // TERM_PROGRAM, or xdg-open / open returned an error).
+            // Print the URL so the user can copy it to any browser.
+            println!("Could not open browser automatically.");
+            println!();
+            println!("Open this URL in your browser to continue:");
+            println!("  {}", init.auth_url);
+            println!();
+            println!(
+                "Waiting for callback on http://127.0.0.1:{port}/oauth/cli/callback ..."
+            );
+        }
     }
     println!();
 
@@ -2643,24 +3028,58 @@ async fn cmd_auth_login(registry_url: &str) -> Result<()> {
     Ok(())
 }
 
-/// Open a URL in the system default browser.
-/// Best-effort: logs a warning on failure but does not return an error.
-fn open_browser(url: &str) {
+/// Attempt to open a URL in the system default browser.
+///
+/// Returns `true` if the browser launch command succeeded (process spawned and
+/// — for macOS/Linux — exited with status 0), `false` otherwise.
+///
+/// On Linux the function additionally checks for `DISPLAY` and `WAYLAND_DISPLAY`
+/// before attempting `xdg-open`; if neither is set the environment is almost
+/// certainly headless and `xdg-open` will fail silently.
+///
+/// On macOS `open` is a reliable synchronous launcher: we wait for it and check
+/// the exit code.
+fn try_open_browser(url: &str) -> bool {
     #[cfg(target_os = "macos")]
     {
-        let _ = std::process::Command::new("open").arg(url).spawn();
+        // `open` on macOS exits with 0 on success and 1 when the URL cannot
+        // be opened.  Wait for it to finish so we get the real exit code.
+        match std::process::Command::new("open").arg(url).status() {
+            Ok(s) => return s.success(),
+            Err(_) => return false,
+        }
     }
+
     #[cfg(target_os = "linux")]
     {
-        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+        // On Linux we need at least one of DISPLAY or WAYLAND_DISPLAY to be set
+        // for a graphical browser to work.
+        let has_display = std::env::var_os("DISPLAY").is_some()
+            || std::env::var_os("WAYLAND_DISPLAY").is_some()
+            || std::env::var_os("TERM_PROGRAM").is_some();
+        if !has_display {
+            return false;
+        }
+        match std::process::Command::new("xdg-open").arg(url).status() {
+            Ok(s) => return s.success(),
+            Err(_) => return false,
+        }
     }
+
     #[cfg(target_os = "windows")]
     {
-        let _ = std::process::Command::new("cmd")
+        match std::process::Command::new("cmd")
             .args(["/c", "start", url])
-            .spawn();
+            .status()
+        {
+            Ok(s) => return s.success(),
+            Err(_) => return false,
+        }
     }
-    // On unknown platforms the URL is already printed; the user can copy-paste.
+
+    // Unknown platform — report failure so the URL gets printed.
+    #[allow(unreachable_code)]
+    false
 }
 
 // ── auth logout ───────────────────────────────────────────────────────────────

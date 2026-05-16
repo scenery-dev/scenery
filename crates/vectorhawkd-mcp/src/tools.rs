@@ -1010,6 +1010,7 @@ pub fn handle_login_with_oauth(
                         }
                     });
 
+                    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
                     let port = ctx.listener_port;
 
                     // On Linux the daemon runs as a systemd service without a display.
