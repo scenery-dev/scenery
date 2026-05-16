@@ -500,14 +500,29 @@ fn is_vectorhawk_configured(path: &std::path::Path, mcp_key: &str) -> bool {
     let Some(entry) = json.get(mcp_key).and_then(|v| v.get(MCP_SERVER_NAME)) else {
         return false;
     };
-    // If the entry exists but uses a bare command name (not an absolute path),
-    // treat it as not configured so mcp setup rewrites it with the absolute path.
-    let command_is_absolute = entry
+    // Treat as unconfigured if the command is:
+    //   - not an absolute path (bare command name), or
+    //   - the binary no longer exists (old Cellar removed after brew upgrade), or
+    //   - doesn't match the currently-running binary (stale Cellar path from a
+    //     previous brew upgrade where the old Cellar was still present during
+    //     post_install).
+    // All three cases require mcp setup to rewrite with the current binary path.
+    let current_exe = std::env::current_exe().ok();
+    let command_is_current = entry
         .get("command")
         .and_then(|c| c.as_str())
-        .map(|s| std::path::Path::new(s).is_absolute())
+        .map(|s| {
+            let p = std::path::Path::new(s);
+            if !p.is_absolute() {
+                return false;
+            }
+            if let Some(ref exe) = current_exe {
+                return p == exe.as_path();
+            }
+            p.exists()
+        })
         .unwrap_or(false);
-    command_is_absolute
+    command_is_current
 }
 
 // ── Unmanaged server detection (GAP-06) ───────────────────────────────────────

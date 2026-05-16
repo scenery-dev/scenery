@@ -159,10 +159,27 @@ pub fn install() -> Result<()> {
 fn install_systemd(bin_path: &std::path::Path) -> Result<()> {
     let unit = unit_path().context("failed to resolve unit file path")?;
 
-    // ── Idempotency guard ─────────────────────────────────────────────────────
+    // ── Idempotency guard — but allow upgrade rewrites ────────────────────────
+    // Skip only when the unit exists, is enabled, AND the ExecStart path in the
+    // unit file matches the current binary. After a brew upgrade the binary path
+    // changes (new Cellar directory), so we must rewrite the unit and restart.
     if unit.exists() && unit_is_enabled() {
-        println!("VectorHawk daemon is already installed and enabled — no changes made.");
-        return Ok(());
+        let unit_has_current_binary = fs::read_to_string(&unit)
+            .ok()
+            .map(|s| {
+                bin_path
+                    .to_str()
+                    .map(|b| s.contains(b))
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        if unit_has_current_binary {
+            println!("VectorHawk daemon is already installed and up to date — no changes made.");
+            return Ok(());
+        }
+        // Binary path changed (upgrade): fall through to rewrite + restart.
+        println!("VectorHawk daemon binary path changed — updating unit and restarting.");
+        let _ = systemctl_user(&["stop", SERVICE_NAME]);
     }
 
     // ── 1. Ensure unit dir exists ─────────────────────────────────────────────

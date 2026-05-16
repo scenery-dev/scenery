@@ -145,10 +145,28 @@ pub fn install() -> Result<()> {
     let bin_path = current_exe_path().context("failed to resolve current binary path")?;
     let uid = current_uid();
 
-    // ── Idempotency guard ─────────────────────────────────────────────────────
+    // ── Idempotency guard — but allow upgrade rewrites ────────────────────────
+    // Skip only when the plist exists, the service is loaded, AND the plist
+    // ExecStart path matches the current binary. After a brew upgrade the binary
+    // path changes (new Cellar directory), so we must rewrite the plist and
+    // restart. Otherwise `daemon install` during post_install is a no-op and
+    // the old binary keeps running.
     if plist.exists() && service_is_loaded(uid) {
-        println!("VectorHawk daemon is already installed and loaded — no changes made.");
-        return Ok(());
+        let plist_has_current_binary = fs::read_to_string(&plist)
+            .ok()
+            .map(|s| {
+                bin_path
+                    .to_str()
+                    .map(|b| s.contains(b))
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        if plist_has_current_binary {
+            println!("VectorHawk daemon is already installed and up to date — no changes made.");
+            return Ok(());
+        }
+        // Binary path changed (upgrade): fall through to rewrite + restart.
+        println!("VectorHawk daemon binary path changed — updating plist and restarting.");
     }
 
     // ── 1. Ensure log directory exists ────────────────────────────────────────
