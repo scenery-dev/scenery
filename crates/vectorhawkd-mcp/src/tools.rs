@@ -328,7 +328,10 @@ pub fn build_tool_list(state: &AppState, registry_url: &Option<String>) -> Vec<T
                 "required": []
             }),
         });
+    }
 
+    // Search and scan — public endpoints, no auth required
+    if registry_url.is_some() {
         tools.push(ToolDefinition {
             name: "vectorhawk_search".to_string(),
             description: "Search the VectorHawk skill registry for skills that can be installed. \
@@ -346,10 +349,7 @@ pub fn build_tool_list(state: &AppState, registry_url: &Option<String>) -> Vec<T
                 "required": []
             }),
         });
-    }
 
-    // Scan tool — available whenever a registry URL is configured (auth loaded lazily in handler)
-    if registry_url.is_some() {
         tools.push(ToolDefinition {
             name: "vectorhawk_scan".to_string(),
             description: "Scan arbitrary content (SKILL.md, MCP JSON config, or package name) \
@@ -678,7 +678,7 @@ fn handle_list(state: &AppState) -> ToolCallResult {
     if skills.is_empty() {
         ToolCallResult::success(
             "No skills installed.\n\nTo get started:\n\
-             - Use vectorhawk_search to browse the registry (requires login)\n\
+             - Use vectorhawk_search to browse the registry\n\
              - Use vectorhawk_install with a local path to install a bundle\n\
              - Use vectorhawk_import to import an external skill or MCP server"
                 .to_string(),
@@ -2544,6 +2544,23 @@ mod tests {
         assert!(names.contains(&"vectorhawk_install"));
         assert!(!names.contains(&"vectorhawk_search"));
         assert!(!names.contains(&"vectorhawk_logout"));
+
+        let _ = fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn build_tool_list_search_available_without_login() {
+        let state_root = temp_root("tool-list-search-no-login");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+        let url = "http://localhost:8000".to_string();
+        // No fake_login — user is not authenticated
+
+        let tools = build_tool_list(&state, &Some(url));
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+
+        assert!(names.contains(&"vectorhawk_search"), "search should appear without login");
+        assert!(names.contains(&"vectorhawk_login"), "login should appear when not logged in");
+        assert!(!names.contains(&"vectorhawk_logout"), "logout should not appear when not logged in");
 
         let _ = fs::remove_dir_all(&state_root);
     }
