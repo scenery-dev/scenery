@@ -307,7 +307,9 @@ For approved servers, suggest using /mcp-install to activate them.
 name: skill-search
 description: Search the VectorHawk registry for available skills
 ---
-Search for skills in the VectorHawk registry. Call the vectorhawk_search tool with the query from the arguments. Use an empty query to list all available skills.
+Search for skills in the VectorHawk registry. Call the vectorhawk_search tool with the query from the arguments.
+
+If no query was provided, ask the user what they're looking for before calling the tool.
 
 $ARGUMENTS
 

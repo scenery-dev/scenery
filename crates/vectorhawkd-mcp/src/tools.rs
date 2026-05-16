@@ -335,18 +335,17 @@ pub fn build_tool_list(state: &AppState, registry_url: &Option<String>) -> Vec<T
         tools.push(ToolDefinition {
             name: "vectorhawk_search".to_string(),
             description: "Search the VectorHawk skill registry for skills that can be installed. \
-                Use this when the user asks 'what skills are available', 'find skills for X', or \
-                wants to discover new capabilities. Use an empty query to list all available skills."
+                Requires a search query — ask the user what they're looking for if none is provided."
                 .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Search query to find skills (e.g., 'contract', 'analysis'). Omit or leave empty to list all available skills."
+                        "description": "Search query (e.g., 'contract review', 'data analysis'). Must not be empty."
                     }
                 },
-                "required": []
+                "required": ["query"]
             }),
         });
 
@@ -701,6 +700,12 @@ fn handle_search(arguments: &serde_json::Value, registry_url: &Option<String>) -
         .get("query")
         .and_then(|v| v.as_str())
         .unwrap_or("");
+
+    if query.trim().is_empty() {
+        return ToolCallResult::error_result(
+            "A search query is required. Ask the user what they're looking for.",
+        );
+    }
 
     match mcp_governance::search_skills(url, query) {
         Ok(results) => {
