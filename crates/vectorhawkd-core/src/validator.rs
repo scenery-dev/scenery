@@ -30,9 +30,7 @@ impl ValidationReport {
     /// Returns `true` only if every check is `Pass` or `Warn`.
     /// A single `Fail` makes this return `false`.
     pub fn all_passed(&self) -> bool {
-        self.checks
-            .iter()
-            .all(|c| c.level != CheckLevel::Fail)
+        self.checks.iter().all(|c| c.level != CheckLevel::Fail)
     }
 
     /// Returns the number of checks that failed.
@@ -156,7 +154,10 @@ pub fn validate_bundle(path: &Utf8Path) -> ValidationReport {
     if let Some(schema) = pkg.manifest.outputs_schema.as_ref() {
         match jsonschema::JSONSchema::compile(schema) {
             Ok(_) => checks.push(pass("output schema", "valid JSON Schema")),
-            Err(e) => checks.push(fail("output schema", &format!("not valid JSON Schema: {e}"))),
+            Err(e) => checks.push(fail(
+                "output schema",
+                &format!("not valid JSON Schema: {e}"),
+            )),
         }
     } else {
         checks.push(pass("output schema", "none declared"));

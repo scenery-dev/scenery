@@ -151,7 +151,12 @@ fn skill_info_parses() {
 fn skill_run_parses() {
     use super::{Command, SkillCommand};
     match parse(&["skill", "run", "my-skill", "--input", "input.json"]).command {
-        Command::Skill(SkillCommand::Run { id, input, stub, model }) => {
+        Command::Skill(SkillCommand::Run {
+            id,
+            input,
+            stub,
+            model,
+        }) => {
             assert_eq!(id, "my-skill");
             assert_eq!(input.as_str(), "input.json");
             assert!(!stub);
@@ -216,14 +221,15 @@ fn skill_update_with_id_parses() {
     use super::{Command, SkillCommand};
     unsafe { std::env::remove_var("VECTORHAWK_REGISTRY_URL") };
     match parse(&["skill", "update", "my-skill"]).command {
-        Command::Skill(SkillCommand::Update { id, all, registry_url }) => {
+        Command::Skill(SkillCommand::Update {
+            id,
+            all,
+            registry_url,
+        }) => {
             assert_eq!(id.as_deref(), Some("my-skill"));
             assert!(!all);
             // Default URL is filled in from the arg default_value.
-            assert_eq!(
-                registry_url.as_deref(),
-                Some("https://app.vectorhawk.ai")
-            );
+            assert_eq!(registry_url.as_deref(), Some("https://app.vectorhawk.ai"));
         }
         other => panic!("expected Skill(Update), got {other:?}"),
     }
@@ -555,7 +561,8 @@ fn needs_publisher_returns_true_when_missing() {
 
 #[test]
 fn needs_publisher_returns_true_for_placeholder() {
-    let md = "---\nname: foo\ndescription: bar\nversion: 0.1.0\npublisher: YOUR_PUBLISHER_ID\n---\n";
+    let md =
+        "---\nname: foo\ndescription: bar\nversion: 0.1.0\npublisher: YOUR_PUBLISHER_ID\n---\n";
     assert!(super::needs_publisher(md));
 }
 
@@ -580,5 +587,8 @@ fn inject_publisher_field_inserts_after_description_when_missing() {
     assert!(patched.contains("publisher: acme-corp"));
     let desc_pos = patched.find("description:").unwrap();
     let pub_pos = patched.find("publisher:").unwrap();
-    assert!(pub_pos > desc_pos, "publisher should appear after description");
+    assert!(
+        pub_pos > desc_pos,
+        "publisher should appear after description"
+    );
 }

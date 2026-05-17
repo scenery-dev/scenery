@@ -34,6 +34,14 @@ tracing-subscriber.workspace = true
 clap.workspace = true
 async-trait.workspace = true
 dirs.workspace = true
+uuid.workspace = true
+futures.workspace = true
+chrono.workspace = true
+zip.workspace = true
+libc.workspace = true
+
+# Async HTTP client for SSE streaming and installation status reporting.
+reqwest.workspace = true
 
 # OAuth callback HTTP listener — daemon-only dep (shim does not link axum).
 # axum 0.8 targets tokio 1.x, matching the workspace tokio version.

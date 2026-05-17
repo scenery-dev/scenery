@@ -223,8 +223,7 @@ pub fn remove_mcp_entry(config: &ClientConfig) -> Result<bool> {
             _ => return Ok(false),
         };
 
-    let removed = if let Some(serde_json::Value::Object(ref mut map)) =
-        obj.get_mut(&config.mcp_key)
+    let removed = if let Some(serde_json::Value::Object(ref mut map)) = obj.get_mut(&config.mcp_key)
     {
         map.remove(MCP_SERVER_NAME).is_some()
     } else {

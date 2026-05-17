@@ -76,6 +76,10 @@ pub enum Command {
     /// Plugin management subcommands (.mcpb / Claude Code plugin format).
     #[command(subcommand)]
     Plugin(PluginCommand),
+
+    /// Sync status subcommands — inspect the daemon reconciler state.
+    #[command(subcommand)]
+    Sync(SyncCommand),
 }
 
 #[derive(Debug, Subcommand)]
@@ -107,7 +111,11 @@ pub enum SkillCommand {
         query: String,
 
         /// Registry base URL.
-        #[arg(long, env = "VECTORHAWK_REGISTRY_URL", default_value = "https://app.vectorhawk.ai")]
+        #[arg(
+            long,
+            env = "VECTORHAWK_REGISTRY_URL",
+            default_value = "https://app.vectorhawk.ai"
+        )]
         registry_url: Option<String>,
     },
 
@@ -214,7 +222,11 @@ pub enum SkillCommand {
         all: bool,
 
         /// Registry base URL.
-        #[arg(long, env = "VECTORHAWK_REGISTRY_URL", default_value = "https://app.vectorhawk.ai")]
+        #[arg(
+            long,
+            env = "VECTORHAWK_REGISTRY_URL",
+            default_value = "https://app.vectorhawk.ai"
+        )]
         registry_url: Option<String>,
     },
 
@@ -398,6 +410,16 @@ pub enum PluginCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+pub enum SyncCommand {
+    /// List all installation records from local SQLite with their current state.
+    ///
+    /// Shows skill_id, version, source (registry/local), installation_id, and
+    /// deactivated status.  Useful for debugging reconcile failures reported by
+    /// `vectorhawk doctor`.
+    Status,
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() {
@@ -440,9 +462,12 @@ async fn run(cli: Cli) -> Result<()> {
             registry_url,
         }) => cmd_skill_search(&query, registry_url.as_deref()).await,
         Command::Skill(SkillCommand::Info { id }) => cmd_skill_info(&id).await,
-        Command::Skill(SkillCommand::Run { id, input, stub, model }) => {
-            cmd_skill_run(&id, input, stub, model.as_deref()).await
-        }
+        Command::Skill(SkillCommand::Run {
+            id,
+            input,
+            stub,
+            model,
+        }) => cmd_skill_run(&id, input, stub, model.as_deref()).await,
         Command::Skill(SkillCommand::Import {
             path,
             registry_url,
@@ -475,9 +500,7 @@ async fn run(cli: Cli) -> Result<()> {
             id,
             all,
             registry_url,
-        }) => {
-            cmd_skill_update(id.as_deref(), all, registry_url.as_deref()).await
-        }
+        }) => cmd_skill_update(id.as_deref(), all, registry_url.as_deref()).await,
         Command::Skill(SkillCommand::Author {
             name,
             prompt_file,
@@ -530,6 +553,8 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Plugin(PluginCommand::Import { path, output_dir }) => {
             cmd_plugin_import(path, output_dir).await
         }
+
+        Command::Sync(SyncCommand::Status) => cmd_sync_status().await,
     }
 }
 
@@ -598,6 +623,13 @@ async fn cmd_doctor(registry_url: Option<&str>) -> Result<()> {
             // SEC3: scan endpoint reachability.
             let scan_status = probe_scan_endpoint(effective_registry).await;
             println!("Scan endpoint:   {scan_status}");
+
+            // RUN2: SSE sync + reconciler status.
+            let sync_status = query_sync_status(&app.state.db_path);
+            println!("SSE sync:        {sync_status}");
+
+            let reconcile_status = query_reconcile_status(&app.state.db_path);
+            println!("Reconcile:       {reconcile_status}");
         }
         Err(e) => {
             eprintln!("warning: could not bootstrap state directory: {e:#}");
@@ -610,6 +642,8 @@ async fn cmd_doctor(registry_url: Option<&str>) -> Result<()> {
             println!("Last sync:       unknown");
             println!("OAuth listener:  not running");
             println!("Scan endpoint:   unknown");
+            println!("SSE sync:        unknown");
+            println!("Reconcile:       unknown");
         }
     }
 
@@ -821,6 +855,85 @@ fn query_last_sync_time(db_path: &camino::Utf8PathBuf) -> String {
     }
 }
 
+/// Return SSE sync status from `sync_state` table.
+///
+/// Reads the `last_event_id` key; if it's present, reports the device_id
+/// and last event.  If the table or keys are absent, reports "no sync state".
+fn query_sync_status(db_path: &camino::Utf8PathBuf) -> String {
+    use rusqlite::Connection;
+    let conn = match Connection::open(db_path) {
+        Ok(c) => c,
+        Err(_) => return "unknown (db open failed)".to_string(),
+    };
+
+    let device_id: Option<String> = conn
+        .query_row(
+            "SELECT value FROM sync_state WHERE key = 'device_id'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+
+    let last_event_id: Option<String> = conn
+        .query_row(
+            "SELECT value FROM sync_state WHERE key = 'last_event_id'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+
+    match (device_id, last_event_id) {
+        (Some(did), Some(eid)) => format!("device {did} — last event id: {eid}"),
+        (Some(did), None) => format!("device {did} — no events received yet"),
+        (None, _) => "not registered — run 'vectorhawk auth login' to enable sync".to_string(),
+    }
+}
+
+/// Return a reconciler summary from local SQLite.
+///
+/// Counts installed (active), deactivated, and error states.
+fn query_reconcile_status(db_path: &camino::Utf8PathBuf) -> String {
+    use rusqlite::Connection;
+    let conn = match Connection::open(db_path) {
+        Ok(c) => c,
+        Err(_) => return "unknown (db open failed)".to_string(),
+    };
+
+    // Count active (non-deactivated) registry-sourced skills.
+    let installed: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM installed_skills WHERE deactivated = 0 AND source = 'registry'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+
+    let deactivated: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM installed_skills WHERE deactivated = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+
+    // "Errors" here means skills with current_status = 'error' (set by reconciler on failure).
+    let errors: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM installed_skills WHERE current_status = 'error'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+
+    if errors > 0 {
+        format!(
+            "{installed} installed, {deactivated} deactivated, {errors} errors — run 'vectorhawk sync status'"
+        )
+    } else {
+        format!("{installed} installed, {deactivated} deactivated, 0 errors")
+    }
+}
+
 /// Truncate a string to at most `max_chars` Unicode scalar values.
 /// Appends "…" when truncation occurs.
 fn truncate_str(s: &str, max_chars: usize) -> String {
@@ -1027,22 +1140,27 @@ async fn cmd_skill_search(query: &str, registry_url: Option<&str>) -> Result<()>
     println!();
 
     let count = results.len();
-    println!(
-        "{count} result(s). Run vectorhawk skill install <id> to install."
-    );
+    println!("{count} result(s). Run vectorhawk skill install <id> to install.");
     Ok(())
 }
 
 // ── skill install ─────────────────────────────────────────────────────────────
+
+/// Maximum time to poll local SQLite for the reconciler to confirm install.
+const REGISTRY_INSTALL_POLL_TIMEOUT_SECS: u64 = 30;
+/// SQLite poll interval while waiting for reconciler confirmation.
+const REGISTRY_INSTALL_POLL_INTERVAL_MS: u64 = 500;
 
 async fn cmd_skill_install(skill_ref: &str, link: bool, registry_url: Option<&str>) -> Result<()> {
     use vectorhawkd_core::state::AppState;
 
     let state = AppState::bootstrap().context("failed to bootstrap state")?;
 
-    // Treat skill_ref as a local path when the path exists on disk.
+    // Treat skill_ref as a local path when it exists on disk or the --link
+    // flag is set (--link only makes sense with local paths).
     let path = camino::Utf8Path::new(skill_ref);
     if path.exists() {
+        // ── Local / offline install (unchanged behavior) ──────────────────────
         use vectorhawkd_core::installer::{install_unpacked_skill, InstallMode};
         use vectorhawkd_manifest::SkillPackage;
 
@@ -1059,30 +1177,184 @@ async fn cmd_skill_install(skill_ref: &str, link: bool, registry_url: Option<&st
             .with_context(|| format!("failed to install skill '{}'", pkg.manifest.id))?;
 
         println!(
-            "Installed skill '{}' version {}.",
+            "Installed skill '{}' version {} (local).",
             pkg.manifest.id, pkg.manifest.version
         );
     } else {
-        // Treat as a registry ID; download and install.
-        use vectorhawkd_core::registry::RegistryClient;
-        use vectorhawkd_core::updater::install_from_registry;
-
+        // ── Registry install via desired-state (RUN2) ─────────────────────────
+        // Call POST /api/installations and wait for the daemon reconciler to
+        // confirm the installed state in local SQLite (max 30 s).
         let url = registry_url.unwrap_or("https://app.vectorhawk.ai");
-        let registry = RegistryClient::new(url);
 
-        // install_from_registry issues blocking HTTP + SQLite calls; run on a
-        // blocking thread so we don't stall the tokio current-thread executor.
-        let skill_id = skill_ref.to_string();
-        let version = tokio::task::spawn_blocking(move || {
-            install_from_registry(&state, &registry, &skill_id, None)
-        })
-        .await
-        .context("install task panicked")?
-        .with_context(|| format!("failed to install '{skill_ref}' from registry"))?;
+        // Check if the daemon has an auth token.  If not, fall through to
+        // direct install so the CLI remains usable without the daemon.
+        let has_token = state.get_sync_state("device_id").ok().flatten().is_some();
 
-        println!("Installed skill '{skill_ref}' version {version} from registry.");
+        if has_token {
+            install_via_desired_state(skill_ref, url, &state).await?;
+        } else {
+            // No daemon registration → direct install path (pre-RUN2 behaviour).
+            direct_registry_install(skill_ref, url, state).await?;
+        }
     }
 
+    Ok(())
+}
+
+/// Call `POST /api/installations` and poll SQLite for the reconciler to confirm.
+async fn install_via_desired_state(
+    skill_id: &str,
+    registry_url: &str,
+    state: &vectorhawkd_core::state::AppState,
+) -> Result<()> {
+    use rusqlite::Connection;
+    use rusqlite::OptionalExtension;
+
+    let url = format!("{}/api/installations", registry_url.trim_end_matches('/'));
+
+    // Load the Bearer token.
+    let token = {
+        let rows =
+            vectorhawkd_core::auth::load_all_tokens(state).context("failed to load auth tokens")?;
+        rows.into_iter()
+            .find(|r| r.registry_url == registry_url)
+            .map(|r| r.access_token)
+    };
+
+    let token = match token {
+        Some(t) => t,
+        None => {
+            // No token → fall back to direct install.
+            eprintln!(
+                "note: not logged in — installing directly from registry (run \
+                 'vectorhawk auth login' to enable portal-driven installs)"
+            );
+            return direct_registry_install(
+                skill_id,
+                registry_url,
+                vectorhawkd_core::state::AppState {
+                    root_dir: state.root_dir.clone(),
+                    db_path: state.db_path.clone(),
+                },
+            )
+            .await;
+        }
+    };
+
+    let payload = serde_json::json!({
+        "skill_id": skill_id,
+        "source": "cli",
+    });
+
+    eprint!("Requesting install of '{skill_id}' from backend");
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .context("failed to build HTTP client")?;
+
+    let resp = client
+        .post(&url)
+        .bearer_auth(&token)
+        .json(&payload)
+        .send()
+        .await
+        .with_context(|| format!("failed to call {url}"))?;
+
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        anyhow::bail!("session expired — run 'vectorhawk auth login' to refresh");
+    }
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("install request failed (HTTP {status}): {body}");
+    }
+
+    // Poll SQLite for the reconciler to confirm 'installed' state (max 30 s).
+    let db_path = state.db_path.clone();
+    let skill_id_str = skill_id.to_string();
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_secs(REGISTRY_INSTALL_POLL_TIMEOUT_SECS);
+
+    loop {
+        if std::time::Instant::now() >= deadline {
+            eprintln!();
+            anyhow::bail!(
+                "timed out waiting for '{skill_id}' to install — the daemon may not be \
+                 running. Run 'vectorhawk daemon install' to enable background sync, \
+                 or 'vectorhawk sync status' to check for errors."
+            );
+        }
+
+        eprint!(".");
+
+        let installed = tokio::task::spawn_blocking({
+            let db = db_path.clone();
+            let id = skill_id_str.clone();
+            move || {
+                let conn = Connection::open(&db)?;
+                let row: Option<(String, i64)> = conn
+                    .query_row(
+                        "SELECT current_status, COALESCE(deactivated, 0) \
+                         FROM installed_skills WHERE skill_id = ?1",
+                        [&id],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()?;
+                anyhow::Ok(row)
+            }
+        })
+        .await
+        .context("poll task panicked")?
+        .context("failed to poll installed_skills")?;
+
+        match installed {
+            Some((status, 0)) if status == "active" => {
+                eprintln!();
+                println!("Installed skill '{skill_id}' from registry.");
+                return Ok(());
+            }
+            Some((status, _)) if status == "error" => {
+                eprintln!();
+                anyhow::bail!(
+                    "install of '{skill_id}' encountered an error — run \
+                     'vectorhawk sync status' for details"
+                );
+            }
+            _ => {
+                // Not yet installed; wait and retry.
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    REGISTRY_INSTALL_POLL_INTERVAL_MS,
+                ))
+                .await;
+            }
+        }
+    }
+}
+
+/// Direct registry install — pre-RUN2 behaviour, used when the daemon is not
+/// running or the user is not logged in.
+async fn direct_registry_install(
+    skill_ref: &str,
+    registry_url: &str,
+    state: vectorhawkd_core::state::AppState,
+) -> Result<()> {
+    use vectorhawkd_core::registry::RegistryClient;
+    use vectorhawkd_core::updater::install_from_registry;
+
+    let url = registry_url.to_string();
+    let registry = RegistryClient::new(&url);
+    let skill_id = skill_ref.to_string();
+
+    let version = tokio::task::spawn_blocking(move || {
+        install_from_registry(&state, &registry, &skill_id, None)
+    })
+    .await
+    .context("install task panicked")?
+    .with_context(|| format!("failed to install '{skill_ref}' from registry"))?;
+
+    println!("Installed skill '{skill_ref}' version {version} from registry.");
     Ok(())
 }
 
@@ -1229,12 +1501,18 @@ fn select_model_for_skill(
     }
 
     if recommended.is_empty() {
-        return available.into_iter().next().unwrap_or_else(|| "llama3".to_string());
+        return available
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| "llama3".to_string());
     }
 
     // Find first recommended model that is available (prefix match).
     for rec in &recommended {
-        if let Some(found) = available.iter().find(|a| *a == rec || a.starts_with(rec.as_str())) {
+        if let Some(found) = available
+            .iter()
+            .find(|a| *a == rec || a.starts_with(rec.as_str()))
+        {
             return found.clone();
         }
     }
@@ -1594,9 +1872,7 @@ async fn cmd_skill_validate(path: camino::Utf8PathBuf) -> Result<()> {
     }
     let summary = summary_parts.join(", ");
 
-    let install_hint = format!(
-        "Run vectorhawk skill install {path}/ to install."
-    );
+    let install_hint = format!("Run vectorhawk skill install {path}/ to install.");
 
     if fail_count == 0 {
         println!("{summary} {install_hint}");
@@ -1754,9 +2030,7 @@ fn needs_publisher(skill_md: &str) -> bool {
 fn inject_publisher_field(skill_md: &str, slug: &str) -> String {
     let placeholder = "YOUR_PUBLISHER_ID";
     // Replace existing placeholder line.
-    if skill_md.contains(&format!("publisher: {placeholder}"))
-        || skill_md.contains("publisher: ")
-    {
+    if skill_md.contains(&format!("publisher: {placeholder}")) || skill_md.contains("publisher: ") {
         return skill_md
             .lines()
             .map(|line| {
@@ -1788,7 +2062,10 @@ fn inject_publisher_field(skill_md: &str, slug: &str) -> String {
 ///
 /// Returns `None` silently on any failure (no tokens, network error, etc.).
 async fn try_infer_publisher_id(registry_url: &str) -> Option<String> {
-    use vectorhawkd_core::{auth::{load_tokens, AuthClient}, state::AppState};
+    use vectorhawkd_core::{
+        auth::{load_tokens, AuthClient},
+        state::AppState,
+    };
 
     let state = AppState::bootstrap().ok()?;
     let tokens = load_tokens(&state, registry_url).ok().flatten()?;
@@ -1798,7 +2075,11 @@ async fn try_infer_publisher_id(registry_url: &str) -> Option<String> {
         .ok()?
         .ok()?;
     let slug = derive_publisher_slug(&user_info.display_name);
-    if slug.is_empty() { None } else { Some(slug) }
+    if slug.is_empty() {
+        None
+    } else {
+        Some(slug)
+    }
 }
 
 async fn cmd_skill_author(
@@ -1916,7 +2197,8 @@ async fn cmd_skill_author(
 
     // Try to infer publisher from logged-in account.
     let effective_registry = registry_url.unwrap_or("https://app.vectorhawk.ai");
-    let publisher_id = try_infer_publisher_id(effective_registry).await
+    let publisher_id = try_infer_publisher_id(effective_registry)
+        .await
         .unwrap_or_else(|| "YOUR_PUBLISHER_ID".to_string());
 
     if skip_metadata {
@@ -1940,20 +2222,38 @@ async fn cmd_skill_author(
 
     if accept_suggestions {
         // Scaffold with recommendations applied.
-        scaffold_with_recommendations(&skill_name, &skill_id, &prompt_text, &base, &rec, &publisher_id)?;
+        scaffold_with_recommendations(
+            &skill_name,
+            &skill_id,
+            &prompt_text,
+            &base,
+            &rec,
+            &publisher_id,
+        )?;
         let confidence_str = format!("{:?}", rec.confidence).to_lowercase();
         println!("Created skill at {}/{}/SKILL.md", base, skill_id);
         println!("Applied recommendations (confidence: {confidence_str}):");
         println!("  Network: {}", rec.permissions.network);
         println!("  Filesystem: {}", rec.permissions.filesystem);
-        let model_primary = rec.model.recommended.first().map(|s| s.as_str()).unwrap_or("gemma3:2b");
-        let model_status = if available_ollama.iter().any(|a| a == model_primary || a.starts_with(model_primary)) {
+        let model_primary = rec
+            .model
+            .recommended
+            .first()
+            .map(|s| s.as_str())
+            .unwrap_or("gemma3:2b");
+        let model_status = if available_ollama
+            .iter()
+            .any(|a| a == model_primary || a.starts_with(model_primary))
+        {
             format!("{model_primary} (installed locally)")
         } else {
             format!("{model_primary} (not installed — run: ollama pull {model_primary})")
         };
         println!("  Offline model: {model_status}");
-        println!("  Timeout: {}", format_duration_ms(rec.execution.timeout_ms));
+        println!(
+            "  Timeout: {}",
+            format_duration_ms(rec.execution.timeout_ms)
+        );
         println!("  Sandbox: {}", rec.execution.sandbox);
         println!("  Triggers: {}", rec.triggers.join(", "));
         if publisher_id != "YOUR_PUBLISHER_ID" {
@@ -1983,13 +2283,21 @@ async fn cmd_skill_author(
     )?;
 
     // Model group.
-    let model_primary = rec.model.recommended.first().map(|s| s.as_str()).unwrap_or("gemma3:2b");
+    let model_primary = rec
+        .model
+        .recommended
+        .first()
+        .map(|s| s.as_str())
+        .unwrap_or("gemma3:2b");
     let fallback_desc = if rec.model.fallback == "mcp_sampling" {
         "falls back to your AI client if unavailable"
     } else {
         "returns an error if unavailable"
     };
-    let model_install_note = if available_ollama.iter().any(|a| a == model_primary || a.starts_with(model_primary)) {
+    let model_install_note = if available_ollama
+        .iter()
+        .any(|a| a == model_primary || a.starts_with(model_primary))
+    {
         format!("{model_primary} (installed locally)")
     } else {
         format!("{model_primary} (not installed — run: ollama pull {model_primary})")
@@ -2507,7 +2815,9 @@ async fn cmd_skill_publish(
     println!(
         "Published '{}' v{}",
         resp.frontmatter.name,
-        resp.frontmatter.version.as_deref()
+        resp.frontmatter
+            .version
+            .as_deref()
             .or(resp.frontmatter.vh_version.as_deref())
             .unwrap_or("?")
     );
@@ -2671,17 +2981,11 @@ vh_execution:
 /// For each targeted skill, fetches the latest registry version and installs it
 /// when it is strictly newer than the installed version.  Prints one line per
 /// skill: "Updating X a.b.c → d.e.f... done." or "X is already up to date (a.b.c).".
-async fn cmd_skill_update(
-    id: Option<&str>,
-    all: bool,
-    registry_url: Option<&str>,
-) -> Result<()> {
+async fn cmd_skill_update(id: Option<&str>, all: bool, registry_url: Option<&str>) -> Result<()> {
     use rusqlite::{Connection, OptionalExtension};
     use semver::Version;
     use vectorhawkd_core::{
-        registry::RegistryClient,
-        state::AppState,
-        updater::install_from_registry,
+        registry::RegistryClient, state::AppState, updater::install_from_registry,
     };
 
     if id.is_none() && !all {
@@ -2725,8 +3029,8 @@ async fn cmd_skill_update(
             .optional()
             .context("failed to query installed_skills")?
         };
-        let ver = installed_ver
-            .ok_or_else(|| anyhow::anyhow!("skill '{skill_id}' is not installed"))?;
+        let ver =
+            installed_ver.ok_or_else(|| anyhow::anyhow!("skill '{skill_id}' is not installed"))?;
         vec![(skill_id.to_string(), ver)]
     };
 
@@ -2965,9 +3269,7 @@ async fn cmd_auth_login(registry_url: &str) -> Result<()> {
             println!("Open this URL in your browser to continue:");
             println!("  {}", init.auth_url);
             println!();
-            println!(
-                "Waiting for callback on http://127.0.0.1:{port}/oauth/cli/callback ..."
-            );
+            println!("Waiting for callback on http://127.0.0.1:{port}/oauth/cli/callback ...");
         }
     }
     println!();
@@ -3618,6 +3920,116 @@ async fn cmd_daemon_uninstall() -> Result<()> {
         .await
         .context("uninstall task panicked")?
         .context("daemon uninstall failed")
+}
+
+// ── sync status ───────────────────────────────────────────────────────────────
+
+async fn cmd_sync_status() -> Result<()> {
+    use rusqlite::Connection;
+    use vectorhawkd_core::state::AppState;
+
+    let state = AppState::bootstrap().context("failed to bootstrap state")?;
+    let conn = Connection::open(&state.db_path).context("failed to open state DB")?;
+
+    // Print sync_state key/value table.
+    println!("=== Sync State ===");
+    let sync_rows: Vec<(String, String)> = {
+        let mut stmt = conn
+            .prepare("SELECT key, value FROM sync_state ORDER BY key")
+            .context("failed to prepare sync_state query")?;
+        let mapped = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .context("failed to query sync_state")?;
+        mapped
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to collect sync_state rows")?
+    };
+
+    if sync_rows.is_empty() {
+        println!("  (no sync state — daemon may not be registered yet)");
+    } else {
+        for (k, v) in &sync_rows {
+            println!("  {k}: {v}");
+        }
+    }
+    println!();
+
+    // Print installation records with reconciler state.
+    println!("=== Installation Records ===");
+
+    struct InstallRow {
+        skill_id: String,
+        active_version: String,
+        source: String,
+        installation_id: Option<String>,
+        deactivated: bool,
+        current_status: String,
+        installed_at: String,
+    }
+
+    // The new columns (installation_id, source, deactivated) may not exist on
+    // older databases; use coalesce/default-value queries to be defensive.
+    let rows: Vec<InstallRow> = {
+        // Try querying with new columns; fall back gracefully.
+        let mut stmt = conn
+            .prepare(
+                "SELECT skill_id, active_version, \
+                 COALESCE(source, 'local'), \
+                 installation_id, \
+                 COALESCE(deactivated, 0), \
+                 current_status, \
+                 installed_at \
+                 FROM installed_skills ORDER BY skill_id",
+            )
+            .context("failed to prepare installations query")?;
+
+        let mapped = stmt
+            .query_map([], |row| {
+                Ok(InstallRow {
+                    skill_id: row.get(0)?,
+                    active_version: row.get(1)?,
+                    source: row.get(2)?,
+                    installation_id: row.get(3)?,
+                    deactivated: row.get::<_, i64>(4).map(|v| v != 0)?,
+                    current_status: row.get(5)?,
+                    installed_at: row.get(6)?,
+                })
+            })
+            .context("failed to execute installations query")?;
+        mapped
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to collect installation rows")?
+    };
+
+    if rows.is_empty() {
+        println!("  (no installations)");
+        return Ok(());
+    }
+
+    println!(
+        "{:<30} {:<10} {:<10} {:<12} {:<38}",
+        "SKILL ID", "VERSION", "SOURCE", "STATUS", "INSTALLATION ID"
+    );
+    println!("{}", "-".repeat(105));
+    for r in &rows {
+        let status = if r.deactivated {
+            "deactivated".to_string()
+        } else {
+            r.current_status.clone()
+        };
+        let iid = r.installation_id.as_deref().unwrap_or("(local)");
+        println!(
+            "{:<30} {:<10} {:<10} {:<12} {:<38}",
+            r.skill_id, r.active_version, r.source, status, iid
+        );
+        if !r.installed_at.is_empty() {
+            println!("  installed_at: {}", r.installed_at);
+        }
+    }
+
+    Ok(())
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

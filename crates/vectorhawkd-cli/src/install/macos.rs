@@ -154,12 +154,7 @@ pub fn install() -> Result<()> {
     if plist.exists() && service_is_loaded(uid) {
         let plist_has_current_binary = fs::read_to_string(&plist)
             .ok()
-            .map(|s| {
-                bin_path
-                    .to_str()
-                    .map(|b| s.contains(b))
-                    .unwrap_or(false)
-            })
+            .map(|s| bin_path.to_str().map(|b| s.contains(b)).unwrap_or(false))
             .unwrap_or(false);
         if plist_has_current_binary {
             println!("VectorHawk daemon is already installed and up to date — no changes made.");

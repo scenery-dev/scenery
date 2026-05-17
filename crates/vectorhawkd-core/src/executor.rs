@@ -688,18 +688,20 @@ mod tests {
             "INSERT INTO installed_skills \
              (skill_id, active_version, install_root, channel, current_status) \
              VALUES (?1, ?2, ?3, 'stable', 'active')",
-            params![
-                "phantom-skill",
-                "1.0.0",
-                phantom_install_root.as_str()
-            ],
+            params!["phantom-skill", "1.0.0", phantom_install_root.as_str()],
         )
         .expect("seed row should insert");
         drop(conn);
 
         let client = MockPolicyClient::new();
-        let err = run_skill(&state, &client, "phantom-skill", &serde_json::json!({}), None)
-            .expect_err("corrupt install should produce an error");
+        let err = run_skill(
+            &state,
+            &client,
+            "phantom-skill",
+            &serde_json::json!({}),
+            None,
+        )
+        .expect_err("corrupt install should produce an error");
 
         let msg = err.to_string();
         // Must mention state.db so the user understands what is inconsistent.

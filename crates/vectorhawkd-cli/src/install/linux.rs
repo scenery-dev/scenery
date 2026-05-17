@@ -166,12 +166,7 @@ fn install_systemd(bin_path: &std::path::Path) -> Result<()> {
     let is_upgrade = if unit.exists() && unit_is_enabled() {
         let unit_has_current_binary = fs::read_to_string(&unit)
             .ok()
-            .map(|s| {
-                bin_path
-                    .to_str()
-                    .map(|b| s.contains(b))
-                    .unwrap_or(false)
-            })
+            .map(|s| bin_path.to_str().map(|b| s.contains(b)).unwrap_or(false))
             .unwrap_or(false);
         if unit_has_current_binary {
             println!("VectorHawk daemon is already installed and up to date — no changes made.");
@@ -306,7 +301,10 @@ fn kill_daemon_process() {
         };
         // cmdline is NUL-separated; check it contains our marker tokens
         let cmdline = String::from_utf8_lossy(&raw);
-        if cmdline.contains("vectorhawk") && cmdline.contains("daemon") && cmdline.contains("foreground") {
+        if cmdline.contains("vectorhawk")
+            && cmdline.contains("daemon")
+            && cmdline.contains("foreground")
+        {
             if let Ok(pid) = pid_str.parse::<i32>() {
                 unsafe { libc::kill(pid, libc::SIGTERM) };
             }

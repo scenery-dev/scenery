@@ -61,6 +61,28 @@ impl AppState {
             "ALTER TABLE execution_history ADD COLUMN cost_usd REAL DEFAULT 0.0",
         )?;
 
+        // RUN2: desired-state reconciler columns on installed_skills.
+        add_column_if_missing(
+            &conn,
+            "ALTER TABLE installed_skills ADD COLUMN installation_id TEXT",
+        )?;
+        add_column_if_missing(
+            &conn,
+            "ALTER TABLE installed_skills ADD COLUMN source TEXT DEFAULT 'local'",
+        )?;
+        add_column_if_missing(
+            &conn,
+            "ALTER TABLE installed_skills ADD COLUMN deactivated INTEGER DEFAULT 0",
+        )?;
+        add_column_if_missing(
+            &conn,
+            "ALTER TABLE installed_skills ADD COLUMN deactivated_at TEXT",
+        )?;
+
+        // RUN2: SSE resume state and device registration.
+        conn.execute_batch(SCHEMA_RUN2_SQL)
+            .context("failed to apply RUN2 schema additions")?;
+
         Ok(Self { root_dir, db_path })
     }
 
@@ -114,6 +136,39 @@ impl AppState {
         }
         // macOS and fallback: socket lives in the data dir alongside state.db
         self.root_dir.join("agent.sock")
+    }
+}
+
+// ── Sync state helpers (RUN2) ─────────────────────────────────────────────────
+
+impl AppState {
+    /// Read a key from the `sync_state` key/value table.
+    ///
+    /// Returns `None` if the key does not exist or the table was not yet created.
+    pub fn get_sync_state(&self, key: &str) -> Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+        let conn = Connection::open(&self.db_path).context("failed to open state DB")?;
+        let result = conn
+            .query_row(
+                "SELECT value FROM sync_state WHERE key = ?1",
+                [key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .context("failed to read sync_state")?;
+        Ok(result)
+    }
+
+    /// Write a key/value pair to the `sync_state` table (upsert).
+    pub fn set_sync_state(&self, key: &str, value: &str) -> Result<()> {
+        let conn = Connection::open(&self.db_path).context("failed to open state DB")?;
+        conn.execute(
+            "INSERT INTO sync_state (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            rusqlite::params![key, value],
+        )
+        .context("failed to write sync_state")?;
+        Ok(())
     }
 }
 
@@ -220,6 +275,16 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 "#;
 
+/// Additive schema applied on top of SCHEMA_SQL.  All statements are
+/// idempotent (`IF NOT EXISTS`) so they are safe to run on every startup.
+const SCHEMA_RUN2_SQL: &str = r#"
+-- RUN2: SSE resume / device-registration state.
+CREATE TABLE IF NOT EXISTS sync_state (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+"#;
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -259,12 +324,13 @@ mod tests {
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN \
                  ('installed_skills','skill_versions','policy_cache','auth_tokens',\
-                  'execution_history','audit_events','skill_ratings','skill_execution_counts')",
+                  'execution_history','audit_events','skill_ratings','skill_execution_counts',\
+                  'sync_state')",
                 [],
                 |row| row.get(0),
             )
             .expect("should query sqlite_master");
-        assert_eq!(table_count, 8, "all eight tables should exist");
+        assert_eq!(table_count, 9, "all nine tables should exist");
 
         cleanup(&state.root_dir);
     }

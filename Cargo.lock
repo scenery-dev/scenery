@@ -2599,8 +2599,10 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "camino",
+ "chrono",
  "clap",
  "dirs",
+ "futures",
  "libc",
  "mockito",
  "reqwest 0.12.28",
@@ -2612,9 +2614,11 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "vectorhawkd-core",
  "vectorhawkd-manifest",
  "vectorhawkd-mcp",
+ "zip",
 ]
 
 [[package]]

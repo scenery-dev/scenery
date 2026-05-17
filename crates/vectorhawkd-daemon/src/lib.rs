@@ -58,6 +58,7 @@ mod auth_dispatch;
 mod oauth_listener;
 mod oauth_state;
 mod socket_dispatch;
+pub mod sync;
 
 use anyhow::{Context, Result};
 use std::{os::unix::fs::PermissionsExt, sync::Arc};
@@ -389,6 +390,28 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
         }
     };
 
+    // ── RUN2: Device registration + SSE sync subsystem ───────────────────────
+    //
+    // After the daemon is authenticated, register this device with the backend
+    // and start the SSE-driven reconciler.  Both steps are best-effort: if the
+    // backend is unreachable (offline mode) we log a warning and continue.
+    let sync_state_arc = Arc::new(AppState {
+        root_dir: state.root_dir.clone(),
+        db_path: state.db_path.clone(),
+    });
+
+    let sync_handle = try_start_sync(
+        &registry_url,
+        Arc::clone(&sync_state_arc),
+        list_changed_tx.clone(),
+    )
+    .await;
+    if let Some(ref _handle) = sync_handle {
+        info!("sync subsystem started");
+    } else {
+        info!("sync subsystem not started (no auth token or registration failed)");
+    }
+
     let mut backend = RealBackend::with_full_context(
         Arc::clone(&vh_registry),
         Arc::clone(&audit_buffer) as Arc<dyn AuditBuffer>,
@@ -581,6 +604,156 @@ pub fn refresh_one_tick(state: &AppState, registry_url: &str) -> Result<()> {
 
     let _ = registry_url; // primary registry_url param kept for future rate-limit context
     Ok(())
+}
+
+// ── RUN2: Device registration + sync startup ─────────────────────────────────
+
+/// Register this device with the backend and start the SSE sync subsystem.
+///
+/// Returns `None` if no auth token is available or registration fails.
+/// The daemon continues to operate without sync in that case.
+async fn try_start_sync(
+    registry_url: &str,
+    state: Arc<AppState>,
+    list_changed_tx: broadcast::Sender<()>,
+) -> Option<sync::ReconcilerHandle> {
+    // Load the access token from SQLite.
+    let token = match load_all_tokens(&state) {
+        Ok(rows) => rows
+            .into_iter()
+            .find(|r| r.registry_url == registry_url)
+            .map(|r| r.access_token),
+        Err(e) => {
+            warn!(error = %e, "sync: failed to load auth tokens");
+            return None;
+        }
+    };
+
+    let token = match token {
+        Some(t) => t,
+        None => {
+            info!("sync: no auth token for {registry_url} — skipping device registration");
+            return None;
+        }
+    };
+
+    // Register device (or confirm existing registration).
+    let device_id = match register_device(registry_url, &token, Arc::clone(&state)).await {
+        Ok(id) => id,
+        Err(e) => {
+            warn!(error = %e, "sync: device registration failed — skipping SSE sync");
+            return None;
+        }
+    };
+
+    // Retrieve the last SSE event ID for resume.
+    let last_event_id = state.get_sync_state("last_event_id").ok().flatten();
+
+    let sync_config = sync::SyncConfig {
+        registry_url: registry_url.to_string(),
+        token,
+        device_id,
+        last_event_id,
+    };
+
+    match sync::run(sync_config, state, list_changed_tx) {
+        Ok(handle) => Some(handle),
+        Err(e) => {
+            warn!(error = %e, "sync: failed to start sync subsystem");
+            None
+        }
+    }
+}
+
+/// Register this device with the backend.
+///
+/// Calls `POST /api/devices/register` with a stable device UUID and system
+/// info.  The backend returns a `device_id` which we persist in `sync_state`.
+///
+/// On success, returns the `device_id` to use for SSE connections.
+async fn register_device(registry_url: &str, token: &str, state: Arc<AppState>) -> Result<String> {
+    // Retrieve or generate a stable device UUID.
+    let device_uuid = match state.get_sync_state("device_uuid")? {
+        Some(u) => u,
+        None => {
+            let new_uuid = uuid::Uuid::new_v4().to_string();
+            state.set_sync_state("device_uuid", &new_uuid)?;
+            new_uuid
+        }
+    };
+
+    // Check if we already have a device_id from a previous registration.
+    if let Some(existing_id) = state.get_sync_state("device_id")? {
+        return Ok(existing_id);
+    }
+
+    let url = format!(
+        "{}/api/devices/register",
+        registry_url.trim_end_matches('/')
+    );
+
+    // Prefer HOSTNAME env var (set by most shells); fall back to gethostname
+    // via the `libc` crate already in the workspace.
+    let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| {
+        // Try gethostname via libc on Unix.
+        #[cfg(unix)]
+        {
+            let mut buf = vec![0u8; 256];
+            if unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) } == 0 {
+                let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+                return String::from_utf8_lossy(&buf[..end]).into_owned();
+            }
+        }
+        "unknown".to_string()
+    });
+
+    let payload = serde_json::json!({
+        "device_uuid": device_uuid,
+        "hostname": hostname,
+        "platform": std::env::consts::OS,
+        "arch": std::env::consts::ARCH,
+        "agent_version": env!("CARGO_PKG_VERSION"),
+    });
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .context("failed to build HTTP client for device registration")?;
+
+    let resp = client
+        .post(&url)
+        .bearer_auth(token)
+        .json(&payload)
+        .send()
+        .await
+        .with_context(|| format!("device registration HTTP call failed to {url}"))?;
+
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        anyhow::bail!("device registration returned 401 — token expired");
+    }
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("device registration failed (HTTP {status}): {body}");
+    }
+
+    #[derive(serde::Deserialize)]
+    struct RegisterResponse {
+        device_id: String,
+    }
+
+    let reg: RegisterResponse = resp
+        .json()
+        .await
+        .context("failed to deserialize device registration response")?;
+
+    state
+        .set_sync_state("device_id", &reg.device_id)
+        .context("failed to persist device_id")?;
+
+    info!(device_id = %reg.device_id, "device registered with backend");
+    Ok(reg.device_id)
 }
 
 /// One tick of the registry sync loop.

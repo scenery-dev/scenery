@@ -1,0 +1,497 @@
+//! Persistent SSE client for the backend `/api/sync/events` stream.
+//!
+//! # Lifecycle
+//!
+//! [`run`] loops forever:
+//! 1. Acquires the current JWT from the daemon's token store.
+//! 2. Opens an HTTP GET to `{registry_url}/api/sync/events` with auth headers.
+//! 3. Streams lines, parses SSE events per RFC 8607.
+//! 4. On each complete event: sends a [`SyncEvent`] to the reconciler and
+//!    persists `last_event_id` to SQLite.
+//! 5. On EOF, error, or watchdog timeout: exponential backoff (1s → 60s max),
+//!    then reconnect.
+//! 6. On HTTP 401: attempts token refresh via a new `AuthClient` call, then
+//!    reconnects immediately.
+//!
+//! # Watchdog
+//!
+//! If no SSE line (including `: ping` keep-alive comments) is received for 60
+//! seconds, the connection is treated as stale and rebuilt.
+//!
+//! # Backoff
+//!
+//! Reconnect delays: 1 s → 2 s → 4 s → 8 s → 16 s → 32 s → 60 s (capped).
+//! A successful connection resets the backoff counter.
+
+use anyhow::{Context, Result};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::mpsc;
+use tokio::time::Instant;
+use tracing::{debug, info, warn};
+use uuid::Uuid;
+
+use crate::sync::SyncConfig;
+use vectorhawkd_core::{
+    auth::{load_all_tokens, save_tokens, AuthClient},
+    state::AppState,
+};
+
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+/// How long to wait with no data before treating the connection as dead.
+const WATCHDOG_SECS: u64 = 60;
+
+/// Starting reconnect delay.
+const BACKOFF_INIT_SECS: u64 = 1;
+
+/// Maximum reconnect delay.
+const BACKOFF_MAX_SECS: u64 = 60;
+
+// ── Entry point ───────────────────────────────────────────────────────────────
+
+/// Run the SSE client loop (never returns unless the channel is closed).
+pub async fn run(config: SyncConfig, state: Arc<AppState>, tx: mpsc::Sender<SyncEvent>) {
+    let mut backoff_secs = BACKOFF_INIT_SECS;
+    let mut last_event_id = config.last_event_id.clone();
+    let mut current_token = config.token.clone();
+
+    loop {
+        match connect_and_stream(
+            &config.registry_url,
+            &current_token,
+            &config.device_id,
+            last_event_id.clone(),
+            Arc::clone(&state),
+            &tx,
+        )
+        .await
+        {
+            ConnectResult::Reconnect { new_last_id } => {
+                // Clean reconnect (EOF or watchdog).  Reset backoff.
+                backoff_secs = BACKOFF_INIT_SECS;
+                if let Some(id) = new_last_id {
+                    last_event_id = Some(id);
+                }
+            }
+            ConnectResult::Unauthorized => {
+                // 401: try to refresh the JWT before reconnecting.
+                info!("SSE: received 401 — attempting token refresh");
+                match try_refresh_token(&config.registry_url, Arc::clone(&state)).await {
+                    Ok(new_token) => {
+                        current_token = new_token;
+                        info!("SSE: token refreshed — reconnecting immediately");
+                        backoff_secs = BACKOFF_INIT_SECS;
+                        continue; // no delay
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "SSE: token refresh failed — backing off");
+                    }
+                }
+            }
+            ConnectResult::ChannelClosed => {
+                info!("SSE: reconciler channel closed — stopping SSE client");
+                return;
+            }
+            ConnectResult::Error(e) => {
+                warn!(error = %e, backoff_secs, "SSE: connection error — backing off");
+            }
+        }
+
+        // Wait before reconnecting.
+        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+        backoff_secs = (backoff_secs * 2).min(BACKOFF_MAX_SECS);
+    }
+}
+
+// ── Connection result ─────────────────────────────────────────────────────────
+
+enum ConnectResult {
+    /// Clean disconnect (EOF or watchdog).  Carry forward last_event_id.
+    Reconnect { new_last_id: Option<String> },
+    /// Server returned 401 — caller should refresh token then reconnect.
+    Unauthorized,
+    /// Downstream channel closed — caller should stop the loop.
+    ChannelClosed,
+    /// Any other connection or I/O error.
+    Error(anyhow::Error),
+}
+
+// ── SSE stream ────────────────────────────────────────────────────────────────
+
+/// Open one SSE connection and stream events until EOF, watchdog, or error.
+async fn connect_and_stream(
+    registry_url: &str,
+    token: &str,
+    device_id: &str,
+    last_event_id: Option<String>,
+    state: Arc<AppState>,
+    tx: &mpsc::Sender<SyncEvent>,
+) -> ConnectResult {
+    let url = format!("{}/api/sync/events", registry_url.trim_end_matches('/'));
+    debug!(url, device_id, "SSE: opening connection");
+
+    // Build an async reqwest client (not the blocking one used elsewhere).
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(0)) // streaming — no overall timeout
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return ConnectResult::Error(anyhow::anyhow!("SSE: failed to build HTTP client: {e}"))
+        }
+    };
+
+    let mut req = client
+        .get(&url)
+        .bearer_auth(token)
+        .header("X-Device-ID", device_id)
+        .header("Accept", "text/event-stream")
+        .header("Cache-Control", "no-cache");
+
+    if let Some(ref id) = last_event_id {
+        req = req.header("Last-Event-ID", id.as_str());
+    }
+
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => return ConnectResult::Error(anyhow::anyhow!("SSE: HTTP request failed: {e}")),
+    };
+
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return ConnectResult::Unauthorized;
+    }
+
+    if !resp.status().is_success() {
+        return ConnectResult::Error(anyhow::anyhow!(
+            "SSE: server returned HTTP {}",
+            resp.status()
+        ));
+    }
+
+    info!(device_id, "SSE: connected to {url}");
+
+    // Stream lines.
+    let mut new_last_id: Option<String> = last_event_id;
+    let stream_result = stream_events(resp, state, tx, &mut new_last_id).await;
+
+    match stream_result {
+        Ok(StreamEnd::Eof) | Ok(StreamEnd::Watchdog) => {
+            info!("SSE: stream ended — will reconnect");
+            ConnectResult::Reconnect { new_last_id }
+        }
+        Ok(StreamEnd::ChannelClosed) => ConnectResult::ChannelClosed,
+        Err(e) => ConnectResult::Error(e),
+    }
+}
+
+// ── Line streaming and SSE parsing ───────────────────────────────────────────
+
+enum StreamEnd {
+    Eof,
+    Watchdog,
+    ChannelClosed,
+}
+
+/// Stream bytes from the SSE response, parse events, and send to the reconciler.
+///
+/// Collects SSE fields across newlines and dispatches a complete event when a
+/// blank line is encountered (per RFC 8607 §9.2.6).
+async fn stream_events(
+    resp: reqwest::Response,
+    state: Arc<AppState>,
+    tx: &mpsc::Sender<SyncEvent>,
+    last_event_id: &mut Option<String>,
+) -> Result<StreamEnd> {
+    use futures::StreamExt;
+
+    let mut byte_stream = resp.bytes_stream();
+
+    // Buffer for accumulated bytes (may span multiple chunks).
+    let mut line_buf = String::new();
+    // Current event fields.
+    let mut event_type = String::new();
+    let mut event_data = String::new();
+    let mut event_id: Option<String> = None;
+
+    let watchdog_duration = Duration::from_secs(WATCHDOG_SECS);
+    let watchdog = tokio::time::sleep(watchdog_duration);
+    // Pin the sleep future so we can reset it.
+    tokio::pin!(watchdog);
+
+    loop {
+        tokio::select! {
+            chunk = byte_stream.next() => {
+                // Reset the watchdog whenever data arrives.
+                watchdog.as_mut().reset(Instant::now() + watchdog_duration);
+
+                let bytes = match chunk {
+                    Some(Ok(b)) => b,
+                    Some(Err(e)) => return Err(anyhow::anyhow!("SSE: stream read error: {e}")),
+                    None => return Ok(StreamEnd::Eof),
+                };
+
+                // Append bytes to line buffer and process complete lines.
+                let text = std::str::from_utf8(&bytes)
+                    .context("SSE: non-UTF-8 bytes in stream")?;
+                line_buf.push_str(text);
+
+                // Process all complete lines (terminated by \n).
+                while let Some(pos) = line_buf.find('\n') {
+                    let line: String = line_buf.drain(..=pos).collect();
+                    let line = line.trim_end_matches('\n').trim_end_matches('\r');
+
+                    let end = process_sse_line(
+                        line,
+                        &mut event_type,
+                        &mut event_data,
+                        &mut event_id,
+                        last_event_id,
+                        &state,
+                        tx,
+                    ).await?;
+                    if let Some(e) = end {
+                        return Ok(e);
+                    }
+                }
+            }
+            _ = &mut watchdog => {
+                warn!("SSE: watchdog triggered — no data for {WATCHDOG_SECS}s, reconnecting");
+                return Ok(StreamEnd::Watchdog);
+            }
+        }
+    }
+}
+
+/// Process one SSE line.  Returns `Some(StreamEnd)` if the loop should stop.
+async fn process_sse_line(
+    line: &str,
+    event_type: &mut String,
+    event_data: &mut String,
+    event_id: &mut Option<String>,
+    last_event_id: &mut Option<String>,
+    state: &AppState,
+    tx: &mpsc::Sender<SyncEvent>,
+) -> Result<Option<StreamEnd>> {
+    // Blank line = dispatch event.
+    if line.is_empty() {
+        if !event_data.is_empty() {
+            let dispatch_result =
+                dispatch_event(event_type, event_data, event_id, last_event_id, state, tx).await?;
+            if dispatch_result {
+                return Ok(Some(StreamEnd::ChannelClosed));
+            }
+        }
+        // Reset for next event.
+        event_type.clear();
+        event_data.clear();
+        *event_id = None;
+        return Ok(None);
+    }
+
+    // Comment line (keep-alive pings, etc.) — no action.
+    if line.starts_with(':') {
+        debug!("SSE: comment: {line}");
+        return Ok(None);
+    }
+
+    // Field lines.
+    if let Some(value) = line.strip_prefix("event:") {
+        *event_type = value.trim_start().to_string();
+    } else if let Some(value) = line.strip_prefix("data:") {
+        if !event_data.is_empty() {
+            event_data.push('\n');
+        }
+        event_data.push_str(value.trim_start());
+    } else if let Some(value) = line.strip_prefix("id:") {
+        *event_id = Some(value.trim_start().to_string());
+    }
+    // `retry:` field ignored (we control backoff ourselves).
+
+    Ok(None)
+}
+
+/// Parse and dispatch one complete SSE event.
+///
+/// Returns `true` if the downstream channel is closed (caller should stop).
+async fn dispatch_event(
+    event_type: &str,
+    event_data: &str,
+    event_id: &Option<String>,
+    last_event_id: &mut Option<String>,
+    state: &AppState,
+    tx: &mpsc::Sender<SyncEvent>,
+) -> Result<bool> {
+    debug!(event_type, "SSE: dispatching event");
+
+    let parsed = match parse_sync_event(event_type, event_data) {
+        Ok(e) => e,
+        Err(e) => {
+            warn!(event_type, error = %e, "SSE: failed to parse event — skipping");
+            return Ok(false);
+        }
+    };
+
+    // Persist last_event_id so reconnects resume correctly.
+    if let Some(id) = event_id {
+        *last_event_id = Some(id.clone());
+        // Best-effort persist — do not abort on error.
+        if let Err(e) = state.set_sync_state("last_event_id", id) {
+            warn!(error = %e, "SSE: failed to persist last_event_id");
+        }
+    }
+
+    // Forward to reconciler.
+    match tx.send(parsed).await {
+        Ok(()) => Ok(false),
+        Err(_) => Ok(true), // channel closed
+    }
+}
+
+// ── SyncEvent types ───────────────────────────────────────────────────────────
+
+/// An event received over the SSE stream.
+#[derive(Debug, Clone)]
+pub enum SyncEvent {
+    /// Full desired-state snapshot (sent on first connect and after long gaps).
+    Snapshot {
+        installations: Vec<InstallationRecord>,
+    },
+    /// Install (or re-activate) a specific skill version.
+    Install {
+        installation_id: Uuid,
+        skill_id: String,
+        version: String,
+    },
+    /// Deactivate a skill (keep files; remove active symlink).
+    Deactivate {
+        installation_id: Uuid,
+        skill_id: String,
+    },
+    /// Purge a skill (delete files and SQLite row).
+    Purge {
+        installation_id: Uuid,
+        skill_id: String,
+    },
+}
+
+/// One entry in a [`SyncEvent::Snapshot`].
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct InstallationRecord {
+    pub installation_id: Uuid,
+    pub skill_id: String,
+    pub version: String,
+    /// `"desired"` | `"deactivated"` | `"removed"`
+    pub state: String,
+}
+
+// ── Wire types (SSE JSON payloads) ────────────────────────────────────────────
+
+#[derive(Debug, serde::Deserialize)]
+struct WireSnapshot {
+    installations: Vec<InstallationRecord>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct WireInstall {
+    installation_id: Uuid,
+    skill_id: String,
+    version: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct WireDeactivate {
+    installation_id: Uuid,
+    skill_id: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct WirePurge {
+    installation_id: Uuid,
+    skill_id: String,
+}
+
+fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
+    match event_type {
+        "snapshot" => {
+            let wire: WireSnapshot = serde_json::from_str(data)
+                .with_context(|| format!("failed to parse snapshot event: {data}"))?;
+            Ok(SyncEvent::Snapshot {
+                installations: wire.installations,
+            })
+        }
+        "install" => {
+            let wire: WireInstall = serde_json::from_str(data)
+                .with_context(|| format!("failed to parse install event: {data}"))?;
+            Ok(SyncEvent::Install {
+                installation_id: wire.installation_id,
+                skill_id: wire.skill_id,
+                version: wire.version,
+            })
+        }
+        "deactivate" => {
+            let wire: WireDeactivate = serde_json::from_str(data)
+                .with_context(|| format!("failed to parse deactivate event: {data}"))?;
+            Ok(SyncEvent::Deactivate {
+                installation_id: wire.installation_id,
+                skill_id: wire.skill_id,
+            })
+        }
+        "purge" => {
+            let wire: WirePurge = serde_json::from_str(data)
+                .with_context(|| format!("failed to parse purge event: {data}"))?;
+            Ok(SyncEvent::Purge {
+                installation_id: wire.installation_id,
+                skill_id: wire.skill_id,
+            })
+        }
+        other => {
+            anyhow::bail!("unknown SSE event type: '{other}'")
+        }
+    }
+}
+
+// ── Token refresh helper ──────────────────────────────────────────────────────
+
+/// Attempt to refresh the stored JWT for `registry_url`.
+///
+/// Uses the existing token store (SQLite `auth_tokens`).  On success, saves the
+/// new tokens back and returns the new access token.
+async fn try_refresh_token(registry_url: &str, state: Arc<AppState>) -> Result<String> {
+    let reg_url = registry_url.to_string();
+    let state_clone = Arc::clone(&state);
+
+    tokio::task::spawn_blocking(move || {
+        let rows =
+            load_all_tokens(&state_clone).context("failed to load auth tokens for refresh")?;
+
+        let row = rows
+            .into_iter()
+            .find(|r| r.registry_url == reg_url)
+            .ok_or_else(|| anyhow::anyhow!("no stored token for {reg_url}"))?;
+
+        let client = AuthClient::new(&reg_url);
+        let new_tokens = client
+            .refresh(&row.refresh_token)
+            .context("token refresh HTTP call failed")?;
+
+        save_tokens(
+            &state_clone,
+            &reg_url,
+            &new_tokens.access_token,
+            &new_tokens.refresh_token,
+        )
+        .context("failed to save refreshed tokens")?;
+
+        Ok(new_tokens.access_token)
+    })
+    .await
+    .context("token refresh task panicked")?
+}
+
+// ── Unit tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+#[path = "sse_client_tests.rs"]
+mod tests;
