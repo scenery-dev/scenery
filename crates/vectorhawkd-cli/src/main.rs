@@ -324,6 +324,12 @@ pub enum McpCommand {
         dry_run: bool,
     },
 
+    /// Remove the VectorHawk MCP entry from all AI client configs and delete
+    /// VectorHawk slash command skill directories from ~/.claude/skills/.
+    ///
+    /// Run this before `brew uninstall vectorhawk` to leave AI client configs clean.
+    Remove,
+
     /// Trigger an immediate registry sync via the daemon (M1.4).
     Sync,
 
@@ -503,6 +509,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Mcp(McpCommand::Setup { client, dry_run }) => {
             cmd_mcp_setup(client.as_deref(), dry_run).await
         }
+        Command::Mcp(McpCommand::Remove) => cmd_mcp_remove().await,
         Command::Mcp(McpCommand::Sync) => cmd_mcp_sync().await,
         Command::Mcp(McpCommand::Backends) => cmd_mcp_backends().await,
 
@@ -3465,6 +3472,51 @@ async fn cmd_plugin_import(
 
     println!("Imported to {result}");
     println!("Next: vectorhawk skill validate {result}");
+    Ok(())
+}
+
+// ── mcp remove ───────────────────────────────────────────────────────────────
+
+async fn cmd_mcp_remove() -> Result<()> {
+    use vectorhawkd_mcp::setup::{detect_ai_clients, remove_mcp_entry, uninstall_claude_skills};
+
+    let clients = detect_ai_clients();
+    if clients.is_empty() {
+        println!("No supported AI clients detected — nothing to remove.");
+    } else {
+        for config in &clients {
+            match remove_mcp_entry(config) {
+                Ok(true) => println!(
+                    "{}: removed vectorhawk MCP entry from {}.",
+                    config.name,
+                    config.config_path.display()
+                ),
+                Ok(false) => println!("{}: vectorhawk was not configured — skipped.", config.name),
+                Err(e) => eprintln!(
+                    "warning: failed to update {} config at {}: {e:#}",
+                    config.name,
+                    config.config_path.display()
+                ),
+            }
+        }
+    }
+
+    match uninstall_claude_skills() {
+        Ok(removed) if !removed.is_empty() => {
+            println!(
+                "Removed {} VectorHawk slash command(s) from ~/.claude/skills/.",
+                removed.len()
+            );
+        }
+        Ok(_) => {
+            println!("No VectorHawk slash commands found in ~/.claude/skills/.");
+        }
+        Err(e) => {
+            eprintln!("warning: failed to remove slash commands: {e:#}");
+        }
+    }
+
+    println!("Done. Restart your AI client to apply the change.");
     Ok(())
 }
 

@@ -206,6 +206,39 @@ pub fn write_mcp_entry(config: &ClientConfig) -> Result<()> {
     Ok(())
 }
 
+/// Remove the VectorHawk MCP entry from a client config file.
+///
+/// Returns `true` if the entry existed and was removed, `false` if it wasn't
+/// present. The file is left unchanged when the entry is absent.
+pub fn remove_mcp_entry(config: &ClientConfig) -> Result<bool> {
+    if !config.config_path.exists() {
+        return Ok(false);
+    }
+    let text = fs::read_to_string(&config.config_path)?;
+    let mut obj: serde_json::Map<String, serde_json::Value> =
+        match serde_json::from_str::<serde_json::Value>(&text)
+            .unwrap_or(serde_json::Value::Object(Default::default()))
+        {
+            serde_json::Value::Object(m) => m,
+            _ => return Ok(false),
+        };
+
+    let removed = if let Some(serde_json::Value::Object(ref mut map)) =
+        obj.get_mut(&config.mcp_key)
+    {
+        map.remove(MCP_SERVER_NAME).is_some()
+    } else {
+        false
+    };
+
+    if removed {
+        let output = serde_json::to_string_pretty(&serde_json::Value::Object(obj))?;
+        fs::write(&config.config_path, output)?;
+    }
+
+    Ok(removed)
+}
+
 // ── Slash command skills ───────────────────────────────────────────────────────
 
 /// SKILL.md definitions for VectorHawk slash commands.
@@ -378,6 +411,27 @@ Show the publish result and the skill's registry URL.
 pub fn install_claude_skills() -> Result<Vec<String>> {
     let home = home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
     install_claude_skills_in(&home)
+}
+
+/// Remove VectorHawk slash command skill directories from `~/.claude/skills/`.
+///
+/// Returns the names of directories that were removed.
+pub fn uninstall_claude_skills() -> Result<Vec<String>> {
+    let home = home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
+    uninstall_claude_skills_in(&home)
+}
+
+fn uninstall_claude_skills_in(home: &std::path::Path) -> Result<Vec<String>> {
+    let skills_dir = home.join(".claude").join("skills");
+    let mut removed = Vec::new();
+    for (dir_name, _) in skill_definitions() {
+        let skill_dir = skills_dir.join(dir_name);
+        if skill_dir.exists() {
+            fs::remove_dir_all(&skill_dir)?;
+            removed.push(dir_name.to_string());
+        }
+    }
+    Ok(removed)
 }
 
 /// Install skills to a custom root directory (for testing).
@@ -1088,5 +1142,148 @@ mod tests {
                 "{name}: must not reference skillclub_* tools"
             );
         }
+    }
+
+    // ── remove_mcp_entry ──────────────────────────────────────────────────────
+
+    #[test]
+    fn remove_mcp_entry_removes_existing_entry() {
+        let tmp = temp_root("remove-entry");
+        let config_path = tmp.join("config.json");
+        fs::create_dir_all(&tmp).unwrap();
+
+        let config = ClientConfig {
+            name: "Test".to_string(),
+            config_path: config_path.clone(),
+            mcp_key: "mcpServers".to_string(),
+            already_configured: false,
+        };
+
+        write_mcp_entry(&config).unwrap();
+        assert!(is_vectorhawk_configured(&config_path, "mcpServers"));
+
+        let removed = remove_mcp_entry(&config).unwrap();
+        assert!(removed, "should report entry was removed");
+        assert!(
+            !is_vectorhawk_configured(&config_path, "mcpServers"),
+            "entry should be gone after remove"
+        );
+
+        // Other keys in the file should survive
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert!(
+            json.get("mcpServers").is_some(),
+            "mcpServers key should still exist (just empty)"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn remove_mcp_entry_returns_false_when_absent() {
+        let tmp = temp_root("remove-absent");
+        let config_path = tmp.join("config.json");
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(
+            &config_path,
+            r#"{"mcpServers": {"other-tool": {"command": "other"}}}"#,
+        )
+        .unwrap();
+
+        let config = ClientConfig {
+            name: "Test".to_string(),
+            config_path: config_path.clone(),
+            mcp_key: "mcpServers".to_string(),
+            already_configured: false,
+        };
+
+        let removed = remove_mcp_entry(&config).unwrap();
+        assert!(!removed, "should report nothing was removed");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn remove_mcp_entry_returns_false_for_missing_file() {
+        let tmp = temp_root("remove-missing-file");
+        let config = ClientConfig {
+            name: "Test".to_string(),
+            config_path: tmp.join("does-not-exist.json"),
+            mcp_key: "mcpServers".to_string(),
+            already_configured: false,
+        };
+
+        let removed = remove_mcp_entry(&config).unwrap();
+        assert!(!removed);
+    }
+
+    #[test]
+    fn remove_mcp_entry_preserves_other_mcp_entries() {
+        let tmp = temp_root("remove-preserves");
+        let config_path = tmp.join("config.json");
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(
+            &config_path,
+            r#"{"mcpServers": {"vectorhawk": {"command": "vectorhawk", "args": ["mcp", "serve"]}, "other": {"command": "other"}}}"#,
+        )
+        .unwrap();
+
+        let config = ClientConfig {
+            name: "Test".to_string(),
+            config_path: config_path.clone(),
+            mcp_key: "mcpServers".to_string(),
+            already_configured: true,
+        };
+
+        let removed = remove_mcp_entry(&config).unwrap();
+        assert!(removed);
+
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert!(
+            json["mcpServers"].get("other").is_some(),
+            "other MCP entry should be preserved"
+        );
+        assert!(
+            json["mcpServers"].get("vectorhawk").is_none(),
+            "vectorhawk entry should be removed"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // ── uninstall_claude_skills ───────────────────────────────────────────────
+
+    #[test]
+    fn uninstall_claude_skills_removes_installed_dirs() {
+        let tmp = temp_root("skills-uninstall");
+        fs::create_dir_all(tmp.join(".claude")).unwrap();
+
+        install_claude_skills_in(&tmp).unwrap();
+
+        let removed = uninstall_claude_skills_in(&tmp).unwrap();
+        assert_eq!(removed.len(), 11, "should remove all 11 skill dirs");
+
+        for name in &removed {
+            let skill_dir = tmp.join(".claude").join("skills").join(name);
+            assert!(!skill_dir.exists(), "{name} dir should be gone");
+        }
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn uninstall_claude_skills_returns_empty_when_not_installed() {
+        let tmp = temp_root("skills-uninstall-empty");
+        fs::create_dir_all(tmp.join(".claude").join("skills")).unwrap();
+
+        let removed = uninstall_claude_skills_in(&tmp).unwrap();
+        assert!(
+            removed.is_empty(),
+            "should return empty list when nothing installed"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 }
