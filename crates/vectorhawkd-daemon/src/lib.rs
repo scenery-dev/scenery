@@ -73,7 +73,8 @@ use vectorhawkd_core::{
     gateway_model::GatewayModelClient,
     model::ModelClient,
     ollama::OllamaClient,
-    registry::RegistryClient,
+    policy::PolicyClient,
+    registry::{HttpPolicyClient, RegistryClient},
     state::AppState,
 };
 use vectorhawkd_mcp::sampling::HybridModelClient;
@@ -351,11 +352,14 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
 
     let registry_url_opt: Option<String> = Some(registry_url.clone());
 
-    let policy_client: Arc<dyn vectorhawkd_core::policy::PolicyClient + Send + Sync> =
-        Arc::new(vectorhawkd_core::policy::MockPolicyClient::new());
-    // TODO: replace MockPolicyClient with HttpPolicyClient once M1.4 wires the
-    // registry-backed policy into the daemon. For now allow-all is correct
-    // for the M1 scope.
+    // Use the real registry-backed policy client. `RegistryClient::new` is
+    // cheap (builds an HTTP client); no I/O happens until `fetch_policy` is
+    // called. The 7-day offline grace window in `HttpPolicyClient` means
+    // policy enforcement degrades gracefully when the registry is unreachable.
+    let policy_client: Arc<dyn PolicyClient + Send + Sync> = Arc::new(HttpPolicyClient::new(
+        RegistryClient::new(&registry_url),
+        &state,
+    ));
 
     let state_arc = Arc::new(AppState {
         root_dir: state.root_dir.clone(),
