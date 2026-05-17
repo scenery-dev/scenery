@@ -132,8 +132,9 @@ async fn connect_and_stream(
     debug!(url, device_id, "SSE: opening connection");
 
     // Build an async reqwest client (not the blocking one used elsewhere).
+    // Do NOT set a request timeout — SSE streams are long-lived. Only the
+    // connect_timeout is set to avoid hanging indefinitely on unreachable hosts.
     let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(0)) // streaming — no overall timeout
         .connect_timeout(Duration::from_secs(10))
         .build()
     {

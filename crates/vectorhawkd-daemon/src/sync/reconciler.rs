@@ -33,7 +33,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::sync::sse_client::{InstallationRecord, SyncEvent};
-use vectorhawkd_core::{registry::RegistryClient, state::AppState};
+use vectorhawkd_core::{auth::load_all_tokens, registry::RegistryClient, state::AppState};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -91,6 +91,10 @@ pub fn spawn(
             .ok()
             .unwrap_or_else(|| "https://app.vectorhawk.ai".to_string())
     };
+
+    // Note: we do NOT cache the access_token here.  The SSE client may refresh
+    // the token at any time (on 401).  `report_installation_status` loads the
+    // current token from SQLite each call so it always uses the latest value.
 
     tokio::spawn(run_loop(rx, state, registry_url, list_changed_tx, stats));
 
@@ -328,6 +332,7 @@ async fn handle_install(
                 "error",
                 Some(&e.to_string()),
                 registry_url,
+                state,
             )
             .await;
 
@@ -350,6 +355,7 @@ async fn handle_install(
                         "error",
                         Some(&retry_err.to_string()),
                         registry_url,
+                        state,
                     )
                     .await;
                     decrement_pending_inc_errors(stats);
@@ -381,12 +387,13 @@ async fn do_install(
             version, "reconciler: version already local — flipping symlink"
         );
         flip_active_symlink(Arc::clone(&state_clone), skill_id.clone(), version.clone()).await?;
-        report_installation_status(installation_id, "installed", None, &reg_url).await;
+        report_installation_status(installation_id, "installed", None, &reg_url, &state_clone)
+            .await;
         return Ok(());
     }
 
     // Report "installing" to backend.
-    report_installation_status(installation_id, "installing", None, &reg_url).await;
+    report_installation_status(installation_id, "installing", None, &reg_url, &state_clone).await;
 
     // Clone reg_url before moving into closure.
     let reg_url_for_install = reg_url.clone();
@@ -406,7 +413,7 @@ async fn do_install(
     .await
     .context("install_blocking task panicked")??;
 
-    report_installation_status(installation_id, "installed", None, &reg_url).await;
+    report_installation_status(installation_id, "installed", None, &reg_url, state).await;
     Ok(())
 }
 
@@ -532,21 +539,154 @@ fn install_from_registry_blocking(
     Ok(())
 }
 
-/// Unpack a `.cskill` ZIP archive into `dest`.
+/// Unpack a `.cskill` archive into `dest`.
 ///
-/// `.cskill` files are ZIP archives (same as `.skill` bundles). We reuse the
-/// zip crate already in the workspace.
+/// Supports two on-disk formats:
+/// - **tar.gz** (`\x1f\x8b` magic): produced by the backend compile pipeline.
+/// - **ZIP** (`PK\x03\x04` magic): legacy format; kept for forward-compat.
+///
+/// The format is auto-detected by reading the first two magic bytes.
 fn unpack_cskill_archive(archive_path: &camino::Utf8Path, dest: &camino::Utf8Path) -> Result<()> {
     use std::io::Read;
 
-    let file = std::fs::File::open(archive_path)
-        .with_context(|| format!("failed to open archive: {archive_path}"))?;
-
-    let mut zip = zip::ZipArchive::new(file)
-        .with_context(|| format!("failed to read ZIP archive: {archive_path}"))?;
+    // Peek at the first two bytes to detect the format.
+    let mut magic = [0u8; 2];
+    {
+        let mut f = std::fs::File::open(archive_path).with_context(|| {
+            format!("failed to open archive for magic detection: {archive_path}")
+        })?;
+        f.read_exact(&mut magic)
+            .with_context(|| format!("archive too small to detect format: {archive_path}"))?;
+    }
 
     std::fs::create_dir_all(dest)
         .with_context(|| format!("failed to create unpack dir: {dest}"))?;
+
+    if magic == [0x1f, 0x8b] {
+        // tar.gz format — used by backend compile pipeline.
+        unpack_tar_gz(archive_path, dest)
+    } else if magic == [0x50, 0x4b] {
+        // ZIP format (PK magic).
+        unpack_zip(archive_path, dest)
+    } else {
+        anyhow::bail!(
+            "unrecognised archive format (magic bytes {:02x}{:02x}): {archive_path}",
+            magic[0],
+            magic[1]
+        )
+    }
+}
+
+/// Unpack a tar.gz archive into `dest`, stripping a single top-level directory
+/// if all entries share one (i.e. the archive has a wrapper dir).
+fn unpack_tar_gz(archive_path: &camino::Utf8Path, dest: &camino::Utf8Path) -> Result<()> {
+    let file = std::fs::File::open(archive_path)
+        .with_context(|| format!("failed to open tar.gz: {archive_path}"))?;
+
+    let gz = flate2::read::GzDecoder::new(file);
+    let mut archive = tar::Archive::new(gz);
+    archive.set_preserve_permissions(false);
+    archive.set_overwrite(true);
+
+    // Collect entries to determine if there is a single top-level wrapper directory.
+    // We re-open rather than buffer, since tar::Archive doesn't implement Seek.
+    let file2 = std::fs::File::open(archive_path)
+        .with_context(|| format!("failed to open tar.gz (2nd pass): {archive_path}"))?;
+    let gz2 = flate2::read::GzDecoder::new(file2);
+    let mut archive2 = tar::Archive::new(gz2);
+
+    // Determine strip prefix: if every path starts with the same first component
+    // and there are no root-level files, strip it.
+    let mut top_dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut has_root_file = false;
+    for entry in archive2
+        .entries()
+        .context("failed to iterate tar entries (1st pass)")?
+    {
+        let entry = entry.context("failed to read tar entry (1st pass)")?;
+        let path = entry.path().context("invalid tar entry path")?;
+        let components: Vec<_> = path.components().collect();
+        if components.is_empty() {
+            continue;
+        }
+        if let std::path::Component::Normal(name) = &components[0] {
+            let name_str = name.to_string_lossy().to_string();
+            if components.len() == 1 {
+                has_root_file = true;
+            }
+            top_dirs.insert(name_str);
+        }
+    }
+
+    // Strip the top-level wrapper dir if: exactly one top-level name, no root files.
+    let strip_prefix: Option<String> = if !has_root_file && top_dirs.len() == 1 {
+        top_dirs.into_iter().next()
+    } else {
+        None
+    };
+
+    // Third pass: actually extract.
+    let file3 = std::fs::File::open(archive_path)
+        .with_context(|| format!("failed to open tar.gz (3rd pass): {archive_path}"))?;
+    let gz3 = flate2::read::GzDecoder::new(file3);
+    let mut archive3 = tar::Archive::new(gz3);
+
+    for entry in archive3
+        .entries()
+        .context("failed to iterate tar entries (extract)")?
+    {
+        let mut entry = entry.context("failed to read tar entry (extract)")?;
+        let path = entry.path().context("invalid tar entry path (extract)")?;
+
+        // Compute destination path, stripping wrapper prefix if applicable.
+        let rel_path: std::path::PathBuf = if let Some(ref _prefix) = strip_prefix {
+            let components: Vec<_> = path.components().collect();
+            if components.len() <= 1 {
+                // This is the wrapper dir itself — skip it.
+                continue;
+            }
+            components[1..].iter().collect()
+        } else {
+            path.to_path_buf()
+        };
+
+        // Safety: reject absolute paths and path traversal.
+        if rel_path.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir | std::path::Component::RootDir
+            )
+        }) {
+            anyhow::bail!("unsafe path in tar archive: {}", rel_path.display());
+        }
+
+        let target = std::path::PathBuf::from(dest.as_str()).join(&rel_path);
+
+        if entry.header().entry_type().is_dir() {
+            std::fs::create_dir_all(&target)
+                .with_context(|| format!("failed to create dir: {}", target.display()))?;
+        } else {
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            entry
+                .unpack(&target)
+                .with_context(|| format!("failed to unpack tar entry: {}", target.display()))?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Unpack a ZIP archive into `dest`.
+fn unpack_zip(archive_path: &camino::Utf8Path, dest: &camino::Utf8Path) -> Result<()> {
+    use std::io::Read;
+
+    let file = std::fs::File::open(archive_path)
+        .with_context(|| format!("failed to open ZIP archive: {archive_path}"))?;
+
+    let mut zip = zip::ZipArchive::new(file)
+        .with_context(|| format!("failed to read ZIP archive: {archive_path}"))?;
 
     for i in 0..zip.len() {
         let mut entry = zip
@@ -602,7 +742,7 @@ async fn handle_deactivate(
 
     match result {
         Ok(Ok(())) => {
-            report_installation_status(installation_id, "deactivated", None, &reg_url).await;
+            report_installation_status(installation_id, "deactivated", None, &reg_url, state).await;
             true
         }
         Ok(Err(e)) => {
@@ -660,7 +800,7 @@ async fn handle_purge(
 
     match result {
         Ok(Ok(())) => {
-            report_installation_status(installation_id, "removed", None, &reg_url).await;
+            report_installation_status(installation_id, "removed", None, &reg_url, state).await;
             true
         }
         Ok(Err(e)) => {
@@ -822,12 +962,15 @@ fn load_local_skill_state(conn: &rusqlite::Connection) -> HashMap<String, (Strin
 
 /// Send `PATCH /api/installations/{id}` to report a state transition.
 ///
+/// Loads the current access token from SQLite on each call so it always uses
+/// the latest value — the SSE client may refresh the token at any time.
 /// Fire-and-forget: failures are logged at WARN but do not affect local state.
 async fn report_installation_status(
     installation_id: Uuid,
     status: &str,
     error_message: Option<&str>,
     registry_url: &str,
+    state: &Arc<AppState>,
 ) {
     let url = format!(
         "{}/api/installations/{}",
@@ -839,6 +982,22 @@ async fn report_installation_status(
     if let Some(msg) = error_message {
         body["error_message"] = serde_json::Value::String(msg.to_string());
     }
+
+    // Load the current access token fresh from SQLite.
+    let reg_url = registry_url.to_string();
+    let state_clone = Arc::clone(state);
+    let access_token = tokio::task::spawn_blocking(move || {
+        load_all_tokens(&state_clone)
+            .ok()
+            .and_then(|rows| {
+                rows.into_iter()
+                    .find(|r| r.registry_url == reg_url)
+                    .map(|r| r.access_token)
+            })
+            .unwrap_or_default()
+    })
+    .await
+    .unwrap_or_default();
 
     // Use an async client here (we are already in an async context).
     let client = match reqwest::Client::builder()
@@ -852,7 +1011,13 @@ async fn report_installation_status(
         }
     };
 
-    match client.patch(&url).json(&body).send().await {
+    let req = if access_token.is_empty() {
+        client.patch(&url).json(&body)
+    } else {
+        client.patch(&url).bearer_auth(access_token).json(&body)
+    };
+
+    match req.send().await {
         Ok(resp) if resp.status().is_success() => {
             tracing::debug!(installation_id = %installation_id, status, "reconciler: status reported");
         }

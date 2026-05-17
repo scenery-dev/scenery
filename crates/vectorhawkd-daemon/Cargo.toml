@@ -38,6 +38,8 @@ uuid.workspace = true
 futures.workspace = true
 chrono.workspace = true
 zip.workspace = true
+flate2.workspace = true
+tar.workspace = true
 libc.workspace = true
 
 # Async HTTP client for SSE streaming and installation status reporting.
