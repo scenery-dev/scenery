@@ -43,6 +43,9 @@ use vectorhawkd_core::{
     mcp_governance,
     model::{ModelClient, ModelSource},
     policy::PolicyClient,
+    ratings::{
+        has_existing_rating, increment_execution_count, record_rating, should_prompt_for_rating,
+    },
     registry::RegistryClient,
     scan::{HttpScanClient, ScanClient},
     state::AppState,
@@ -65,6 +68,13 @@ pub struct UpdateCheckEntry {
 
 /// Shared update-check cache passed from `ServerState` to the tools layer.
 pub type UpdateCheckCache = Arc<Mutex<HashMap<String, UpdateCheckEntry>>>;
+
+/// Pending rating prompt: `Some((skill_id, version))` when the previous skill
+/// execution appended a thumbs-up/down prompt that has not yet been answered.
+/// Shared across tool calls within a single MCP session via interior mutability.
+pub type RatingState = Arc<Mutex<Option<(String, String)>>>;
+
+const RATING_PROMPT: &str = "\n\nWas this skill helpful? Reply 'thumbs up' or 'thumbs down'.";
 
 const GOVERNANCE_FOOTER: &str = "\n\n---\nTo add new MCP servers, use /mcp-request. Direct installation via /mcp bypasses governance.";
 
@@ -585,6 +595,41 @@ fn skill_to_tool(skill_id: &str, active_path: &str) -> Result<ToolDefinition> {
 
 // ── Tool dispatch ─────────────────────────────────────────────────────────────
 
+/// Scan a tool call's arguments for a thumbs-up or thumbs-down rating reply.
+///
+/// Checks the `_rating_reply` key first, then all string values in the arguments
+/// map. Returns `"up"` or `"down"` (the canonical SQLite values), or `None`.
+fn extract_rating_reply(arguments: &serde_json::Value) -> Option<&'static str> {
+    let check = |s: &str| -> Option<&'static str> {
+        let lower = s.to_lowercase();
+        if lower.contains("thumbs up") || lower.contains("thumb up") {
+            Some("up")
+        } else if lower.contains("thumbs down") || lower.contains("thumb down") {
+            Some("down")
+        } else {
+            None
+        }
+    };
+
+    if let Some(reply) = arguments.get("_rating_reply").and_then(|v| v.as_str()) {
+        if let Some(r) = check(reply) {
+            return Some(r);
+        }
+    }
+
+    if let Some(map) = arguments.as_object() {
+        for v in map.values() {
+            if let Some(s) = v.as_str() {
+                if let Some(r) = check(s) {
+                    return Some(r);
+                }
+            }
+        }
+    }
+
+    None
+}
+
 /// Execute a tool call and return the MCP result.
 #[allow(clippy::too_many_arguments)]
 pub fn handle_tool_call(
@@ -596,7 +641,35 @@ pub fn handle_tool_call(
     registry_url: &Option<String>,
     update_check_cache: &UpdateCheckCache,
     aggregator: Option<&BackendRegistry>,
+    rating_state: Option<&RatingState>,
 ) -> ToolCallResult {
+    // Check if this tool call is a rating reply to a pending prompt.
+    if let Some(rs) = rating_state {
+        if let Some(reply) = extract_rating_reply(arguments) {
+            if let Ok(mut guard) = rs.lock() {
+                if let Some((skill_id, version)) = guard.take() {
+                    if let Ok(conn) = Connection::open(&state.db_path) {
+                        let _ = record_rating(&conn, &skill_id, &version, reply);
+                        debug!(
+                            skill_id,
+                            version,
+                            rating = reply,
+                            "recorded rating from tool call reply"
+                        );
+                    }
+                    let rating_word = if reply == "up" {
+                        "thumbs up"
+                    } else {
+                        "thumbs down"
+                    };
+                    return ToolCallResult::success(format!(
+                        "Got it — {rating_word} recorded for {skill_id}@{version}. Thanks!"
+                    ));
+                }
+            }
+        }
+    }
+
     let result = match name {
         "vectorhawk_list" => handle_list(state),
         "vectorhawk_search" => handle_search(arguments, registry_url),
@@ -617,7 +690,9 @@ pub fn handle_tool_call(
         "vectorhawk_plugin_export" => handle_plugin_export(arguments),
         "vectorhawk_plugin_import" => handle_plugin_import(arguments),
         "vectorhawk_author" => handle_author(arguments, state, registry_url.as_deref()),
-        "vectorhawk_author_confirm" => handle_author_confirm(arguments, state, registry_url.as_deref()),
+        "vectorhawk_author_confirm" => {
+            handle_author_confirm(arguments, state, registry_url.as_deref())
+        }
         _ => handle_skill_run(
             name,
             arguments,
@@ -625,6 +700,7 @@ pub fn handle_tool_call(
             policy_client,
             model_client,
             update_check_cache,
+            rating_state,
         ),
     };
 
@@ -1768,6 +1844,7 @@ fn handle_skill_run(
     policy_client: &dyn PolicyClient,
     model_client: Option<&dyn ModelClient>,
     update_check_cache: &UpdateCheckCache,
+    rating_state: Option<&RatingState>,
 ) -> ToolCallResult {
     // Check if skill is deactivated before attempting execution
     if let Ok(conn) = Connection::open(&state.db_path) {
@@ -1821,10 +1898,15 @@ fn handle_skill_run(
             };
 
             let llm_summary = build_llm_execution_summary(&result);
-            let text = match llm_summary {
+            let base_text = match llm_summary {
                 Some(summary) => format!("{summary}\n\n{output_text}"),
                 None => output_text,
             };
+
+            // RAT1-B: increment execution count and maybe append rating prompt.
+            let rating_suffix =
+                maybe_rating_prompt(state, &result.skill_id, &result.version, rating_state);
+            let text = format!("{base_text}{rating_suffix}");
 
             ToolCallResult::success(text)
         }
@@ -1848,6 +1930,53 @@ fn handle_skill_run(
             ToolCallResult::error_result(chain)
         }
     }
+}
+
+/// Increment the execution count for a successful skill run, check the rating
+/// prompt schedule, and return the prompt suffix string if a prompt is due.
+///
+/// Returns an empty string when no prompt is needed. When a prompt is returned,
+/// also sets `rating_state` so the next tool call can capture the reply.
+fn maybe_rating_prompt(
+    state: &AppState,
+    skill_id: &str,
+    version: &str,
+    rating_state: Option<&RatingState>,
+) -> String {
+    let conn = match Connection::open(&state.db_path) {
+        Ok(c) => c,
+        Err(_) => return String::new(),
+    };
+
+    let count = match increment_execution_count(&conn, skill_id, version) {
+        Ok(c) => c,
+        Err(e) => {
+            debug!(error = %e, "failed to increment execution count");
+            return String::new();
+        }
+    };
+
+    if !should_prompt_for_rating(count) {
+        return String::new();
+    }
+
+    // Skip if a rating already exists for this version.
+    if has_existing_rating(&conn, skill_id, version).unwrap_or(false) {
+        return String::new();
+    }
+
+    // Only prompt if we have session state to track the reply. Without it there
+    // is no mechanism to capture a thumbs-up/down, so the prompt would be noise.
+    let rs = match rating_state {
+        Some(rs) => rs,
+        None => return String::new(),
+    };
+
+    if let Ok(mut guard) = rs.lock() {
+        *guard = Some((skill_id.to_string(), version.to_string()));
+    }
+
+    RATING_PROMPT.to_string()
 }
 
 /// Consult the update-check cache for `skill_id`.
@@ -2126,7 +2255,11 @@ fn try_infer_publisher_id(state: &AppState, registry_url: Option<&str>) -> Optio
     let client = AuthClient::new(url);
     let user_info = client.me(&tokens.access_token).ok()?;
     let slug = derive_publisher_slug(&user_info.display_name);
-    if slug.is_empty() { None } else { Some(slug) }
+    if slug.is_empty() {
+        None
+    } else {
+        Some(slug)
+    }
 }
 
 /// Format milliseconds as a human-readable duration string.
@@ -2233,7 +2366,12 @@ fn handle_author(
             }) {
                 Ok(path) => {
                     let confidence = format!("{:?}", rec.confidence).to_lowercase();
-                    let model_primary = rec.model.recommended.first().map(|s| s.as_str()).unwrap_or("gemma3:2b");
+                    let model_primary = rec
+                        .model
+                        .recommended
+                        .first()
+                        .map(|s| s.as_str())
+                        .unwrap_or("gemma3:2b");
                     let fallback_note = if rec.model.fallback == "mcp_sampling" {
                         "falls back to AI client"
                     } else {
@@ -2278,7 +2416,12 @@ fn handle_author(
             let triggers_json: Vec<serde_json::Value> =
                 rec.triggers.iter().map(|t| serde_json::json!(t)).collect();
 
-            let model_primary = rec.model.recommended.first().map(|s| s.as_str()).unwrap_or("gemma3:2b");
+            let model_primary = rec
+                .model
+                .recommended
+                .first()
+                .map(|s| s.as_str())
+                .unwrap_or("gemma3:2b");
             let fallback_note = if rec.model.fallback == "mcp_sampling" {
                 "falls back to your AI client if unavailable"
             } else {
@@ -2563,9 +2706,18 @@ mod tests {
         let tools = build_tool_list(&state, &Some(url));
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
 
-        assert!(names.contains(&"vectorhawk_search"), "search should appear without login");
-        assert!(names.contains(&"vectorhawk_login"), "login should appear when not logged in");
-        assert!(!names.contains(&"vectorhawk_logout"), "logout should not appear when not logged in");
+        assert!(
+            names.contains(&"vectorhawk_search"),
+            "search should appear without login"
+        );
+        assert!(
+            names.contains(&"vectorhawk_login"),
+            "login should appear when not logged in"
+        );
+        assert!(
+            !names.contains(&"vectorhawk_logout"),
+            "logout should not appear when not logged in"
+        );
 
         let _ = fs::remove_dir_all(&state_root);
     }
@@ -2976,6 +3128,7 @@ mod tests {
             &policy,
             None,
             &empty_cache(),
+            None,
         );
         assert_eq!(result.is_error, Some(true));
         assert!(result.content[0].text.contains("deactivated"));
@@ -3042,6 +3195,181 @@ mod tests {
             names.contains(&"vectorhawk_plugin_import"),
             "tool list should include vectorhawk_plugin_import"
         );
+        let _ = fs::remove_dir_all(&state_root);
+    }
+
+    // ── RAT1-B: rating prompt and capture ─────────────────────────────────────
+
+    fn make_rating_state() -> RatingState {
+        Arc::new(Mutex::new(None))
+    }
+
+    #[test]
+    fn extract_rating_reply_detects_thumbs_up() {
+        let args = serde_json::json!({"message": "thumbs up"});
+        assert_eq!(extract_rating_reply(&args), Some("up"));
+    }
+
+    #[test]
+    fn extract_rating_reply_detects_thumbs_down_case_insensitive() {
+        let args = serde_json::json!({"message": "THUMBS DOWN please"});
+        assert_eq!(extract_rating_reply(&args), Some("down"));
+    }
+
+    #[test]
+    fn extract_rating_reply_checks_rating_reply_key_first() {
+        let args = serde_json::json!({"_rating_reply": "thumbs up", "other": "thumbs down"});
+        assert_eq!(extract_rating_reply(&args), Some("up"));
+    }
+
+    #[test]
+    fn extract_rating_reply_returns_none_for_unrelated_args() {
+        let args = serde_json::json!({"query": "summarize this document"});
+        assert_eq!(extract_rating_reply(&args), None);
+    }
+
+    #[test]
+    fn should_prompt_for_rating_triggers_at_3_then_every_5() {
+        use vectorhawkd_core::ratings::should_prompt_for_rating;
+        assert!(!should_prompt_for_rating(1));
+        assert!(!should_prompt_for_rating(2));
+        assert!(should_prompt_for_rating(3));
+        assert!(!should_prompt_for_rating(4));
+        assert!(!should_prompt_for_rating(7));
+        assert!(should_prompt_for_rating(8));
+        assert!(should_prompt_for_rating(13));
+        assert!(should_prompt_for_rating(18));
+    }
+
+    #[test]
+    fn rating_prompt_appended_on_3rd_successful_execution() {
+        use rusqlite::Connection;
+        use vectorhawkd_core::ratings::increment_execution_count;
+
+        let state_root = temp_root("rat1b-prompt");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+        let rs = make_rating_state();
+
+        // Pre-seed count to 2 so the next call makes it 3.
+        let conn = Connection::open(&state.db_path).unwrap();
+        increment_execution_count(&conn, "my-skill", "1.0.0").unwrap();
+        increment_execution_count(&conn, "my-skill", "1.0.0").unwrap();
+        drop(conn);
+
+        let suffix = maybe_rating_prompt(&state, "my-skill", "1.0.0", Some(&rs));
+        assert!(
+            suffix.contains("thumbs up") || suffix.contains("thumbs down"),
+            "prompt suffix should contain rating text: {suffix:?}"
+        );
+
+        // Pending state should now be set.
+        let guard = rs.lock().unwrap();
+        assert_eq!(
+            guard.as_ref().map(|(a, b)| (a.as_str(), b.as_str())),
+            Some(("my-skill", "1.0.0"))
+        );
+        drop(guard);
+
+        let _ = fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn rating_not_appended_when_no_rating_state() {
+        use rusqlite::Connection;
+        use vectorhawkd_core::ratings::increment_execution_count;
+
+        let state_root = temp_root("rat1b-no-rs");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+
+        let conn = Connection::open(&state.db_path).unwrap();
+        increment_execution_count(&conn, "my-skill", "1.0.0").unwrap();
+        increment_execution_count(&conn, "my-skill", "1.0.0").unwrap();
+        drop(conn);
+
+        let suffix = maybe_rating_prompt(&state, "my-skill", "1.0.0", None);
+        assert!(suffix.is_empty(), "no rating state → no prompt suffix");
+
+        let _ = fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn rating_reply_captured_and_state_cleared() {
+        use rusqlite::Connection;
+        use vectorhawkd_core::ratings::get_unsynced_ratings;
+
+        let state_root = temp_root("rat1b-capture");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+        let rs = make_rating_state();
+
+        // Set a pending rating prompt manually.
+        {
+            let mut guard = rs.lock().unwrap();
+            *guard = Some(("cool-skill".to_string(), "2.0.0".to_string()));
+        }
+
+        let policy = vectorhawkd_core::policy::MockPolicyClient::new();
+        let result = handle_tool_call(
+            "vectorhawk_list",
+            &serde_json::json!({"_rating_reply": "thumbs up"}),
+            &state,
+            &policy,
+            None,
+            &None,
+            &empty_cache(),
+            None,
+            Some(&rs),
+        );
+
+        assert!(result.is_error.is_none() || result.is_error == Some(false));
+        assert!(result.content[0].text.contains("thumbs up"));
+
+        // Pending state should be cleared.
+        let guard = rs.lock().unwrap();
+        assert!(
+            guard.is_none(),
+            "pending rating should be cleared after capture"
+        );
+        drop(guard);
+
+        // Rating should be recorded in SQLite.
+        let conn = Connection::open(&state.db_path).unwrap();
+        let ratings = get_unsynced_ratings(&conn).unwrap();
+        assert_eq!(ratings.len(), 1);
+        assert_eq!(ratings[0].skill_id, "cool-skill");
+        assert_eq!(ratings[0].version, "2.0.0");
+        assert_eq!(ratings[0].rating, "up");
+
+        let _ = fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn rating_prompt_skipped_when_already_rated() {
+        use rusqlite::Connection;
+        use vectorhawkd_core::ratings::{increment_execution_count, record_rating};
+
+        let state_root = temp_root("rat1b-skip");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+        let rs = make_rating_state();
+
+        let conn = Connection::open(&state.db_path).unwrap();
+        // Seed count to 2 and record an existing rating.
+        increment_execution_count(&conn, "my-skill", "1.0.0").unwrap();
+        increment_execution_count(&conn, "my-skill", "1.0.0").unwrap();
+        record_rating(&conn, "my-skill", "1.0.0", "up").unwrap();
+        drop(conn);
+
+        let suffix = maybe_rating_prompt(&state, "my-skill", "1.0.0", Some(&rs));
+        assert!(
+            suffix.is_empty(),
+            "prompt should be skipped when already rated"
+        );
+
+        let guard = rs.lock().unwrap();
+        assert!(
+            guard.is_none(),
+            "pending state should not be set when skipped"
+        );
+
         let _ = fs::remove_dir_all(&state_root);
     }
 }

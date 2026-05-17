@@ -32,7 +32,7 @@
 //! and wire protocols.
 
 #[cfg(feature = "daemon")]
-use crate::tools::UpdateCheckCache;
+use crate::tools::{RatingState, UpdateCheckCache};
 use crate::{
     aggregator::{BackendEntry, BackendRegistry, BackendTransport, ToolDefinition, ToolVisibility},
     protocol::{
@@ -499,6 +499,10 @@ pub struct RealBackend {
     /// Pub/sub hub for receiving authorization codes from the browser callback.
     #[cfg(feature = "daemon")]
     oauth_subscriber: Option<std::sync::Arc<dyn crate::oauth::OAuthSubscriber>>,
+    /// Per-session rating state: tracks the pending rating prompt (if any) so
+    /// the next tool call can capture a thumbs-up/down reply.
+    #[cfg(feature = "daemon")]
+    rating_state: Option<RatingState>,
 }
 
 impl RealBackend {
@@ -525,6 +529,8 @@ impl RealBackend {
             oauth_listener_port: None,
             #[cfg(feature = "daemon")]
             oauth_subscriber: None,
+            #[cfg(feature = "daemon")]
+            rating_state: None,
         }
     }
 
@@ -548,6 +554,7 @@ impl RealBackend {
             update_check_cache: None,
             oauth_listener_port: None,
             oauth_subscriber: None,
+            rating_state: None,
         }
     }
 
@@ -573,6 +580,7 @@ impl RealBackend {
             update_check_cache: None,
             oauth_listener_port: None,
             oauth_subscriber: None,
+            rating_state: None,
         }
     }
 
@@ -608,6 +616,7 @@ impl RealBackend {
             update_check_cache: Some(update_check_cache),
             oauth_listener_port: None,
             oauth_subscriber: None,
+            rating_state: Some(Arc::new(std::sync::Mutex::new(None))),
         }
     }
 
@@ -639,7 +648,11 @@ impl Backend for RealBackend {
             let logged_in = self.state.as_ref().map_or(false, |state| {
                 self.registry_url
                     .as_ref()
-                    .and_then(|url| vectorhawkd_core::auth::load_tokens(state, url).ok().flatten())
+                    .and_then(|url| {
+                        vectorhawkd_core::auth::load_tokens(state, url)
+                            .ok()
+                            .flatten()
+                    })
                     .is_some()
             });
             crate::instructions::build_instructions(self.managed.as_ref(), "daemon", logged_in)
@@ -777,6 +790,7 @@ impl Backend for RealBackend {
                 let model_client = self.model_client.clone();
                 let policy_client = self.policy_client.clone();
 
+                let rating_state_clone = self.rating_state.clone();
                 let tool_result = tokio::task::spawn_blocking(move || {
                     if let Some(pc) = policy_client {
                         crate::tools::handle_tool_call(
@@ -788,6 +802,7 @@ impl Backend for RealBackend {
                             &registry_url,
                             &cache,
                             Some(&*registry_arc),
+                            rating_state_clone.as_ref(),
                         )
                     } else {
                         let mock_policy = vectorhawkd_core::policy::MockPolicyClient::new();
@@ -800,6 +815,7 @@ impl Backend for RealBackend {
                             &registry_url,
                             &cache,
                             Some(&*registry_arc),
+                            rating_state_clone.as_ref(),
                         )
                     }
                 })
