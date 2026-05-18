@@ -3571,12 +3571,12 @@ async fn cmd_auth_pair(code: &str, registry_url: &str) -> Result<()> {
     struct PairResponse {
         device_id: String,
         access_token: String,
+        refresh_token: String,
     }
     let pair: PairResponse =
         serde_json::from_str(&body_text).context("unexpected response format from registry")?;
 
-    // Persist auth token (reuse as refresh token; daemon SSE loop refreshes it).
-    save_tokens(&state, registry_url, &pair.access_token, &pair.access_token)
+    save_tokens(&state, registry_url, &pair.access_token, &pair.refresh_token)
         .context("failed to save auth token")?;
 
     // Persist device_uuid and device_id so the daemon picks them up on next start.
