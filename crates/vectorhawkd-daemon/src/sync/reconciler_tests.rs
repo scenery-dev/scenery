@@ -284,3 +284,107 @@ fn snapshot_mixed_batch_generates_correct_events() {
 
     cleanup(&root);
 }
+
+#[test]
+fn snapshot_installed_state_treated_like_desired_when_missing_locally() {
+    // Backend sees the row as "installed" but locally it isn't — the daemon
+    // should install it. Previously this state was logged as "unknown" and
+    // skipped, which meant a fresh-from-install device could not converge
+    // until the snapshot was re-sent with state="desired" (never happens).
+    let root = temp_root("snapshot-installed-state");
+    let state = AppState::bootstrap_in(root.clone()).unwrap();
+
+    let iid = install_id();
+    let installations = vec![InstallationRecord {
+        installation_id: iid,
+        skill_id: "needs-install".to_string(),
+        version: "1.2.3".to_string(),
+        state: "installed".to_string(),
+    }];
+
+    let events = build_derived_events_blocking(installations, &state);
+
+    assert_eq!(events.len(), 1);
+    match &events[0] {
+        SyncEvent::Install {
+            installation_id,
+            skill_id,
+            version,
+        } => {
+            assert_eq!(*installation_id, iid);
+            assert_eq!(skill_id, "needs-install");
+            assert_eq!(version, "1.2.3");
+        }
+        other => panic!("expected Install, got {other:?}"),
+    }
+
+    cleanup(&root);
+}
+
+#[test]
+fn snapshot_installed_state_noop_when_already_present_locally() {
+    let root = temp_root("snapshot-installed-noop");
+    let state = AppState::bootstrap_in(root.clone()).unwrap();
+    let conn = Connection::open(&state.db_path).unwrap();
+    seed_skill(&conn, "already-here", "1.0.0", false);
+    drop(conn);
+
+    let installations = vec![InstallationRecord {
+        installation_id: install_id(),
+        skill_id: "already-here".to_string(),
+        version: "1.0.0".to_string(),
+        state: "installed".to_string(),
+    }];
+
+    let events = build_derived_events_blocking(installations, &state);
+    assert!(events.is_empty(), "installed + locally present → no events");
+
+    cleanup(&root);
+}
+
+#[test]
+fn snapshot_skips_rows_with_unresolved_latest_version() {
+    // Legacy rows that bypassed POST version resolution may carry
+    // version="latest"; the artifact-metadata endpoint requires a concrete
+    // semver and would 404. Skip rather than spin in retries.
+    let root = temp_root("snapshot-unresolved");
+    let state = AppState::bootstrap_in(root.clone()).unwrap();
+
+    let installations = vec![
+        InstallationRecord {
+            installation_id: install_id(),
+            skill_id: "latest-row".to_string(),
+            version: "latest".to_string(),
+            state: "desired".to_string(),
+        },
+        InstallationRecord {
+            installation_id: install_id(),
+            skill_id: "empty-row".to_string(),
+            version: String::new(),
+            state: "desired".to_string(),
+        },
+    ];
+
+    let events = build_derived_events_blocking(installations, &state);
+    assert!(events.is_empty(), "unresolved-version rows → no events");
+
+    cleanup(&root);
+}
+
+#[test]
+fn snapshot_skips_error_state_rows() {
+    let root = temp_root("snapshot-error-state");
+    let state = AppState::bootstrap_in(root.clone()).unwrap();
+
+    let installations = vec![InstallationRecord {
+        installation_id: install_id(),
+        skill_id: "errored".to_string(),
+        version: "1.0.0".to_string(),
+        state: "error".to_string(),
+    }];
+
+    let events = build_derived_events_blocking(installations, &state);
+    assert!(events.is_empty(), "error-state rows → no auto-retry");
+
+    cleanup(&root);
+}

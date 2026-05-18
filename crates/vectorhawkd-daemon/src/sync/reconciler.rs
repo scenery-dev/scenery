@@ -873,9 +873,28 @@ fn build_derived_events_blocking(
     let mut events = Vec::new();
 
     for record in &installations {
+        // Skip records with a non-semver version sentinel — the artifact
+        // endpoint requires a concrete version and would 404. The backend
+        // should have resolved "latest" before sending; if it didn't, the
+        // safest action is to leave the row alone rather than spin in a
+        // retry loop.
+        if record.version.is_empty() || record.version == "latest" {
+            warn!(
+                skill_id = %record.skill_id,
+                state = %record.state,
+                version = %record.version,
+                "reconciler: snapshot row has unresolved version — skipping"
+            );
+            continue;
+        }
+
         match record.state.as_str() {
-            "desired" => {
-                // Should be installed and active.
+            // "desired", "installing", and "installed" all mean the same thing
+            // from the runner's perspective: this skill should be present and
+            // active locally at this version. If it isn't, install. The state
+            // is the desired-state machine on the backend, not the runner's
+            // job to enforce — the runner reports its own actual state.
+            "desired" | "installing" | "installed" => {
                 let locally_installed = local_state
                     .get(&record.skill_id)
                     .map(|(ver, deactivated)| ver == &record.version && !deactivated)
@@ -911,6 +930,12 @@ fn build_derived_events_blocking(
                         skill_id: record.skill_id.clone(),
                     });
                 }
+            }
+            "error" => {
+                // Backend recorded the last install attempt failed. Don't
+                // auto-retry from the snapshot — the row will be retried when
+                // the user re-issues an install (which flips state to
+                // "desired") or the reconciler's in-process retry path runs.
             }
             other => {
                 warn!(

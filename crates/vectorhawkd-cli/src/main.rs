@@ -1170,7 +1170,13 @@ async fn cmd_skill_search(query: &str, registry_url: Option<&str>) -> Result<()>
 // ── skill install ─────────────────────────────────────────────────────────────
 
 /// Maximum time to poll local SQLite for the reconciler to confirm install.
-const REGISTRY_INSTALL_POLL_TIMEOUT_SECS: u64 = 30;
+///
+/// The reconciler retries failed installs once after a 30s delay (see
+/// `RETRY_DELAY_SECS` in `vectorhawkd-daemon::sync::reconciler`). Keep this
+/// comfortably above 30s so a transient failure on the first attempt does
+/// not surface to the user as a timeout when the second attempt would have
+/// succeeded.
+const REGISTRY_INSTALL_POLL_TIMEOUT_SECS: u64 = 120;
 /// SQLite poll interval while waiting for reconciler confirmation.
 const REGISTRY_INSTALL_POLL_INTERVAL_MS: u64 = 500;
 
