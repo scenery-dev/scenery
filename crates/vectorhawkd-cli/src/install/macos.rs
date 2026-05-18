@@ -185,19 +185,28 @@ pub fn install() -> Result<()> {
     // ── 4. If currently loaded (stale state), boot it out first ───────────────
     if service_is_loaded(uid) {
         let _ = launchctl(&["bootout", &service_target(uid)]);
+        // Give launchd a moment to settle after bootout; on Sequoia a
+        // bootstrap immediately after bootout can fail with exit 5 (EBUSY).
+        std::thread::sleep(std::time::Duration::from_millis(500));
     }
 
-    // ── 5. Bootstrap the service (loads into the domain) ─────────────────────
+    // ── 5. Enable before bootstrap ────────────────────────────────────────────
+    // `enable` must come before `bootstrap` on Sequoia; if the service was ever
+    // disabled via `launchctl disable`, bootstrap fails with exit 5 until
+    // the service is re-enabled.
+    let _ = launchctl(&["enable", &service_target(uid)]);
+
+    // ── 6. Bootstrap the service (loads into the domain) ─────────────────────
     let plist_str = plist.to_str().context("plist path is not valid UTF-8")?;
     launchctl(&["bootstrap", &domain_target(uid), plist_str])
         .context("failed to bootstrap LaunchAgent")?;
 
-    // ── 6. Enable for persistence across reboots ──────────────────────────────
-    // `enable` marks the service as not disabled; if it was previously disabled
-    // via `disable`, this re-arms the RunAtLoad behavior on next login.
-    launchctl(&["enable", &service_target(uid)]).context("failed to enable LaunchAgent")?;
+    // ── 7. Enable for persistence (idempotent, already done above) ───────────
+    // Call again after bootstrap to ensure the label is persisted in the
+    // enabled-services database even on first install.
+    let _ = launchctl(&["enable", &service_target(uid)]);
 
-    // ── 7. Kickstart for immediate launch ─────────────────────────────────────
+    // ── 8. Kickstart for immediate launch ─────────────────────────────────────
     // On macOS 15+ (Sequoia) `bootstrap` may defer the initial start as
     // "speculative" even with RunAtLoad=true. `kickstart -k` forces an
     // immediate start. We use `-k` (kill existing) so that if a stale process
