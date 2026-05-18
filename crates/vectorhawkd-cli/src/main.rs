@@ -314,6 +314,26 @@ pub enum AuthCommand {
         )]
         registry_url: String,
     },
+
+    /// Pair this device using a code from the VectorHawk portal.
+    ///
+    /// In the portal, open the catalog page — if this device isn't registered
+    /// yet you'll see a setup screen with a pairing code.  Then run:
+    ///   vectorhawk auth pair <code>
+    ///
+    /// This registers the device and authenticates the CLI in one step,
+    /// without a separate browser login.
+    Pair {
+        /// The pairing code shown in the portal (e.g. VH-7X4K-9M2P).
+        code: String,
+
+        #[arg(
+            long,
+            env = "VECTORHAWK_REGISTRY_URL",
+            default_value = "https://app.vectorhawk.ai"
+        )]
+        registry_url: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -523,6 +543,9 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Auth(AuthCommand::Login { registry_url }) => cmd_auth_login(&registry_url).await,
         Command::Auth(AuthCommand::Logout { registry_url }) => cmd_auth_logout(&registry_url).await,
         Command::Auth(AuthCommand::Status { registry_url }) => cmd_auth_status(&registry_url).await,
+        Command::Auth(AuthCommand::Pair { code, registry_url }) => {
+            cmd_auth_pair(&code, &registry_url).await
+        }
         Command::Auth(AuthCommand::Token {
             token,
             registry_url,
@@ -3468,6 +3491,109 @@ async fn cmd_auth_token(token: &str, registry_url: &str) -> Result<()> {
 
     println!("Authenticated as {} ({}).", user.display_name, user.email);
     println!("Token saved for {}.", registry_url);
+    Ok(())
+}
+
+// ── auth pair ────────────────────────────────────────────────────────────────
+
+async fn cmd_auth_pair(code: &str, registry_url: &str) -> Result<()> {
+    use vectorhawkd_core::{auth::save_tokens, state::AppState};
+
+    let state = AppState::bootstrap().context("failed to bootstrap application state")?;
+
+    // Retrieve or generate a stable device UUID. SQLite calls go directly on
+    // this thread — AppState wraps a non-Send Connection, so no spawn_blocking.
+    let device_uuid = state
+        .get_sync_state("device_uuid")
+        .context("failed to read sync_state")?
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| {
+        #[cfg(unix)]
+        {
+            let mut buf = vec![0u8; 256];
+            if unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) } == 0 {
+                if let Some(end) = buf.iter().position(|&b| b == 0) {
+                    return String::from_utf8_lossy(&buf[..end]).to_string();
+                }
+            }
+        }
+        "unknown".to_string()
+    });
+
+    #[cfg(target_os = "macos")]
+    let platform = "macos";
+    #[cfg(target_os = "linux")]
+    let platform = "linux";
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let platform = "windows";
+
+    #[cfg(target_arch = "aarch64")]
+    let arch = "aarch64";
+    #[cfg(not(target_arch = "aarch64"))]
+    let arch = "x86_64";
+
+    let body = serde_json::json!({
+        "code": code,
+        "device_uuid": device_uuid,
+        "hostname": hostname,
+        "platform": platform,
+        "arch": arch,
+        "agent_version": env!("CARGO_PKG_VERSION"),
+    });
+
+    // HTTP call — use the async reqwest client already in scope via the
+    // existing registry client infrastructure.
+    let resp = reqwest::Client::new()
+        .post(format!("{registry_url}/api/devices/confirm-pair"))
+        .json(&body)
+        .send()
+        .await
+        .context("failed to reach registry")?;
+
+    let status = resp.status();
+    let body_text = resp.text().await.unwrap_or_default();
+
+    if status == reqwest::StatusCode::NOT_FOUND {
+        anyhow::bail!("Pairing code not found. Make sure you copied it correctly from the portal.");
+    }
+    if status == reqwest::StatusCode::GONE {
+        anyhow::bail!(
+            "Pairing code has expired or was already used. \
+             Return to the portal to generate a new one."
+        );
+    }
+    if !status.is_success() {
+        anyhow::bail!("Pairing failed ({status}): {body_text}");
+    }
+
+    #[derive(serde::Deserialize)]
+    struct PairResponse {
+        device_id: String,
+        access_token: String,
+    }
+    let pair: PairResponse =
+        serde_json::from_str(&body_text).context("unexpected response format from registry")?;
+
+    // Persist auth token (reuse as refresh token; daemon SSE loop refreshes it).
+    save_tokens(&state, registry_url, &pair.access_token, &pair.access_token)
+        .context("failed to save auth token")?;
+
+    // Persist device_uuid and device_id so the daemon picks them up on next start.
+    state
+        .set_sync_state("device_uuid", &device_uuid)
+        .context("failed to save device_uuid")?;
+    state
+        .set_sync_state("device_id", &pair.device_id)
+        .context("failed to save device_id")?;
+
+    println!("Paired successfully.");
+    println!("Device ID : {}", pair.device_id);
+    println!("Registry  : {registry_url}");
+    println!();
+    println!("Your skills will sync automatically once the daemon is running.");
+    println!("Run `vectorhawk doctor` to check status.");
+
     Ok(())
 }
 
