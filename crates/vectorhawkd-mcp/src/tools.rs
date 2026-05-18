@@ -203,24 +203,25 @@ pub fn build_tool_list(state: &AppState, registry_url: &Option<String>) -> Vec<T
 
     tools.push(ToolDefinition {
         name: "vectorhawk_import".to_string(),
-        description: "Import an external skill or MCP server into VectorHawk. Paste an npm \
-            package name (e.g. @modelcontextprotocol/server-github), npx command, or GitHub URL. \
-            The system detects whether it's a skill or MCP server and routes to the appropriate \
-            approval workflow."
+        description: "Import an external skill or MCP server into your organization's governed \
+            catalog. Pass a GitHub URL, npm package name (e.g. '@modelcontextprotocol/server-slack'), \
+            or marketplace URL. Use action='preview' first to see what will be imported, then \
+            action='submit' to request approval."
             .to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
                 "input": {
                     "type": "string",
-                    "description": "The npm package name, npx command, or GitHub URL to import"
+                    "description": "GitHub URL, npm package name (e.g. '@modelcontextprotocol/server-slack'), or marketplace URL to import"
                 },
-                "confirm": {
-                    "type": "boolean",
-                    "description": "If true, submit the import after preview. If false (default), only preview."
+                "action": {
+                    "type": "string",
+                    "enum": ["preview", "submit"],
+                    "description": "preview: see what will be imported without committing. submit: submit for approval (or auto-approve if policy allows)."
                 }
             },
-            "required": ["input"]
+            "required": ["input", "action"]
         }),
     });
 
@@ -1169,6 +1170,30 @@ fn handle_logout(state: &AppState, server_registry_url: &Option<String>) -> Tool
 
 // ── MCP import handler ────────────────────────────────────────────────────────
 
+/// Import action variant parsed from the `action` field of a `vectorhawk_import` call.
+#[derive(Debug, PartialEq, Eq)]
+enum ImportAction {
+    Preview,
+    Submit,
+}
+
+/// Parse the `action` field from tool arguments.
+///
+/// Returns `Err(ToolCallResult)` with an actionable error message when the
+/// field is missing or contains an unrecognised value.
+fn parse_import_action(arguments: &serde_json::Value) -> Result<ImportAction, ToolCallResult> {
+    match arguments.get("action").and_then(|v| v.as_str()) {
+        Some("preview") => Ok(ImportAction::Preview),
+        Some("submit") => Ok(ImportAction::Submit),
+        Some(other) => Err(ToolCallResult::error_result(format!(
+            "Invalid action '{other}'. Must be 'preview' or 'submit'."
+        ))),
+        None => Err(ToolCallResult::error_result(
+            "Missing required parameter: action. Use 'preview' to inspect, then 'submit' to request approval.",
+        )),
+    }
+}
+
 fn handle_import(
     arguments: &serde_json::Value,
     state: &AppState,
@@ -1183,23 +1208,41 @@ fn handle_import(
         Some(i) if !i.is_empty() => i,
         _ => {
             return ToolCallResult::error_result(
-                "Missing required parameter: input. Provide an npm package name, npx command, or GitHub URL.",
+                "Missing required parameter: input. Provide a GitHub URL, npm package name, or marketplace URL.",
             )
         }
     };
 
-    let confirm = arguments
-        .get("confirm")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let action = match parse_import_action(arguments) {
+        Ok(a) => a,
+        Err(e) => return e,
+    };
 
     let access_token = match ensure_auth(state, url) {
         Ok(t) => t,
         Err(e) => return e,
     };
 
-    let preview = match mcp_governance::import_preview(url, input, &access_token) {
-        Ok(v) => v,
+    match action {
+        ImportAction::Preview => handle_import_preview(url, input, &access_token, state),
+        ImportAction::Submit => handle_import_submit(url, input, &access_token, state),
+    }
+}
+
+/// Execute the preview step: call the registry and return a formatted preview.
+///
+/// Retries once with a refreshed token on 401.
+fn handle_import_preview(
+    url: &str,
+    input: &str,
+    access_token: &str,
+    state: &AppState,
+) -> ToolCallResult {
+    match mcp_governance::import_preview(url, input, access_token) {
+        Ok(preview) => ToolCallResult::success(format!(
+            "{}\n\nUse action='submit' to request approval.",
+            format_import_preview(&preview)
+        )),
         Err(e) => {
             let err_str = e.to_string();
             if err_str.contains("401") || err_str.contains("Unauthorized") {
@@ -1212,31 +1255,29 @@ fn handle_import(
                     Err(e) => return e,
                 };
                 match mcp_governance::import_preview(url, input, &new_token) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        return ToolCallResult::error_result(format!("Import preview failed: {e}"))
-                    }
+                    Ok(preview) => ToolCallResult::success(format!(
+                        "{}\n\nUse action='submit' to request approval.",
+                        format_import_preview(&preview)
+                    )),
+                    Err(e) => ToolCallResult::error_result(format!("Import preview failed: {e}")),
                 }
             } else {
-                return ToolCallResult::error_result(format!("Import preview failed: {e}"));
+                ToolCallResult::error_result(format!("Import preview failed: {e}"))
             }
         }
-    };
-
-    let preview_text = format_import_preview(&preview);
-
-    if !confirm {
-        return ToolCallResult::success(format!(
-            "{preview_text}\n\nSet confirm=true to submit this import."
-        ));
     }
+}
 
-    let submit_token = match ensure_auth(state, url) {
-        Ok(t) => t,
-        Err(e) => return e,
-    };
-
-    match mcp_governance::import_submit(url, input, &submit_token) {
+/// Execute the submit step: call the registry and return a formatted result.
+///
+/// Retries once with a refreshed token on 401.
+fn handle_import_submit(
+    url: &str,
+    input: &str,
+    access_token: &str,
+    state: &AppState,
+) -> ToolCallResult {
+    match mcp_governance::import_submit(url, input, access_token) {
         Ok(result) => ToolCallResult::success(format_import_result(&result)),
         Err(e) => {
             let err_str = e.to_string();
@@ -3079,16 +3120,66 @@ mod tests {
         assert!(result.content[0].text.contains("No active MCP server"));
     }
 
+    // ── parse_import_action unit tests ────────────────────────────────────────
+
+    #[test]
+    fn parse_import_action_accepts_preview() {
+        let args = serde_json::json!({"action": "preview"});
+        assert_eq!(parse_import_action(&args).unwrap(), ImportAction::Preview);
+    }
+
+    #[test]
+    fn parse_import_action_accepts_submit() {
+        let args = serde_json::json!({"action": "submit"});
+        assert_eq!(parse_import_action(&args).unwrap(), ImportAction::Submit);
+    }
+
+    #[test]
+    fn parse_import_action_rejects_unknown_value() {
+        let args = serde_json::json!({"action": "confirm"});
+        let err = parse_import_action(&args).unwrap_err();
+        assert_eq!(err.is_error, Some(true));
+        assert!(err.content[0].text.contains("Invalid action"));
+        assert!(err.content[0].text.contains("preview"));
+        assert!(err.content[0].text.contains("submit"));
+    }
+
+    #[test]
+    fn parse_import_action_errors_when_missing() {
+        let args = serde_json::json!({"input": "some-package"});
+        let err = parse_import_action(&args).unwrap_err();
+        assert_eq!(err.is_error, Some(true));
+        assert!(err.content[0].text.contains("action"));
+    }
+
+    // ── handle_import integration tests ───────────────────────────────────────
+
     #[test]
     fn handle_import_requires_input() {
         let state_root = temp_root("import-no-input");
         let state = AppState::bootstrap_in(state_root.clone()).unwrap();
         let result = handle_import(
-            &serde_json::json!({}),
+            &serde_json::json!({"action": "preview"}),
             &state,
             &Some("http://localhost:8000".to_string()),
         );
         assert_eq!(result.is_error, Some(true));
+        assert!(result.content[0].text.contains("input"));
+        let _ = fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn handle_import_requires_action() {
+        let state_root = temp_root("import-no-action");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+        fake_login(&state, "http://localhost:8000");
+        let result = handle_import(
+            &serde_json::json!({"input": "some-package"}),
+            &state,
+            &Some("http://localhost:8000".to_string()),
+        );
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content[0].text.contains("action"));
         let _ = fs::remove_dir_all(&state_root);
     }
 
@@ -3096,9 +3187,313 @@ mod tests {
     fn handle_import_no_registry() {
         let state_root = temp_root("import-no-reg");
         let state = AppState::bootstrap_in(state_root.clone()).unwrap();
-        let result = handle_import(&serde_json::json!({"input": "some-package"}), &state, &None);
+        let result = handle_import(
+            &serde_json::json!({"input": "some-package", "action": "preview"}),
+            &state,
+            &None,
+        );
         assert_eq!(result.is_error, Some(true));
         assert!(result.content[0].text.contains("registry"));
+        let _ = fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn handle_import_preview_requires_auth() {
+        let state_root = temp_root("import-preview-no-auth");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+        // No fake_login — user is not authenticated
+        let result = handle_import(
+            &serde_json::json!({"input": "@modelcontextprotocol/server-slack", "action": "preview"}),
+            &state,
+            &Some("http://localhost:8000".to_string()),
+        );
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            result.content[0].text.contains("login") || result.content[0].text.contains("auth"),
+            "expected auth error, got: {}",
+            result.content[0].text
+        );
+        let _ = fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn handle_import_submit_requires_auth() {
+        let state_root = temp_root("import-submit-no-auth");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+        // No fake_login — user is not authenticated
+        let result = handle_import(
+            &serde_json::json!({"input": "@modelcontextprotocol/server-slack", "action": "submit"}),
+            &state,
+            &Some("http://localhost:8000".to_string()),
+        );
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            result.content[0].text.contains("login") || result.content[0].text.contains("auth"),
+            "expected auth error, got: {}",
+            result.content[0].text
+        );
+        let _ = fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn handle_import_preview_skill_formats_output() {
+        use mockito::Server;
+
+        let state_root = temp_root("import-preview-skill-ok");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+
+        let mut server = Server::new();
+        let url = server.url();
+        fake_login(&state, &url);
+
+        let _mock = server
+            .mock("POST", "/portal/import/preview")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "type": "skill",
+                    "skill_id": "contract-compare",
+                    "name": "Contract Compare",
+                    "version": "0.3.0",
+                    "publisher": "acme-corp",
+                    "description": "Compare two contracts side by side.",
+                    "license": "MIT"
+                }"#,
+            )
+            .create();
+
+        let result = handle_import(
+            &serde_json::json!({
+                "input": "https://github.com/acme/contract-compare",
+                "action": "preview"
+            }),
+            &state,
+            &Some(url),
+        );
+
+        assert_eq!(
+            result.is_error, None,
+            "expected success, got: {}",
+            result.content[0].text
+        );
+        let text = &result.content[0].text;
+        assert!(text.contains("Contract Compare"), "got: {text}");
+        assert!(text.contains("0.3.0"), "got: {text}");
+        assert!(text.contains("acme-corp"), "got: {text}");
+        assert!(
+            text.contains("submit"),
+            "preview should suggest submit step, got: {text}"
+        );
+
+        let _ = fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn handle_import_preview_mcp_server_formats_output() {
+        use mockito::Server;
+
+        let state_root = temp_root("import-preview-mcp-ok");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+
+        let mut server = Server::new();
+        let url = server.url();
+        fake_login(&state, &url);
+
+        let _mock = server
+            .mock("POST", "/portal/import/preview")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "type": "mcp_server",
+                    "package_name": "@modelcontextprotocol/server-slack",
+                    "description": "Slack integration for MCP.",
+                    "latest_version": "1.2.0",
+                    "license": "Apache-2.0",
+                    "keywords": ["slack", "messaging"],
+                    "already_in_catalog": false,
+                    "approval_mode": "strict"
+                }"#,
+            )
+            .create();
+
+        let result = handle_import(
+            &serde_json::json!({
+                "input": "@modelcontextprotocol/server-slack",
+                "action": "preview"
+            }),
+            &state,
+            &Some(url),
+        );
+
+        assert_eq!(
+            result.is_error, None,
+            "expected success, got: {}",
+            result.content[0].text
+        );
+        let text = &result.content[0].text;
+        assert!(
+            text.contains("@modelcontextprotocol/server-slack"),
+            "got: {text}"
+        );
+        assert!(text.contains("strict"), "got: {text}");
+        assert!(
+            text.contains("submit"),
+            "preview should suggest submit step, got: {text}"
+        );
+
+        let _ = fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn handle_import_submit_mcp_server_approved() {
+        use mockito::Server;
+
+        let state_root = temp_root("import-submit-mcp-approved");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+
+        let mut server = Server::new();
+        let url = server.url();
+        fake_login(&state, &url);
+
+        let _mock = server
+            .mock("POST", "/portal/import/submit")
+            .with_status(201)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "type": "mcp_server",
+                    "request_id": "req-abc-123",
+                    "server_name": "Slack MCP",
+                    "package_source": "@modelcontextprotocol/server-slack",
+                    "status": "approved",
+                    "approval_mode": "trust"
+                }"#,
+            )
+            .create();
+
+        let result = handle_import(
+            &serde_json::json!({
+                "input": "@modelcontextprotocol/server-slack",
+                "action": "submit"
+            }),
+            &state,
+            &Some(url),
+        );
+
+        assert_eq!(
+            result.is_error, None,
+            "expected success, got: {}",
+            result.content[0].text
+        );
+        let text = &result.content[0].text;
+        assert!(text.contains("Slack MCP"), "got: {text}");
+        assert!(text.contains("approved"), "got: {text}");
+        assert!(
+            text.contains("catalog"),
+            "approved result should mention catalog, got: {text}"
+        );
+
+        let _ = fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn handle_import_submit_mcp_server_pending() {
+        use mockito::Server;
+
+        let state_root = temp_root("import-submit-mcp-pending");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+
+        let mut server = Server::new();
+        let url = server.url();
+        fake_login(&state, &url);
+
+        let _mock = server
+            .mock("POST", "/portal/import/submit")
+            .with_status(201)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "type": "mcp_server",
+                    "request_id": "req-xyz-789",
+                    "server_name": "Custom MCP",
+                    "package_source": "my-org/custom-mcp",
+                    "status": "pending",
+                    "approval_mode": "strict"
+                }"#,
+            )
+            .create();
+
+        let result = handle_import(
+            &serde_json::json!({
+                "input": "my-org/custom-mcp",
+                "action": "submit"
+            }),
+            &state,
+            &Some(url),
+        );
+
+        assert_eq!(
+            result.is_error, None,
+            "expected success, got: {}",
+            result.content[0].text
+        );
+        let text = &result.content[0].text;
+        assert!(text.contains("pending"), "got: {text}");
+        assert!(
+            text.contains("review"),
+            "pending result should mention review, got: {text}"
+        );
+
+        let _ = fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn handle_import_submit_skill_ok() {
+        use mockito::Server;
+
+        let state_root = temp_root("import-submit-skill-ok");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+
+        let mut server = Server::new();
+        let url = server.url();
+        fake_login(&state, &url);
+
+        let _mock = server
+            .mock("POST", "/portal/import/submit")
+            .with_status(201)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "type": "skill",
+                    "skill_id": "contract-compare",
+                    "version": "0.3.0",
+                    "review_status": "approved",
+                    "is_published": true,
+                    "source_url": "https://github.com/acme/contract-compare"
+                }"#,
+            )
+            .create();
+
+        let result = handle_import(
+            &serde_json::json!({
+                "input": "https://github.com/acme/contract-compare",
+                "action": "submit"
+            }),
+            &state,
+            &Some(url),
+        );
+
+        assert_eq!(
+            result.is_error, None,
+            "expected success, got: {}",
+            result.content[0].text
+        );
+        let text = &result.content[0].text;
+        assert!(text.contains("contract-compare"), "got: {text}");
+        assert!(text.contains("0.3.0"), "got: {text}");
+
         let _ = fs::remove_dir_all(&state_root);
     }
 

@@ -759,6 +759,107 @@ impl RegistryClient {
         map_submit_response_to_outcome(wire)
     }
 
+    /// Preview an external import (skill or MCP server) via the portal endpoint.
+    ///
+    /// Calls `POST /portal/import/preview` with the auth token. Returns the raw
+    /// JSON response as `serde_json::Value` — the discriminated-union shape
+    /// (skill / mcp_server / plugin) is forwarded as-is to callers.
+    ///
+    /// Requires that `auth_token` be set.
+    pub fn import_preview(&self, input: &str) -> Result<serde_json::Value> {
+        let token = self.auth_token.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "not authenticated; run `vectorhawk auth login` before using import preview"
+            )
+        })?;
+
+        let base = self.base_url.trim_end_matches('/');
+        let url = format!("{base}/portal/import/preview");
+        debug!(url, "requesting import preview");
+
+        let body = serde_json::json!({ "url": input });
+
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+            .with_context(|| format!("failed to reach registry at {url}"))?;
+
+        let status = resp.status();
+
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            anyhow::bail!(
+                "registry returned 401 Unauthorized — your session has expired; \
+                 run `vectorhawk auth login` to refresh"
+            );
+        }
+        if status == reqwest::StatusCode::FORBIDDEN {
+            anyhow::bail!(
+                "registry returned 403 Forbidden — your account may lack permission \
+                 for import; contact your IT administrator"
+            );
+        }
+        if !status.is_success() {
+            let body_text = resp.text().unwrap_or_default();
+            anyhow::bail!("import preview failed (HTTP {status}): {body_text}");
+        }
+
+        resp.json()
+            .context("failed to deserialize import preview response")
+    }
+
+    /// Submit an external import for org approval via the portal endpoint.
+    ///
+    /// Calls `POST /portal/import/submit` with the auth token. Returns the raw
+    /// JSON response — the shape depends on `type`: skill, mcp_server, or plugin.
+    ///
+    /// Requires that `auth_token` be set.
+    pub fn import_submit(&self, input: &str) -> Result<serde_json::Value> {
+        let token = self.auth_token.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "not authenticated; run `vectorhawk auth login` before using import submit"
+            )
+        })?;
+
+        let base = self.base_url.trim_end_matches('/');
+        let url = format!("{base}/portal/import/submit");
+        debug!(url, "submitting import");
+
+        let body = serde_json::json!({ "url": input });
+
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+            .with_context(|| format!("failed to reach registry at {url}"))?;
+
+        let status = resp.status();
+
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            anyhow::bail!(
+                "registry returned 401 Unauthorized — your session has expired; \
+                 run `vectorhawk auth login` to refresh"
+            );
+        }
+        if status == reqwest::StatusCode::FORBIDDEN {
+            anyhow::bail!(
+                "registry returned 403 Forbidden — your account may lack permission \
+                 for import; contact your IT administrator"
+            );
+        }
+        if !status.is_success() {
+            let body_text = resp.text().unwrap_or_default();
+            anyhow::bail!("import submit failed (HTTP {status}): {body_text}");
+        }
+
+        resp.json()
+            .context("failed to deserialize import submit response")
+    }
+
     /// Upload a batch of unsynced skill ratings to the registry.
     ///
     /// Calls `POST /api/runner/skill-ratings`. Best-effort: callers should log
@@ -925,6 +1026,24 @@ impl MockRegistryClient {
             statuses: std::collections::HashMap::new(),
             unknown: vec![],
         })
+    }
+
+    pub fn import_preview(&self, _input: &str) -> Result<serde_json::Value> {
+        Ok(serde_json::json!({
+            "type": "mcp_server",
+            "package_name": "mock-package",
+            "already_in_catalog": false,
+            "approval_mode": "trust"
+        }))
+    }
+
+    pub fn import_submit(&self, _input: &str) -> Result<serde_json::Value> {
+        Ok(serde_json::json!({
+            "type": "mcp_server",
+            "server_name": "mock-server",
+            "package_source": "mock-package",
+            "status": "approved"
+        }))
     }
 
     pub fn upload_skill_ratings(&self, _ratings: &[crate::ratings::LocalRating]) -> Result<()> {
@@ -1291,6 +1410,142 @@ mod tests {
         let client = RegistryClient::new(server.url());
         assert!(client.health_check().unwrap());
         mock.assert();
+    }
+
+    #[test]
+    fn import_preview_requires_auth_token() {
+        let client = RegistryClient::new("http://localhost:8000");
+        // No auth token set — should return a descriptive error.
+        let result = client.import_preview("@modelcontextprotocol/server-slack");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("auth") || msg.contains("login"),
+            "expected auth error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn import_submit_requires_auth_token() {
+        let client = RegistryClient::new("http://localhost:8000");
+        let result = client.import_submit("@modelcontextprotocol/server-slack");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("auth") || msg.contains("login"),
+            "expected auth error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn import_preview_returns_json_on_200() {
+        use mockito::Server;
+        let mut server = Server::new();
+        let mock = server
+            .mock("POST", "/portal/import/preview")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "type": "mcp_server",
+                    "package_name": "@modelcontextprotocol/server-slack",
+                    "already_in_catalog": false,
+                    "approval_mode": "strict"
+                }"#,
+            )
+            .create();
+
+        let client = RegistryClient::new(server.url()).with_auth("test-token");
+        let result = client
+            .import_preview("@modelcontextprotocol/server-slack")
+            .unwrap();
+
+        assert_eq!(result["type"].as_str(), Some("mcp_server"));
+        assert_eq!(
+            result["package_name"].as_str(),
+            Some("@modelcontextprotocol/server-slack")
+        );
+        mock.assert();
+    }
+
+    #[test]
+    fn import_submit_returns_json_on_201() {
+        use mockito::Server;
+        let mut server = Server::new();
+        let mock = server
+            .mock("POST", "/portal/import/submit")
+            .with_status(201)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "type": "mcp_server",
+                    "request_id": "req-001",
+                    "server_name": "Slack MCP",
+                    "package_source": "@modelcontextprotocol/server-slack",
+                    "status": "approved"
+                }"#,
+            )
+            .create();
+
+        let client = RegistryClient::new(server.url()).with_auth("test-token");
+        let result = client
+            .import_submit("@modelcontextprotocol/server-slack")
+            .unwrap();
+
+        assert_eq!(result["status"].as_str(), Some("approved"));
+        assert_eq!(result["server_name"].as_str(), Some("Slack MCP"));
+        mock.assert();
+    }
+
+    #[test]
+    fn import_preview_errors_on_401() {
+        use mockito::Server;
+        let mut server = Server::new();
+        let mock = server
+            .mock("POST", "/portal/import/preview")
+            .with_status(401)
+            .with_body("Unauthorized")
+            .create();
+
+        let client = RegistryClient::new(server.url()).with_auth("expired-token");
+        let result = client.import_preview("some-package");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("401") || msg.contains("Unauthorized"),
+            "got: {msg}"
+        );
+        mock.assert();
+    }
+
+    #[test]
+    fn import_submit_errors_on_non_success() {
+        use mockito::Server;
+        let mut server = Server::new();
+        let mock = server
+            .mock("POST", "/portal/import/submit")
+            .with_status(400)
+            .with_body(r#"{"detail": "invalid input"}"#)
+            .create();
+
+        let client = RegistryClient::new(server.url()).with_auth("test-token");
+        let result = client.import_submit("bad-input");
+        assert!(result.is_err());
+        mock.assert();
+    }
+
+    #[test]
+    fn mock_registry_import_preview_returns_mcp_server() {
+        let client = MockRegistryClient::new("http://localhost:8000");
+        let result = client.import_preview("some-package").unwrap();
+        assert_eq!(result["type"].as_str(), Some("mcp_server"));
+    }
+
+    #[test]
+    fn mock_registry_import_submit_returns_approved() {
+        let client = MockRegistryClient::new("http://localhost:8000");
+        let result = client.import_submit("some-package").unwrap();
+        assert_eq!(result["status"].as_str(), Some("approved"));
     }
 
     #[test]
