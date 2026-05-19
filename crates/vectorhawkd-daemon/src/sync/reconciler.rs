@@ -463,6 +463,12 @@ async fn flip_active_symlink(
         )
         .context("failed to update installed_skills after symlink flip")?;
 
+        // Mirror the active dir into ~/.claude/skills/<id> so Claude Code's
+        // native Skills mechanism picks it up alongside the runner's MCP
+        // exposure. install_unpacked_skill already does this; flip path
+        // must too so a "re-install of already-local version" stays in sync.
+        vectorhawkd_core::installer::register_in_claude_skills(&skill_id, &active_dir);
+
         Ok(())
     })
     .await
@@ -778,6 +784,10 @@ fn deactivate_skill_blocking(state: &AppState, skill_id: &str) -> Result<()> {
     )
     .context("failed to mark skill as deactivated in SQLite")?;
 
+    // Remove the Claude Code skills symlink so the skill stops appearing
+    // there. Mirror to `installer::deactivate_skill`'s behaviour.
+    vectorhawkd_core::installer::unregister_from_claude_skills(skill_id);
+
     info!(skill_id, "reconciler: skill deactivated");
     Ok(())
 }
@@ -835,6 +845,8 @@ fn purge_skill_blocking(state: &AppState, skill_id: &str) -> Result<()> {
         rusqlite::params![skill_id],
     )
     .context("failed to remove skill_versions from SQLite")?;
+
+    vectorhawkd_core::installer::unregister_from_claude_skills(skill_id);
 
     info!(skill_id, "reconciler: skill purged");
     Ok(())

@@ -57,7 +57,7 @@ fn unregister_from_claude_skills_at(home: &std::path::Path, skill_id: &str) {
 /// at call time. Returns early when $HOME is unset or when the
 /// `VECTORHAWK_DISABLE_CLAUDE_SKILLS_LINK` env var is set (used by tests so
 /// they never touch the developer's real `~/.claude/skills/`).
-fn register_in_claude_skills(skill_id: &str, active_dir: &Utf8Path) {
+pub fn register_in_claude_skills(skill_id: &str, active_dir: &Utf8Path) {
     if std::env::var_os("VECTORHAWK_DISABLE_CLAUDE_SKILLS_LINK").is_some() {
         return;
     }
@@ -65,7 +65,7 @@ fn register_in_claude_skills(skill_id: &str, active_dir: &Utf8Path) {
         register_in_claude_skills_at(std::path::Path::new(&home), skill_id, active_dir);
     }
 }
-fn unregister_from_claude_skills(skill_id: &str) {
+pub fn unregister_from_claude_skills(skill_id: &str) {
     if std::env::var_os("VECTORHAWK_DISABLE_CLAUDE_SKILLS_LINK").is_some() {
         return;
     }
