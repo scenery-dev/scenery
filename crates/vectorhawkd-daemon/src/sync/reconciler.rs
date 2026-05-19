@@ -35,6 +35,19 @@ use uuid::Uuid;
 use crate::sync::sse_client::{InstallationRecord, SyncEvent};
 use vectorhawkd_core::{auth::load_all_tokens, registry::RegistryClient, state::AppState};
 
+/// One async mutex per skill_id, used to serialize install/deactivate/purge
+/// for the same skill while still letting different skills run in parallel.
+/// The outer `std::sync::Mutex` is only held during the get-or-insert lookup;
+/// the per-skill `tokio::sync::Mutex` is what guards the actual work.
+type SkillLockMap = Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>;
+
+fn skill_lock(locks: &SkillLockMap, skill_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let mut map = locks.lock().expect("skill_locks mutex poisoned");
+    map.entry(skill_id.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const MAX_CONCURRENT_INSTALLS: usize = 4;
@@ -113,6 +126,13 @@ async fn run_loop(
     // Semaphore limits concurrent install workers.
     let sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_INSTALLS));
 
+    // Per-skill serialization. Operations on the *same* skill_id (install,
+    // deactivate, purge) acquire the same lock before touching filesystem
+    // or SQLite, so a fast POST + DELETE pair can't interleave and leave
+    // orphan symlinks (the race the v1.0.35 snapshot cross-check catches
+    // reactively). Different skill_ids stay parallel under the semaphore.
+    let skill_locks: SkillLockMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
+
     // Track install worker join handles so we can coalesce notifications.
     let mut install_tasks: tokio::task::JoinSet<bool> = tokio::task::JoinSet::new();
 
@@ -145,98 +165,20 @@ async fn run_loop(
                     }
                 };
 
-                match event {
-                    SyncEvent::Install { installation_id, skill_id, version } => {
-                        let st = Arc::clone(&state);
-                        let reg_url = registry_url.clone();
-                        let sem_clone = Arc::clone(&sem);
-                        let stats_clone = Arc::clone(&stats);
+                dispatch_event(
+                    event,
+                    &state,
+                    &registry_url,
+                    &sem,
+                    &skill_locks,
+                    &stats,
+                    &mut install_tasks,
+                ).await;
 
-                        // Increment pending counter.
-                        increment_pending(&stats);
-
-                        install_tasks.spawn(async move {
-                            let _permit = sem_clone.acquire().await;
-                            handle_install(
-                                installation_id,
-                                &skill_id,
-                                &version,
-                                &st,
-                                &reg_url,
-                                &stats_clone,
-                            ).await
-                        });
-                    }
-
-                    SyncEvent::Deactivate { installation_id, skill_id } => {
-                        let st = Arc::clone(&state);
-                        let reg_url = registry_url.clone();
-                        if handle_deactivate(installation_id, &skill_id, &st, &reg_url).await {
-                            fire_notification(&list_changed_tx, &mut notify_pending, &mut coalesce_deadline);
-                        }
-                    }
-
-                    SyncEvent::Purge { installation_id, skill_id } => {
-                        let st = Arc::clone(&state);
-                        let reg_url = registry_url.clone();
-                        if handle_purge(installation_id, &skill_id, &st, &reg_url).await {
-                            fire_notification(&list_changed_tx, &mut notify_pending, &mut coalesce_deadline);
-                        }
-                    }
-
-                    SyncEvent::Snapshot { installations } => {
-                        let derived = build_derived_events(installations, Arc::clone(&state)).await;
-                        for derived_event in derived {
-                            // Feed derived events back into the channel (bounded).
-                            // If the channel is full the event is dropped with a warning;
-                            // the next snapshot will catch it.
-                            if rx.is_closed() {
-                                break;
-                            }
-                            // We can't send on `rx` (the receiver end); instead
-                            // we process derived events inline to avoid a second channel.
-                            match derived_event {
-                                SyncEvent::Install { installation_id, skill_id, version } => {
-                                    let st = Arc::clone(&state);
-                                    let reg_url = registry_url.clone();
-                                    let sem_clone = Arc::clone(&sem);
-                                    let stats_clone = Arc::clone(&stats);
-
-                                    increment_pending(&stats);
-
-                                    install_tasks.spawn(async move {
-                                        let _permit = sem_clone.acquire().await;
-                                        handle_install(
-                                            installation_id,
-                                            &skill_id,
-                                            &version,
-                                            &st,
-                                            &reg_url,
-                                            &stats_clone,
-                                        ).await
-                                    });
-                                }
-                                SyncEvent::Deactivate { installation_id, skill_id } => {
-                                    let st = Arc::clone(&state);
-                                    let reg_url = registry_url.clone();
-                                    if handle_deactivate(installation_id, &skill_id, &st, &reg_url).await {
-                                        fire_notification(&list_changed_tx, &mut notify_pending, &mut coalesce_deadline);
-                                    }
-                                }
-                                SyncEvent::Purge { installation_id, skill_id } => {
-                                    let st = Arc::clone(&state);
-                                    let reg_url = registry_url.clone();
-                                    if handle_purge(installation_id, &skill_id, &st, &reg_url).await {
-                                        fire_notification(&list_changed_tx, &mut notify_pending, &mut coalesce_deadline);
-                                    }
-                                }
-                                SyncEvent::Snapshot { .. } => {
-                                    // Nested snapshots not expected; ignore.
-                                }
-                            }
-                        }
-                    }
-                }
+                // Process any snapshot-derived events. The current event was
+                // already dispatched above; if it was a snapshot,
+                // dispatch_event spawned all derived events into install_tasks
+                // before returning.
             }
 
             // ── Install worker completion ─────────────────────────────────
@@ -264,6 +206,179 @@ async fn run_loop(
             }
         }
     }
+}
+
+/// Spawn handler tasks for a single SSE event into `install_tasks`.
+///
+/// Every handler — install, deactivate, purge — acquires the per-skill
+/// mutex before doing any work. Different skill_ids stay parallel under
+/// the semaphore; rapid POST/DELETE/POST for the same skill_id is
+/// serialized so the install/deactivate critical sections can't
+/// interleave.
+///
+/// Snapshot events are not spawned directly; they fan out into derived
+/// install/deactivate/purge events which are spawned the same way.
+async fn dispatch_event(
+    event: SyncEvent,
+    state: &Arc<AppState>,
+    registry_url: &str,
+    sem: &Arc<tokio::sync::Semaphore>,
+    skill_locks: &SkillLockMap,
+    stats: &Arc<Mutex<ReconcilerStats>>,
+    install_tasks: &mut tokio::task::JoinSet<bool>,
+) {
+    match event {
+        SyncEvent::Install { installation_id, skill_id, version } => {
+            spawn_install(
+                installation_id,
+                skill_id,
+                version,
+                state,
+                registry_url,
+                sem,
+                skill_locks,
+                stats,
+                install_tasks,
+            );
+        }
+        SyncEvent::Deactivate { installation_id, skill_id } => {
+            spawn_deactivate(
+                installation_id,
+                skill_id,
+                state,
+                registry_url,
+                skill_locks,
+                install_tasks,
+            );
+        }
+        SyncEvent::Purge { installation_id, skill_id } => {
+            spawn_purge(
+                installation_id,
+                skill_id,
+                state,
+                registry_url,
+                skill_locks,
+                install_tasks,
+            );
+        }
+        SyncEvent::Snapshot { installations } => {
+            let derived = build_derived_events(installations, Arc::clone(state)).await;
+            for d in derived {
+                match d {
+                    SyncEvent::Install { installation_id, skill_id, version } => {
+                        spawn_install(
+                            installation_id,
+                            skill_id,
+                            version,
+                            state,
+                            registry_url,
+                            sem,
+                            skill_locks,
+                            stats,
+                            install_tasks,
+                        );
+                    }
+                    SyncEvent::Deactivate { installation_id, skill_id } => {
+                        spawn_deactivate(
+                            installation_id,
+                            skill_id,
+                            state,
+                            registry_url,
+                            skill_locks,
+                            install_tasks,
+                        );
+                    }
+                    SyncEvent::Purge { installation_id, skill_id } => {
+                        spawn_purge(
+                            installation_id,
+                            skill_id,
+                            state,
+                            registry_url,
+                            skill_locks,
+                            install_tasks,
+                        );
+                    }
+                    SyncEvent::Snapshot { .. } => {
+                        // Nested snapshots not expected; ignore.
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_install(
+    installation_id: Uuid,
+    skill_id: String,
+    version: String,
+    state: &Arc<AppState>,
+    registry_url: &str,
+    sem: &Arc<tokio::sync::Semaphore>,
+    skill_locks: &SkillLockMap,
+    stats: &Arc<Mutex<ReconcilerStats>>,
+    install_tasks: &mut tokio::task::JoinSet<bool>,
+) {
+    let st = Arc::clone(state);
+    let reg_url = registry_url.to_string();
+    let sem_clone = Arc::clone(sem);
+    let stats_clone = Arc::clone(stats);
+    let lock = skill_lock(skill_locks, &skill_id);
+
+    increment_pending(stats);
+
+    install_tasks.spawn(async move {
+        // Serialize against any in-flight deactivate/purge/install for the
+        // same skill. Acquired before the semaphore so a stalled per-skill
+        // queue doesn't burn a semaphore permit.
+        let _skill_guard = lock.lock_owned().await;
+        let _permit = sem_clone.acquire().await;
+        handle_install(
+            installation_id,
+            &skill_id,
+            &version,
+            &st,
+            &reg_url,
+            &stats_clone,
+        )
+        .await
+    });
+}
+
+fn spawn_deactivate(
+    installation_id: Uuid,
+    skill_id: String,
+    state: &Arc<AppState>,
+    registry_url: &str,
+    skill_locks: &SkillLockMap,
+    install_tasks: &mut tokio::task::JoinSet<bool>,
+) {
+    let st = Arc::clone(state);
+    let reg_url = registry_url.to_string();
+    let lock = skill_lock(skill_locks, &skill_id);
+
+    install_tasks.spawn(async move {
+        let _skill_guard = lock.lock_owned().await;
+        handle_deactivate(installation_id, &skill_id, &st, &reg_url).await
+    });
+}
+
+fn spawn_purge(
+    installation_id: Uuid,
+    skill_id: String,
+    state: &Arc<AppState>,
+    registry_url: &str,
+    skill_locks: &SkillLockMap,
+    install_tasks: &mut tokio::task::JoinSet<bool>,
+) {
+    let st = Arc::clone(state);
+    let reg_url = registry_url.to_string();
+    let lock = skill_lock(skill_locks, &skill_id);
+
+    install_tasks.spawn(async move {
+        let _skill_guard = lock.lock_owned().await;
+        handle_purge(installation_id, &skill_id, &st, &reg_url).await
+    });
 }
 
 /// Schedule a `tools/list_changed` notification within the coalesce window.

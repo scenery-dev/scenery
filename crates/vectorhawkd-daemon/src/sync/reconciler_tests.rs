@@ -1,7 +1,7 @@
 //! Unit tests for the reconciler snapshot-diff logic.
 #![allow(clippy::unwrap_used)]
 
-use super::{build_derived_events_blocking, load_local_skill_state};
+use super::{build_derived_events_blocking, load_local_skill_state, skill_lock, SkillLockMap};
 use crate::sync::sse_client::{InstallationRecord, SyncEvent};
 use camino::Utf8PathBuf;
 use rusqlite::Connection;
@@ -37,6 +37,31 @@ fn seed_skill(conn: &Connection, skill_id: &str, version: &str, deactivated: boo
         rusqlite::params![skill_id, version, if deactivated { 1i64 } else { 0i64 }],
     )
     .unwrap();
+}
+
+/// Seed a skill plus its on-disk active/ symlink under the state root so
+/// the build_derived_events filesystem check sees it as installed.
+fn seed_skill_with_fs(
+    state: &AppState,
+    skill_id: &str,
+    version: &str,
+    deactivated: bool,
+) {
+    let conn = Connection::open(&state.db_path).unwrap();
+    seed_skill(&conn, skill_id, version, deactivated);
+
+    let install_root = state.root_dir.join("skills").join(skill_id);
+    let version_dir = install_root.join("versions").join(version);
+    let active_dir = install_root.join("active");
+    std::fs::create_dir_all(version_dir.as_std_path()).unwrap();
+    // Active symlink only exists when not deactivated.
+    if !deactivated {
+        if active_dir.exists() || active_dir.is_symlink() {
+            let _ = std::fs::remove_file(active_dir.as_std_path());
+        }
+        #[cfg(target_family = "unix")]
+        std::os::unix::fs::symlink(version_dir.as_std_path(), active_dir.as_std_path()).unwrap();
+    }
 }
 
 // ── load_local_skill_state tests ──────────────────────────────────────────────
@@ -125,9 +150,7 @@ fn snapshot_installs_missing_desired_skill() {
 fn snapshot_no_op_when_skill_already_installed() {
     let root = temp_root("snapshot-noop");
     let state = AppState::bootstrap_in(root.clone()).unwrap();
-    let conn = Connection::open(&state.db_path).unwrap();
-    seed_skill(&conn, "installed-skill", "1.0.0", false);
-    drop(conn);
+    seed_skill_with_fs(&state, "installed-skill", "1.0.0", false);
 
     let installations = vec![InstallationRecord {
         installation_id: install_id(),
@@ -227,12 +250,10 @@ fn snapshot_no_purge_when_skill_not_locally_present() {
 fn snapshot_mixed_batch_generates_correct_events() {
     let root = temp_root("snapshot-mixed");
     let state = AppState::bootstrap_in(root.clone()).unwrap();
-    let conn = Connection::open(&state.db_path).unwrap();
     // install-me is not local (desired → Install)
-    seed_skill(&conn, "deactivate-me", "1.0.0", false); // active → Deactivate
-    seed_skill(&conn, "purge-me", "1.0.0", false); // present → Purge
-    seed_skill(&conn, "keep-me", "2.0.0", false); // active, desired → no-op
-    drop(conn);
+    seed_skill_with_fs(&state, "deactivate-me", "1.0.0", false); // active → Deactivate
+    seed_skill_with_fs(&state, "purge-me", "1.0.0", false); // present → Purge
+    seed_skill_with_fs(&state, "keep-me", "2.0.0", false); // active, desired → no-op
 
     let installations = vec![
         InstallationRecord {
@@ -325,9 +346,7 @@ fn snapshot_installed_state_treated_like_desired_when_missing_locally() {
 fn snapshot_installed_state_noop_when_already_present_locally() {
     let root = temp_root("snapshot-installed-noop");
     let state = AppState::bootstrap_in(root.clone()).unwrap();
-    let conn = Connection::open(&state.db_path).unwrap();
-    seed_skill(&conn, "already-here", "1.0.0", false);
-    drop(conn);
+    seed_skill_with_fs(&state, "already-here", "1.0.0", false);
 
     let installations = vec![InstallationRecord {
         installation_id: install_id(),
@@ -387,4 +406,119 @@ fn snapshot_skips_error_state_rows() {
     assert!(events.is_empty(), "error-state rows → no auto-retry");
 
     cleanup(&root);
+}
+
+// ── Per-skill mutex tests ─────────────────────────────────────────────────────
+
+#[test]
+fn skill_lock_returns_same_mutex_for_same_id() {
+    let map: SkillLockMap =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let a = skill_lock(&map, "hello-world");
+    let b = skill_lock(&map, "hello-world");
+    assert!(
+        std::sync::Arc::ptr_eq(&a, &b),
+        "same skill_id must yield the same Arc<Mutex>",
+    );
+}
+
+#[test]
+fn skill_lock_returns_distinct_mutex_for_different_ids() {
+    let map: SkillLockMap =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let a = skill_lock(&map, "alpha");
+    let b = skill_lock(&map, "beta");
+    assert!(
+        !std::sync::Arc::ptr_eq(&a, &b),
+        "different skill_ids must yield different mutexes",
+    );
+}
+
+#[tokio::test]
+async fn skill_lock_serializes_same_skill_fifo() {
+    // Two tasks racing for the same skill's mutex must run sequentially in
+    // submission order, not interleave. This is the property that prevents
+    // the install/deactivate race the snapshot cross-check used to catch
+    // reactively.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::time::{sleep, Duration};
+
+    let map: SkillLockMap =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let interleave = std::sync::Arc::new(AtomicUsize::new(0));
+    let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+
+    let lock1 = skill_lock(&map, "shared");
+    let lock2 = skill_lock(&map, "shared");
+    let i1 = interleave.clone();
+    let i2 = interleave.clone();
+    let o1 = observed.clone();
+    let o2 = observed.clone();
+
+    let t1 = tokio::spawn(async move {
+        let _g = lock1.lock_owned().await;
+        // Bump entry counter; if anyone else entered concurrently we'd see 2.
+        let in_count = i1.fetch_add(1, Ordering::SeqCst) + 1;
+        o1.lock().unwrap().push("t1-start");
+        assert_eq!(in_count, 1, "t1 must hold the lock exclusively");
+        sleep(Duration::from_millis(40)).await;
+        i1.fetch_sub(1, Ordering::SeqCst);
+        o1.lock().unwrap().push("t1-end");
+    });
+
+    // Submit t2 a moment later so the FIFO ordering is unambiguous.
+    sleep(Duration::from_millis(5)).await;
+
+    let t2 = tokio::spawn(async move {
+        let _g = lock2.lock_owned().await;
+        let in_count = i2.fetch_add(1, Ordering::SeqCst) + 1;
+        o2.lock().unwrap().push("t2-start");
+        assert_eq!(in_count, 1, "t2 must hold the lock exclusively");
+        sleep(Duration::from_millis(5)).await;
+        i2.fetch_sub(1, Ordering::SeqCst);
+        o2.lock().unwrap().push("t2-end");
+    });
+
+    t1.await.unwrap();
+    t2.await.unwrap();
+
+    let seen = observed.lock().unwrap().clone();
+    assert_eq!(
+        seen,
+        vec!["t1-start", "t1-end", "t2-start", "t2-end"],
+        "same-skill tasks must execute end-to-end in submission order",
+    );
+}
+
+#[tokio::test]
+async fn skill_lock_does_not_serialize_different_skills() {
+    use tokio::time::{sleep, Duration};
+
+    let map: SkillLockMap =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+
+    let alpha = skill_lock(&map, "alpha");
+    let beta = skill_lock(&map, "beta");
+
+    let start = std::time::Instant::now();
+
+    let t1 = tokio::spawn(async move {
+        let _g = alpha.lock_owned().await;
+        sleep(Duration::from_millis(50)).await;
+    });
+    let t2 = tokio::spawn(async move {
+        let _g = beta.lock_owned().await;
+        sleep(Duration::from_millis(50)).await;
+    });
+
+    t1.await.unwrap();
+    t2.await.unwrap();
+
+    let elapsed = start.elapsed();
+    // If they were serialized this would be ~100ms; running in parallel
+    // it lands well under 90ms even on a busy CI box.
+    assert!(
+        elapsed < Duration::from_millis(90),
+        "different-skill locks should not serialize (took {elapsed:?})",
+    );
 }
