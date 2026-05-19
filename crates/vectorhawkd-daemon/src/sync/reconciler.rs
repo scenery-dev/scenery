@@ -457,7 +457,9 @@ async fn flip_active_symlink(
         let conn = rusqlite::Connection::open(&state.db_path)
             .context("failed to open state DB for symlink flip")?;
         conn.execute(
-            "UPDATE installed_skills SET active_version = ?1, deactivated = 0, deactivated_at = NULL \
+            "UPDATE installed_skills \
+             SET active_version = ?1, deactivated = 0, deactivated_at = NULL, \
+                 current_status = 'active' \
              WHERE skill_id = ?2",
             rusqlite::params![version, skill_id],
         )
