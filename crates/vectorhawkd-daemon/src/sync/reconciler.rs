@@ -907,12 +907,24 @@ fn build_derived_events_blocking(
             // is the desired-state machine on the backend, not the runner's
             // job to enforce — the runner reports its own actual state.
             "desired" | "installing" | "installed" => {
-                let locally_installed = local_state
+                // The runner considers a skill "locally installed" only when
+                // the DB flag agrees *and* the on-disk `active/` symlink is
+                // present at the right version. Without the filesystem check
+                // a prior race (deactivate beats install task) can leave the
+                // DB in `active` while the symlink is gone — we'd then skip
+                // the install event and the skill would silently stay broken.
+                let db_match = local_state
                     .get(&record.skill_id)
                     .map(|(ver, deactivated)| ver == &record.version && !deactivated)
                     .unwrap_or(false);
+                let fs_match = state
+                    .root_dir
+                    .join("skills")
+                    .join(&record.skill_id)
+                    .join("active")
+                    .exists();
 
-                if !locally_installed {
+                if !(db_match && fs_match) {
                     events.push(SyncEvent::Install {
                         installation_id: record.installation_id,
                         skill_id: record.skill_id.clone(),
@@ -921,13 +933,26 @@ fn build_derived_events_blocking(
                 }
             }
             "deactivated" => {
-                // Should be deactivated; if locally active, enqueue deactivate.
-                let locally_active = local_state
+                // Should be deactivated. Generate a deactivate event when
+                // either the SQLite flag *or* the filesystem disagree with
+                // the desired state — install and deactivate tasks can
+                // race in the reconciler, leaving a `deactivated=1` flag
+                // alongside an orphaned `active/` symlink (and matching
+                // ~/.claude/skills entry). Without a filesystem cross-check
+                // we'd silently leak the skill into Claude Code despite
+                // the portal saying it's removed.
+                let db_active = local_state
                     .get(&record.skill_id)
                     .map(|(_, deactivated)| !deactivated)
                     .unwrap_or(false);
+                let fs_active = state
+                    .root_dir
+                    .join("skills")
+                    .join(&record.skill_id)
+                    .join("active")
+                    .exists();
 
-                if locally_active {
+                if db_active || fs_active {
                     events.push(SyncEvent::Deactivate {
                         installation_id: record.installation_id,
                         skill_id: record.skill_id.clone(),
