@@ -32,7 +32,7 @@ use tokio::sync::{broadcast, mpsc};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::sync::sse_client::{InstallationRecord, SyncEvent};
+use crate::sync::sse_client::{InstallationRecord, McpInstallationRecord, SyncEvent};
 use vectorhawkd_core::{
     auth::load_all_tokens,
     registry::RegistryClient,
@@ -319,7 +319,11 @@ async fn dispatch_event(
                 install_tasks,
             );
         }
-        SyncEvent::Snapshot { installations } => {
+        SyncEvent::Snapshot {
+            installations,
+            mcp_installations,
+        } => {
+            // ── Skill reconciliation (unchanged) ─────────────────────────────
             let derived = build_derived_events(installations, Arc::clone(state)).await;
             for d in derived {
                 match d {
@@ -369,11 +373,63 @@ async fn dispatch_event(
                     SyncEvent::Snapshot { .. } => {
                         // Nested snapshots not expected; ignore.
                     }
-                    // TODO(G3-snapshot): MCP installations are not yet reconciled
-                    // from the snapshot payload. The snapshot shape would need a
-                    // top-level `mcp_installations` key from the backend. Add
-                    // that reconciliation path when the backend ships it.
                     SyncEvent::InstallMcp { .. } | SyncEvent::DeactivateMcp { .. } => {}
+                }
+            }
+
+            // ── MCP reconciliation ───────────────────────────────────────────
+            //
+            // An empty `mcp_installations` vec means the backend did not emit
+            // the key (old backend, backwards compat).  Do NOT treat it as
+            // "desired state is zero servers" — that would wipe existing installs.
+            // Only reconcile when the vec is non-empty.
+            if !mcp_installations.is_empty() {
+                let mcp_derived =
+                    build_derived_mcp_events(mcp_installations, Arc::clone(state)).await;
+                for d in mcp_derived {
+                    match d {
+                        SyncEvent::InstallMcp {
+                            installation_id,
+                            mcp_server_id,
+                            mcp_server_name,
+                            package_source,
+                            version_pin,
+                            server_config,
+                            auth_type,
+                            gateway_server_id,
+                        } => {
+                            spawn_install_mcp(
+                                installation_id,
+                                mcp_server_id,
+                                mcp_server_name,
+                                package_source,
+                                version_pin,
+                                server_config,
+                                auth_type,
+                                gateway_server_id,
+                                state,
+                                registry_url,
+                                skill_locks,
+                                stats,
+                                install_tasks,
+                            );
+                        }
+                        SyncEvent::DeactivateMcp {
+                            installation_id,
+                            mcp_server_id,
+                        } => {
+                            spawn_deactivate_mcp(
+                                installation_id,
+                                mcp_server_id,
+                                state,
+                                registry_url,
+                                skill_locks,
+                                stats,
+                                install_tasks,
+                            );
+                        }
+                        _ => {}
+                    }
                 }
             }
         }
@@ -1544,6 +1600,173 @@ fn build_derived_events_blocking(
     events
 }
 
+// ── MCP snapshot diff ─────────────────────────────────────────────────────────
+
+/// Async wrapper: diff MCP snapshot records vs local SQLite and return derived events.
+///
+/// An empty `records` vec means "old backend — no MCP key in snapshot"; callers
+/// must guard against calling this with an empty slice (they would get no events,
+/// which is correct, but also a wasted blocking spawn).
+async fn build_derived_mcp_events(
+    records: Vec<McpInstallationRecord>,
+    state: Arc<AppState>,
+) -> Vec<SyncEvent> {
+    tokio::task::spawn_blocking(move || build_derived_mcp_events_blocking(records, &state))
+        .await
+        .unwrap_or_else(|e| {
+            warn!(error = %e, "reconciler: MCP snapshot diff task panicked");
+            vec![]
+        })
+}
+
+/// Diff a slice of MCP snapshot records against the local `mcp_installations`
+/// SQLite table and return the minimal set of `InstallMcp`/`DeactivateMcp`
+/// events needed to converge state.
+///
+/// Additionally removes any local SQLite rows whose `mcp_server_id` is **not**
+/// in the snapshot (orphan detection: the catalog row was deleted while the
+/// daemon was offline).
+///
+/// A single `write_managed_mcp_json` call at the end of all mutations keeps the
+/// managed-mcp.json file consistent without N per-event writes.
+pub(crate) fn build_derived_mcp_events_blocking(
+    records: Vec<McpInstallationRecord>,
+    state: &AppState,
+) -> Vec<SyncEvent> {
+    // An empty records slice means "old backend — no mcp_installations key".
+    // Treat as a no-op: do not remove existing installs.  The caller in
+    // dispatch_event already guards `if !mcp_installations.is_empty()` before
+    // calling the async wrapper, but this guard makes the function safe to
+    // call directly from tests with an empty slice.
+    if records.is_empty() {
+        return vec![];
+    }
+
+    // Load current local state: mcp_server_id → installation_id (string).
+    let local_rows = match state.list_mcp_installs() {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(error = %e, "reconciler: cannot read mcp_installations for snapshot diff");
+            return vec![];
+        }
+    };
+
+    // Build a set of mcp_server_ids present in the snapshot for orphan detection.
+    let snapshot_ids: std::collections::HashSet<String> = records
+        .iter()
+        .map(|r| r.mcp_server_id.to_string())
+        .collect();
+
+    // Remove orphans (local rows absent from the snapshot).
+    // These represent servers deleted from the backend catalog while offline.
+    let mut any_orphan_removed = false;
+    for local in &local_rows {
+        if !snapshot_ids.contains(&local.mcp_server_id) {
+            if let Err(e) = state.delete_mcp_install(&local.mcp_server_id) {
+                warn!(
+                    mcp_server_id = %local.mcp_server_id,
+                    error = %e,
+                    "reconciler: failed to remove orphan mcp_installations row"
+                );
+            } else {
+                info!(
+                    mcp_server_id = %local.mcp_server_id,
+                    "reconciler: removed orphan MCP install (not in snapshot)"
+                );
+                any_orphan_removed = true;
+            }
+        }
+    }
+
+    // Build a set of currently-installed mcp_server_ids for fast lookup.
+    let installed_ids: std::collections::HashSet<String> =
+        local_rows.iter().map(|r| r.mcp_server_id.clone()).collect();
+
+    let mut events: Vec<SyncEvent> = Vec::new();
+    let mut any_deactivation = false;
+
+    for record in &records {
+        let server_id_str = record.mcp_server_id.to_string();
+        match record.state.as_str() {
+            // "desired", "installing", "installed" → server should be present locally.
+            "desired" | "installing" | "installed" => {
+                if !installed_ids.contains(&server_id_str) {
+                    events.push(SyncEvent::InstallMcp {
+                        installation_id: record.installation_id,
+                        mcp_server_id: record.mcp_server_id,
+                        mcp_server_name: record.mcp_server_name.clone(),
+                        package_source: record.package_source.clone(),
+                        version_pin: record.version_pin.clone(),
+                        server_config: record.server_config.clone(),
+                        auth_type: record.auth_type.clone(),
+                        gateway_server_id: record.gateway_server_id.clone(),
+                    });
+                }
+                // Already installed: no event needed.
+            }
+            "deactivated" => {
+                // Should be removed locally.  If it's still in the local table, deactivate.
+                if installed_ids.contains(&server_id_str) {
+                    if let Err(e) = state.delete_mcp_install(&server_id_str) {
+                        warn!(
+                            mcp_server_id = %server_id_str,
+                            error = %e,
+                            "reconciler: failed to remove deactivated mcp_installations row in snapshot"
+                        );
+                    } else {
+                        info!(
+                            mcp_server_id = %server_id_str,
+                            "reconciler: deactivated MCP server removed from local state (snapshot)"
+                        );
+                        any_deactivation = true;
+                        events.push(SyncEvent::DeactivateMcp {
+                            installation_id: record.installation_id,
+                            mcp_server_id: record.mcp_server_id,
+                        });
+                    }
+                }
+            }
+            "removed" => {
+                // Fully deleted on the backend; remove the local row and skip emitting an event.
+                if installed_ids.contains(&server_id_str) {
+                    if let Err(e) = state.delete_mcp_install(&server_id_str) {
+                        warn!(
+                            mcp_server_id = %server_id_str,
+                            error = %e,
+                            "reconciler: failed to remove 'removed' mcp_installations row in snapshot"
+                        );
+                    } else {
+                        info!(
+                            mcp_server_id = %server_id_str,
+                            "reconciler: purged MCP server from local state (snapshot state=removed)"
+                        );
+                        any_deactivation = true;
+                        // No event emitted: the server is gone, nothing to report to the backend.
+                    }
+                }
+            }
+            other => {
+                warn!(
+                    mcp_server_id = %server_id_str,
+                    state = other,
+                    "reconciler: unknown MCP installation state in snapshot — skipping"
+                );
+            }
+        }
+    }
+
+    // Regenerate managed-mcp.json once for all mutations (orphan removals +
+    // deactivations) rather than once per event.  Install events will each
+    // call write_managed_mcp_json themselves via handle_install_mcp.
+    if any_orphan_removed || any_deactivation {
+        if let Err(e) = write_managed_mcp_json(state) {
+            warn!(error = %e, "reconciler: failed to write managed-mcp.json after snapshot MCP diff");
+        }
+    }
+
+    events
+}
+
 /// Load all locally installed skills as a map: skill_id → (version, deactivated).
 fn load_local_skill_state(conn: &rusqlite::Connection) -> HashMap<String, (String, bool)> {
     let mut stmt =
@@ -1667,6 +1890,14 @@ async fn report_installation_status(
 #[cfg(test)]
 pub(crate) fn write_managed_mcp_json_for_test(state: &AppState) -> anyhow::Result<()> {
     write_managed_mcp_json(state)
+}
+
+#[cfg(test)]
+pub(crate) fn build_derived_mcp_events_blocking_for_test(
+    records: Vec<crate::sync::sse_client::McpInstallationRecord>,
+    state: &AppState,
+) -> Vec<SyncEvent> {
+    build_derived_mcp_events_blocking(records, state)
 }
 
 #[cfg(test)]

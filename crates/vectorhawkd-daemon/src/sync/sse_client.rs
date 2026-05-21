@@ -358,6 +358,9 @@ pub enum SyncEvent {
     /// Full desired-state snapshot (sent on first connect and after long gaps).
     Snapshot {
         installations: Vec<InstallationRecord>,
+        /// MCP installation desired-state from the snapshot payload.
+        /// Empty when the backend is older and does not emit the key.
+        mcp_installations: Vec<McpInstallationRecord>,
     },
     /// Install (or re-activate) a specific skill version.
     Install {
@@ -393,13 +396,31 @@ pub enum SyncEvent {
     },
 }
 
-/// One entry in a [`SyncEvent::Snapshot`].
+/// One entry in a [`SyncEvent::Snapshot`] skill installations list.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct InstallationRecord {
     pub installation_id: Uuid,
     pub skill_id: String,
     pub version: String,
-    /// `"desired"` | `"deactivated"` | `"removed"`
+    /// `"desired"` | `"installing"` | `"installed"` | `"deactivated"` | `"removed"` | `"error"`
+    pub state: String,
+}
+
+/// One entry in a [`SyncEvent::Snapshot`] MCP installations list.
+///
+/// Mirrors the fields from a live `install_mcp` event payload, plus a
+/// `state` field so the snapshot reconciler knows the desired disposition.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct McpInstallationRecord {
+    pub installation_id: Uuid,
+    pub mcp_server_id: Uuid,
+    pub mcp_server_name: String,
+    pub package_source: String,
+    pub version_pin: Option<String>,
+    pub server_config: Option<serde_json::Value>,
+    pub auth_type: String,
+    pub gateway_server_id: Option<String>,
+    /// `"desired"` | `"installing"` | `"installed"` | `"deactivated"` | `"removed"`
     pub state: String,
 }
 
@@ -408,6 +429,11 @@ pub struct InstallationRecord {
 #[derive(Debug, serde::Deserialize)]
 struct WireSnapshot {
     installations: Vec<InstallationRecord>,
+    /// MCP installation desired-state list.  `#[serde(default)]` so snapshots
+    /// from older backends (which do not emit the key) parse successfully with
+    /// an empty vec rather than failing deserialization.
+    #[serde(default)]
+    mcp_installations: Vec<McpInstallationRecord>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -461,6 +487,7 @@ fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
                 .with_context(|| format!("failed to parse snapshot event: {data}"))?;
             Ok(SyncEvent::Snapshot {
                 installations: wire.installations,
+                mcp_installations: wire.mcp_installations,
             })
         }
         "install" => {
@@ -517,11 +544,14 @@ fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
             let wire: WireState = serde_json::from_str(data).unwrap_or(WireState { kind: None });
             let kind = wire.kind.as_deref().unwrap_or("unknown");
             debug!("SSE: received state event (kind={kind}) — no-op");
-            // Return a no-op Snapshot with empty installations so the reconciler
-            // ignores this without special-casing it. The reconciler drops empty
-            // snapshot diffs with zero derived events.
+            // Return a no-op Snapshot with empty lists so the reconciler ignores
+            // this without special-casing it. The reconciler drops empty snapshot
+            // diffs with zero derived events and does not wipe existing MCP state
+            // because an empty `mcp_installations` vec is treated as "old backend
+            // with no MCP key" rather than "zero desired servers".
             Ok(SyncEvent::Snapshot {
                 installations: vec![],
+                mcp_installations: vec![],
             })
         }
         other => {

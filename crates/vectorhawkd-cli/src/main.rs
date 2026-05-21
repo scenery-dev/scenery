@@ -3582,8 +3582,13 @@ async fn cmd_auth_pair(code: &str, registry_url: &str) -> Result<()> {
     let pair: PairResponse =
         serde_json::from_str(&body_text).context("unexpected response format from registry")?;
 
-    save_tokens(&state, registry_url, &pair.access_token, &pair.refresh_token)
-        .context("failed to save auth token")?;
+    save_tokens(
+        &state,
+        registry_url,
+        &pair.access_token,
+        &pair.refresh_token,
+    )
+    .context("failed to save auth token")?;
 
     // Persist device_uuid and device_id so the daemon picks them up on next start.
     state

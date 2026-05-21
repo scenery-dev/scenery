@@ -285,6 +285,230 @@ async fn patch_callback_receives_installing_then_installed_in_order() {
     cleanup(&root);
 }
 
+// ── Snapshot MCP reconciliation tests ────────────────────────────────────────
+
+/// Helper to build a McpInstallationRecord for snapshot tests.
+fn make_mcp_snapshot_record(
+    mcp_server_id: Uuid,
+    iid: Uuid,
+    name: &str,
+    state: &str,
+) -> crate::sync::sse_client::McpInstallationRecord {
+    crate::sync::sse_client::McpInstallationRecord {
+        installation_id: iid,
+        mcp_server_id,
+        mcp_server_name: name.to_string(),
+        package_source: format!("@org/{}", name.to_lowercase().replace(' ', "-")),
+        version_pin: None,
+        server_config: None,
+        auth_type: "none".to_string(),
+        gateway_server_id: None,
+        state: state.to_string(),
+    }
+}
+
+/// Helper to seed an MCP row into the local mcp_installations table.
+fn seed_mcp_row(state: &AppState, mcp_server_id: Uuid, name: &str) {
+    let row = vectorhawkd_core::state::McpInstallRow {
+        mcp_server_id: mcp_server_id.to_string(),
+        installation_id: install_id().to_string(),
+        mcp_server_name: name.to_string(),
+        package_source: format!("@org/{}", name.to_lowercase().replace(' ', "-")),
+        version_pin: None,
+        server_config: None,
+        auth_type: "none".to_string(),
+        gateway_server_id: None,
+    };
+    state.upsert_mcp_install(&row).unwrap();
+}
+
+#[test]
+fn snapshot_mcp_two_desired_rows_produce_two_install_events_and_write_json() {
+    // Scenario: fresh device reconnects after downtime. Backend snapshot carries
+    // two desired MCP servers; neither is in local SQLite.  Expect two InstallMcp
+    // events and a managed-mcp.json written by handle_install_mcp (not by the diff
+    // itself — the diff only writes json when it deletes orphans or deactivations).
+    //
+    // NOTE: The diff function itself does not call write_managed_mcp_json for
+    // the install path — that happens inside handle_install_mcp.  This test
+    // verifies only that two InstallMcp events are emitted.
+    let root = temp_root("snapshot-mcp-two-desired");
+    let state = AppState::bootstrap_in(root.clone()).unwrap();
+
+    let sid1 = server_id();
+    let sid2 = server_id();
+    let iid1 = install_id();
+    let iid2 = install_id();
+
+    let records = vec![
+        make_mcp_snapshot_record(sid1, iid1, "GitHub MCP", "desired"),
+        make_mcp_snapshot_record(sid2, iid2, "Slack MCP", "desired"),
+    ];
+
+    let events = super::build_derived_mcp_events_blocking_for_test(records, &state);
+
+    assert_eq!(events.len(), 2, "two desired rows → two InstallMcp events");
+
+    let install_events: Vec<_> = events
+        .iter()
+        .filter(|e| matches!(e, crate::sync::sse_client::SyncEvent::InstallMcp { .. }))
+        .collect();
+    assert_eq!(install_events.len(), 2, "both events must be InstallMcp");
+
+    // Verify no managed-mcp.json was written by the diff itself
+    // (no orphan removals or deactivations occurred).
+    let json_path = state.root_dir.as_std_path().join("managed-mcp.json");
+    assert!(
+        !json_path.exists(),
+        "diff alone must not write managed-mcp.json for install-only events"
+    );
+
+    cleanup(&root);
+}
+
+#[test]
+fn snapshot_mcp_orphan_removed_from_sqlite_and_managed_json() {
+    // Scenario: daemon was offline; backend deleted server B from the catalog.
+    // Snapshot now only contains server A.  Server B was locally installed.
+    // Expect: server B row deleted from SQLite, managed-mcp.json rewritten with
+    // only server A.
+    let root = temp_root("snapshot-mcp-orphan");
+    let state = AppState::bootstrap_in(root.clone()).unwrap();
+
+    let sid_a = server_id();
+    let sid_b = server_id();
+    let iid_a = install_id();
+
+    // Seed both servers locally.
+    seed_mcp_row(&state, sid_a, "GitHub MCP");
+    seed_mcp_row(&state, sid_b, "Slack MCP");
+    // Write initial managed-mcp.json with both servers.
+    super::write_managed_mcp_json_for_test(&state).unwrap();
+    assert_eq!(
+        read_managed_mcp_json(&state)["servers"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+
+    // Snapshot only contains server A (server B was deleted on the backend).
+    let records = vec![make_mcp_snapshot_record(
+        sid_a,
+        iid_a,
+        "GitHub MCP",
+        "installed",
+    )];
+
+    let events = super::build_derived_mcp_events_blocking_for_test(records, &state);
+
+    // No new install events — server A is already present.
+    assert!(events.is_empty(), "server A already installed → no events");
+
+    // Server B must be gone from SQLite.
+    let remaining = state.list_mcp_installs().unwrap();
+    assert_eq!(remaining.len(), 1, "orphan server B must be removed");
+    assert_eq!(remaining[0].mcp_server_id, sid_a.to_string());
+
+    // managed-mcp.json must be rewritten with only server A.
+    let json = read_managed_mcp_json(&state);
+    let servers = json["servers"].as_array().unwrap();
+    assert_eq!(
+        servers.len(),
+        1,
+        "managed-mcp.json must reflect only server A"
+    );
+    assert_eq!(servers[0]["name"], "GitHub MCP");
+
+    cleanup(&root);
+}
+
+#[test]
+fn snapshot_mcp_deactivated_state_removes_local_row_and_rewrites_json() {
+    // Scenario: server was installed; portal admin deactivates it. Daemon
+    // reconnects and receives a snapshot with state=deactivated for that server.
+    // Expect: row deleted from SQLite, managed-mcp.json is empty, DeactivateMcp
+    // event emitted so the backend PATCH callback fires.
+    let root = temp_root("snapshot-mcp-deactivated");
+    let state = AppState::bootstrap_in(root.clone()).unwrap();
+
+    let sid = server_id();
+    let iid = install_id();
+
+    seed_mcp_row(&state, sid, "GitHub MCP");
+    super::write_managed_mcp_json_for_test(&state).unwrap();
+    assert_eq!(
+        read_managed_mcp_json(&state)["servers"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let records = vec![make_mcp_snapshot_record(
+        sid,
+        iid,
+        "GitHub MCP",
+        "deactivated",
+    )];
+
+    let events = super::build_derived_mcp_events_blocking_for_test(records, &state);
+
+    // One DeactivateMcp event so the reconciler can PATCH the backend.
+    assert_eq!(events.len(), 1);
+    match &events[0] {
+        crate::sync::sse_client::SyncEvent::DeactivateMcp { mcp_server_id, .. } => {
+            assert_eq!(*mcp_server_id, sid);
+        }
+        other => panic!("expected DeactivateMcp, got {other:?}"),
+    }
+
+    // Row removed from SQLite.
+    assert!(state.list_mcp_installs().unwrap().is_empty());
+
+    // managed-mcp.json rewritten with zero servers.
+    let json = read_managed_mcp_json(&state);
+    assert_eq!(
+        json["servers"].as_array().unwrap().len(),
+        0,
+        "managed-mcp.json must be empty after deactivation"
+    );
+
+    cleanup(&root);
+}
+
+#[test]
+fn snapshot_mcp_empty_array_is_noop_for_existing_installs() {
+    // Backwards-compat scenario: old backend does not emit `mcp_installations`
+    // key. The SSE parser defaults it to an empty vec.  The reconciler must
+    // treat an empty slice as "old backend, no data" — NOT as "desired state is
+    // zero servers".  Existing local installs must be left untouched.
+    let root = temp_root("snapshot-mcp-empty-compat");
+    let state = AppState::bootstrap_in(root.clone()).unwrap();
+
+    let sid = server_id();
+    seed_mcp_row(&state, sid, "GitHub MCP");
+    super::write_managed_mcp_json_for_test(&state).unwrap();
+
+    // Caller guards against empty vec (as done in dispatch_event).
+    // To test the function directly we call it with an empty vec and confirm
+    // it is a no-op (no events, no SQLite changes, no JSON rewrite).
+    let events = super::build_derived_mcp_events_blocking_for_test(vec![], &state);
+
+    assert!(events.is_empty(), "empty snapshot → no events");
+
+    // Existing row must still be present.
+    let remaining = state.list_mcp_installs().unwrap();
+    assert_eq!(
+        remaining.len(),
+        1,
+        "empty snapshot must not wipe existing installs"
+    );
+    assert_eq!(remaining[0].mcp_server_id, sid.to_string());
+
+    cleanup(&root);
+}
+
 // ── Per-server mutex (reuses SkillLockMap) ────────────────────────────────────
 
 #[tokio::test]

@@ -8,11 +8,18 @@ fn parses_snapshot_event() {
     let data = r#"{"installations":[{"installation_id":"550e8400-e29b-41d4-a716-446655440000","skill_id":"my-skill","version":"1.0.0","state":"desired"}]}"#;
     let event = parse_sync_event("snapshot", data).unwrap();
     match event {
-        super::SyncEvent::Snapshot { installations } => {
+        super::SyncEvent::Snapshot {
+            installations,
+            mcp_installations,
+        } => {
             assert_eq!(installations.len(), 1);
             assert_eq!(installations[0].skill_id, "my-skill");
             assert_eq!(installations[0].version, "1.0.0");
             assert_eq!(installations[0].state, "desired");
+            assert!(
+                mcp_installations.is_empty(),
+                "old-format snapshot has no mcp_installations key → default empty vec"
+            );
         }
         other => panic!("expected Snapshot, got {other:?}"),
     }
@@ -86,7 +93,10 @@ fn snapshot_with_multiple_records() {
     }"#;
     let event = parse_sync_event("snapshot", data).unwrap();
     match event {
-        super::SyncEvent::Snapshot { installations } => {
+        super::SyncEvent::Snapshot {
+            installations,
+            mcp_installations: _,
+        } => {
             assert_eq!(installations.len(), 2);
             assert_eq!(installations[0].skill_id, "skill-a");
             assert_eq!(installations[1].state, "deactivated");
