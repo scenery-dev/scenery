@@ -33,15 +33,20 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::sync::sse_client::{InstallationRecord, SyncEvent};
-use vectorhawkd_core::{auth::load_all_tokens, registry::RegistryClient, state::AppState};
+use vectorhawkd_core::{
+    auth::load_all_tokens,
+    registry::RegistryClient,
+    state::{AppState, McpInstallRow},
+};
 
-/// One async mutex per skill_id, used to serialize install/deactivate/purge
-/// for the same skill while still letting different skills run in parallel.
-/// The outer `std::sync::Mutex` is only held during the get-or-insert lookup;
-/// the per-skill `tokio::sync::Mutex` is what guards the actual work.
-type SkillLockMap = Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>;
+/// One async mutex per skill_id (or mcp_server_id), used to serialize
+/// operations on the same resource while letting different resources run in
+/// parallel. The outer `std::sync::Mutex` is only held during the
+/// get-or-insert lookup; the per-resource `tokio::sync::Mutex` guards the
+/// actual work.
+pub(crate) type SkillLockMap = Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>;
 
-fn skill_lock(locks: &SkillLockMap, skill_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+pub(crate) fn skill_lock(locks: &SkillLockMap, skill_id: &str) -> Arc<tokio::sync::Mutex<()>> {
     let mut map = locks.lock().expect("skill_locks mutex poisoned");
     map.entry(skill_id.to_string())
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
@@ -67,6 +72,9 @@ pub struct ReconcilerStats {
     pub installed: u32,
     pub pending: u32,
     pub errors: u32,
+    pub mcp_installs_handled: u32,
+    pub mcp_deactivates_handled: u32,
+    pub mcp_errors: u32,
 }
 
 /// Handle returned by [`spawn`], consumed by `doctor` output.
@@ -228,7 +236,11 @@ async fn dispatch_event(
     install_tasks: &mut tokio::task::JoinSet<bool>,
 ) {
     match event {
-        SyncEvent::Install { installation_id, skill_id, version } => {
+        SyncEvent::Install {
+            installation_id,
+            skill_id,
+            version,
+        } => {
             spawn_install(
                 installation_id,
                 skill_id,
@@ -241,7 +253,10 @@ async fn dispatch_event(
                 install_tasks,
             );
         }
-        SyncEvent::Deactivate { installation_id, skill_id } => {
+        SyncEvent::Deactivate {
+            installation_id,
+            skill_id,
+        } => {
             spawn_deactivate(
                 installation_id,
                 skill_id,
@@ -251,7 +266,10 @@ async fn dispatch_event(
                 install_tasks,
             );
         }
-        SyncEvent::Purge { installation_id, skill_id } => {
+        SyncEvent::Purge {
+            installation_id,
+            skill_id,
+        } => {
             spawn_purge(
                 installation_id,
                 skill_id,
@@ -261,11 +279,55 @@ async fn dispatch_event(
                 install_tasks,
             );
         }
+        SyncEvent::InstallMcp {
+            installation_id,
+            mcp_server_id,
+            mcp_server_name,
+            package_source,
+            version_pin,
+            server_config,
+            auth_type,
+            gateway_server_id,
+        } => {
+            spawn_install_mcp(
+                installation_id,
+                mcp_server_id,
+                mcp_server_name,
+                package_source,
+                version_pin,
+                server_config,
+                auth_type,
+                gateway_server_id,
+                state,
+                registry_url,
+                skill_locks,
+                stats,
+                install_tasks,
+            );
+        }
+        SyncEvent::DeactivateMcp {
+            installation_id,
+            mcp_server_id,
+        } => {
+            spawn_deactivate_mcp(
+                installation_id,
+                mcp_server_id,
+                state,
+                registry_url,
+                skill_locks,
+                stats,
+                install_tasks,
+            );
+        }
         SyncEvent::Snapshot { installations } => {
             let derived = build_derived_events(installations, Arc::clone(state)).await;
             for d in derived {
                 match d {
-                    SyncEvent::Install { installation_id, skill_id, version } => {
+                    SyncEvent::Install {
+                        installation_id,
+                        skill_id,
+                        version,
+                    } => {
                         spawn_install(
                             installation_id,
                             skill_id,
@@ -278,7 +340,10 @@ async fn dispatch_event(
                             install_tasks,
                         );
                     }
-                    SyncEvent::Deactivate { installation_id, skill_id } => {
+                    SyncEvent::Deactivate {
+                        installation_id,
+                        skill_id,
+                    } => {
                         spawn_deactivate(
                             installation_id,
                             skill_id,
@@ -288,7 +353,10 @@ async fn dispatch_event(
                             install_tasks,
                         );
                     }
-                    SyncEvent::Purge { installation_id, skill_id } => {
+                    SyncEvent::Purge {
+                        installation_id,
+                        skill_id,
+                    } => {
                         spawn_purge(
                             installation_id,
                             skill_id,
@@ -301,6 +369,11 @@ async fn dispatch_event(
                     SyncEvent::Snapshot { .. } => {
                         // Nested snapshots not expected; ignore.
                     }
+                    // TODO(G3-snapshot): MCP installations are not yet reconciled
+                    // from the snapshot payload. The snapshot shape would need a
+                    // top-level `mcp_installations` key from the backend. Add
+                    // that reconciliation path when the backend ships it.
+                    SyncEvent::InstallMcp { .. } | SyncEvent::DeactivateMcp { .. } => {}
                 }
             }
         }
@@ -381,6 +454,355 @@ fn spawn_purge(
     });
 }
 
+// ── MCP install/deactivate spawners ──────────────────────────────────────────
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_install_mcp(
+    installation_id: Uuid,
+    mcp_server_id: Uuid,
+    mcp_server_name: String,
+    package_source: String,
+    version_pin: Option<String>,
+    server_config: Option<serde_json::Value>,
+    auth_type: String,
+    gateway_server_id: Option<String>,
+    state: &Arc<AppState>,
+    registry_url: &str,
+    skill_locks: &SkillLockMap,
+    stats: &Arc<Mutex<ReconcilerStats>>,
+    install_tasks: &mut tokio::task::JoinSet<bool>,
+) {
+    let st = Arc::clone(state);
+    let reg_url = registry_url.to_string();
+    let stats_clone = Arc::clone(stats);
+    // Key the per-resource lock by mcp_server_id to prevent races on the same
+    // server (e.g. rapid install → deactivate → install).
+    let lock = skill_lock(skill_locks, &mcp_server_id.to_string());
+
+    install_tasks.spawn(async move {
+        let _guard = lock.lock_owned().await;
+        handle_install_mcp(
+            installation_id,
+            mcp_server_id,
+            mcp_server_name,
+            package_source,
+            version_pin,
+            server_config,
+            auth_type,
+            gateway_server_id,
+            &st,
+            &reg_url,
+            &stats_clone,
+        )
+        .await
+    });
+}
+
+fn spawn_deactivate_mcp(
+    installation_id: Uuid,
+    mcp_server_id: Uuid,
+    state: &Arc<AppState>,
+    registry_url: &str,
+    skill_locks: &SkillLockMap,
+    stats: &Arc<Mutex<ReconcilerStats>>,
+    install_tasks: &mut tokio::task::JoinSet<bool>,
+) {
+    let st = Arc::clone(state);
+    let reg_url = registry_url.to_string();
+    let stats_clone = Arc::clone(stats);
+    let lock = skill_lock(skill_locks, &mcp_server_id.to_string());
+
+    install_tasks.spawn(async move {
+        let _guard = lock.lock_owned().await;
+        handle_deactivate_mcp(installation_id, mcp_server_id, &st, &reg_url, &stats_clone).await
+    });
+}
+
+// ── MCP install handler ───────────────────────────────────────────────────────
+
+/// Handle one `InstallMcp` event.  Returns `true` if the tool list changed.
+#[allow(clippy::too_many_arguments)]
+async fn handle_install_mcp(
+    installation_id: Uuid,
+    mcp_server_id: Uuid,
+    mcp_server_name: String,
+    package_source: String,
+    version_pin: Option<String>,
+    server_config: Option<serde_json::Value>,
+    auth_type: String,
+    gateway_server_id: Option<String>,
+    state: &Arc<AppState>,
+    registry_url: &str,
+    stats: &Arc<Mutex<ReconcilerStats>>,
+) -> bool {
+    report_mcp_installation_status(installation_id, "installing", None, registry_url, state).await;
+
+    let server_config_str = server_config
+        .as_ref()
+        .and_then(|v| serde_json::to_string(v).ok());
+
+    let row = McpInstallRow {
+        mcp_server_id: mcp_server_id.to_string(),
+        installation_id: installation_id.to_string(),
+        mcp_server_name: mcp_server_name.clone(),
+        package_source: package_source.clone(),
+        version_pin: version_pin.clone(),
+        server_config: server_config_str,
+        auth_type: auth_type.clone(),
+        gateway_server_id: gateway_server_id.clone(),
+    };
+
+    let state_clone = Arc::clone(state);
+    let result = tokio::task::spawn_blocking(move || {
+        state_clone
+            .upsert_mcp_install(&row)
+            .context("failed to upsert mcp_installations row")?;
+        write_managed_mcp_json(&state_clone)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(())) => {
+            info!(
+                mcp_server_id = %mcp_server_id,
+                mcp_server_name,
+                "reconciler: MCP server installed"
+            );
+            report_mcp_installation_status(installation_id, "installed", None, registry_url, state)
+                .await;
+            increment_mcp_installs(stats);
+            // NOTE: No existing broadcast path for tools/list_changed for MCP
+            // servers specifically — the notification channel is keyed on skill
+            // changes via the JoinSet return value. Returning `true` here will
+            // fire a tools/list_changed notification to all connected shims,
+            // which is the correct behavior since managed-mcp.json changed.
+            true
+        }
+        Ok(Err(e)) => {
+            warn!(
+                mcp_server_id = %mcp_server_id,
+                error = %e,
+                "reconciler: MCP server install failed"
+            );
+            report_mcp_installation_status(
+                installation_id,
+                "error",
+                Some(&e.to_string()),
+                registry_url,
+                state,
+            )
+            .await;
+            increment_mcp_errors(stats);
+            false
+        }
+        Err(e) => {
+            warn!(
+                mcp_server_id = %mcp_server_id,
+                error = %e,
+                "reconciler: MCP server install task panicked"
+            );
+            increment_mcp_errors(stats);
+            false
+        }
+    }
+}
+
+// ── MCP deactivate handler ────────────────────────────────────────────────────
+
+/// Handle one `DeactivateMcp` event.  Returns `true` if the tool list changed.
+async fn handle_deactivate_mcp(
+    installation_id: Uuid,
+    mcp_server_id: Uuid,
+    state: &Arc<AppState>,
+    registry_url: &str,
+    stats: &Arc<Mutex<ReconcilerStats>>,
+) -> bool {
+    let state_clone = Arc::clone(state);
+    let server_id_str = mcp_server_id.to_string();
+
+    let result = tokio::task::spawn_blocking(move || {
+        state_clone
+            .delete_mcp_install(&server_id_str)
+            .context("failed to delete mcp_installations row")?;
+        write_managed_mcp_json(&state_clone)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(())) => {
+            info!(mcp_server_id = %mcp_server_id, "reconciler: MCP server deactivated");
+            report_mcp_installation_status(
+                installation_id,
+                "deactivated",
+                None,
+                registry_url,
+                state,
+            )
+            .await;
+            increment_mcp_deactivates(stats);
+            true
+        }
+        Ok(Err(e)) => {
+            warn!(
+                mcp_server_id = %mcp_server_id,
+                error = %e,
+                "reconciler: MCP server deactivate failed"
+            );
+            increment_mcp_errors(stats);
+            false
+        }
+        Err(e) => {
+            warn!(
+                mcp_server_id = %mcp_server_id,
+                error = %e,
+                "reconciler: MCP server deactivate task panicked"
+            );
+            increment_mcp_errors(stats);
+            false
+        }
+    }
+}
+
+// ── managed-mcp.json writer ───────────────────────────────────────────────────
+
+/// Regenerate `managed-mcp.json` from the `mcp_installations` SQLite table.
+///
+/// Uses the atomic write pattern: write to a `.tmp` file then rename so
+/// readers (the MCP server) never see a partial write.
+///
+/// Path: `{state.root_dir}/managed-mcp.json`
+fn write_managed_mcp_json(state: &AppState) -> Result<()> {
+    let rows = state
+        .list_mcp_installs()
+        .context("failed to read mcp_installations for managed-mcp.json")?;
+
+    let mut servers = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let server_config: Option<serde_json::Value> = row
+            .server_config
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .context("failed to deserialise server_config JSON from mcp_installations")?;
+
+        servers.push(serde_json::json!({
+            "name": row.mcp_server_name,
+            "package_source": row.package_source,
+            "version_pin": row.version_pin,
+            "server_config": server_config,
+            "auth_type": row.auth_type,
+            "gateway_server_id": row.gateway_server_id,
+        }));
+    }
+
+    let payload = serde_json::json!({ "servers": servers });
+    let json_bytes =
+        serde_json::to_vec_pretty(&payload).context("failed to serialise managed-mcp.json")?;
+
+    let dest = state.root_dir.as_std_path().join("managed-mcp.json");
+    let tmp = state.root_dir.as_std_path().join("managed-mcp.json.tmp");
+
+    std::fs::write(&tmp, &json_bytes)
+        .with_context(|| format!("failed to write managed-mcp.json.tmp to {}", tmp.display()))?;
+
+    std::fs::rename(&tmp, &dest).with_context(|| {
+        format!(
+            "failed to rename managed-mcp.json.tmp → managed-mcp.json at {}",
+            dest.display()
+        )
+    })?;
+
+    tracing::debug!(
+        path = %dest.display(),
+        server_count = rows.len(),
+        "reconciler: managed-mcp.json written"
+    );
+    Ok(())
+}
+
+// ── MCP PATCH callback ────────────────────────────────────────────────────────
+
+/// Send `PATCH /api/mcp-installations/{id}` to report a state transition.
+///
+/// Mirrors `report_installation_status` for skills. Fire-and-forget: failures
+/// are logged at WARN but do not affect local state.
+async fn report_mcp_installation_status(
+    installation_id: Uuid,
+    status: &str,
+    error_message: Option<&str>,
+    registry_url: &str,
+    state: &Arc<AppState>,
+) {
+    let url = format!(
+        "{}/api/mcp-installations/{}",
+        registry_url.trim_end_matches('/'),
+        installation_id
+    );
+
+    let mut body = serde_json::json!({ "state": status });
+    if let Some(msg) = error_message {
+        body["error_message"] = serde_json::Value::String(msg.to_string());
+    }
+
+    let reg_url = registry_url.to_string();
+    let state_clone = Arc::clone(state);
+    let access_token = tokio::task::spawn_blocking(move || {
+        load_all_tokens(&state_clone)
+            .ok()
+            .and_then(|rows| {
+                rows.into_iter()
+                    .find(|r| r.registry_url == reg_url)
+                    .map(|r| r.access_token)
+            })
+            .unwrap_or_default()
+    })
+    .await
+    .unwrap_or_default();
+
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "reconciler: failed to build HTTP client for MCP status report");
+            return;
+        }
+    };
+
+    let req = if access_token.is_empty() {
+        client.patch(&url).json(&body)
+    } else {
+        client.patch(&url).bearer_auth(access_token).json(&body)
+    };
+
+    match req.send().await {
+        Ok(resp) if resp.status().is_success() => {
+            tracing::debug!(
+                installation_id = %installation_id,
+                status,
+                "reconciler: MCP status reported"
+            );
+        }
+        Ok(resp) => {
+            warn!(
+                installation_id = %installation_id,
+                status,
+                http_status = %resp.status(),
+                "reconciler: MCP status report returned non-success"
+            );
+        }
+        Err(e) => {
+            warn!(
+                installation_id = %installation_id,
+                status,
+                error = %e,
+                "reconciler: MCP status report failed"
+            );
+        }
+    }
+}
+
 /// Schedule a `tools/list_changed` notification within the coalesce window.
 fn fire_notification(
     _tx: &broadcast::Sender<()>,
@@ -413,6 +835,24 @@ fn decrement_pending_inc_errors(stats: &Arc<Mutex<ReconcilerStats>>) {
     if let Ok(mut g) = stats.lock() {
         g.pending = g.pending.saturating_sub(1);
         g.errors = g.errors.saturating_add(1);
+    }
+}
+
+fn increment_mcp_installs(stats: &Arc<Mutex<ReconcilerStats>>) {
+    if let Ok(mut g) = stats.lock() {
+        g.mcp_installs_handled = g.mcp_installs_handled.saturating_add(1);
+    }
+}
+
+fn increment_mcp_deactivates(stats: &Arc<Mutex<ReconcilerStats>>) {
+    if let Ok(mut g) = stats.lock() {
+        g.mcp_deactivates_handled = g.mcp_deactivates_handled.saturating_add(1);
+    }
+}
+
+fn increment_mcp_errors(stats: &Arc<Mutex<ReconcilerStats>>) {
+    if let Ok(mut g) = stats.lock() {
+        g.mcp_errors = g.mcp_errors.saturating_add(1);
     }
 }
 
@@ -1219,8 +1659,34 @@ async fn report_installation_status(
     }
 }
 
+// ── Test-only re-exports ──────────────────────────────────────────────────────
+//
+// These thin wrappers expose private functions to the sibling test modules
+// without making them part of the public library API.
+
+#[cfg(test)]
+pub(crate) fn write_managed_mcp_json_for_test(state: &AppState) -> anyhow::Result<()> {
+    write_managed_mcp_json(state)
+}
+
+#[cfg(test)]
+pub(crate) async fn report_mcp_installation_status_for_test(
+    installation_id: Uuid,
+    status: &str,
+    error_message: Option<&str>,
+    registry_url: &str,
+    state: &Arc<AppState>,
+) {
+    report_mcp_installation_status(installation_id, status, error_message, registry_url, state)
+        .await;
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 #[path = "reconciler_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "mcp_reconciler_tests.rs"]
+mod mcp_tests;

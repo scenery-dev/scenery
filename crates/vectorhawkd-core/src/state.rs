@@ -83,6 +83,10 @@ impl AppState {
         conn.execute_batch(SCHEMA_RUN2_SQL)
             .context("failed to apply RUN2 schema additions")?;
 
+        // G3: MCP installation desired-state table.
+        conn.execute_batch(SCHEMA_G3_SQL)
+            .context("failed to apply G3 schema additions")?;
+
         Ok(Self { root_dir, db_path })
     }
 
@@ -169,6 +173,105 @@ impl AppState {
         )
         .context("failed to write sync_state")?;
         Ok(())
+    }
+}
+
+// ── MCP installation state (G3) ──────────────────────────────────────────────
+
+/// One row in the `mcp_installations` table.
+#[derive(Debug, Clone)]
+pub struct McpInstallRow {
+    pub mcp_server_id: String,
+    pub installation_id: String,
+    pub mcp_server_name: String,
+    pub package_source: String,
+    pub version_pin: Option<String>,
+    /// Raw JSON string from the `server_config` column.
+    pub server_config: Option<String>,
+    pub auth_type: String,
+    pub gateway_server_id: Option<String>,
+}
+
+impl AppState {
+    /// Upsert one MCP installation row.
+    ///
+    /// On conflict (same `mcp_server_id`) the row is fully replaced so that a
+    /// re-install with a new `installation_id` or updated config is idempotent.
+    pub fn upsert_mcp_install(&self, row: &McpInstallRow) -> Result<()> {
+        let conn = Connection::open(&self.db_path)
+            .context("failed to open state DB for mcp_installations upsert")?;
+        conn.execute(
+            "INSERT INTO mcp_installations \
+             (mcp_server_id, installation_id, mcp_server_name, package_source, \
+              version_pin, server_config, auth_type, gateway_server_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+             ON CONFLICT(mcp_server_id) DO UPDATE SET \
+               installation_id  = excluded.installation_id, \
+               mcp_server_name  = excluded.mcp_server_name, \
+               package_source   = excluded.package_source, \
+               version_pin      = excluded.version_pin, \
+               server_config    = excluded.server_config, \
+               auth_type        = excluded.auth_type, \
+               gateway_server_id = excluded.gateway_server_id",
+            rusqlite::params![
+                row.mcp_server_id,
+                row.installation_id,
+                row.mcp_server_name,
+                row.package_source,
+                row.version_pin,
+                row.server_config,
+                row.auth_type,
+                row.gateway_server_id,
+            ],
+        )
+        .context("failed to upsert mcp_installations row")?;
+        Ok(())
+    }
+
+    /// Delete one MCP installation row by `mcp_server_id`.
+    ///
+    /// No-ops if the row does not exist.
+    pub fn delete_mcp_install(&self, mcp_server_id: &str) -> Result<()> {
+        let conn = Connection::open(&self.db_path)
+            .context("failed to open state DB for mcp_installations delete")?;
+        conn.execute(
+            "DELETE FROM mcp_installations WHERE mcp_server_id = ?1",
+            rusqlite::params![mcp_server_id],
+        )
+        .context("failed to delete mcp_installations row")?;
+        Ok(())
+    }
+
+    /// Return all rows in `mcp_installations`.
+    pub fn list_mcp_installs(&self) -> Result<Vec<McpInstallRow>> {
+        let conn = Connection::open(&self.db_path)
+            .context("failed to open state DB for mcp_installations list")?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT mcp_server_id, installation_id, mcp_server_name, package_source, \
+                 version_pin, server_config, auth_type, gateway_server_id \
+                 FROM mcp_installations",
+            )
+            .context("failed to prepare mcp_installations list query")?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(McpInstallRow {
+                    mcp_server_id: row.get(0)?,
+                    installation_id: row.get(1)?,
+                    mcp_server_name: row.get(2)?,
+                    package_source: row.get(3)?,
+                    version_pin: row.get(4)?,
+                    server_config: row.get(5)?,
+                    auth_type: row.get(6)?,
+                    gateway_server_id: row.get(7)?,
+                })
+            })
+            .context("failed to query mcp_installations")?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to collect mcp_installations rows")?;
+
+        Ok(rows)
     }
 }
 
@@ -285,6 +388,24 @@ CREATE TABLE IF NOT EXISTS sync_state (
 );
 "#;
 
+/// G3: MCP server desired-state table.
+///
+/// Rows are upserted on `install_mcp` events and deleted on `deactivate_mcp`.
+/// The daemon regenerates `managed-mcp.json` from this table on every change.
+const SCHEMA_G3_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS mcp_installations (
+    mcp_server_id    TEXT PRIMARY KEY,
+    installation_id  TEXT NOT NULL,
+    mcp_server_name  TEXT NOT NULL,
+    package_source   TEXT NOT NULL,
+    version_pin      TEXT,
+    server_config    TEXT,
+    auth_type        TEXT NOT NULL,
+    gateway_server_id TEXT,
+    installed_at     TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+"#;
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -325,12 +446,12 @@ mod tests {
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN \
                  ('installed_skills','skill_versions','policy_cache','auth_tokens',\
                   'execution_history','audit_events','skill_ratings','skill_execution_counts',\
-                  'sync_state')",
+                  'sync_state','mcp_installations')",
                 [],
                 |row| row.get(0),
             )
             .expect("should query sqlite_master");
-        assert_eq!(table_count, 9, "all nine tables should exist");
+        assert_eq!(table_count, 10, "all ten tables should exist");
 
         cleanup(&state.root_dir);
     }

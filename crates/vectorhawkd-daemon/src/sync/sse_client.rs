@@ -375,6 +375,22 @@ pub enum SyncEvent {
         installation_id: Uuid,
         skill_id: String,
     },
+    /// Install (or re-configure) a managed MCP server.
+    InstallMcp {
+        installation_id: Uuid,
+        mcp_server_id: Uuid,
+        mcp_server_name: String,
+        package_source: String,
+        version_pin: Option<String>,
+        server_config: Option<serde_json::Value>,
+        auth_type: String,
+        gateway_server_id: Option<String>,
+    },
+    /// Deactivate (remove) a managed MCP server.
+    DeactivateMcp {
+        installation_id: Uuid,
+        mcp_server_id: Uuid,
+    },
 }
 
 /// One entry in a [`SyncEvent::Snapshot`].
@@ -413,6 +429,31 @@ struct WirePurge {
     skill_id: String,
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct WireInstallMcp {
+    pub installation_id: Uuid,
+    pub mcp_server_id: Uuid,
+    pub mcp_server_name: String,
+    pub package_source: String,
+    pub version_pin: Option<String>,
+    pub server_config: Option<serde_json::Value>,
+    pub auth_type: String,
+    pub gateway_server_id: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct WireDeactivateMcp {
+    pub installation_id: Uuid,
+    pub mcp_server_id: Uuid,
+}
+
+/// Wire payload for the `state` event. The daemon ignores `state` events with
+/// `kind == "mcp"` that it doesn't recognize — same pattern as skill state events.
+#[derive(Debug, serde::Deserialize)]
+struct WireState {
+    kind: Option<String>,
+}
+
 fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
     match event_type {
         "snapshot" => {
@@ -445,6 +486,42 @@ fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
             Ok(SyncEvent::Purge {
                 installation_id: wire.installation_id,
                 skill_id: wire.skill_id,
+            })
+        }
+        "install_mcp" => {
+            let wire: WireInstallMcp = serde_json::from_str(data)
+                .with_context(|| format!("failed to parse install_mcp event: {data}"))?;
+            Ok(SyncEvent::InstallMcp {
+                installation_id: wire.installation_id,
+                mcp_server_id: wire.mcp_server_id,
+                mcp_server_name: wire.mcp_server_name,
+                package_source: wire.package_source,
+                version_pin: wire.version_pin,
+                server_config: wire.server_config,
+                auth_type: wire.auth_type,
+                gateway_server_id: wire.gateway_server_id,
+            })
+        }
+        "deactivate_mcp" => {
+            let wire: WireDeactivateMcp = serde_json::from_str(data)
+                .with_context(|| format!("failed to parse deactivate_mcp event: {data}"))?;
+            Ok(SyncEvent::DeactivateMcp {
+                installation_id: wire.installation_id,
+                mcp_server_id: wire.mcp_server_id,
+            })
+        }
+        "state" => {
+            // The backend sends `state` events after PATCH-backs. Parse the `kind`
+            // field and skip — reconciler state transitions are handled via PATCH
+            // callbacks, not inbound state events. Log at DEBUG for observability.
+            let wire: WireState = serde_json::from_str(data).unwrap_or(WireState { kind: None });
+            let kind = wire.kind.as_deref().unwrap_or("unknown");
+            debug!("SSE: received state event (kind={kind}) — no-op");
+            // Return a no-op Snapshot with empty installations so the reconciler
+            // ignores this without special-casing it. The reconciler drops empty
+            // snapshot diffs with zero derived events.
+            Ok(SyncEvent::Snapshot {
+                installations: vec![],
             })
         }
         other => {

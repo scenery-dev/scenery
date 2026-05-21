@@ -41,12 +41,7 @@ fn seed_skill(conn: &Connection, skill_id: &str, version: &str, deactivated: boo
 
 /// Seed a skill plus its on-disk active/ symlink under the state root so
 /// the build_derived_events filesystem check sees it as installed.
-fn seed_skill_with_fs(
-    state: &AppState,
-    skill_id: &str,
-    version: &str,
-    deactivated: bool,
-) {
+fn seed_skill_with_fs(state: &AppState, skill_id: &str, version: &str, deactivated: bool) {
     let conn = Connection::open(&state.db_path).unwrap();
     seed_skill(&conn, skill_id, version, deactivated);
 

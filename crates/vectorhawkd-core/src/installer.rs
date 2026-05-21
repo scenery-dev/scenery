@@ -15,11 +15,7 @@ use vectorhawkd_manifest::SkillPackage;
 /// directory exists there (user-managed skill), we leave it alone so the
 /// runner never clobbers user content. Failures are non-fatal — we log
 /// and continue, since Claude Code may not be installed.
-fn register_in_claude_skills_at(
-    home: &std::path::Path,
-    skill_id: &str,
-    active_dir: &Utf8Path,
-) {
+fn register_in_claude_skills_at(home: &std::path::Path, skill_id: &str, active_dir: &Utf8Path) {
     let skills_dir = home.join(".claude").join("skills");
     if let Err(e) = fs::create_dir_all(&skills_dir) {
         tracing::warn!(error = %e, "could not create ~/.claude/skills/");
