@@ -1128,42 +1128,68 @@ async fn cmd_skill_search(query: &str, registry_url: Option<&str>) -> Result<()>
         .context("skill search failed")?;
 
     if results.is_empty() {
-        println!("No skills found matching \"{query}\".");
+        println!("No skills matched \"{query}\".");
         return Ok(());
     }
 
-    // Compute column widths from actual data.
-    let id_width = results.iter().map(|r| r.skill_id.len()).max().unwrap_or(10);
-    let id_width = id_width.max(10);
-    let ver_width = results
-        .iter()
-        .map(|r| r.latest_version.as_deref().unwrap_or("-").len())
-        .max()
-        .unwrap_or(7);
-    let ver_width = ver_width.max(7);
-    let pub_width = results
-        .iter()
-        .map(|r| r.publisher_name.as_deref().unwrap_or("-").len())
-        .max()
-        .unwrap_or(9);
-    let pub_width = pub_width.max(9);
+    // Column caps — content is truncated to these, headers are not.
+    const ID_CAP: usize = 32;
+    const VER_CAP: usize = 10; // semver fits easily
+    const PUB_CAP: usize = 20;
+    const DESC_CAP: usize = 60;
 
-    println!();
+    // Compute column widths from actual data, bounded by caps and header minimums.
+    let id_w = results
+        .iter()
+        .map(|r| r.skill_id.len().min(ID_CAP))
+        .max()
+        .unwrap_or(8)
+        .max("SKILL_ID".len());
+    let ver_w = results
+        .iter()
+        .map(|r| {
+            r.latest_version
+                .as_deref()
+                .unwrap_or("-")
+                .len()
+                .min(VER_CAP)
+        })
+        .max()
+        .unwrap_or(6)
+        .max("LATEST".len());
+    let pub_w = results
+        .iter()
+        .map(|r| {
+            r.publisher_name
+                .as_deref()
+                .unwrap_or("-")
+                .len()
+                .min(PUB_CAP)
+        })
+        .max()
+        .unwrap_or(9)
+        .max("PUBLISHER".len());
+
+    // Header + separator — style matches `skill update`.
+    println!(
+        "{:<id_w$}  {:<ver_w$}  {:<pub_w$}  DESCRIPTION",
+        "SKILL_ID", "LATEST", "PUBLISHER",
+    );
+    println!("{}", "-".repeat(id_w + ver_w + pub_w + DESC_CAP + 8));
+
     for r in &results {
-        let desc_raw = r.description.as_deref().unwrap_or("");
-        // Truncate description at 60 chars; add ellipsis if needed.
-        let desc = truncate_str(desc_raw, 60);
-        let version = r.latest_version.as_deref().unwrap_or("-");
-        let publisher = r.publisher_name.as_deref().unwrap_or("-");
+        let id = truncate_str(&r.skill_id, ID_CAP);
+        let version = truncate_str(r.latest_version.as_deref().unwrap_or("-"), VER_CAP);
+        let publisher = truncate_str(r.publisher_name.as_deref().unwrap_or("-"), PUB_CAP);
+        let desc = truncate_str(r.description.as_deref().unwrap_or(""), DESC_CAP);
         println!(
-            "  {:<id_width$}  {:<ver_width$}  {:<pub_width$}  {desc}",
-            r.skill_id, version, publisher,
+            "{:<id_w$}  {:<ver_w$}  {:<pub_w$}  {desc}",
+            id, version, publisher
         );
     }
-    println!();
 
     let count = results.len();
-    println!("{count} result(s). Run vectorhawk skill install <id> to install.");
+    println!("\n{count} result(s). Run: vectorhawk skill install <id>");
     Ok(())
 }
 
@@ -1831,6 +1857,13 @@ fn insert_before_closing_fence(content: &str, additions: &str) -> String {
 
 // ── skill validate ────────────────────────────────────────────────────────────
 
+/// A single row in the validation output table.
+struct ValidateRow {
+    check: String,
+    status: String,
+    detail: String,
+}
+
 async fn cmd_skill_validate(path: camino::Utf8PathBuf) -> Result<()> {
     use vectorhawkd_core::validator::{validate_bundle, CheckLevel};
 
@@ -1839,47 +1872,47 @@ async fn cmd_skill_validate(path: camino::Utf8PathBuf) -> Result<()> {
 
     let report = validate_bundle(&path);
 
-    // Detect whether stdout is a terminal for ANSI color support.
-    let use_color = atty::is(atty::Stream::Stdout);
+    // Build table rows from the core validation report.
+    let mut rows: Vec<ValidateRow> = report
+        .checks
+        .iter()
+        .map(|c| ValidateRow {
+            check: c.name.clone(),
+            status: match c.level {
+                CheckLevel::Pass => "PASS".to_string(),
+                CheckLevel::Warn => "WARN".to_string(),
+                CheckLevel::Fail => "FAIL".to_string(),
+            },
+            detail: c.detail.clone().unwrap_or_default(),
+        })
+        .collect();
 
-    println!("Validating {path}/");
-    println!();
-
-    // Column widths: icon (2), name (14), detail (rest).
-    for check in &report.checks {
-        let (icon, color_on, color_off) = match check.level {
-            CheckLevel::Pass => {
-                let on = if use_color { "\x1b[32m" } else { "" };
-                ("✓", on, if use_color { "\x1b[0m" } else { "" })
-            }
-            CheckLevel::Warn => {
-                let on = if use_color { "\x1b[33m" } else { "" };
-                ("⚠", on, if use_color { "\x1b[0m" } else { "" })
-            }
-            CheckLevel::Fail => {
-                let on = if use_color { "\x1b[31m" } else { "" };
-                ("✗", on, if use_color { "\x1b[0m" } else { "" })
-            }
-        };
-        let detail = check.detail.as_deref().unwrap_or("");
-        println!(
-            "  {color_on}{icon}{color_off}  {:<14}  {detail}",
-            check.name
-        );
+    // Append Ollama row when the bundle declares a model requirement.
+    // None means no model requirement — skip the row entirely.
+    if let Some(ref ollama_line) = ollama_status {
+        let is_warn = ollama_line.starts_with("not");
+        rows.push(ValidateRow {
+            check: "ollama_model".to_string(),
+            status: if is_warn { "WARN" } else { "PASS" }.to_string(),
+            detail: ollama_line.clone(),
+        });
     }
 
-    // Append Ollama model availability check.
-    if let Some(ollama_line) = &ollama_status {
-        let (icon, color_on, color_off) = if ollama_line.starts_with("not") {
-            let on = if use_color { "\x1b[33m" } else { "" };
-            ("⚠", on, if use_color { "\x1b[0m" } else { "" })
-        } else {
-            let on = if use_color { "\x1b[32m" } else { "" };
-            ("✓", on, if use_color { "\x1b[0m" } else { "" })
-        };
+    // Compute dynamic column widths (minimum widths match the header labels).
+    let check_w = rows.iter().map(|r| r.check.len()).max().unwrap_or(5).max(5); // "CHECK"
+    let status_w: usize = 6; // "STATUS" / "PASS  " / "WARN  " / "FAIL  "
+
+    // Print header.
+    println!("Validating {path}/");
+    println!();
+    println!("{:<check_w$}  {:<status_w$}  DETAIL", "CHECK", "STATUS",);
+    println!("{}", "-".repeat(check_w + status_w + 4 + 6)); // 4 = two "  " gaps, 6 = "DETAIL"
+
+    // Print rows.
+    for row in &rows {
         println!(
-            "  {color_on}{icon}{color_off}  {:<14}  {ollama_line}",
-            "model"
+            "{:<check_w$}  {:<status_w$}  {}",
+            row.check, row.status, row.detail,
         );
     }
 
@@ -1887,28 +1920,16 @@ async fn cmd_skill_validate(path: camino::Utf8PathBuf) -> Result<()> {
 
     let fail_count = report.fail_count();
     let warn_count = report.warn_count();
+    let pass_count = report.checks.len().saturating_sub(fail_count + warn_count);
 
-    // Build the summary line.
-    let mut summary_parts: Vec<String> = Vec::new();
-    if fail_count > 0 {
-        summary_parts.push(format!("{fail_count} failure(s)"));
-    }
-    if warn_count > 0 {
-        summary_parts.push(format!("{warn_count} warning(s)"));
-    }
-    if summary_parts.is_empty() {
-        summary_parts.push("All checks passed.".to_string());
-    }
-    let summary = summary_parts.join(", ");
-
-    let install_hint = format!("Run vectorhawk skill install {path}/ to install.");
+    // Ollama WARN row does not affect the core counts — only core checks determine exit code.
+    println!("{pass_count} passed, {warn_count} warn, {fail_count} fail");
 
     if fail_count == 0 {
-        println!("{summary} {install_hint}");
+        println!("Run: vectorhawk skill install {path}/");
         Ok(())
     } else {
-        println!("{summary}");
-        anyhow::bail!("validation failed — see checks above")
+        anyhow::bail!("validation failed — fix FAIL rows above")
     }
 }
 
