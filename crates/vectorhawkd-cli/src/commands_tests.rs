@@ -270,6 +270,62 @@ fn skill_update_with_registry_url_parses() {
     }
 }
 
+// ── decide_update_action unit tests ──────────────────────────────────────────
+
+#[test]
+fn decide_update_action_upgrades_when_newer() {
+    use semver::Version;
+    let installed = Version::parse("1.0.0").unwrap();
+    let latest = Some(Version::parse("1.1.0").unwrap());
+    let action = super::decide_update_action(&installed, latest);
+    assert_eq!(
+        action,
+        super::UpdateAction::Upgrade {
+            latest: Version::parse("1.1.0").unwrap()
+        }
+    );
+}
+
+#[test]
+fn decide_update_action_skips_when_same_version() {
+    use semver::Version;
+    let installed = Version::parse("2.0.0").unwrap();
+    let latest = Some(Version::parse("2.0.0").unwrap());
+    let action = super::decide_update_action(&installed, latest);
+    assert_eq!(action, super::UpdateAction::AlreadyUpToDate);
+}
+
+#[test]
+fn decide_update_action_skips_when_installed_is_ahead() {
+    use semver::Version;
+    let installed = Version::parse("1.5.0").unwrap();
+    let latest = Some(Version::parse("1.4.0").unwrap());
+    let action = super::decide_update_action(&installed, latest);
+    assert_eq!(action, super::UpdateAction::AlreadyUpToDate);
+}
+
+#[test]
+fn decide_update_action_no_versions_when_none() {
+    use semver::Version;
+    let installed = Version::parse("1.0.0").unwrap();
+    let action = super::decide_update_action(&installed, None);
+    assert_eq!(action, super::UpdateAction::NoVersions);
+}
+
+#[test]
+fn decide_update_action_upgrades_on_patch_bump() {
+    use semver::Version;
+    let installed = Version::parse("0.3.0").unwrap();
+    let latest = Some(Version::parse("0.3.1").unwrap());
+    let action = super::decide_update_action(&installed, latest);
+    assert_eq!(
+        action,
+        super::UpdateAction::Upgrade {
+            latest: Version::parse("0.3.1").unwrap()
+        }
+    );
+}
+
 // ── auth subcommands ──────────────────────────────────────────────────────────
 
 #[test]

@@ -3005,11 +3005,49 @@ vh_execution:
 
 // ── skill update ─────────────────────────────────────────────────────────────
 
+/// The outcome of comparing an installed version against the registry latest.
+///
+/// Pure, testable — no I/O.  Produced by [`decide_update_action`] and consumed
+/// by [`cmd_skill_update`] to drive the install loop and the summary table.
+#[derive(Debug, PartialEq)]
+pub enum UpdateAction {
+    /// Registry advertises a newer version; install it.
+    Upgrade { latest: semver::Version },
+    /// Installed version is already at or ahead of registry latest.
+    AlreadyUpToDate,
+    /// Registry has no published versions for this skill.
+    NoVersions,
+}
+
+/// Decide what action to take for a single skill based on installed vs. latest.
+///
+/// `latest` is `None` when the registry returned no published version for the
+/// skill.  This function is pure and has no side effects, making it unit-testable
+/// without a DB or HTTP server.
+pub fn decide_update_action(
+    installed: &semver::Version,
+    latest: Option<semver::Version>,
+) -> UpdateAction {
+    match latest {
+        None => UpdateAction::NoVersions,
+        Some(v) if v > *installed => UpdateAction::Upgrade { latest: v },
+        Some(_) => UpdateAction::AlreadyUpToDate,
+    }
+}
+
+/// A single row in the update summary table.
+struct UpdateRow {
+    skill_id: String,
+    current: String,
+    latest: String,
+    status: String,
+}
+
 /// Update one or all active skills from the registry.
 ///
-/// For each targeted skill, fetches the latest registry version and installs it
-/// when it is strictly newer than the installed version.  Prints one line per
-/// skill: "Updating X a.b.c → d.e.f... done." or "X is already up to date (a.b.c).".
+/// Fetches the latest registry version for each targeted skill, installs it
+/// when strictly newer than installed, then prints a one-line-per-skill summary
+/// table with columns: SKILL_ID | CURRENT | LATEST | STATUS.
 async fn cmd_skill_update(id: Option<&str>, all: bool, registry_url: Option<&str>) -> Result<()> {
     use rusqlite::{Connection, OptionalExtension};
     use semver::Version;
@@ -3070,67 +3108,157 @@ async fn cmd_skill_update(id: Option<&str>, all: bool, registry_url: Option<&str
 
     let registry_url_owned = url.to_string();
 
+    // ── Process each skill; collect summary rows ──────────────────────────────
+
+    let mut summary: Vec<UpdateRow> = Vec::with_capacity(targets.len());
+    let mut had_error = false;
+
     for (skill_id, installed_str) in targets {
-        let installed = Version::parse(&installed_str)
-            .with_context(|| format!("installed version '{installed_str}' is not valid semver"))?;
-
-        let registry_url_inner = registry_url_owned.clone();
-        let skill_id_inner = skill_id.clone();
-
-        // Fetch latest version from registry (blocking call).
-        let detail = tokio::task::spawn_blocking({
-            let r = registry_url_inner.clone();
-            let s = skill_id_inner.clone();
-            move || {
-                let reg = RegistryClient::new(&r);
-                reg.fetch_skill_detail(&s)
-            }
-        })
-        .await
-        .context("fetch detail task panicked")?
-        .with_context(|| format!("failed to fetch registry info for '{skill_id}'"))?;
-
-        let latest_str = match detail.latest_version {
-            Some(v) => v,
-            None => {
-                println!("{skill_id} — no published versions in registry.");
+        let installed = match Version::parse(&installed_str) {
+            Ok(v) => v,
+            Err(e) => {
+                summary.push(UpdateRow {
+                    skill_id: skill_id.clone(),
+                    current: installed_str.clone(),
+                    latest: "-".to_string(),
+                    status: format!("error: invalid semver ({e})"),
+                });
+                had_error = true;
                 continue;
             }
         };
 
-        let latest = Version::parse(&latest_str)
-            .with_context(|| format!("registry returned invalid semver '{latest_str}'"))?;
-
-        if latest <= installed {
-            println!("{skill_id} is already up to date ({installed_str}).");
-            continue;
-        }
-
-        print!("Updating {skill_id} {installed_str} → {latest_str}...");
-        // Flush stdout before the blocking install so the user sees the prefix.
-        use std::io::Write;
-        std::io::stdout().flush().ok();
-
-        let state_db = state.db_path.clone();
-        let state_root = state.root_dir.clone();
-        let url_clone = registry_url_owned.clone();
-        let skill_clone = skill_id.clone();
-        let ver_clone = latest_str.clone();
-
-        tokio::task::spawn_blocking(move || {
-            // Reconstruct a minimal AppState from the paths (no I/O on already-bootstrapped dirs).
-            let install_state = AppState {
-                root_dir: state_root,
-                db_path: state_db,
-            };
-            let registry = RegistryClient::new(&url_clone);
-            install_from_registry(&install_state, &registry, &skill_clone, Some(&ver_clone))
+        // Fetch latest version from registry (blocking call in async context).
+        let registry_url_inner = registry_url_owned.clone();
+        let skill_id_inner = skill_id.clone();
+        let detail_result = tokio::task::spawn_blocking(move || {
+            let reg = RegistryClient::new(&registry_url_inner);
+            reg.fetch_skill_detail(&skill_id_inner)
         })
         .await
-        .context("install task panicked")?
-        .with_context(|| format!("failed to update '{skill_id}' to {latest_str}"))?;
+        .context("fetch detail task panicked")?;
 
-        println!(" done.");
+        let detail = match detail_result {
+            Ok(d) => d,
+            Err(e) => {
+                summary.push(UpdateRow {
+                    skill_id: skill_id.clone(),
+                    current: installed_str.clone(),
+                    latest: "-".to_string(),
+                    status: format!("error: registry unreachable ({e:#})"),
+                });
+                had_error = true;
+                continue;
+            }
+        };
+
+        let latest_parsed = detail
+            .latest_version
+            .as_deref()
+            .map(Version::parse)
+            .transpose()
+            .with_context(|| {
+                format!(
+                    "registry returned invalid semver for '{skill_id}': {:?}",
+                    detail.latest_version
+                )
+            })?;
+
+        let latest_display = detail.latest_version.as_deref().unwrap_or("-").to_string();
+
+        let action = decide_update_action(&installed, latest_parsed);
+
+        match action {
+            UpdateAction::NoVersions => {
+                summary.push(UpdateRow {
+                    skill_id,
+                    current: installed_str,
+                    latest: latest_display,
+                    status: "no published versions".to_string(),
+                });
+            }
+            UpdateAction::AlreadyUpToDate => {
+                summary.push(UpdateRow {
+                    skill_id,
+                    current: installed_str,
+                    latest: latest_display,
+                    status: "up to date".to_string(),
+                });
+            }
+            UpdateAction::Upgrade {
+                latest: ref latest_ver,
+            } => {
+                let state_db = state.db_path.clone();
+                let state_root = state.root_dir.clone();
+                let url_clone = registry_url_owned.clone();
+                let skill_clone = skill_id.clone();
+                let ver_str = latest_ver.to_string();
+
+                let install_result = tokio::task::spawn_blocking(move || {
+                    let install_state = AppState {
+                        root_dir: state_root,
+                        db_path: state_db,
+                    };
+                    let registry = RegistryClient::new(&url_clone);
+                    install_from_registry(&install_state, &registry, &skill_clone, Some(&ver_str))
+                })
+                .await
+                .context("install task panicked")?;
+
+                let status = match install_result {
+                    Ok(_) => format!("updated {} → {}", installed_str, latest_ver),
+                    Err(e) => {
+                        had_error = true;
+                        format!("error: update failed ({e:#})")
+                    }
+                };
+
+                summary.push(UpdateRow {
+                    skill_id,
+                    current: installed_str,
+                    latest: latest_display,
+                    status,
+                });
+            }
+        }
+    }
+
+    // ── Print summary table ───────────────────────────────────────────────────
+
+    let id_w = summary
+        .iter()
+        .map(|r| r.skill_id.len())
+        .max()
+        .unwrap_or(8)
+        .max(8);
+    let cur_w = summary
+        .iter()
+        .map(|r| r.current.len())
+        .max()
+        .unwrap_or(7)
+        .max(7);
+    let lat_w = summary
+        .iter()
+        .map(|r| r.latest.len())
+        .max()
+        .unwrap_or(6)
+        .max(6);
+
+    println!(
+        "{:<id_w$}  {:<cur_w$}  {:<lat_w$}  STATUS",
+        "SKILL_ID", "CURRENT", "LATEST",
+    );
+    println!("{}", "-".repeat(id_w + cur_w + lat_w + 14));
+
+    for row in &summary {
+        println!(
+            "{:<id_w$}  {:<cur_w$}  {:<lat_w$}  {}",
+            row.skill_id, row.current, row.latest, row.status,
+        );
+    }
+
+    if had_error {
+        anyhow::bail!("one or more skills could not be updated — see table above");
     }
 
     Ok(())
