@@ -192,6 +192,7 @@ async fn run_loop(
                     &stats,
                     &mut install_tasks,
                     &backend_registry,
+                    list_changed_tx.clone(),
                 ).await;
 
                 // Process any snapshot-derived events. The current event was
@@ -247,6 +248,7 @@ async fn dispatch_event(
     stats: &Arc<Mutex<ReconcilerStats>>,
     install_tasks: &mut tokio::task::JoinSet<bool>,
     backend_registry: &Arc<BackendRegistry>,
+    list_changed_tx: broadcast::Sender<()>,
 ) {
     match event {
         SyncEvent::Install {
@@ -317,6 +319,7 @@ async fn dispatch_event(
                 stats,
                 install_tasks,
                 backend_registry,
+                list_changed_tx.clone(),
             );
         }
         SyncEvent::DeactivateMcp {
@@ -428,6 +431,7 @@ async fn dispatch_event(
                                 stats,
                                 install_tasks,
                                 backend_registry,
+                                list_changed_tx.clone(),
                             );
                         }
                         SyncEvent::DeactivateMcp {
@@ -545,6 +549,7 @@ fn spawn_install_mcp(
     stats: &Arc<Mutex<ReconcilerStats>>,
     install_tasks: &mut tokio::task::JoinSet<bool>,
     backend_registry: &Arc<BackendRegistry>,
+    list_changed_tx: broadcast::Sender<()>,
 ) {
     let st = Arc::clone(state);
     let reg_url = registry_url.to_string();
@@ -569,6 +574,7 @@ fn spawn_install_mcp(
             &reg_url,
             &stats_clone,
             &br,
+            list_changed_tx,
         )
         .await
     });
@@ -622,6 +628,7 @@ async fn handle_install_mcp(
     registry_url: &str,
     stats: &Arc<Mutex<ReconcilerStats>>,
     backend_registry: &Arc<BackendRegistry>,
+    list_changed_tx: broadcast::Sender<()>,
 ) -> bool {
     report_mcp_installation_status(installation_id, "installing", None, registry_url, state).await;
 
@@ -679,7 +686,7 @@ async fn handle_install_mcp(
                     let sid = entry.server_id.clone();
                     backend_registry.register_backend(entry.clone());
                     info!(server_id = %sid, "reconciler: live-registered MCP backend in aggregator");
-                    crate::spawn_tool_discovery(backend_registry.clone(), entry);
+                    crate::spawn_tool_discovery(backend_registry.clone(), entry, list_changed_tx.clone());
                 }
                 None => {
                     warn!(
@@ -2003,6 +2010,7 @@ pub(crate) async fn handle_install_mcp_for_test(
     stats: &Arc<std::sync::Mutex<ReconcilerStats>>,
     backend_registry: &Arc<BackendRegistry>,
 ) -> bool {
+    let (list_changed_tx, _) = broadcast::channel(16);
     handle_install_mcp(
         installation_id,
         mcp_server_id,
@@ -2016,6 +2024,7 @@ pub(crate) async fn handle_install_mcp_for_test(
         registry_url,
         stats,
         backend_registry,
+        list_changed_tx,
     )
     .await
 }

@@ -343,7 +343,7 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     let model_client: Option<Arc<dyn ModelClient>> = Some(Arc::new(hybrid) as Arc<dyn ModelClient>);
 
     let vh_registry = Arc::new(build_stub_registry());
-    load_managed_mcp_into_registry(&state, &vh_registry);
+    load_managed_mcp_into_registry(&state, &vh_registry, list_changed_tx.clone());
     if let Some(ref m) = managed_config {
         info!(
             org = m.org.as_deref().unwrap_or("(unspecified)"),
@@ -1046,6 +1046,7 @@ fn flush_ratings_and_scan(
 fn load_managed_mcp_into_registry(
     state: &AppState,
     registry: &Arc<BackendRegistry>,
+    list_changed_tx: tokio::sync::broadcast::Sender<()>,
 ) {
     let rows = match state.list_mcp_installs() {
         Ok(r) => r,
@@ -1063,7 +1064,7 @@ fn load_managed_mcp_into_registry(
                 registry.register_backend(entry.clone());
                 info!(server_id = %server_id, "startup: registered managed MCP backend");
                 loaded += 1;
-                spawn_tool_discovery(Arc::clone(registry), entry);
+                spawn_tool_discovery(Arc::clone(registry), entry, list_changed_tx.clone());
             }
             None => {
                 warn!(
@@ -1090,7 +1091,11 @@ fn load_managed_mcp_into_registry(
 ///
 /// Re-registration via `register_backend` overwrites the existing entry by
 /// server_id, so the empty-tools placeholder is replaced atomically.
-pub fn spawn_tool_discovery(registry: Arc<BackendRegistry>, entry: BackendEntry) {
+pub fn spawn_tool_discovery(
+    registry: Arc<BackendRegistry>,
+    entry: BackendEntry,
+    list_changed_tx: tokio::sync::broadcast::Sender<()>,
+) {
     // Skip when no Tokio runtime is in scope (synchronous tests call
     // load_managed_mcp_into_registry directly without a runtime).
     if tokio::runtime::Handle::try_current().is_err() {
@@ -1121,6 +1126,12 @@ pub fn spawn_tool_discovery(registry: Arc<BackendRegistry>, entry: BackendEntry)
                     tools = count,
                     "tool discovery completed — backend re-registered with tools"
                 );
+                // Fire a second tools/list_changed so AI clients refresh now
+                // that the backend actually exposes tools. The first
+                // notification fired immediately on install (when the entry
+                // was still tools-empty), so without this clients see a
+                // stale empty list and never re-fetch.
+                let _ = list_changed_tx.send(());
             }
             Ok(_) => {
                 warn!(server_id = %server_id, name = %name, "tool discovery returned zero tools");
