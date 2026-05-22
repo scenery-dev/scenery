@@ -343,6 +343,7 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     let model_client: Option<Arc<dyn ModelClient>> = Some(Arc::new(hybrid) as Arc<dyn ModelClient>);
 
     let vh_registry = Arc::new(build_stub_registry());
+    load_managed_mcp_into_registry(&state, &vh_registry);
     if let Some(ref m) = managed_config {
         info!(
             org = m.org.as_deref().unwrap_or("(unspecified)"),
@@ -404,6 +405,7 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
         &registry_url,
         Arc::clone(&sync_state_arc),
         list_changed_tx.clone(),
+        Arc::clone(&vh_registry),
     )
     .await;
     if let Some(ref _handle) = sync_handle {
@@ -616,6 +618,7 @@ async fn try_start_sync(
     registry_url: &str,
     state: Arc<AppState>,
     list_changed_tx: broadcast::Sender<()>,
+    backend_registry: Arc<BackendRegistry>,
 ) -> Option<sync::ReconcilerHandle> {
     // Load the access token from SQLite.
     let token = match load_all_tokens(&state) {
@@ -656,7 +659,7 @@ async fn try_start_sync(
         last_event_id,
     };
 
-    match sync::run(sync_config, state, list_changed_tx) {
+    match sync::run(sync_config, state, list_changed_tx, backend_registry) {
         Ok(handle) => Some(handle),
         Err(e) => {
             warn!(error = %e, "sync: failed to start sync subsystem");
@@ -1029,6 +1032,139 @@ fn flush_ratings_and_scan(
     }
 
     Ok(())
+}
+
+/// Load any rows from `mcp_installations` (via SQLite) and register each as a
+/// live backend in the aggregator at daemon startup.
+///
+/// This is the startup path that makes previously-installed MCP servers visible
+/// to Claude Code immediately on daemon launch, without waiting for the next SSE
+/// event. Failures are logged at WARN per entry and never abort startup — a
+/// missing or malformed row is skipped rather than crashing the daemon.
+///
+/// Called once from `run_daemon` after `build_stub_registry()`.
+fn load_managed_mcp_into_registry(state: &AppState, registry: &BackendRegistry) {
+    let rows = match state.list_mcp_installs() {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(error = %e, "startup: failed to read mcp_installations — no managed MCP backends loaded");
+            return;
+        }
+    };
+
+    let mut loaded = 0usize;
+    for row in &rows {
+        match mcp_row_to_backend_entry(row) {
+            Some(entry) => {
+                let server_id = entry.server_id.clone();
+                registry.register_backend(entry);
+                info!(server_id = %server_id, "startup: registered managed MCP backend");
+                loaded += 1;
+            }
+            None => {
+                warn!(
+                    mcp_server_id = %row.mcp_server_id,
+                    mcp_server_name = %row.mcp_server_name,
+                    "startup: skipping managed MCP backend — server_config missing command/url"
+                );
+            }
+        }
+    }
+
+    if loaded > 0 {
+        info!(
+            count = loaded,
+            "startup: managed MCP backends registered in aggregator"
+        );
+    }
+}
+
+/// Translate a `McpInstallRow` from SQLite into a `BackendEntry` for the aggregator.
+///
+/// Translation rules for `server_config` (a JSON blob):
+/// - `{"command": "...", "args": [...], "env": {...}}` → `BackendTransport::Stdio`
+/// - `{"url": "..."}` → `BackendTransport::Http` (no auth_token in this pass)
+/// - `null` or neither key present → returns `None` (row is skipped with a warning)
+///
+/// The `server_id` in the aggregator is the `mcp_server_id` UUID string so that
+/// live install/deactivate events (which carry that UUID) can find the entry with
+/// a direct key lookup.
+///
+/// Tools list starts empty. The AI client must call `tools/list` against the
+/// vectorhawk MCP server to trigger discovery — that call fans out to all
+/// registered backends and caches their tool definitions. Subsequent
+/// `tools/call` invocations dispatch against the cached list; calling
+/// `tools/call` BEFORE any `tools/list` returns an error from
+/// `aggregator.rs::dispatch` (tool name not in cache). This matches the MCP
+/// protocol contract — clients must list before they call.
+pub fn mcp_row_to_backend_entry(
+    row: &vectorhawkd_core::state::McpInstallRow,
+) -> Option<BackendEntry> {
+    let config: serde_json::Value = match &row.server_config {
+        Some(s) => match serde_json::from_str(s) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(
+                    mcp_server_id = %row.mcp_server_id,
+                    error = %e,
+                    "mcp_row_to_backend_entry: invalid server_config JSON — skipping"
+                );
+                return None;
+            }
+        },
+        None => {
+            return None;
+        }
+    };
+
+    let transport = if let (Some(command), Some(args_val)) = (
+        config.get("command").and_then(|v| v.as_str()),
+        config.get("args"),
+    ) {
+        let args: Vec<String> = args_val
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let env: std::collections::HashMap<String, String> = config
+            .get("env")
+            .and_then(|v| v.as_object())
+            .map(|obj| {
+                obj.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        BackendTransport::Stdio {
+            command: command.to_string(),
+            args,
+            env,
+            process: Arc::new(std::sync::Mutex::new(None)),
+        }
+    } else if let Some(url) = config.get("url").and_then(|v| v.as_str()) {
+        BackendTransport::Http {
+            url: url.to_string(),
+            auth_token: None,
+        }
+    } else {
+        return None;
+    };
+
+    Some(BackendEntry {
+        server_id: row.mcp_server_id.clone(),
+        name: row.mcp_server_name.clone(),
+        transport,
+        tools: vec![],
+        tool_visibility: ToolVisibility::All,
+        priority: 50,
+        consecutive_errors: 0,
+        unhealthy: false,
+    })
 }
 
 /// Construct the M0 stub `BackendRegistry`.

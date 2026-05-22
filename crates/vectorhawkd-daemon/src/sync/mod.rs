@@ -20,6 +20,7 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 use tracing::info;
 use vectorhawkd_core::state::AppState;
+use vectorhawkd_mcp::aggregator::BackendRegistry;
 
 /// Configuration for the sync subsystem.
 #[derive(Debug, Clone)]
@@ -44,6 +45,7 @@ pub fn run(
     config: SyncConfig,
     state: Arc<AppState>,
     list_changed_tx: broadcast::Sender<()>,
+    backend_registry: Arc<BackendRegistry>,
 ) -> Result<ReconcilerHandle> {
     let (event_tx, event_rx) = mpsc::channel::<SyncEvent>(64);
 
@@ -59,7 +61,7 @@ pub fn run(
     tokio::spawn(sse_client::run(sse_config, sse_state, event_tx));
 
     // Spawn reconciler — consumes events and converges local state.
-    let handle = reconciler::spawn(event_rx, state, list_changed_tx);
+    let handle = reconciler::spawn(event_rx, state, list_changed_tx, backend_registry);
 
     Ok(handle)
 }

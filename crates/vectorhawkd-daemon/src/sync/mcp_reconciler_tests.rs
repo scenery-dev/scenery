@@ -8,6 +8,7 @@ use camino::Utf8PathBuf;
 use uuid::Uuid;
 
 use vectorhawkd_core::state::AppState;
+use vectorhawkd_mcp::aggregator::BackendRegistry;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -569,4 +570,209 @@ async fn mcp_server_lock_prevents_concurrent_installs_for_same_server() {
 
     t1.await.unwrap();
     t2.await.unwrap();
+}
+
+// ── BackendRegistry aggregator integration tests ──────────────────────────────
+
+/// Helper: build a fresh BackendRegistry (no stub backend).
+fn fresh_registry() -> Arc<BackendRegistry> {
+    Arc::new(BackendRegistry::new())
+}
+
+/// Helper: build a server_config JSON blob with command+args shape.
+fn stdio_server_config() -> serde_json::Value {
+    serde_json::json!({
+        "command": "npx",
+        "args": ["-y", "@modelcontextprotocol/server-github"],
+        "env": {}
+    })
+}
+
+/// Helper: seed an MCP row with a command-based server_config.
+fn seed_mcp_row_with_config(
+    state: &AppState,
+    mcp_server_id: Uuid,
+    name: &str,
+    server_config: Option<serde_json::Value>,
+) {
+    let row = vectorhawkd_core::state::McpInstallRow {
+        mcp_server_id: mcp_server_id.to_string(),
+        installation_id: install_id().to_string(),
+        mcp_server_name: name.to_string(),
+        package_source: "@org/server".to_string(),
+        version_pin: None,
+        server_config: server_config.as_ref().map(|v| v.to_string()),
+        auth_type: "none".to_string(),
+        gateway_server_id: None,
+    };
+    state.upsert_mcp_install(&row).unwrap();
+}
+
+#[test]
+fn startup_with_two_entries_registers_two_backends() {
+    // Arrange: seed two MCP rows with valid stdio server_config.
+    let root = temp_root("startup-two-backends");
+    let state = AppState::bootstrap_in(root.clone()).unwrap();
+
+    let sid1 = server_id();
+    let sid2 = server_id();
+    seed_mcp_row_with_config(&state, sid1, "GitHub MCP", Some(stdio_server_config()));
+    seed_mcp_row_with_config(&state, sid2, "Slack MCP", Some(stdio_server_config()));
+
+    // Act: run the startup loader.
+    let registry = fresh_registry();
+    crate::load_managed_mcp_into_registry(&state, &registry);
+
+    // Assert: both backends are registered by their UUID server_id.
+    let backends = registry.list_backends();
+    assert_eq!(
+        backends.len(),
+        2,
+        "two entries should register two backends"
+    );
+
+    let ids: Vec<&str> = backends.iter().map(|b| b.server_id.as_str()).collect();
+    assert!(
+        ids.contains(&sid1.to_string().as_str()),
+        "sid1 must be in registry"
+    );
+    assert!(
+        ids.contains(&sid2.to_string().as_str()),
+        "sid2 must be in registry"
+    );
+
+    cleanup(&root);
+}
+
+#[test]
+fn startup_with_null_server_config_skips_entry() {
+    // Arrange: one row with server_config = None (null in SQLite).
+    let root = temp_root("startup-null-config");
+    let state = AppState::bootstrap_in(root.clone()).unwrap();
+
+    let sid = server_id();
+    seed_mcp_row_with_config(&state, sid, "No-Config MCP", None);
+
+    // Act.
+    let registry = fresh_registry();
+    crate::load_managed_mcp_into_registry(&state, &registry);
+
+    // Assert: no backends registered (null config → skip with warning).
+    let backends = registry.list_backends();
+    assert!(
+        backends.is_empty(),
+        "null server_config must not register a backend"
+    );
+
+    cleanup(&root);
+}
+
+#[tokio::test]
+async fn handle_install_mcp_registers_backend_in_aggregator() {
+    // Arrange: fresh state + registry.
+    let root = temp_root("install-registers-aggregator");
+    let state = AppState::bootstrap_in(root.clone()).unwrap();
+    let state_arc = Arc::new(AppState {
+        root_dir: state.root_dir.clone(),
+        db_path: state.db_path.clone(),
+    });
+
+    let registry = fresh_registry();
+    let stats = Arc::new(std::sync::Mutex::new(super::ReconcilerStats::default()));
+
+    let iid = install_id();
+    let sid = server_id();
+
+    // Act: drive handle_install_mcp directly (no network — use a local mockito
+    // server for the PATCH callback so the function doesn't hang).
+    let mut mock_server = mockito::Server::new_async().await;
+    let url_path = format!("/api/mcp-installations/{iid}");
+    let _m = mock_server
+        .mock("PATCH", url_path.as_str())
+        .with_status(200)
+        .with_body("{}")
+        .expect(2) // installing + installed
+        .create_async()
+        .await;
+
+    let changed = super::handle_install_mcp_for_test(
+        iid,
+        sid,
+        "GitHub MCP".to_string(),
+        "@modelcontextprotocol/server-github".to_string(),
+        None,
+        Some(stdio_server_config()),
+        "none".to_string(),
+        None,
+        &state_arc,
+        &mock_server.url(),
+        &stats,
+        &registry,
+    )
+    .await;
+
+    // Assert: the handler returns true (tool list changed) and the backend
+    // is now present in the aggregator under the mcp_server_id key.
+    assert!(changed, "handle_install_mcp must return true on success");
+    assert!(
+        registry.has_backend(&sid.to_string()),
+        "backend must be registered in aggregator after install"
+    );
+
+    cleanup(&root);
+}
+
+#[tokio::test]
+async fn handle_deactivate_mcp_removes_backend_from_aggregator() {
+    // Arrange: seed a row + register it in the aggregator.
+    let root = temp_root("deactivate-removes-aggregator");
+    let state = AppState::bootstrap_in(root.clone()).unwrap();
+    let state_arc = Arc::new(AppState {
+        root_dir: state.root_dir.clone(),
+        db_path: state.db_path.clone(),
+    });
+
+    let sid = server_id();
+    let iid = install_id();
+    seed_mcp_row_with_config(&state, sid, "GitHub MCP", Some(stdio_server_config()));
+
+    let registry = fresh_registry();
+    // Pre-register so we can verify it gets removed.
+    crate::load_managed_mcp_into_registry(&state, &registry);
+    assert!(
+        registry.has_backend(&sid.to_string()),
+        "backend must be registered before deactivate"
+    );
+
+    let stats = Arc::new(std::sync::Mutex::new(super::ReconcilerStats::default()));
+
+    let mut mock_server = mockito::Server::new_async().await;
+    let url_path = format!("/api/mcp-installations/{iid}");
+    let _m = mock_server
+        .mock("PATCH", url_path.as_str())
+        .with_status(200)
+        .with_body("{}")
+        .expect(1) // deactivated
+        .create_async()
+        .await;
+
+    // Act.
+    let changed = super::handle_deactivate_mcp_for_test(
+        iid,
+        sid,
+        &state_arc,
+        &mock_server.url(),
+        &stats,
+        &registry,
+    )
+    .await;
+
+    // Assert: handler returns true and backend is gone from aggregator.
+    assert!(changed, "handle_deactivate_mcp must return true on success");
+    assert!(
+        !registry.has_backend(&sid.to_string()),
+        "backend must be removed from aggregator after deactivate"
+    );
+
+    cleanup(&root);
 }
