@@ -227,10 +227,7 @@ pub async fn run_shim() -> Result<()> {
 /// read of the same socket. Frames with an `id` (responses) on this connection
 /// are ignored — they belong to no in-flight request from this pump.
 #[cfg(unix)]
-async fn run_notification_pump(
-    socket_path: PathBuf,
-    stdout_lock: Arc<StdMutex<()>>,
-) -> Result<()> {
+async fn run_notification_pump(socket_path: PathBuf, stdout_lock: Arc<StdMutex<()>>) -> Result<()> {
     use tokio::net::UnixStream;
     use vectorhawkd_mcp::backend::read_framed;
 

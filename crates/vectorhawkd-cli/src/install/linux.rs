@@ -24,7 +24,7 @@
 use anyhow::{Context, Result};
 use std::{fs, process::Command};
 
-use super::{current_exe_path, daemon_socket_path, socket_is_reachable, InstallStatus};
+use super::{daemon_socket_path, resolve_daemon_bin_path, socket_is_reachable, InstallStatus};
 
 const SERVICE_NAME: &str = "vectorhawk-agent.service";
 const DESKTOP_FILENAME: &str = "vectorhawk.desktop";
@@ -54,6 +54,7 @@ After=network.target
 
 [Service]
 Type=simple
+Environment="PATH=/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin"
 ExecStart={bin_str} daemon run --foreground
 Restart=on-failure
 RestartSec=2
@@ -146,7 +147,7 @@ fn unit_is_enabled() -> bool {
 
 /// Install and start the daemon via systemd user unit (or XDG autostart fallback).
 pub fn install() -> Result<()> {
-    let bin_path = current_exe_path().context("failed to resolve current binary path")?;
+    let bin_path = resolve_daemon_bin_path().context("failed to resolve daemon binary path")?;
 
     if systemctl_available() {
         install_systemd(&bin_path)

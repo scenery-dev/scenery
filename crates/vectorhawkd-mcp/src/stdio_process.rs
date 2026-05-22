@@ -307,10 +307,7 @@ impl StdioProcess {
             // Notifications have no `id`; skip them.
             let Some(id_val) = body.get("id") else {
                 debug!(
-                    method = body
-                        .get("method")
-                        .and_then(|m| m.as_str())
-                        .unwrap_or("?"),
+                    method = body.get("method").and_then(|m| m.as_str()).unwrap_or("?"),
                     "skipping notification while awaiting response"
                 );
                 continue;

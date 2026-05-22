@@ -10,7 +10,7 @@
 //! single cross-platform API. Windows is deferred — the seam is clean because
 //! the cfg gates are per-function, not wrapping the whole module.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 #[cfg(target_os = "macos")]
 pub mod macos;
@@ -109,14 +109,41 @@ pub fn status() -> Result<InstallStatus> {
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
 
-/// Return the absolute path of the currently-running binary, resolving any
-/// symlinks in the path (e.g. `/private/var/folders/…` cargo target paths on
-/// macOS are stable once canonicalized).
-pub(crate) fn current_exe_path() -> Result<std::path::PathBuf> {
-    let raw = std::env::current_exe()
-        .map_err(|e| anyhow::anyhow!("failed to resolve current binary path: {e}"))?;
-    std::fs::canonicalize(&raw)
-        .map_err(|e| anyhow::anyhow!("failed to canonicalize binary path {}: {e}", raw.display()))
+/// Return the binary path that should be written into the auto-start unit.
+///
+/// When the current executable lives inside a Homebrew Cellar directory (e.g.
+/// `/opt/homebrew/Cellar/vectorhawk/1.0.45/bin/vectorhawk` or
+/// `/home/linuxbrew/.linuxbrew/Cellar/vectorhawk/1.0.45/bin/vectorhawk`),
+/// rewrite to the unversioned symlink directory so that `brew upgrade`
+/// automatically picks up the new binary without re-running `daemon install`.
+///
+/// For any other install location (manual, cargo install, etc.) the
+/// `std::env::current_exe()` result is returned unchanged.
+pub(crate) fn resolve_daemon_bin_path() -> Result<std::path::PathBuf> {
+    let exe = std::env::current_exe().context("failed to resolve current binary path")?;
+    Ok(rewrite_homebrew_cellar_to_symlink(&exe))
+}
+
+/// Rewrite a Homebrew Cellar path (`<prefix>/Cellar/<formula>/<version>/bin/<name>`)
+/// to the unversioned symlink (`<prefix>/bin/<name>`). Any non-Cellar path is
+/// returned unchanged. Extracted so unit tests can hit it without spawning a
+/// real exe.
+pub(crate) fn rewrite_homebrew_cellar_to_symlink(exe: &std::path::Path) -> std::path::PathBuf {
+    let Some(bin_name) = exe.file_name() else {
+        return exe.to_path_buf();
+    };
+
+    let components: Vec<_> = exe.components().collect();
+    for (idx, component) in components.iter().enumerate() {
+        // OsStr literal comparison via `==` works because OsStr implements
+        // PartialEq<str>.
+        if component.as_os_str() == std::ffi::OsStr::new("Cellar") && idx >= 1 {
+            let prefix: std::path::PathBuf = components[..idx].iter().collect();
+            return prefix.join("bin").join(bin_name);
+        }
+    }
+
+    exe.to_path_buf()
 }
 
 /// Probe whether the daemon Unix socket at `socket_path` is accepting
@@ -164,4 +191,37 @@ pub(crate) fn daemon_socket_path() -> String {
 
     // Last resort (will not work, but is a valid path string).
     "~/.local/share/VectorHawk/agent.sock".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rewrite_homebrew_cellar_to_symlink;
+    use std::path::Path;
+
+    #[test]
+    fn rewrites_arm_homebrew_cellar_to_symlink() {
+        let got = rewrite_homebrew_cellar_to_symlink(Path::new(
+            "/opt/homebrew/Cellar/vectorhawk/1.0.45/bin/vectorhawk",
+        ));
+        assert_eq!(got, Path::new("/opt/homebrew/bin/vectorhawk"));
+    }
+
+    #[test]
+    fn rewrites_linuxbrew_cellar_to_symlink() {
+        let got = rewrite_homebrew_cellar_to_symlink(Path::new(
+            "/home/linuxbrew/.linuxbrew/Cellar/vectorhawk/1.0.45/bin/vectorhawk",
+        ));
+        assert_eq!(got, Path::new("/home/linuxbrew/.linuxbrew/bin/vectorhawk"));
+    }
+
+    #[test]
+    fn leaves_non_cellar_paths_alone() {
+        let got = rewrite_homebrew_cellar_to_symlink(Path::new(
+            "/Users/dev/code/vectorhawk/target/release/vectorhawk",
+        ));
+        assert_eq!(
+            got,
+            Path::new("/Users/dev/code/vectorhawk/target/release/vectorhawk")
+        );
+    }
 }

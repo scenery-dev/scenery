@@ -18,7 +18,7 @@
 use anyhow::{Context, Result};
 use std::{fs, process::Command};
 
-use super::{current_exe_path, daemon_socket_path, socket_is_reachable, InstallStatus};
+use super::{daemon_socket_path, socket_is_reachable, InstallStatus};
 
 const LABEL: &str = "com.vectorhawk.agent";
 const PLIST_FILENAME: &str = "com.vectorhawk.agent.plist";
@@ -87,6 +87,11 @@ fn render_plist(bin_path: &std::path::Path, log_dir: &std::path::Path) -> Result
         <string>run</string>
         <string>--foreground</string>
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -142,7 +147,8 @@ fn service_is_loaded(uid: u32) -> bool {
 pub fn install() -> Result<()> {
     let plist = plist_path().context("failed to resolve plist path")?;
     let log_dir = log_dir().context("failed to resolve log dir path")?;
-    let bin_path = current_exe_path().context("failed to resolve current binary path")?;
+    let bin_path =
+        super::resolve_daemon_bin_path().context("failed to resolve daemon binary path")?;
     let uid = current_uid();
 
     // ── Idempotency guard — but allow upgrade rewrites ────────────────────────

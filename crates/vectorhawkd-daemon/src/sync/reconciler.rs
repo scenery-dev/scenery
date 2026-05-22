@@ -686,7 +686,11 @@ async fn handle_install_mcp(
                     let sid = entry.server_id.clone();
                     backend_registry.register_backend(entry.clone());
                     info!(server_id = %sid, "reconciler: live-registered MCP backend in aggregator");
-                    crate::spawn_tool_discovery(backend_registry.clone(), entry, list_changed_tx.clone());
+                    crate::spawn_tool_discovery(
+                        backend_registry.clone(),
+                        entry,
+                        list_changed_tx.clone(),
+                    );
                 }
                 None => {
                     warn!(
@@ -752,14 +756,11 @@ async fn handle_deactivate_mcp(
     let state_for_lookup = Arc::clone(state);
     let id_for_lookup = server_id_str.clone();
     let aggregator_key = tokio::task::spawn_blocking(move || {
-        state_for_lookup
-            .list_mcp_installs()
-            .ok()
-            .and_then(|rows| {
-                rows.into_iter()
-                    .find(|r| r.mcp_server_id == id_for_lookup)
-                    .map(|r| crate::mcp_server_slug(&r.mcp_server_name))
-            })
+        state_for_lookup.list_mcp_installs().ok().and_then(|rows| {
+            rows.into_iter()
+                .find(|r| r.mcp_server_id == id_for_lookup)
+                .map(|r| crate::mcp_server_slug(&r.mcp_server_name))
+        })
     })
     .await
     .ok()

@@ -1105,9 +1105,9 @@ pub fn spawn_tool_discovery(
         let server_id = entry.server_id.clone();
         let name = entry.name.clone();
         let result = match &entry.transport {
-            BackendTransport::Stdio { command, args, env, .. } => {
-                BackendRegistry::fetch_tools_stdio(command, args, env).await
-            }
+            BackendTransport::Stdio {
+                command, args, env, ..
+            } => BackendRegistry::fetch_tools_stdio(command, args, env).await,
             BackendTransport::Http { url, auth_token } => {
                 registry.fetch_tools_http(url, auth_token.as_deref()).await
             }
@@ -1329,7 +1329,10 @@ mod slug_tests {
     fn slug_lowercases_and_hyphenates() {
         assert_eq!(mcp_server_slug("Filesystem"), "filesystem");
         assert_eq!(mcp_server_slug("GitHub MCP"), "github-mcp");
-        assert_eq!(mcp_server_slug("GW2c-Runner Default"), "gw2c-runner-default");
+        assert_eq!(
+            mcp_server_slug("GW2c-Runner Default"),
+            "gw2c-runner-default"
+        );
     }
 
     #[test]
