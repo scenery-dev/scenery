@@ -159,11 +159,9 @@ impl StdioProcess {
         self.send_request(id, "tools/list", serde_json::json!({}))
             .context("failed to send tools/list request")?;
 
-        let resp = self
-            .recv_line(READ_TIMEOUT)
+        let body = self
+            .recv_matching_response(id)
             .context("no response to tools/list")?;
-        let body: serde_json::Value =
-            serde_json::from_str(&resp).context("tools/list response is not valid JSON")?;
 
         if let Some(err) = body.get("error") {
             bail!("backend returned JSON-RPC error on tools/list: {err}");
@@ -193,11 +191,9 @@ impl StdioProcess {
         )
         .with_context(|| format!("failed to send tools/call for '{name}'"))?;
 
-        let resp = self
-            .recv_line(READ_TIMEOUT)
+        let body = self
+            .recv_matching_response(id)
             .with_context(|| format!("no response to tools/call '{name}'"))?;
-        let body: serde_json::Value =
-            serde_json::from_str(&resp).context("tools/call response is not valid JSON")?;
 
         if let Some(err) = body.get("error") {
             bail!(
@@ -294,6 +290,41 @@ impl StdioProcess {
         self.rx
             .recv_timeout(timeout)
             .with_context(|| format!("backend read timed out after {timeout:?}"))
+    }
+
+    /// Read frames until we get a JSON-RPC response with the requested `id`,
+    /// skipping any notifications (no `id`) or stray frames that arrive in
+    /// between. Some MCP servers (e.g. @modelcontextprotocol/server-everything)
+    /// emit a `notifications/tools/list_changed` immediately after initialize
+    /// or between request-response pairs — without this skip-loop, that
+    /// notification would be consumed as the response and discovery would
+    /// fail with "missing result.tools array".
+    fn recv_matching_response(&self, expected_id: u64) -> Result<serde_json::Value> {
+        loop {
+            let line = self.recv_line(READ_TIMEOUT)?;
+            let body: serde_json::Value = serde_json::from_str(&line)
+                .with_context(|| format!("backend produced invalid JSON: {line}"))?;
+            // Notifications have no `id`; skip them.
+            let Some(id_val) = body.get("id") else {
+                debug!(
+                    method = body
+                        .get("method")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("?"),
+                    "skipping notification while awaiting response"
+                );
+                continue;
+            };
+            // Compare by numeric value; ids are u64 in our send_request.
+            if id_val.as_u64() == Some(expected_id) {
+                return Ok(body);
+            }
+            debug!(
+                got = id_val.to_string(),
+                expected = expected_id,
+                "skipping stray response with non-matching id"
+            );
+        }
     }
 }
 
