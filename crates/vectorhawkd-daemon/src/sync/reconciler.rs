@@ -746,6 +746,25 @@ async fn handle_deactivate_mcp(
     // Clone before the move closure so we can use the string again after await.
     let server_id_for_closure = server_id_str.clone();
 
+    // Look up the server name BEFORE deletion so we can compute the
+    // aggregator slug — the SQLite row holds the only mapping from
+    // mcp_server_id (UUID) → display name needed for `remove_backend`.
+    let state_for_lookup = Arc::clone(state);
+    let id_for_lookup = server_id_str.clone();
+    let aggregator_key = tokio::task::spawn_blocking(move || {
+        state_for_lookup
+            .list_mcp_installs()
+            .ok()
+            .and_then(|rows| {
+                rows.into_iter()
+                    .find(|r| r.mcp_server_id == id_for_lookup)
+                    .map(|r| crate::mcp_server_slug(&r.mcp_server_name))
+            })
+    })
+    .await
+    .ok()
+    .flatten();
+
     let result = tokio::task::spawn_blocking(move || {
         state_clone
             .delete_mcp_install(&server_id_for_closure)
@@ -770,11 +789,21 @@ async fn handle_deactivate_mcp(
             // Remove the backend from the live aggregator so the AI client
             // stops seeing its tools immediately without a daemon restart.
             // `remove_backend` shuts down any spawned stdio child process.
-            let removed = backend_registry.remove_backend(&server_id_str);
-            if removed {
-                info!(
+            // Look up keyed by the slug we registered under (not the UUID).
+            if let Some(ref key) = aggregator_key {
+                let removed = backend_registry.remove_backend(key);
+                if removed {
+                    info!(
+                        mcp_server_id = %mcp_server_id,
+                        aggregator_key = %key,
+                        "reconciler: removed MCP backend from aggregator"
+                    );
+                }
+            } else {
+                warn!(
                     mcp_server_id = %mcp_server_id,
-                    "reconciler: removed MCP backend from aggregator"
+                    "reconciler: could not resolve aggregator key for deactivate \
+                     — backend will remain visible until daemon restart"
                 );
             }
 

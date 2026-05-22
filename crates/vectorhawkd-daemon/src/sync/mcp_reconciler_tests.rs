@@ -633,13 +633,18 @@ fn startup_with_two_entries_registers_two_backends() {
     );
 
     let ids: Vec<&str> = backends.iter().map(|b| b.server_id.as_str()).collect();
+    // Backends are keyed by the slug of their display name, not the UUID.
+    let _ = sid1;
+    let _ = sid2;
     assert!(
-        ids.contains(&sid1.to_string().as_str()),
-        "sid1 must be in registry"
+        ids.contains(&"github-mcp"),
+        "github-mcp slug must be in registry, got {:?}",
+        ids
     );
     assert!(
-        ids.contains(&sid2.to_string().as_str()),
-        "sid2 must be in registry"
+        ids.contains(&"slack-mcp"),
+        "slack-mcp slug must be in registry, got {:?}",
+        ids
     );
 
     cleanup(&root);
@@ -716,9 +721,10 @@ async fn handle_install_mcp_registers_backend_in_aggregator() {
     // Assert: the handler returns true (tool list changed) and the backend
     // is now present in the aggregator under the mcp_server_id key.
     assert!(changed, "handle_install_mcp must return true on success");
+    let _ = sid;
     assert!(
-        registry.has_backend(&sid.to_string()),
-        "backend must be registered in aggregator after install"
+        registry.has_backend("github-mcp"),
+        "backend must be registered in aggregator under display-name slug"
     );
 
     cleanup(&root);
@@ -743,7 +749,7 @@ async fn handle_deactivate_mcp_removes_backend_from_aggregator() {
     let (list_changed_tx, _) = tokio::sync::broadcast::channel(16);
     crate::load_managed_mcp_into_registry(&state, &registry, list_changed_tx);
     assert!(
-        registry.has_backend(&sid.to_string()),
+        registry.has_backend("github-mcp"),
         "backend must be registered before deactivate"
     );
 
@@ -772,8 +778,9 @@ async fn handle_deactivate_mcp_removes_backend_from_aggregator() {
 
     // Assert: handler returns true and backend is gone from aggregator.
     assert!(changed, "handle_deactivate_mcp must return true on success");
+    let _ = sid;
     assert!(
-        !registry.has_backend(&sid.to_string()),
+        !registry.has_backend("github-mcp"),
         "backend must be removed from aggregator after deactivate"
     );
 

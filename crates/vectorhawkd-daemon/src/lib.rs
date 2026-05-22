@@ -1166,6 +1166,36 @@ pub fn spawn_tool_discovery(
 /// `tools/call` BEFORE any `tools/list` returns an error from
 /// `aggregator.rs::dispatch` (tool name not in cache). This matches the MCP
 /// protocol contract — clients must list before they call.
+/// Convert an MCP server display name into a kebab-case slug suitable for the
+/// aggregator's `server_id` key. Tool names surfaced to AI clients are
+/// namespaced as `<server_id>__<tool>`, so a readable slug gives the user
+/// `everything__echo` rather than `e9d7cc5a-a676-4682-9c5d-68a4e389f368__echo`.
+///
+/// Lowercases, replaces every non-alphanumeric run with a single `-`, trims
+/// leading/trailing `-`. Empty input collapses to `"server"` to keep
+/// `register_backend` from being called with an empty key.
+pub fn mcp_server_slug(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut prev_dash = true;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            for lc in ch.to_lowercase() {
+                out.push(lc);
+            }
+            prev_dash = false;
+        } else if !prev_dash {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    let trimmed = out.trim_end_matches('-').to_string();
+    if trimmed.is_empty() {
+        "server".to_string()
+    } else {
+        trimmed
+    }
+}
+
 pub fn mcp_row_to_backend_entry(
     row: &vectorhawkd_core::state::McpInstallRow,
 ) -> Option<BackendEntry> {
@@ -1225,7 +1255,7 @@ pub fn mcp_row_to_backend_entry(
     };
 
     Some(BackendEntry {
-        server_id: row.mcp_server_id.clone(),
+        server_id: mcp_server_slug(&row.mcp_server_name),
         name: row.mcp_server_name.clone(),
         transport,
         tools: vec![],
@@ -1290,3 +1320,34 @@ mod refresh_loop_tests;
 #[cfg(test)]
 #[path = "sync_tick_tests.rs"]
 mod sync_tick_tests;
+
+#[cfg(test)]
+mod slug_tests {
+    use super::mcp_server_slug;
+
+    #[test]
+    fn slug_lowercases_and_hyphenates() {
+        assert_eq!(mcp_server_slug("Filesystem"), "filesystem");
+        assert_eq!(mcp_server_slug("GitHub MCP"), "github-mcp");
+        assert_eq!(mcp_server_slug("GW2c-Runner Default"), "gw2c-runner-default");
+    }
+
+    #[test]
+    fn slug_collapses_runs_and_trims() {
+        assert_eq!(mcp_server_slug("  Foo   Bar  "), "foo-bar");
+        assert_eq!(mcp_server_slug("---weird---"), "weird");
+        assert_eq!(mcp_server_slug("a/b/c"), "a-b-c");
+    }
+
+    #[test]
+    fn slug_strips_unicode_to_alphanumeric() {
+        assert_eq!(mcp_server_slug("Atlassian™"), "atlassian");
+        assert_eq!(mcp_server_slug("notion (alpha)"), "notion-alpha");
+    }
+
+    #[test]
+    fn slug_empty_collapses_to_server() {
+        assert_eq!(mcp_server_slug(""), "server");
+        assert_eq!(mcp_server_slug("---"), "server");
+    }
+}
