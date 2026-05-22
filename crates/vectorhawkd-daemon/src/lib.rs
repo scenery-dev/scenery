@@ -1043,7 +1043,10 @@ fn flush_ratings_and_scan(
 /// missing or malformed row is skipped rather than crashing the daemon.
 ///
 /// Called once from `run_daemon` after `build_stub_registry()`.
-fn load_managed_mcp_into_registry(state: &AppState, registry: &BackendRegistry) {
+fn load_managed_mcp_into_registry(
+    state: &AppState,
+    registry: &Arc<BackendRegistry>,
+) {
     let rows = match state.list_mcp_installs() {
         Ok(r) => r,
         Err(e) => {
@@ -1057,9 +1060,10 @@ fn load_managed_mcp_into_registry(state: &AppState, registry: &BackendRegistry) 
         match mcp_row_to_backend_entry(row) {
             Some(entry) => {
                 let server_id = entry.server_id.clone();
-                registry.register_backend(entry);
+                registry.register_backend(entry.clone());
                 info!(server_id = %server_id, "startup: registered managed MCP backend");
                 loaded += 1;
+                spawn_tool_discovery(Arc::clone(registry), entry);
             }
             None => {
                 warn!(
@@ -1074,9 +1078,63 @@ fn load_managed_mcp_into_registry(state: &AppState, registry: &BackendRegistry) 
     if loaded > 0 {
         info!(
             count = loaded,
-            "startup: managed MCP backends registered in aggregator"
+            "startup: managed MCP backends registered in aggregator (tool discovery running in background)"
         );
     }
+}
+
+/// Fetch a backend's tool list off-thread and re-register the entry with the
+/// populated `tools` Vec. This keeps daemon startup fast (no blocking npx-pull
+/// per backend) while making the tools visible to `tools/list` once each
+/// backend has responded.
+///
+/// Re-registration via `register_backend` overwrites the existing entry by
+/// server_id, so the empty-tools placeholder is replaced atomically.
+pub fn spawn_tool_discovery(registry: Arc<BackendRegistry>, entry: BackendEntry) {
+    // Skip when no Tokio runtime is in scope (synchronous tests call
+    // load_managed_mcp_into_registry directly without a runtime).
+    if tokio::runtime::Handle::try_current().is_err() {
+        return;
+    }
+    tokio::spawn(async move {
+        let server_id = entry.server_id.clone();
+        let name = entry.name.clone();
+        let result = match &entry.transport {
+            BackendTransport::Stdio { command, args, env, .. } => {
+                BackendRegistry::fetch_tools_stdio(command, args, env).await
+            }
+            BackendTransport::Http { url, auth_token } => {
+                registry.fetch_tools_http(url, auth_token.as_deref()).await
+            }
+            BackendTransport::Stub => return,
+        };
+
+        match result {
+            Ok(tools) if !tools.is_empty() => {
+                let mut new_entry = entry.clone();
+                new_entry.tools = tools;
+                let count = new_entry.tools.len();
+                registry.register_backend(new_entry);
+                info!(
+                    server_id = %server_id,
+                    name = %name,
+                    tools = count,
+                    "tool discovery completed — backend re-registered with tools"
+                );
+            }
+            Ok(_) => {
+                warn!(server_id = %server_id, name = %name, "tool discovery returned zero tools");
+            }
+            Err(e) => {
+                warn!(
+                    server_id = %server_id,
+                    name = %name,
+                    error = %e,
+                    "tool discovery failed — backend will remain visible but exposing no tools"
+                );
+            }
+        }
+    });
 }
 
 /// Translate a `McpInstallRow` from SQLite into a `BackendEntry` for the aggregator.

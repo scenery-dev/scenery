@@ -677,8 +677,9 @@ async fn handle_install_mcp(
             match crate::mcp_row_to_backend_entry(&row) {
                 Some(entry) => {
                     let sid = entry.server_id.clone();
-                    backend_registry.register_backend(entry);
+                    backend_registry.register_backend(entry.clone());
                     info!(server_id = %sid, "reconciler: live-registered MCP backend in aggregator");
+                    crate::spawn_tool_discovery(backend_registry.clone(), entry);
                 }
                 None => {
                     warn!(
