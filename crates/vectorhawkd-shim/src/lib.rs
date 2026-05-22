@@ -45,8 +45,10 @@
 //! implementation lives there; any change must be mirrored here.
 
 use anyhow::Result;
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex as StdMutex};
+use tokio::io::{AsyncBufReadExt, BufReader as TokioBufReader};
 use tracing::{debug, error, info, warn};
 use vectorhawkd_mcp::{
     backend::SocketBackend,
@@ -141,19 +143,40 @@ pub async fn run_shim() -> Result<()> {
         SessionMode::DaemonRequired { reason }
     };
 
-    let stdin = io::stdin();
-    let stdout = io::stdout();
-    let mut reader = io::BufReader::new(stdin.lock());
-    let mut writer = io::BufWriter::new(stdout.lock());
+    let mut reader = TokioBufReader::new(tokio::io::stdin());
+
+    // Serializing lock around stdout so the main loop's request responses
+    // and the notification pump's frames can't interleave at the byte level.
+    // io::stdout() has internal stdlib locking but doesn't keep it across
+    // separate writeln+flush calls; this mutex makes each full frame atomic.
+    let stdout_lock = Arc::new(StdMutex::new(()));
+
+    // Spawn a background task that opens a SECOND socket connection
+    // dedicated to receiving server→client notifications (e.g.
+    // notifications/tools/list_changed). The daemon broadcasts these to
+    // every connected session, so the pump just reads frames and forwards
+    // notification frames (no id) to stdout. The original relay socket
+    // keeps doing request/response on the same connection.
+    if let SessionMode::Relaying(_) = &mode {
+        if let Some(ref path) = socket_path {
+            let path = path.clone();
+            let stdout_lock = Arc::clone(&stdout_lock);
+            tokio::spawn(async move {
+                if let Err(e) = run_notification_pump(path, stdout_lock).await {
+                    warn!(error = %e, "notification pump exited");
+                }
+            });
+        }
+    }
 
     info!("shim read-loop starting");
 
     loop {
         let mut line = String::new();
-        match reader.read_line(&mut line) {
+        match reader.read_line(&mut line).await {
             Ok(0) => break, // EOF — AI client disconnected
             Ok(_) => {}
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(e) => {
                 error!(error = %e, "failed to read from stdin");
                 break;
@@ -175,6 +198,9 @@ pub async fn run_shim() -> Result<()> {
                     continue;
                 }
             };
+            let _guard = stdout_lock.lock().unwrap();
+            let stdout = io::stdout();
+            let mut writer = stdout.lock();
             if let Err(e) = writeln!(writer, "{serialized}") {
                 error!(error = %e, "failed to write to stdout");
                 break;
@@ -188,6 +214,68 @@ pub async fn run_shim() -> Result<()> {
 
     info!("shim read-loop exiting");
     Ok(())
+}
+
+// ── Notification pump ─────────────────────────────────────────────────────────
+
+/// Background task: open a dedicated socket connection and forward any
+/// JSON-RPC notification frames (those without an `id`) to stdout.
+///
+/// The daemon's `socket_dispatch` broadcasts `notifications/tools/list_changed`
+/// to every connected session, so a second connection is the simplest way to
+/// receive notifications without contending with the primary relay loop's
+/// read of the same socket. Frames with an `id` (responses) on this connection
+/// are ignored — they belong to no in-flight request from this pump.
+#[cfg(unix)]
+async fn run_notification_pump(
+    socket_path: PathBuf,
+    stdout_lock: Arc<StdMutex<()>>,
+) -> Result<()> {
+    use tokio::net::UnixStream;
+    use vectorhawkd_mcp::backend::read_framed;
+
+    let stream = UnixStream::connect(&socket_path)
+        .await
+        .map_err(|e| anyhow::anyhow!("notification pump connect failed: {e}"))?;
+    debug!(socket = %socket_path.display(), "notification pump connected");
+    let (mut reader, _writer) = stream.into_split();
+
+    loop {
+        let frame = match read_framed(&mut reader).await {
+            Ok(Some(f)) => f,
+            Ok(None) => {
+                debug!("notification pump: daemon closed socket");
+                return Ok(());
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!("notification pump read error: {e}"));
+            }
+        };
+
+        // Only forward notifications (no `id`). Responses on this connection
+        // are stray and ignored.
+        let parsed: serde_json::Value = match serde_json::from_slice(&frame) {
+            Ok(v) => v,
+            Err(e) => {
+                debug!(error = %e, "notification pump: dropping unparseable frame");
+                continue;
+            }
+        };
+        if parsed.get("id").is_some() || parsed.get("method").is_none() {
+            continue;
+        }
+
+        let serialized = String::from_utf8_lossy(&frame);
+        let _guard = stdout_lock.lock().unwrap();
+        let stdout = io::stdout();
+        let mut writer = stdout.lock();
+        if let Err(e) = writeln!(writer, "{serialized}") {
+            return Err(anyhow::anyhow!("notification pump write failed: {e}"));
+        }
+        if let Err(e) = writer.flush() {
+            return Err(anyhow::anyhow!("notification pump flush failed: {e}"));
+        }
+    }
 }
 
 // ── Per-frame dispatch ────────────────────────────────────────────────────────
