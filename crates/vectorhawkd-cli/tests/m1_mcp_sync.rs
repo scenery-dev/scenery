@@ -11,46 +11,18 @@
 // ── mcp backends ─────────────────────────────────────────────────────────────
 
 #[test]
-fn mcp_backends_lists_stub_backend() {
+fn build_stub_registry_returns_empty_registry() {
     use vectorhawkd_daemon::build_stub_registry;
     use vectorhawkd_mcp::aggregator::BackendRegistry;
 
+    // The M0 stub backend (echo + ping) was removed once real backend
+    // registration shipped via managed-mcp.json. build_stub_registry now
+    // just constructs an empty registry that gets populated by
+    // load_managed_mcp_into_registry at startup.
     let registry: BackendRegistry = build_stub_registry();
-    let backends = registry.list_backends();
-
     assert!(
-        !backends.is_empty(),
-        "build_stub_registry must produce at least one backend"
-    );
-
-    let stub = backends
-        .iter()
-        .find(|b| b.server_id == "stub")
-        .expect("stub backend must be present");
-
-    assert_eq!(stub.name, "stub");
-    assert!(
-        stub.tool_count >= 2,
-        "stub backend must expose at least 2 tools (echo + ping), got {}",
-        stub.tool_count
-    );
-    assert!(!stub.unhealthy, "stub backend must start healthy");
-}
-
-#[test]
-fn mcp_backends_tool_names_include_echo_and_ping() {
-    use vectorhawkd_daemon::build_stub_registry;
-
-    let registry = build_stub_registry();
-    let tools = registry.backend_tools("stub");
-
-    assert!(
-        tools.iter().any(|t| t.contains("echo")),
-        "stub backend must have an echo tool; got {tools:?}"
-    );
-    assert!(
-        tools.iter().any(|t| t.contains("ping")),
-        "stub backend must have a ping tool; got {tools:?}"
+        registry.list_backends().is_empty(),
+        "build_stub_registry must produce an empty registry now"
     );
 }
 

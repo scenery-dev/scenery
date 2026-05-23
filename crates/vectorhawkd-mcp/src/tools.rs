@@ -81,7 +81,34 @@ const GOVERNANCE_FOOTER: &str = "\n\n---\nTo add new MCP servers, use /mcp-reque
 // ── Tool registry ─────────────────────────────────────────────────────────────
 
 /// Builds the list of MCP tool definitions from installed skills + management tools.
+///
+/// The vectorhawk_* management tools (search/install/uninstall/etc.) are
+/// hidden by default because users now manage skills + MCP servers via the
+/// portal — the management tools clutter the AI client's tool list. Set
+/// `VECTORHAWK_EXPOSE_BUILTIN_TOOLS=1` to surface them for CLI-style
+/// workflows.
 pub fn build_tool_list(state: &AppState, registry_url: &Option<String>) -> Vec<ToolDefinition> {
+    let expose = std::env::var("VECTORHAWK_EXPOSE_BUILTIN_TOOLS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    build_tool_list_inner(state, registry_url, expose)
+}
+
+/// Test-only entry point: same as `build_tool_list` but takes the
+/// `expose_builtins` flag explicitly so tests don't depend on env vars.
+#[cfg(test)]
+pub(crate) fn build_tool_list_with_builtins(
+    state: &AppState,
+    registry_url: &Option<String>,
+) -> Vec<ToolDefinition> {
+    build_tool_list_inner(state, registry_url, true)
+}
+
+fn build_tool_list_inner(
+    state: &AppState,
+    registry_url: &Option<String>,
+    expose_builtins: bool,
+) -> Vec<ToolDefinition> {
     let mut tools = Vec::new();
 
     let logged_in = registry_url
@@ -94,7 +121,11 @@ pub fn build_tool_list(state: &AppState, registry_url: &Option<String>) -> Vec<T
         tools.extend(skill_tools);
     }
 
-    // Management tools — always available (local operations)
+    if !expose_builtins {
+        return tools;
+    }
+
+    // Management tools — opt-in via VECTORHAWK_EXPOSE_BUILTIN_TOOLS.
     tools.push(ToolDefinition {
         name: "vectorhawk_list".to_string(),
         description:
@@ -2708,7 +2739,7 @@ mod tests {
         let url = "http://localhost:8000".to_string();
         fake_login(&state, &url);
 
-        let tools = build_tool_list(&state, &Some(url));
+        let tools = build_tool_list_with_builtins(&state, &Some(url));
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
 
         assert!(names.contains(&"vectorhawk_list"));
@@ -2725,7 +2756,7 @@ mod tests {
         let state_root = temp_root("tool-list-no-reg");
         let state = AppState::bootstrap_in(state_root.clone()).unwrap();
 
-        let tools = build_tool_list(&state, &None);
+        let tools = build_tool_list_with_builtins(&state, &None);
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
 
         assert!(names.contains(&"vectorhawk_list"));
@@ -2744,7 +2775,7 @@ mod tests {
         let url = "http://localhost:8000".to_string();
         // No fake_login — user is not authenticated
 
-        let tools = build_tool_list(&state, &Some(url));
+        let tools = build_tool_list_with_builtins(&state, &Some(url));
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
 
         assert!(
@@ -2773,7 +2804,7 @@ mod tests {
         let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
         install_unpacked_skill(&state, &pkg, InstallMode::Copy).unwrap();
 
-        let tools = build_tool_list(&state, &None);
+        let tools = build_tool_list_with_builtins(&state, &None);
         let skill_tool = tools.iter().find(|t| t.name == "test-skill");
 
         assert!(
@@ -3580,7 +3611,7 @@ mod tests {
     fn build_tool_list_includes_plugin_tools() {
         let state_root = temp_root("tool-list-plugin");
         let state = AppState::bootstrap_in(state_root.clone()).unwrap();
-        let tools = build_tool_list(&state, &None);
+        let tools = build_tool_list_with_builtins(&state, &None);
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert!(
             names.contains(&"vectorhawk_plugin_export"),

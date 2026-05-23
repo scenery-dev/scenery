@@ -80,7 +80,7 @@ use vectorhawkd_core::{
 };
 use vectorhawkd_mcp::sampling::HybridModelClient;
 use vectorhawkd_mcp::{
-    aggregator::{BackendEntry, BackendRegistry, BackendTransport, ToolDefinition, ToolVisibility},
+    aggregator::{BackendEntry, BackendRegistry, BackendTransport, ToolVisibility},
     backend::{Backend, RealBackend},
     tools::UpdateCheckCache,
 };
@@ -1268,47 +1268,11 @@ pub fn mcp_row_to_backend_entry(
 
 /// Construct the M0 stub `BackendRegistry`.
 ///
-/// Registers a single in-memory backend (`stub`) with two tools (`echo`,
-/// `ping`) so that `tools/list` returns at least one result. Real HTTP
-/// backends land in M1.3.
+/// Construct an empty `BackendRegistry`. Live backends are loaded from
+/// `managed-mcp.json` via `load_managed_mcp_into_registry`. The M0 stub
+/// backend (echo/ping) was removed once real backend registration shipped.
 pub fn build_stub_registry() -> BackendRegistry {
-    let registry = BackendRegistry::new();
-    registry.register_backend(BackendEntry {
-        server_id: "stub".to_string(),
-        name: "stub".to_string(),
-        transport: BackendTransport::Stub,
-        tools: vec![
-            ToolDefinition {
-                name: "echo".to_string(),
-                description: Some(
-                    "Echo tool — returns the arguments it received. M0 stub.".to_string(),
-                ),
-                input_schema: Some(serde_json::json!({
-                    "type": "object",
-                    "properties": {
-                        "message": {
-                            "type": "string",
-                            "description": "The message to echo back"
-                        }
-                    },
-                    "required": ["message"]
-                })),
-            },
-            ToolDefinition {
-                name: "ping".to_string(),
-                description: Some("Health check — returns pong. M0 stub.".to_string()),
-                input_schema: Some(serde_json::json!({
-                    "type": "object",
-                    "properties": {}
-                })),
-            },
-        ],
-        tool_visibility: ToolVisibility::All,
-        priority: 50,
-        consecutive_errors: 0,
-        unhealthy: false,
-    });
-    registry
+    BackendRegistry::new()
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
