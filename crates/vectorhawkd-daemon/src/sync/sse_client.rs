@@ -383,6 +383,51 @@ async fn dispatch_event(
         }
     }
 
+    // T3 (v1.0.56): admin triggered a publish from the portal (discovery status
+    // transitions to 'publishing').  The daemon packs source_path and uploads to
+    // the registry compile endpoint.  Spawned as its own task so SSE dispatch is
+    // not blocked on disk I/O or the HTTP upload.
+    if event_type == "discovery_publish_requested" {
+        #[derive(serde::Deserialize)]
+        struct Wire {
+            discovery_id: String,
+            slug: String,
+            source_path: String,
+            #[allow(dead_code)]
+            skill_db_id: Option<String>,
+        }
+        match serde_json::from_str::<Wire>(event_data) {
+            Ok(w) => {
+                let state_arc: Arc<AppState> = Arc::new(state.clone());
+                let registry_url = state
+                    .get_sync_state("registry_url")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                tokio::spawn(async move {
+                    if registry_url.is_empty() {
+                        warn!("publish: no registry_url in sync_state — cannot publish");
+                        return;
+                    }
+                    if let Err(e) = crate::managed_paths::publish::handle_publish_requested(
+                        state_arc,
+                        registry_url,
+                        w.discovery_id,
+                        w.slug,
+                        w.source_path,
+                    )
+                    .await
+                    {
+                        warn!(error = %e, "publish: handler failed");
+                    }
+                });
+            }
+            Err(e) => {
+                warn!(error = %e, "publish: malformed discovery_publish_requested payload");
+            }
+        }
+    }
+
     if event_type == "managed_paths_drift_resolution" {
         #[derive(serde::Deserialize)]
         struct WireDriftResolution {
@@ -691,6 +736,15 @@ fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
             // Handled in `dispatch_event` before this parser is called — no
             // additional reconciler action needed.  Return an empty snapshot so
             // the reconciler produces no diff actions.
+            Ok(SyncEvent::Snapshot {
+                installations: vec![],
+                mcp_installations: vec![],
+            })
+        }
+        "discovery_publish_requested" => {
+            // Handled in `dispatch_event` before this parser is called — no
+            // reconciler action needed.  Return an empty snapshot so the
+            // reconciler produces no diff actions.
             Ok(SyncEvent::Snapshot {
                 installations: vec![],
                 mcp_installations: vec![],

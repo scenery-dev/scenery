@@ -221,77 +221,164 @@ pub async fn rollback(
         }
 
         // ── 3. DELETE catalog entry (non-fatal) ───────────────────────────────
-        if let Some(ref token) = bearer_token {
-            let catalog_url = format!(
-                "{}/portal/managed-paths/catalog/{}",
-                registry_url.trim_end_matches('/'),
-                item.slug
-            );
-            match http_client
-                .delete(&catalog_url)
-                .bearer_auth(token)
-                .send()
-                .await
-            {
-                Ok(resp) => {
-                    let status = resp.status();
-                    if status.is_success()
-                        || status == reqwest::StatusCode::NOT_FOUND
-                        || status == reqwest::StatusCode::FORBIDDEN
-                    {
-                        debug!(slug = %item.slug, %status, "rollback: catalog DELETE done");
-                    } else {
+        match bearer_token {
+            None => {
+                warn!(
+                    slug = %item.slug,
+                    "rollback: no bearer token available — skipping catalog DELETE"
+                );
+                report.errors.push(RollbackError {
+                    slug: item.slug.clone(),
+                    message: "catalog DELETE skipped: no auth token available".to_string(),
+                });
+            }
+            Some(ref token) => {
+                let catalog_url = format!(
+                    "{}/portal/managed-paths/catalog/{}",
+                    registry_url.trim_end_matches('/'),
+                    item.slug
+                );
+                match http_client
+                    .delete(&catalog_url)
+                    .bearer_auth(token)
+                    .send()
+                    .await
+                {
+                    Ok(resp) => {
+                        let status = resp.status();
+                        if status.is_success() {
+                            info!(slug = %item.slug, %status, "rollback: catalog DELETE succeeded");
+                        } else if status == reqwest::StatusCode::NOT_FOUND {
+                            info!(
+                                slug = %item.slug,
+                                "rollback: catalog DELETE 404 — entry already removed"
+                            );
+                        } else if status == reqwest::StatusCode::FORBIDDEN {
+                            let body = resp.text().await.unwrap_or_default();
+                            warn!(
+                                slug = %item.slug,
+                                %status,
+                                body,
+                                "rollback: catalog DELETE 403 — insufficient permissions"
+                            );
+                            report.errors.push(RollbackError {
+                                slug: item.slug.clone(),
+                                message: format!("catalog DELETE forbidden (403): {body}"),
+                            });
+                        } else {
+                            let body = resp.text().await.unwrap_or_default();
+                            warn!(
+                                slug = %item.slug,
+                                %status,
+                                body,
+                                "rollback: catalog DELETE failed"
+                            );
+                            report.errors.push(RollbackError {
+                                slug: item.slug.clone(),
+                                message: format!("catalog DELETE returned HTTP {status}: {body}"),
+                            });
+                        }
+                    }
+                    Err(e) => {
                         warn!(
                             slug = %item.slug,
-                            %status,
-                            "rollback: catalog DELETE returned unexpected status (non-fatal)"
+                            error = %e,
+                            "rollback: catalog DELETE HTTP call failed"
                         );
+                        report.errors.push(RollbackError {
+                            slug: item.slug.clone(),
+                            message: format!("catalog DELETE HTTP error: {e}"),
+                        });
                     }
-                }
-                Err(e) => {
-                    warn!(slug = %item.slug, error = %e, "rollback: catalog DELETE HTTP call failed (non-fatal)");
                 }
             }
         }
 
         // ── 4. DELETE installation row (non-fatal) ────────────────────────────
-        if let (Some(ref token), Some(ref iid)) = (&bearer_token, &item.installation_id) {
-            let install_url = format!(
-                "{}/installations/{}",
-                registry_url.trim_end_matches('/'),
-                iid
-            );
-            match http_client
-                .delete(&install_url)
-                .bearer_auth(token)
-                .send()
-                .await
-            {
-                Ok(resp) => {
-                    let status = resp.status();
-                    if status.is_success()
-                        || status == reqwest::StatusCode::NOT_FOUND
-                        || status == reqwest::StatusCode::FORBIDDEN
-                    {
-                        debug!(slug = %item.slug, installation_id = %iid, %status, "rollback: installation DELETE done");
-                    } else {
+        match (&bearer_token, &item.installation_id) {
+            (None, Some(_)) => {
+                warn!(
+                    slug = %item.slug,
+                    "rollback: no bearer token available — skipping installation DELETE"
+                );
+                report.errors.push(RollbackError {
+                    slug: item.slug.clone(),
+                    message: "installation DELETE skipped: no auth token available".to_string(),
+                });
+            }
+            (Some(token), Some(iid)) => {
+                let install_url = format!(
+                    "{}/installations/{}",
+                    registry_url.trim_end_matches('/'),
+                    iid
+                );
+                match http_client
+                    .delete(&install_url)
+                    .bearer_auth(token)
+                    .send()
+                    .await
+                {
+                    Ok(resp) => {
+                        let status = resp.status();
+                        if status.is_success() {
+                            info!(
+                                slug = %item.slug,
+                                installation_id = %iid,
+                                %status,
+                                "rollback: installation DELETE succeeded"
+                            );
+                        } else if status == reqwest::StatusCode::NOT_FOUND {
+                            info!(
+                                slug = %item.slug,
+                                installation_id = %iid,
+                                "rollback: installation DELETE 404 — row already removed"
+                            );
+                        } else if status == reqwest::StatusCode::FORBIDDEN {
+                            let body = resp.text().await.unwrap_or_default();
+                            warn!(
+                                slug = %item.slug,
+                                installation_id = %iid,
+                                %status,
+                                body,
+                                "rollback: installation DELETE 403 — insufficient permissions"
+                            );
+                            report.errors.push(RollbackError {
+                                slug: item.slug.clone(),
+                                message: format!("installation DELETE forbidden (403): {body}"),
+                            });
+                        } else {
+                            let body = resp.text().await.unwrap_or_default();
+                            warn!(
+                                slug = %item.slug,
+                                installation_id = %iid,
+                                %status,
+                                body,
+                                "rollback: installation DELETE failed"
+                            );
+                            report.errors.push(RollbackError {
+                                slug: item.slug.clone(),
+                                message: format!(
+                                    "installation DELETE returned HTTP {status}: {body}"
+                                ),
+                            });
+                        }
+                    }
+                    Err(e) => {
                         warn!(
                             slug = %item.slug,
                             installation_id = %iid,
-                            %status,
-                            "rollback: installation DELETE returned unexpected status (non-fatal)"
+                            error = %e,
+                            "rollback: installation DELETE HTTP call failed"
                         );
+                        report.errors.push(RollbackError {
+                            slug: item.slug.clone(),
+                            message: format!("installation DELETE HTTP error: {e}"),
+                        });
                     }
                 }
-                Err(e) => {
-                    warn!(
-                        slug = %item.slug,
-                        installation_id = %iid,
-                        error = %e,
-                        "rollback: installation DELETE HTTP call failed (non-fatal)"
-                    );
-                }
             }
+            // No installation_id in manifest — nothing to delete.
+            (_, None) => {}
         }
 
         info!(slug = %item.slug, "rollback: item restored");
@@ -605,7 +692,18 @@ mod tests {
             .unwrap();
 
         assert_eq!(report.restored, vec!["test-skill"]);
-        assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
+        // No auth token is stored for the test registry URL, so the catalog
+        // DELETE leg will report a "skipped" error.  That is expected and correct
+        // behaviour — the important assertion is that files are actually restored.
+        let fatal_errors: Vec<_> = report
+            .errors
+            .iter()
+            .filter(|e| !e.message.contains("no auth token"))
+            .collect();
+        assert!(
+            fatal_errors.is_empty(),
+            "unexpected fatal errors: {fatal_errors:?}"
+        );
         // File was restored.
         assert!(
             original_skill.join("SKILL.md").exists(),
@@ -666,7 +764,18 @@ mod tests {
         .unwrap();
 
         assert_eq!(report.restored, vec!["skill-a"]);
-        assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
+        // No auth token is stored for the test registry URL, so the catalog
+        // DELETE leg will report a "skipped" error.  Filter those out — the
+        // important assertion is that only skill-a is touched.
+        let fatal_errors: Vec<_> = report
+            .errors
+            .iter()
+            .filter(|e| !e.message.contains("no auth token"))
+            .collect();
+        assert!(
+            fatal_errors.is_empty(),
+            "unexpected fatal errors: {fatal_errors:?}"
+        );
 
         // skill-a restored; skill-b untouched (backup still there, original not created).
         assert!(
@@ -676,6 +785,115 @@ mod tests {
         assert!(
             !home.path().join(".claude/skills/skill-b").exists(),
             "skill-b should NOT be restored"
+        );
+    }
+
+    /// Verify that a 500 response from the catalog DELETE endpoint is surfaced
+    /// as an entry in `RollbackReport::errors` rather than silently swallowed.
+    #[tokio::test]
+    async fn rollback_reports_catalog_delete_failure_in_errors() {
+        let home = make_home();
+        let backup_base = home.path().join(".claude").join(".vectorhawk-backup");
+        let ts = "2025-06-12T000000Z";
+        let run_dir = backup_base.join(ts);
+
+        let slug = "bad-skill";
+        let backup_dir = run_dir.join("skills").join(slug);
+        fs::create_dir_all(&backup_dir).unwrap();
+        fs::write(backup_dir.join("SKILL.md"), "# test").unwrap();
+        let original = home.path().join(".claude").join("skills").join(slug);
+
+        let item = ManifestItem {
+            kind: "skill".to_string(),
+            slug: slug.to_string(),
+            original_path: original.to_string_lossy().to_string(),
+            backup_path: backup_dir.to_string_lossy().to_string(),
+            f2_marker_path: original.to_string_lossy().to_string(),
+            catalog_skill_id: None,
+            // No installation_id so only the catalog DELETE is attempted.
+            installation_id: None,
+        };
+        append_manifest_item(&run_dir, ts, item).unwrap();
+
+        // Minimal AppState with a token stored so load_bearer_token returns Some.
+        let db_dir = home.path().join(".vectorhawk");
+        fs::create_dir_all(&db_dir).unwrap();
+        let db_path = camino::Utf8PathBuf::from(db_dir.join("state.db").to_string_lossy().as_ref());
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS auth_tokens \
+                (id INTEGER PRIMARY KEY, registry_url TEXT, access_token TEXT, \
+                 refresh_token TEXT, expires_at INTEGER); \
+             CREATE TABLE IF NOT EXISTS sync_state (key TEXT PRIMARY KEY, value TEXT); \
+             CREATE TABLE IF NOT EXISTS managed_path_markers \
+                (path TEXT PRIMARY KEY, kind TEXT, slug TEXT, installation_id TEXT, \
+                 source_sha256 TEXT, migrated_at TEXT);",
+        )
+        .unwrap();
+        // Insert a fake token so the HTTP leg fires.
+        conn.execute(
+            "INSERT INTO auth_tokens (registry_url, access_token, refresh_token, expires_at) \
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                "__mock__",
+                "fake-access-token",
+                "fake-refresh-token",
+                9_999_999_999_i64
+            ],
+        )
+        .unwrap();
+        drop(conn);
+        let root_dir = camino::Utf8PathBuf::from(db_dir.to_string_lossy().as_ref());
+        let state = AppState { root_dir, db_path };
+
+        // Start a mock server that always returns 500 for the catalog DELETE.
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock(
+                "DELETE",
+                format!("/portal/managed-paths/catalog/{slug}").as_str(),
+            )
+            .with_status(500)
+            .with_body("internal server error")
+            .create_async()
+            .await;
+
+        let registry_url = server.url();
+        // Override the token registry_url to match the mock server URL so
+        // load_bearer_token finds it.
+        let conn2 = rusqlite::Connection::open(&state.db_path).unwrap();
+        conn2
+            .execute(
+                "UPDATE auth_tokens SET registry_url = ?1",
+                rusqlite::params![registry_url],
+            )
+            .unwrap();
+        drop(conn2);
+
+        let report = rollback(&state, &registry_url, home.path(), ts, None)
+            .await
+            .unwrap();
+
+        // File restore should have succeeded.
+        assert!(
+            original.join("SKILL.md").exists(),
+            "SKILL.md should be restored even when HTTP DELETE fails"
+        );
+        assert_eq!(
+            report.restored,
+            vec![slug],
+            "item should still be in restored list"
+        );
+
+        // The catalog DELETE failure must appear in errors.
+        let catalog_err = report
+            .errors
+            .iter()
+            .find(|e| e.slug == slug && e.message.contains("500"));
+        assert!(
+            catalog_err.is_some(),
+            "expected an error entry for the 500 catalog DELETE; errors: {:?}",
+            report.errors
         );
     }
 }

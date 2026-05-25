@@ -31,6 +31,7 @@ pub mod drift;
 pub mod marker;
 pub mod migrator;
 pub mod paths;
+pub mod publish;
 pub mod pusher;
 pub mod rollback;
 pub mod scanner;
