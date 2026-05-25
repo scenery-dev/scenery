@@ -9,6 +9,7 @@ use std::fs;
 /// and `$XDG_DATA_HOME/vectorhawk/` (defaulting to `~/.local/share/vectorhawk/`)
 /// on Linux. The daemon owns this state; the CLI reads it directly for now (M1
 /// will decide whether CLI goes through the socket or reads SQLite directly).
+#[derive(Clone)]
 pub struct AppState {
     pub root_dir: Utf8PathBuf,
     pub db_path: Utf8PathBuf,
@@ -86,6 +87,10 @@ impl AppState {
         // G3: MCP installation desired-state table.
         conn.execute_batch(SCHEMA_G3_SQL)
             .context("failed to apply G3 schema additions")?;
+
+        // F1: managed-paths reconciler marker table.
+        conn.execute_batch(SCHEMA_F1_SQL)
+            .context("failed to apply F1 schema additions")?;
 
         Ok(Self { root_dir, db_path })
     }
@@ -406,6 +411,24 @@ CREATE TABLE IF NOT EXISTS mcp_installations (
 );
 "#;
 
+/// F1: managed-paths reconciler marker table.
+///
+/// Tracks every skill, plugin, and MCP entry that has been migrated into
+/// VectorHawk ownership.  The `path` column is the absolute filesystem path
+/// (or `<path>:<key>` virtual key for MCP entries) and serves as the
+/// idempotency key so re-runs are no-ops.
+const SCHEMA_F1_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS managed_path_markers (
+    path            TEXT NOT NULL,
+    kind            TEXT NOT NULL,
+    slug            TEXT NOT NULL,
+    installation_id TEXT,
+    source_sha256   TEXT NOT NULL,
+    migrated_at     TEXT NOT NULL,
+    PRIMARY KEY (path)
+);
+"#;
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -446,12 +469,12 @@ mod tests {
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN \
                  ('installed_skills','skill_versions','policy_cache','auth_tokens',\
                   'execution_history','audit_events','skill_ratings','skill_execution_counts',\
-                  'sync_state','mcp_installations')",
+                  'sync_state','mcp_installations','managed_path_markers')",
                 [],
                 |row| row.get(0),
             )
             .expect("should query sqlite_master");
-        assert_eq!(table_count, 10, "all ten tables should exist");
+        assert_eq!(table_count, 11, "all eleven tables should exist");
 
         cleanup(&state.root_dir);
     }

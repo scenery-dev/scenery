@@ -374,8 +374,8 @@ fn auth_status_parses() {
 fn mcp_serve_parses() {
     use super::{Command, McpCommand};
     match parse(&["mcp", "serve"]).command {
-        Command::Mcp(McpCommand::Serve) => {}
-        other => panic!("expected Mcp(Serve), got {other:?}"),
+        Command::Mcp(McpCommand::Serve { server: None }) => {}
+        other => panic!("expected Mcp(Serve {{ server: None }}), got {other:?}"),
     }
 }
 

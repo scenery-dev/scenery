@@ -32,6 +32,7 @@ use tokio::sync::{broadcast, mpsc};
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use crate::managed_paths::ManagedPathsPusher;
 use crate::sync::sse_client::{InstallationRecord, McpInstallationRecord, SyncEvent};
 use vectorhawkd_core::{
     auth::load_all_tokens,
@@ -99,6 +100,7 @@ pub fn spawn(
     state: Arc<AppState>,
     list_changed_tx: broadcast::Sender<()>,
     backend_registry: Arc<BackendRegistry>,
+    pusher: Option<Arc<ManagedPathsPusher>>,
 ) -> ReconcilerHandle {
     let stats = Arc::new(Mutex::new(ReconcilerStats::default()));
     let handle = ReconcilerHandle {
@@ -126,6 +128,7 @@ pub fn spawn(
         list_changed_tx,
         stats,
         backend_registry,
+        pusher,
     ));
 
     handle
@@ -140,6 +143,7 @@ async fn run_loop(
     list_changed_tx: broadcast::Sender<()>,
     stats: Arc<Mutex<ReconcilerStats>>,
     backend_registry: Arc<BackendRegistry>,
+    pusher: Option<Arc<ManagedPathsPusher>>,
 ) {
     // Semaphore limits concurrent install workers.
     let sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_INSTALLS));
@@ -193,6 +197,7 @@ async fn run_loop(
                     &mut install_tasks,
                     &backend_registry,
                     list_changed_tx.clone(),
+                    pusher.as_ref().map(Arc::clone),
                 ).await;
 
                 // Process any snapshot-derived events. The current event was
@@ -249,6 +254,7 @@ async fn dispatch_event(
     install_tasks: &mut tokio::task::JoinSet<bool>,
     backend_registry: &Arc<BackendRegistry>,
     list_changed_tx: broadcast::Sender<()>,
+    pusher: Option<Arc<ManagedPathsPusher>>,
 ) {
     match event {
         SyncEvent::Install {
@@ -266,6 +272,7 @@ async fn dispatch_event(
                 skill_locks,
                 stats,
                 install_tasks,
+                pusher,
             );
         }
         SyncEvent::Deactivate {
@@ -279,6 +286,7 @@ async fn dispatch_event(
                 registry_url,
                 skill_locks,
                 install_tasks,
+                pusher,
             );
         }
         SyncEvent::Purge {
@@ -320,6 +328,7 @@ async fn dispatch_event(
                 install_tasks,
                 backend_registry,
                 list_changed_tx.clone(),
+                pusher,
             );
         }
         SyncEvent::DeactivateMcp {
@@ -335,6 +344,7 @@ async fn dispatch_event(
                 stats,
                 install_tasks,
                 backend_registry,
+                pusher,
             );
         }
         SyncEvent::Snapshot {
@@ -360,6 +370,7 @@ async fn dispatch_event(
                             skill_locks,
                             stats,
                             install_tasks,
+                            pusher.as_ref().map(Arc::clone),
                         );
                     }
                     SyncEvent::Deactivate {
@@ -373,6 +384,7 @@ async fn dispatch_event(
                             registry_url,
                             skill_locks,
                             install_tasks,
+                            pusher.as_ref().map(Arc::clone),
                         );
                     }
                     SyncEvent::Purge {
@@ -432,6 +444,7 @@ async fn dispatch_event(
                                 install_tasks,
                                 backend_registry,
                                 list_changed_tx.clone(),
+                                pusher.as_ref().map(Arc::clone),
                             );
                         }
                         SyncEvent::DeactivateMcp {
@@ -447,6 +460,7 @@ async fn dispatch_event(
                                 stats,
                                 install_tasks,
                                 backend_registry,
+                                pusher.as_ref().map(Arc::clone),
                             );
                         }
                         _ => {}
@@ -468,6 +482,7 @@ fn spawn_install(
     skill_locks: &SkillLockMap,
     stats: &Arc<Mutex<ReconcilerStats>>,
     install_tasks: &mut tokio::task::JoinSet<bool>,
+    pusher: Option<Arc<ManagedPathsPusher>>,
 ) {
     let st = Arc::clone(state);
     let reg_url = registry_url.to_string();
@@ -490,6 +505,7 @@ fn spawn_install(
             &st,
             &reg_url,
             &stats_clone,
+            pusher.as_deref(),
         )
         .await
     });
@@ -502,6 +518,7 @@ fn spawn_deactivate(
     registry_url: &str,
     skill_locks: &SkillLockMap,
     install_tasks: &mut tokio::task::JoinSet<bool>,
+    pusher: Option<Arc<ManagedPathsPusher>>,
 ) {
     let st = Arc::clone(state);
     let reg_url = registry_url.to_string();
@@ -509,7 +526,7 @@ fn spawn_deactivate(
 
     install_tasks.spawn(async move {
         let _skill_guard = lock.lock_owned().await;
-        handle_deactivate(installation_id, &skill_id, &st, &reg_url).await
+        handle_deactivate(installation_id, &skill_id, &st, &reg_url, pusher.as_deref()).await
     });
 }
 
@@ -550,6 +567,7 @@ fn spawn_install_mcp(
     install_tasks: &mut tokio::task::JoinSet<bool>,
     backend_registry: &Arc<BackendRegistry>,
     list_changed_tx: broadcast::Sender<()>,
+    pusher: Option<Arc<ManagedPathsPusher>>,
 ) {
     let st = Arc::clone(state);
     let reg_url = registry_url.to_string();
@@ -575,6 +593,7 @@ fn spawn_install_mcp(
             &stats_clone,
             &br,
             list_changed_tx,
+            pusher.as_deref(),
         )
         .await
     });
@@ -590,6 +609,7 @@ fn spawn_deactivate_mcp(
     stats: &Arc<Mutex<ReconcilerStats>>,
     install_tasks: &mut tokio::task::JoinSet<bool>,
     backend_registry: &Arc<BackendRegistry>,
+    pusher: Option<Arc<ManagedPathsPusher>>,
 ) {
     let st = Arc::clone(state);
     let reg_url = registry_url.to_string();
@@ -606,6 +626,7 @@ fn spawn_deactivate_mcp(
             &reg_url,
             &stats_clone,
             &br,
+            pusher.as_deref(),
         )
         .await
     });
@@ -629,6 +650,7 @@ async fn handle_install_mcp(
     stats: &Arc<Mutex<ReconcilerStats>>,
     backend_registry: &Arc<BackendRegistry>,
     list_changed_tx: broadcast::Sender<()>,
+    pusher: Option<&ManagedPathsPusher>,
 ) -> bool {
     report_mcp_installation_status(installation_id, "installing", None, registry_url, state).await;
 
@@ -666,6 +688,22 @@ async fn handle_install_mcp(
             report_mcp_installation_status(installation_id, "installed", None, registry_url, state)
                 .await;
             increment_mcp_installs(stats);
+
+            // F2: Push a per-server entry to ~/.claude.json so Claude Code's
+            // native /mcp UI lists it.  The aggregator entry (above) stays for
+            // existing users who point their AI client at the vectorhawk shim;
+            // the per-server entry is additional.
+            let slug = crate::mcp_server_slug(&mcp_server_name);
+            if let Some(p) = pusher {
+                if let Err(e) = p.push_mcp(&slug, Some(&installation_id.to_string())) {
+                    warn!(
+                        mcp_server_id = %mcp_server_id,
+                        slug = %slug,
+                        error = %e,
+                        "reconciler: F2 push_mcp failed (non-fatal)"
+                    );
+                }
+            }
 
             // Register the new backend in the live aggregator so the AI client
             // sees it immediately without a daemon restart.
@@ -744,6 +782,7 @@ async fn handle_deactivate_mcp(
     registry_url: &str,
     stats: &Arc<Mutex<ReconcilerStats>>,
     backend_registry: &Arc<BackendRegistry>,
+    pusher: Option<&ManagedPathsPusher>,
 ) -> bool {
     let state_clone = Arc::clone(state);
     let server_id_str = mcp_server_id.to_string();
@@ -786,6 +825,20 @@ async fn handle_deactivate_mcp(
             )
             .await;
             increment_mcp_deactivates(stats);
+
+            // F2: Remove the per-server entry from ~/.claude.json.
+            if let Some(ref key) = aggregator_key {
+                if let Some(p) = pusher {
+                    if let Err(e) = p.remove_mcp(key) {
+                        warn!(
+                            mcp_server_id = %mcp_server_id,
+                            slug = %key,
+                            error = %e,
+                            "reconciler: F2 remove_mcp failed (non-fatal)"
+                        );
+                    }
+                }
+            }
 
             // Remove the backend from the live aggregator so the AI client
             // stops seeing its tools immediately without a daemon restart.
@@ -1034,8 +1087,17 @@ async fn handle_install(
     state: &Arc<AppState>,
     registry_url: &str,
     stats: &Arc<Mutex<ReconcilerStats>>,
+    pusher: Option<&ManagedPathsPusher>,
 ) -> bool {
-    let result = do_install(installation_id, skill_id, version, state, registry_url).await;
+    let result = do_install(
+        installation_id,
+        skill_id,
+        version,
+        state,
+        registry_url,
+        pusher,
+    )
+    .await;
 
     match result {
         Ok(()) => {
@@ -1061,7 +1123,16 @@ async fn handle_install(
 
             // Wait then retry once.
             tokio::time::sleep(Duration::from_secs(RETRY_DELAY_SECS)).await;
-            match do_install(installation_id, skill_id, version, state, registry_url).await {
+            match do_install(
+                installation_id,
+                skill_id,
+                version,
+                state,
+                registry_url,
+                pusher,
+            )
+            .await
+            {
                 Ok(()) => {
                     decrement_pending_inc_installed(stats);
                     true
@@ -1096,6 +1167,7 @@ async fn do_install(
     version: &str,
     state: &Arc<AppState>,
     registry_url: &str,
+    pusher: Option<&ManagedPathsPusher>,
 ) -> Result<()> {
     let skill_id = skill_id.to_string();
     let version = version.to_string();
@@ -1112,6 +1184,10 @@ async fn do_install(
         flip_active_symlink(Arc::clone(&state_clone), skill_id.clone(), version.clone()).await?;
         report_installation_status(installation_id, "installed", None, &reg_url, &state_clone)
             .await;
+
+        // F2: Push the skill into ~/.claude/skills/ after symlink flip.
+        push_skill_to_claude(pusher, &skill_id, Some(&installation_id.to_string()), state);
+
         return Ok(());
     }
 
@@ -1137,7 +1213,91 @@ async fn do_install(
     .context("install_blocking task panicked")??;
 
     report_installation_status(installation_id, "installed", None, &reg_url, state).await;
+
+    // F2: Push the skill into ~/.claude/skills/ after successful install.
+    push_skill_to_claude(pusher, &skill_id, Some(&installation_id.to_string()), state);
+
     Ok(())
+}
+
+/// F2 helper: read the installed skill's SKILL.md from disk and push it into
+/// `~/.claude/skills/<skill_id>/`.
+///
+/// Non-fatal: all failures are logged at WARN.  The install itself already
+/// succeeded; the push is a best-effort Claude Code native-UI integration.
+fn push_skill_to_claude(
+    pusher: Option<&ManagedPathsPusher>,
+    skill_id: &str,
+    installation_id: Option<&str>,
+    state: &Arc<AppState>,
+) {
+    let p = match pusher {
+        Some(p) => p,
+        None => return,
+    };
+
+    let active_dir = state.root_dir.join("skills").join(skill_id).join("active");
+    let skill_md_path = active_dir.join("SKILL.md");
+
+    let skill_md_bytes = match std::fs::read(&skill_md_path) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(
+                skill_id,
+                error = %e,
+                "reconciler: F2 cannot read SKILL.md for push — skipping"
+            );
+            return;
+        }
+    };
+
+    // Collect referenced files (prompts/ etc.) for the push.
+    let referenced = collect_referenced_files(active_dir.as_std_path());
+
+    if let Err(e) = p.push_skill(skill_id, installation_id, &skill_md_bytes, &referenced) {
+        warn!(
+            skill_id,
+            error = %e,
+            "reconciler: F2 push_skill failed (non-fatal)"
+        );
+    }
+}
+
+/// Walk `dir` and collect all files that aren't SKILL.md or the marker, returning
+/// `(relative_path_string, bytes)` pairs.
+fn collect_referenced_files(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    let walker = match std::fs::read_dir(dir) {
+        Ok(w) => w,
+        Err(_) => return out,
+    };
+
+    for entry in walker.flatten() {
+        let path = entry.path();
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+
+        // Skip SKILL.md (written separately) and the marker file.
+        if name == "SKILL.md" || name == ".vectorhawk-managed.json" {
+            continue;
+        }
+
+        if path.is_file() {
+            if let Ok(bytes) = std::fs::read(&path) {
+                out.push((name, bytes));
+            }
+        } else if path.is_dir() {
+            // Recurse one level for prompts/ etc.
+            let sub = collect_referenced_files(&path);
+            for (rel, bytes) in sub {
+                out.push((format!("{name}/{rel}"), bytes));
+            }
+        }
+    }
+
+    out
 }
 
 /// Check if a specific version of a skill is already installed in the versioned
@@ -1462,8 +1622,10 @@ async fn handle_deactivate(
     skill_id: &str,
     state: &Arc<AppState>,
     registry_url: &str,
+    pusher: Option<&ManagedPathsPusher>,
 ) -> bool {
     let skill_id = skill_id.to_string();
+    let skill_id_for_pusher = skill_id.clone();
     let state_clone = Arc::clone(state);
     let reg_url = registry_url.to_string();
 
@@ -1474,6 +1636,18 @@ async fn handle_deactivate(
     match result {
         Ok(Ok(())) => {
             report_installation_status(installation_id, "deactivated", None, &reg_url, state).await;
+
+            // F2: Remove the skill from ~/.claude/skills/.
+            if let Some(p) = pusher {
+                if let Err(e) = p.remove_skill(&skill_id_for_pusher) {
+                    warn!(
+                        skill_id = %skill_id_for_pusher,
+                        error = %e,
+                        "reconciler: F2 remove_skill failed (non-fatal)"
+                    );
+                }
+            }
+
             true
         }
         Ok(Err(e)) => {
@@ -2055,6 +2229,7 @@ pub(crate) async fn handle_install_mcp_for_test(
         stats,
         backend_registry,
         list_changed_tx,
+        None, // pusher: tests don't need F2 push
     )
     .await
 }
@@ -2075,6 +2250,7 @@ pub(crate) async fn handle_deactivate_mcp_for_test(
         registry_url,
         stats,
         backend_registry,
+        None, // pusher: tests don't need F2 remove
     )
     .await
 }

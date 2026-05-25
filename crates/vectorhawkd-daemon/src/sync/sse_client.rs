@@ -326,6 +326,66 @@ async fn dispatch_event(
 ) -> Result<bool> {
     debug!(event_type, "SSE: dispatching event");
 
+    // F4: persist managed_paths mode before parse so AppState is in scope.
+    // parse_sync_event is a pure parser and does not have access to AppState.
+    if event_type == "managed_paths_policy_update" {
+        #[derive(serde::Deserialize)]
+        struct ModeOnly {
+            mode: String,
+        }
+        if let Ok(w) = serde_json::from_str::<ModeOnly>(event_data) {
+            if let Err(e) = state.set_sync_state("managed_paths_mode", &w.mode) {
+                warn!(error = %e, mode = %w.mode, "managed_paths: failed to persist mode to sync_state");
+            } else {
+                debug!(mode = %w.mode, "managed_paths: mode persisted to sync_state");
+            }
+        }
+    }
+
+    // F3: admin resolved a drift event. Apply the resolution locally and ack
+    // the backend. Spawned as its own task so SSE dispatch isn't blocked on
+    // the disk + HTTP round-trip.
+    if event_type == "managed_paths_drift_resolution" {
+        #[derive(serde::Deserialize)]
+        struct WireDriftResolution {
+            drift_id: String,
+            slug: String,
+            kind: String,
+            resolution: String,
+        }
+        match serde_json::from_str::<WireDriftResolution>(event_data) {
+            Ok(w) => {
+                let state_arc: Arc<AppState> = Arc::new(state.clone());
+                let registry_url = state
+                    .get_sync_state("registry_url")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                tokio::spawn(async move {
+                    if registry_url.is_empty() {
+                        warn!("drift: no registry_url in sync_state — cannot ack resolution");
+                        return;
+                    }
+                    if let Err(e) = crate::managed_paths::drift::handle_drift_resolution(
+                        state_arc,
+                        registry_url,
+                        w.drift_id,
+                        w.slug,
+                        w.kind,
+                        w.resolution,
+                    )
+                    .await
+                    {
+                        warn!(error = %e, "drift: resolution handler failed");
+                    }
+                });
+            }
+            Err(e) => {
+                warn!(error = %e, "drift: malformed managed_paths_drift_resolution payload");
+            }
+        }
+    }
+
     let parsed = match parse_sync_event(event_type, event_data) {
         Ok(e) => e,
         Err(e) => {
@@ -549,6 +609,41 @@ fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
             // diffs with zero derived events and does not wipe existing MCP state
             // because an empty `mcp_installations` vec is treated as "old backend
             // with no MCP key" rather than "zero desired servers".
+            Ok(SyncEvent::Snapshot {
+                installations: vec![],
+                mcp_installations: vec![],
+            })
+        }
+        "managed_paths_policy_update" => {
+            // F4: backend broadcasts this when the admin changes the org's
+            // managed-paths enforcement mode.  Parse and stash the new mode in
+            // the sync_state KV table so F3's reconciler can read it without
+            // an extra API round-trip.
+            //
+            // Expected payload:
+            //   {"org_id": "default", "mode": "quarantine", "updated_at": "..."}
+            //
+            // F3 reads `sync_state["managed_paths_mode"]` to decide whether to
+            // quarantine, warn-only, or just audit unmanaged drops.
+            // For F4 we only receive + persist — no filesystem action yet.
+            #[derive(Debug, serde::Deserialize)]
+            struct WireManagedPathsPolicy {
+                mode: String,
+                #[allow(dead_code)]
+                org_id: Option<String>,
+                #[allow(dead_code)]
+                updated_at: Option<String>,
+            }
+
+            let wire: WireManagedPathsPolicy = serde_json::from_str(data).with_context(|| {
+                format!("failed to parse managed_paths_policy_update event: {data}")
+            })?;
+
+            info!(mode = %wire.mode, "managed_paths: policy update received");
+
+            // Return an empty snapshot so the reconciler produces no diff actions.
+            // The caller (dispatch_event) persists the mode to sync_state because
+            // it has access to AppState; parse_sync_event is a pure parser.
             Ok(SyncEvent::Snapshot {
                 installations: vec![],
                 mcp_installations: vec![],

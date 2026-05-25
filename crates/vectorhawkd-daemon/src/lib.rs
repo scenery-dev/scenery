@@ -55,6 +55,7 @@
 //!   loop or per-connection handlers without adding `spawn_blocking`.
 
 mod auth_dispatch;
+pub mod managed_paths;
 mod oauth_listener;
 mod oauth_state;
 mod socket_dispatch;
@@ -344,6 +345,69 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
 
     let vh_registry = Arc::new(build_stub_registry());
     load_managed_mcp_into_registry(&state, &vh_registry, list_changed_tx.clone());
+
+    // ── F1: Managed-paths first-run migration ─────────────────────────────────
+    //
+    // Scans ~/.claude/skills/, ~/.claude/plugins/, and ~/.claude.json; migrates
+    // anything not already tracked in `managed_path_markers`.  Run once at
+    // startup.  Failure is non-fatal — the daemon continues regardless.
+    //
+    // Set VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER=1 to skip entirely (useful
+    // in tests, CI, and operator opt-out scenarios).
+    if std::env::var("VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER").is_err() {
+        let state_arc_f1 = Arc::new(AppState {
+            root_dir: state.root_dir.clone(),
+            db_path: state.db_path.clone(),
+        });
+        let registry_url_f1 = registry_url.clone();
+        match managed_paths::ManagedPathsReconciler::new(state_arc_f1, registry_url_f1) {
+            Ok(reconciler) => match reconciler.migrate_existing().await {
+                Ok(report) => info!(
+                    skills = report.skills_migrated,
+                    plugins = report.plugins_migrated,
+                    mcps = report.mcps_migrated,
+                    errors = report.errors.len(),
+                    "managed_paths: first-run migration complete"
+                ),
+                Err(e) => warn!(
+                    error = %e,
+                    "managed_paths: migration failed; daemon continues without ownership"
+                ),
+            },
+            Err(e) => {
+                warn!(error = %e, "managed_paths: reconciler initialisation failed; skipping migration");
+            }
+        }
+    } else {
+        info!("managed_paths: VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER set — skipping migration");
+    }
+
+    // ── F3: Drift scanner ─────────────────────────────────────────────────────
+    //
+    // Periodically (default 5 min) re-hashes every managed_path_markers row
+    // and reports any divergence to the backend. Policy-aware: quarantines
+    // when mode=quarantine, holds for approval when mode=approve_required.
+    // Killswitch: same VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER env var.
+    if std::env::var("VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER").is_err() {
+        let state_arc_f3 = Arc::new(AppState {
+            root_dir: state.root_dir.clone(),
+            db_path: state.db_path.clone(),
+        });
+        // Persist registry_url so the SSE drift-resolution handler can find it.
+        if let Err(e) = state_arc_f3.set_sync_state("registry_url", &registry_url) {
+            warn!(error = %e, "drift: failed to persist registry_url to sync_state");
+        }
+        match managed_paths::DriftScanner::new(state_arc_f3, registry_url.clone()) {
+            Ok(scanner) => {
+                Arc::new(scanner).spawn_loop();
+                info!("drift: scanner spawned");
+            }
+            Err(e) => {
+                warn!(error = %e, "drift: scanner init failed; running without drift detection");
+            }
+        }
+    }
+
     if let Some(ref m) = managed_config {
         info!(
             org = m.org.as_deref().unwrap_or("(unspecified)"),
@@ -401,11 +465,25 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
         db_path: state.db_path.clone(),
     });
 
+    // F2: Build the managed-paths pusher (gated by the same env var as F1).
+    let f2_pusher = if std::env::var("VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER").is_err() {
+        let pusher_state = AppState {
+            root_dir: state.root_dir.clone(),
+            db_path: state.db_path.clone(),
+        };
+        Some(Arc::new(managed_paths::ManagedPathsPusher::new(
+            &pusher_state,
+        )))
+    } else {
+        None
+    };
+
     let sync_handle = try_start_sync(
         &registry_url,
         Arc::clone(&sync_state_arc),
         list_changed_tx.clone(),
         Arc::clone(&vh_registry),
+        f2_pusher,
     )
     .await;
     if let Some(ref _handle) = sync_handle {
@@ -619,6 +697,7 @@ async fn try_start_sync(
     state: Arc<AppState>,
     list_changed_tx: broadcast::Sender<()>,
     backend_registry: Arc<BackendRegistry>,
+    pusher: Option<Arc<managed_paths::ManagedPathsPusher>>,
 ) -> Option<sync::ReconcilerHandle> {
     // Load the access token from SQLite.
     let token = match load_all_tokens(&state) {
@@ -657,6 +736,7 @@ async fn try_start_sync(
         token,
         device_id,
         last_event_id,
+        pusher,
     };
 
     match sync::run(sync_config, state, list_changed_tx, backend_registry) {

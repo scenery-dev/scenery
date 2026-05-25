@@ -105,13 +105,19 @@ enum SessionMode {
 
 /// Run the shim for one AI-client session.
 ///
+/// When `server` is `Some(slug)` the shim acts as a single-backend adapter:
+/// `tools/list` is filtered to only the tools whose namespaced name begins
+/// with `<slug>__`, and the prefix is stripped before returning them to the
+/// AI client. On `tools/call` the prefix is re-added before forwarding to
+/// the daemon.
+///
 /// Reads newline-delimited JSON-RPC from stdin, writes responses to stdout.
 /// Returns when stdin closes (AI client disconnects) or on an unrecoverable error.
 ///
 /// The shim tries the daemon socket first (2 s timeout). On any failure it
 /// enters `DaemonRequired` mode and serves the same JSON-RPC error to every
 /// subsequent request — never an in-process degradation in production.
-pub async fn run_shim() -> Result<()> {
+pub async fn run_shim(server: Option<String>) -> Result<()> {
     let socket_path = daemon_socket_path();
 
     #[cfg(unix)]
@@ -188,7 +194,7 @@ pub async fn run_shim() -> Result<()> {
             continue;
         }
 
-        let response = dispatch_line(line, &mut mode).await;
+        let response = dispatch_line(line, &mut mode, server.as_deref()).await;
 
         if let Some(resp) = response {
             let serialized = match serde_json::to_string(&resp) {
@@ -280,7 +286,14 @@ async fn run_notification_pump(socket_path: PathBuf, stdout_lock: Arc<StdMutex<(
 /// Dispatch one JSON-RPC line, potentially switching mode on socket failure.
 ///
 /// Returns `None` for notifications (no `id`), `Some(response)` otherwise.
-async fn dispatch_line(line: &str, mode: &mut SessionMode) -> Option<JsonRpcResponse> {
+///
+/// `server_slug` — when `Some`, the shim is in single-server mode (F2):
+/// `tools/list` is filtered and de-prefixed; `tools/call` is re-prefixed.
+async fn dispatch_line(
+    line: &str,
+    mode: &mut SessionMode,
+    server_slug: Option<&str>,
+) -> Option<JsonRpcResponse> {
     let request: JsonRpcRequest = match serde_json::from_str(line) {
         Ok(r) => r,
         Err(e) => {
@@ -299,16 +312,20 @@ async fn dispatch_line(line: &str, mode: &mut SessionMode) -> Option<JsonRpcResp
         return None;
     }
 
-    Some(dispatch_request(request, mode).await)
+    Some(dispatch_request(request, mode, server_slug).await)
 }
 
 /// Dispatch a parsed request, switching to `DaemonRequired` on socket failure.
-async fn dispatch_request(request: JsonRpcRequest, mode: &mut SessionMode) -> JsonRpcResponse {
+async fn dispatch_request(
+    request: JsonRpcRequest,
+    mode: &mut SessionMode,
+    server_slug: Option<&str>,
+) -> JsonRpcResponse {
     let id = request.id.clone();
 
     #[cfg(unix)]
     if let SessionMode::Relaying(ref backend) = *mode {
-        match relay_via_socket(backend, &request).await {
+        match relay_via_socket(backend, &request, server_slug).await {
             Ok(response) => return response,
             Err(e) => {
                 let reason = format!("daemon socket error: {e}");
@@ -339,10 +356,15 @@ async fn dispatch_request(request: JsonRpcRequest, mode: &mut SessionMode) -> Js
 ///
 /// Returns `Err` on any I/O failure (broken pipe, closed socket, timeout).
 /// The caller is responsible for switching to `DaemonRequired` mode on error.
+///
+/// When `server_slug` is `Some(slug)`:
+/// - `tools/list`: filters to tools named `<slug>__*`, strips the prefix.
+/// - `tools/call`: re-adds `<slug>__` prefix before forwarding to daemon.
 #[cfg(unix)]
 async fn relay_via_socket(
     backend: &SocketBackend,
     request: &JsonRpcRequest,
+    server_slug: Option<&str>,
 ) -> Result<JsonRpcResponse> {
     use vectorhawkd_mcp::backend::Backend;
     use vectorhawkd_mcp::protocol::{
@@ -358,13 +380,24 @@ async fn relay_via_socket(
             Ok(JsonRpcResponse::success(id, value))
         }
         "tools/list" => {
-            let result: ToolsListResult = backend.list_tools(request.params.clone()).await?;
+            let mut result: ToolsListResult = backend.list_tools(request.params.clone()).await?;
+
+            if let Some(slug) = server_slug {
+                result = filter_tools_for_server(result, slug);
+            }
+
             let value = serde_json::to_value(result).unwrap_or_default();
             Ok(JsonRpcResponse::success(id, value))
         }
         "tools/call" => {
-            let params: ToolCallParams = serde_json::from_value(request.params.clone())
+            let mut params: ToolCallParams = serde_json::from_value(request.params.clone())
                 .map_err(|e| anyhow::anyhow!("invalid tool call params: {e}"))?;
+
+            // Re-add the slug prefix so the daemon can dispatch to the right backend.
+            if let Some(slug) = server_slug {
+                params.name = format!("{slug}__{}", params.name);
+            }
+
             let result: ToolCallResult = backend.call_tool(params).await?;
             let value = serde_json::to_value(result).unwrap_or_default();
             Ok(JsonRpcResponse::success(id, value))
@@ -375,6 +408,32 @@ async fn relay_via_socket(
             format!("unknown method: {other}"),
         )),
     }
+}
+
+/// Filter `ToolsListResult` to only the tools belonging to `slug`, stripping
+/// the `<slug>__` prefix from each tool's name.
+///
+/// Tools whose names do not start with `<slug>__` are dropped entirely.
+/// This gives the AI client a clean, prefix-free tool list as if it were
+/// talking to the backend directly.
+#[cfg(unix)]
+fn filter_tools_for_server(
+    mut result: vectorhawkd_mcp::protocol::ToolsListResult,
+    slug: &str,
+) -> vectorhawkd_mcp::protocol::ToolsListResult {
+    let prefix = format!("{slug}__");
+    let mut kept = Vec::new();
+
+    for mut tool in result.tools {
+        if let Some(bare_name) = tool.name.strip_prefix(&prefix) {
+            tool.name = bare_name.to_string();
+            kept.push(tool);
+        }
+        // Tools that don't belong to this server are silently dropped.
+    }
+
+    result.tools = kept;
+    result
 }
 
 // ── DaemonRequired error response ─────────────────────────────────────────────

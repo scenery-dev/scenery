@@ -45,6 +45,14 @@ libc.workspace = true
 # Async HTTP client for SSE streaming and installation status reporting.
 reqwest.workspace = true
 
+# F1: managed-paths reconciler — SHA-256 hashing for canonical content fingerprints.
+sha2 = "0.10"
+hex = "0.4"
+
+# F2: managed-paths pusher — exclusive file lock on ~/.claude.json during
+# the read-modify-write cycle so concurrent daemon pushes cannot corrupt it.
+fs2 = "0.4"
+
 # OAuth callback HTTP listener — daemon-only dep (shim does not link axum).
 # axum 0.8 targets tokio 1.x, matching the workspace tokio version.
 axum = { version = "0.8", default-features = false, features = ["http1", "query", "tokio"] }
@@ -53,6 +61,7 @@ axum = { version = "0.8", default-features = false, features = ["http1", "query"
 serde_json.workspace = true
 dirs.workspace = true
 libc.workspace = true
+tempfile.workspace = true
 # Used by m1_multi_shim integration test to count audit_events rows directly.
 # Replaced a previous `sqlite3` CLI shellout that failed on Linux hosts
 # without the CLI installed. rusqlite is already in the workspace via

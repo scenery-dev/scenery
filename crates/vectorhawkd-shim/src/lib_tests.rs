@@ -68,7 +68,7 @@ async fn daemon_required_mode_returns_error_for_initialize() {
         reason: "test: socket missing".to_string(),
     };
     let line = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
-    let resp = dispatch_line(line, &mut mode)
+    let resp = dispatch_line(line, &mut mode, None)
         .await
         .expect("initialize must produce a response");
     let err = resp.error.expect("response must be an error");
@@ -84,7 +84,7 @@ async fn daemon_required_mode_returns_error_for_tools_list() {
         reason: "test".to_string(),
     };
     let line = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#;
-    let resp = dispatch_line(line, &mut mode)
+    let resp = dispatch_line(line, &mut mode, None)
         .await
         .expect("tools/list must produce a response");
     assert_eq!(resp.error.expect("must error").code, -32001);
@@ -97,7 +97,7 @@ async fn daemon_required_mode_drops_notifications() {
         reason: "test".to_string(),
     };
     let line = r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#;
-    let resp = dispatch_line(line, &mut mode).await;
+    let resp = dispatch_line(line, &mut mode, None).await;
     assert!(resp.is_none(), "notifications must not produce a response");
 }
 
@@ -107,7 +107,7 @@ async fn malformed_json_gets_parse_error() {
     let mut mode = SessionMode::DaemonRequired {
         reason: "test".to_string(),
     };
-    let resp = dispatch_line("this is not json", &mut mode)
+    let resp = dispatch_line("this is not json", &mut mode, None)
         .await
         .expect("must produce a response");
     let err = resp.error.expect("must error");
@@ -116,4 +116,106 @@ async fn malformed_json_gets_parse_error() {
         vectorhawkd_mcp::protocol::PARSE_ERROR,
         "must surface the parse error code, not the daemon-unreachable code"
     );
+}
+
+// ── F2: --server prefix filter tests ─────────────────────────────────────────
+
+/// `filter_tools_for_server` keeps only tools whose names start with the slug
+/// prefix, and strips the prefix from the returned names.
+#[cfg(unix)]
+#[test]
+fn filter_tools_for_server_strips_prefix_and_filters() {
+    use vectorhawkd_mcp::protocol::{ToolDefinition, ToolsListResult};
+
+    let result = ToolsListResult {
+        tools: vec![
+            ToolDefinition {
+                name: "filesystem__read_file".to_string(),
+                description: "Read a file".to_string(),
+                input_schema: serde_json::json!({}),
+            },
+            ToolDefinition {
+                name: "filesystem__write_file".to_string(),
+                description: "Write a file".to_string(),
+                input_schema: serde_json::json!({}),
+            },
+            ToolDefinition {
+                name: "github__create_issue".to_string(),
+                description: "Create an issue".to_string(),
+                input_schema: serde_json::json!({}),
+            },
+            ToolDefinition {
+                name: "vectorhawk_list_skills".to_string(),
+                description: "VH management".to_string(),
+                input_schema: serde_json::json!({}),
+            },
+        ],
+    };
+
+    let filtered = crate::filter_tools_for_server(result, "filesystem");
+
+    assert_eq!(
+        filtered.tools.len(),
+        2,
+        "only filesystem tools must survive"
+    );
+    assert_eq!(
+        filtered.tools[0].name, "read_file",
+        "prefix must be stripped"
+    );
+    assert_eq!(
+        filtered.tools[1].name, "write_file",
+        "prefix must be stripped"
+    );
+}
+
+/// When no tools match the slug, the result is an empty list (not an error).
+#[cfg(unix)]
+#[test]
+fn filter_tools_for_server_returns_empty_when_no_match() {
+    use vectorhawkd_mcp::protocol::{ToolDefinition, ToolsListResult};
+
+    let result = ToolsListResult {
+        tools: vec![ToolDefinition {
+            name: "github__create_pr".to_string(),
+            description: "Create PR".to_string(),
+            input_schema: serde_json::json!({}),
+        }],
+    };
+
+    let filtered = crate::filter_tools_for_server(result, "filesystem");
+    assert!(
+        filtered.tools.is_empty(),
+        "no matching tools must yield empty list"
+    );
+}
+
+/// Without --server, the dispatch passes the full tool list through.
+/// This exercises `dispatch_line` in DaemonRequired mode; the filter is
+/// applied in `relay_via_socket` which requires a live socket.  Here we
+/// verify that without a server_slug the mode is entered correctly.
+#[tokio::test]
+async fn without_server_slug_daemon_required_returns_error() {
+    let mut mode = SessionMode::DaemonRequired {
+        reason: "no socket".to_string(),
+    };
+    let line = r#"{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{}}"#;
+    // No server slug — full passthrough (in DaemonRequired mode, always errors).
+    let resp = dispatch_line(line, &mut mode, None).await.unwrap();
+    assert_eq!(resp.error.unwrap().code, -32001);
+}
+
+/// With server slug in DaemonRequired mode — still returns the daemon error,
+/// not a filter-related error.  The filter only applies once a live socket is
+/// established.
+#[tokio::test]
+async fn with_server_slug_daemon_required_still_returns_error() {
+    let mut mode = SessionMode::DaemonRequired {
+        reason: "no socket".to_string(),
+    };
+    let line = r#"{"jsonrpc":"2.0","id":4,"method":"tools/list","params":{}}"#;
+    let resp = dispatch_line(line, &mut mode, Some("filesystem"))
+        .await
+        .unwrap();
+    assert_eq!(resp.error.unwrap().code, -32001);
 }

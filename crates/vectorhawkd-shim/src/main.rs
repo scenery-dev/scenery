@@ -16,7 +16,7 @@ async fn main() {
         )
         .init();
 
-    if let Err(e) = vectorhawkd_shim::run_shim().await {
+    if let Err(e) = vectorhawkd_shim::run_shim(None).await {
         tracing::error!(error = %e, "shim exited with error");
         std::process::exit(1);
     }

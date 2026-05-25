@@ -22,8 +22,10 @@ use tracing::info;
 use vectorhawkd_core::state::AppState;
 use vectorhawkd_mcp::aggregator::BackendRegistry;
 
+use crate::managed_paths::ManagedPathsPusher;
+
 /// Configuration for the sync subsystem.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SyncConfig {
     /// Registry base URL (e.g. `https://app.vectorhawk.ai`).
     pub registry_url: String,
@@ -33,6 +35,9 @@ pub struct SyncConfig {
     pub device_id: String,
     /// Last SSE event ID received (for resume on reconnect).
     pub last_event_id: Option<String>,
+    /// F2: pusher for writing installs into Claude Code's native directories.
+    /// `None` when `VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER` is set.
+    pub pusher: Option<Arc<ManagedPathsPusher>>,
 }
 
 /// Spawn the SSE client and reconciler tasks.
@@ -61,7 +66,13 @@ pub fn run(
     tokio::spawn(sse_client::run(sse_config, sse_state, event_tx));
 
     // Spawn reconciler — consumes events and converges local state.
-    let handle = reconciler::spawn(event_rx, state, list_changed_tx, backend_registry);
+    let handle = reconciler::spawn(
+        event_rx,
+        state,
+        list_changed_tx,
+        backend_registry,
+        config.pusher,
+    );
 
     Ok(handle)
 }

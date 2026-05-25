@@ -343,7 +343,18 @@ pub enum McpCommand {
     /// Connects to the vectorhawkd daemon over a Unix socket. If the daemon
     /// is unreachable, returns a JSON-RPC error containing install/restart
     /// instructions for every request — never a silent in-process fallback.
-    Serve,
+    ///
+    /// When `--server <slug>` is supplied the shim filters the daemon's
+    /// tool list to only the tools belonging to that one backend, stripping
+    /// the `<slug>__` prefix on the way out and re-adding it on `tools/call`.
+    /// This is what the per-server `~/.claude.json` entries written by F2 use.
+    Serve {
+        /// Filter the aggregator to only this one backend server.
+        /// When set, tools/list only returns tools from this server,
+        /// with the `<slug>__` namespace prefix stripped for the AI client.
+        #[arg(long, value_name = "SLUG")]
+        server: Option<String>,
+    },
 
     /// Write the VectorHawk MCP entry into the specified AI client's config.
     Setup {
@@ -551,7 +562,7 @@ async fn run(cli: Cli) -> Result<()> {
             registry_url,
         }) => cmd_auth_token(&token, &registry_url).await,
 
-        Command::Mcp(McpCommand::Serve) => cmd_mcp_serve().await,
+        Command::Mcp(McpCommand::Serve { server }) => cmd_mcp_serve(server).await,
         Command::Mcp(McpCommand::Setup { client, dry_run }) => {
             cmd_mcp_setup(client.as_deref(), dry_run).await
         }
@@ -3759,10 +3770,15 @@ async fn cmd_auth_pair(code: &str, registry_url: &str) -> Result<()> {
 
 // ── mcp serve ─────────────────────────────────────────────────────────────────
 
-async fn cmd_mcp_serve() -> Result<()> {
+async fn cmd_mcp_serve(server: Option<String>) -> Result<()> {
     // Delegate entirely to the shim library, which owns the per-frame read-loop
     // and the mid-session daemon-kill fallback logic (AC4).
-    vectorhawkd_shim::run_shim().await
+    //
+    // When --server <slug> is supplied the shim acts as a single-backend
+    // adapter: it strips the `<slug>__` prefix from outbound tool names and
+    // re-adds it for `tools/call`. This is used by the per-server entries
+    // that F2 writes into ~/.claude.json.
+    vectorhawkd_shim::run_shim(server).await
 }
 
 // ── mcp setup ────────────────────────────────────────────────────────────────
