@@ -2877,7 +2877,9 @@ async fn cmd_skill_publish(
     }
 
     let registry = RegistryClient::new(registry_url).with_auth(tokens.access_token);
-    let resp = tokio::task::spawn_blocking(move || registry.compile_and_publish(gz_buf))
+    // CLI publish is not discovery-driven; pass None so the backend does not
+    // attempt to back-fill frontmatter from a catalog stub.
+    let resp = tokio::task::spawn_blocking(move || registry.compile_and_publish(gz_buf, None))
         .await
         .context("publish task panicked")?
         .context("publish failed")?;

@@ -84,12 +84,17 @@ pub async fn handle_publish_requested(
         registry_url.trim_end_matches('/')
     );
     let registry = RegistryClient::new(registry_url.clone()).with_auth(token);
-    let resp = tokio::task::spawn_blocking(move || registry.compile_and_publish(gz_buf))
-        .await
-        .context("publish: upload task panicked")?
-        .with_context(|| {
-            format!("publish: stage=compile_and_publish url={upload_url} — registry upload failed")
-        })?;
+    // Pass discovery_id so the backend can auto-fill missing frontmatter
+    // (version, publisher) from the catalog Skill stub created during adopt.
+    let discovery_id_opt = Some(discovery_id.clone());
+    let resp = tokio::task::spawn_blocking(move || {
+        registry.compile_and_publish(gz_buf, discovery_id_opt.as_deref())
+    })
+    .await
+    .context("publish: upload task panicked")?
+    .with_context(|| {
+        format!("publish: stage=compile_and_publish url={upload_url} — registry upload failed")
+    })?;
 
     if !resp.warnings.is_empty() {
         warn!(

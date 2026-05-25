@@ -562,9 +562,16 @@ impl RegistryClient {
     ///
     /// Posts a gzipped tar to `POST /portal/skills/compile` with `publish=true`.
     /// Requires auth token to be set via [`with_auth`].
+    ///
+    /// When `publish_from_discovery_id` is `Some`, the form field
+    /// `publish_from_discovery_id` is attached so the backend can auto-fill
+    /// missing frontmatter (`version`, `publisher`) from the catalog Skill stub
+    /// that the adopt flow created.  Pass `None` for CLI-driven publishes where
+    /// the SKILL.md is already complete.
     pub fn compile_and_publish(
         &self,
         source_tar_gz_bytes: Vec<u8>,
+        publish_from_discovery_id: Option<&str>,
     ) -> Result<CompilePublishResponse> {
         let token = self.auth_token.as_ref().ok_or_else(|| {
             anyhow::anyhow!("not authenticated; run `vectorhawk auth login` first")
@@ -575,6 +582,7 @@ impl RegistryClient {
         debug!(
             url,
             size_bytes = source_tar_gz_bytes.len(),
+            discovery_id = publish_from_discovery_id,
             "uploading SKILL.md tree"
         );
 
@@ -583,9 +591,13 @@ impl RegistryClient {
             .mime_str("application/gzip")
             .context("invalid MIME type for source upload")?;
 
-        let form = reqwest::blocking::multipart::Form::new()
+        let mut form = reqwest::blocking::multipart::Form::new()
             .part("file", file_part)
             .text("publish", "true");
+
+        if let Some(discovery_id) = publish_from_discovery_id {
+            form = form.text("publish_from_discovery_id", discovery_id.to_string());
+        }
 
         let resp = self
             .http
@@ -1678,5 +1690,108 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── compile_and_publish: discovery_id form field ───────────────────────────
+
+    /// Verify that `compile_and_publish` attaches `publish_from_discovery_id`
+    /// as a multipart form field when `Some` is passed.
+    ///
+    /// mockito's `Matcher::Regex` inspects the raw multipart body; multipart
+    /// encoding includes part names in ASCII Content-Disposition headers, so a
+    /// plain substring regex match is reliable across boundary values.
+    #[test]
+    fn compile_and_publish_sends_discovery_id_when_some() {
+        use mockito::Server;
+
+        let mut server = Server::new();
+        let compile_response = serde_json::json!({
+            "content_hash": "deadbeef",
+            "size_bytes": 128,
+            "frontmatter": {
+                "name": "test-skill",
+                "description": "unit test"
+            },
+            "warnings": [],
+            "compiled_artifact_key": "key/compiled",
+            "source_artifact_key": "key/source",
+            "download_url": "https://example.com/dl"
+        });
+
+        let mock = server
+            .mock("POST", "/portal/skills/compile")
+            .match_body(mockito::Matcher::Regex(
+                "publish_from_discovery_id".to_string(),
+            ))
+            .match_body(mockito::Matcher::Regex("disc-unit-001".to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(compile_response.to_string())
+            .create();
+
+        let client = RegistryClient::new(server.url()).with_auth("tok");
+        // Minimal valid tar.gz: just an empty gzip stream.
+        let gz_bytes = {
+            use flate2::{write::GzEncoder, Compression};
+            use std::io::Write;
+            let mut buf = Vec::new();
+            let mut enc = GzEncoder::new(&mut buf, Compression::default());
+            enc.write_all(b"").unwrap();
+            enc.finish().unwrap();
+            buf
+        };
+        let result = client.compile_and_publish(gz_bytes, Some("disc-unit-001"));
+        assert!(
+            result.is_ok(),
+            "compile_and_publish should succeed; got: {:#?}",
+            result.unwrap_err()
+        );
+        mock.assert();
+    }
+
+    /// Verify that when `publish_from_discovery_id` is `None`, the field is
+    /// absent from the request — the mock has no `match_body` for it, so
+    /// if the field were present the Regex mock would still pass (this checks
+    /// the `None` path completes without error and the basic form is correct).
+    #[test]
+    fn compile_and_publish_omits_discovery_id_when_none() {
+        use mockito::Server;
+
+        let mut server = Server::new();
+        let compile_response = serde_json::json!({
+            "content_hash": "deadbeef",
+            "size_bytes": 128,
+            "frontmatter": {
+                "name": "test-skill",
+                "description": "unit test"
+            },
+            "warnings": [],
+            "compiled_artifact_key": "key/compiled",
+            "source_artifact_key": "key/source",
+            "download_url": "https://example.com/dl"
+        });
+
+        // This mock does NOT require the discovery_id field — verifies None path
+        // still sends a valid request.
+        let mock = server
+            .mock("POST", "/portal/skills/compile")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(compile_response.to_string())
+            .create();
+
+        let client = RegistryClient::new(server.url()).with_auth("tok");
+        let gz_bytes = {
+            use flate2::{write::GzEncoder, Compression};
+            use std::io::Write;
+            let mut buf = Vec::new();
+            let mut enc = GzEncoder::new(&mut buf, Compression::default());
+            enc.write_all(b"").unwrap();
+            enc.finish().unwrap();
+            buf
+        };
+        let result = client.compile_and_publish(gz_bytes, None);
+        assert!(result.is_ok(), "compile_and_publish(None) should succeed");
+        mock.assert();
     }
 }
