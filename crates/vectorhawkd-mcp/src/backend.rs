@@ -693,23 +693,17 @@ impl Backend for RealBackend {
         #[cfg(not(feature = "daemon"))]
         let mut tools: Vec<ProtoToolDef> = Vec::new();
 
-        // Merge in namespaced backend tools from the BackendRegistry, EXCEPT
-        // for any backend whose slug already has a per-server entry in
-        // `~/.claude.json` (F2). Those are surfaced to the AI client directly
-        // via `vectorhawk mcp serve --server <slug>`, so re-exposing them
-        // under the `vectorhawk` aggregator namespace would duplicate every
-        // tool. We query the F2 marker table to discover the exclusion set.
-        #[cfg(feature = "daemon")]
-        let excluded_slugs: std::collections::HashSet<String> = self
-            .state
-            .as_ref()
-            .and_then(|s| s.list_managed_mcp_slugs().ok())
-            .map(|v| v.into_iter().collect())
-            .unwrap_or_default();
-        #[cfg(not(feature = "daemon"))]
-        let excluded_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-        let backend_tools = self.registry.all_tools_excluding(&excluded_slugs);
+        // Merge in namespaced backend tools from the BackendRegistry.
+        // Names are already namespaced with `__` so they cannot collide with
+        // `vectorhawk_*` management tools.
+        //
+        // Filtering F2-pushed slugs out of the aggregator surface is done in
+        // the *aggregator shim* (vectorhawk mcp serve, no --server flag), not
+        // here, because the per-server shim depends on this response still
+        // containing every `<slug>__*` tool — it filters client-side. If the
+        // daemon stripped them server-side, per-server shims would see an
+        // empty tools list.
+        let backend_tools = self.registry.all_tools();
         for bt in &backend_tools {
             let name = match bt["name"].as_str() {
                 Some(n) if !n.is_empty() => n.to_string(),

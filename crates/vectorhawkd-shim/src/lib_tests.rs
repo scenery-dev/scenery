@@ -169,6 +169,64 @@ fn filter_tools_for_server_strips_prefix_and_filters() {
     );
 }
 
+/// `filter_tools_for_aggregator` drops `<slug>__*` tools whose slug is in the
+/// exclusion set but keeps everything else (other backends + unprefixed
+/// management tools).
+#[cfg(unix)]
+#[test]
+fn filter_tools_for_aggregator_drops_excluded_slugs() {
+    use vectorhawkd_mcp::protocol::{ToolDefinition, ToolsListResult};
+
+    let result = ToolsListResult {
+        tools: vec![
+            ToolDefinition {
+                name: "everything__echo".to_string(),
+                description: "".to_string(),
+                input_schema: serde_json::json!({}),
+            },
+            ToolDefinition {
+                name: "everything__get_sum".to_string(),
+                description: "".to_string(),
+                input_schema: serde_json::json!({}),
+            },
+            ToolDefinition {
+                name: "filesystem__read_file".to_string(),
+                description: "".to_string(),
+                input_schema: serde_json::json!({}),
+            },
+            ToolDefinition {
+                name: "vectorhawk_list".to_string(),
+                description: "".to_string(),
+                input_schema: serde_json::json!({}),
+            },
+        ],
+    };
+
+    let excluded: std::collections::HashSet<String> =
+        std::iter::once("everything".to_string()).collect();
+    let filtered = crate::filter_tools_for_aggregator(result, &excluded);
+
+    let names: Vec<&str> = filtered.tools.iter().map(|t| t.name.as_str()).collect();
+    assert_eq!(names, vec!["filesystem__read_file", "vectorhawk_list"]);
+}
+
+/// Empty exclusion set is a no-op.
+#[cfg(unix)]
+#[test]
+fn filter_tools_for_aggregator_empty_exclusions_keeps_all() {
+    use vectorhawkd_mcp::protocol::{ToolDefinition, ToolsListResult};
+
+    let result = ToolsListResult {
+        tools: vec![ToolDefinition {
+            name: "everything__echo".to_string(),
+            description: "".to_string(),
+            input_schema: serde_json::json!({}),
+        }],
+    };
+    let filtered = crate::filter_tools_for_aggregator(result, &std::collections::HashSet::new());
+    assert_eq!(filtered.tools.len(), 1);
+}
+
 /// When no tools match the slug, the result is an empty list (not an error).
 #[cfg(unix)]
 #[test]
