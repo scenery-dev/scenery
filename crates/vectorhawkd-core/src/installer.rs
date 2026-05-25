@@ -5,70 +5,19 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::fs;
 use vectorhawkd_manifest::SkillPackage;
 
-/// Best-effort registration of an installed skill into `<home>/.claude/skills/`.
-///
-/// Creates a symlink at `<home>/.claude/skills/<skill_id>` that points at the
-/// runner-managed `active` directory. This makes the skill visible to
-/// Claude Code's native Skills mechanism without restarting the client.
-///
-/// Idempotent: if the path is already our symlink we replace it. If a real
-/// directory exists there (user-managed skill), we leave it alone so the
-/// runner never clobbers user content. Failures are non-fatal — we log
-/// and continue, since Claude Code may not be installed.
-fn register_in_claude_skills_at(home: &std::path::Path, skill_id: &str, active_dir: &Utf8Path) {
-    let skills_dir = home.join(".claude").join("skills");
-    if let Err(e) = fs::create_dir_all(&skills_dir) {
-        tracing::warn!(error = %e, "could not create ~/.claude/skills/");
-        return;
-    }
-    let link = skills_dir.join(skill_id);
-
-    if link.is_symlink() {
-        let _ = fs::remove_file(&link);
-    } else if link.exists() {
-        tracing::warn!(
-            skill_id,
-            path = %link.display(),
-            "~/.claude/skills/<id> is a real directory; not overwriting user content"
-        );
-        return;
-    }
-
-    #[cfg(target_family = "unix")]
-    if let Err(e) = std::os::unix::fs::symlink(active_dir.as_std_path(), &link) {
-        tracing::warn!(skill_id, error = %e, "could not symlink into ~/.claude/skills/");
-    }
-}
-
-/// Remove the `<home>/.claude/skills/<skill_id>` symlink we created. Only
-/// removes the entry if it's a symlink — never touches a real directory.
-fn unregister_from_claude_skills_at(home: &std::path::Path, skill_id: &str) {
-    let link = home.join(".claude").join("skills").join(skill_id);
-    if link.is_symlink() {
-        let _ = fs::remove_file(&link);
-    }
-}
-
-/// Public wrappers used by production call sites — resolve home from $HOME
-/// at call time. Returns early when $HOME is unset or when the
-/// `VECTORHAWK_DISABLE_CLAUDE_SKILLS_LINK` env var is set (used by tests so
-/// they never touch the developer's real `~/.claude/skills/`).
-pub fn register_in_claude_skills(skill_id: &str, active_dir: &Utf8Path) {
-    if std::env::var_os("VECTORHAWK_DISABLE_CLAUDE_SKILLS_LINK").is_some() {
-        return;
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        register_in_claude_skills_at(std::path::Path::new(&home), skill_id, active_dir);
-    }
-}
-pub fn unregister_from_claude_skills(skill_id: &str) {
-    if std::env::var_os("VECTORHAWK_DISABLE_CLAUDE_SKILLS_LINK").is_some() {
-        return;
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        unregister_from_claude_skills_at(std::path::Path::new(&home), skill_id);
-    }
-}
+// ── `~/.claude/skills/` ownership ─────────────────────────────────────────────
+//
+// As of v1.0.51 the installer NO LONGER creates symlinks under
+// `~/.claude/skills/<skill_id>`.  That path is owned by the F2 pusher
+// (`managed_paths::pusher::push_skill`) which writes a real directory plus a
+// `.vectorhawk-managed.json` marker.  Having two writers caused state to
+// resurrect itself after F2-driven cleanup — see the v1.0.50→1.0.51 fix.
+//
+// The legacy `register_in_claude_skills` / `unregister_from_claude_skills`
+// helpers were removed.  Any pre-existing symlinks under `~/.claude/skills/`
+// are reclaimed by the daemon at startup via
+// `managed_paths::pusher::reclaim_active_skills` so the F2 marker exists and
+// the path becomes a real directory the user can edit + that F3 can audit.
 
 /// Controls how a skill source directory is placed into the versioned install layout.
 #[derive(Clone, Copy, Debug)]
@@ -128,7 +77,10 @@ pub fn install_unpacked_skill(
         ],
     )?;
 
-    register_in_claude_skills(&skill.manifest.id, &active_dir);
+    // NOTE: ~/.claude/skills/<id> is owned by the F2 pusher; the installer no
+    // longer writes a symlink there. F2's push_skill creates a real directory
+    // + .vectorhawk-managed.json marker, so there's a single writer per path.
+    let _ = active_dir;
 
     Ok(())
 }
@@ -229,7 +181,9 @@ pub fn uninstall_skill(state: &AppState, skill_id: &str) -> Result<Option<String
         [skill_id],
     )?;
 
-    unregister_from_claude_skills(skill_id);
+    // ~/.claude/skills/<id> is owned by the F2 pusher; the installer does not
+    // unlink it here. The reconciler's deactivate / purge handler invokes
+    // `ManagedPathsPusher::remove_skill` for that side.
 
     Ok(Some(active_version))
 }
@@ -270,7 +224,8 @@ pub fn deactivate_skill(state: &AppState, skill_id: &str) -> Result<bool> {
         [skill_id],
     )?;
 
-    unregister_from_claude_skills(skill_id);
+    // F2 pusher owns ~/.claude/skills/<id>; reconciler invokes
+    // `ManagedPathsPusher::remove_skill` separately for that side.
 
     Ok(true)
 }
@@ -330,9 +285,9 @@ pub fn reactivate_skill(state: &AppState, skill_id: &str) -> Result<bool> {
         [skill_id],
     )?;
 
-    let active_utf8 = Utf8PathBuf::from_path_buf(active_path)
-        .unwrap_or_else(|p| Utf8PathBuf::from(p.to_string_lossy().into_owned()));
-    register_in_claude_skills(skill_id, &active_utf8);
+    // F2 push happens in the reconciler when the desired-state row flips back
+    // to installed. The installer no longer creates ~/.claude/skills/<id>.
+    let _ = (active_path, Utf8PathBuf::new);
 
     Ok(true)
 }
@@ -373,12 +328,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_root(test_name: &str) -> Utf8PathBuf {
-        // Tests must never touch the developer's real ~/.claude/skills/.
-        // Setting this env var to any value disables the registration
-        // side effect of install/uninstall/deactivate/reactivate.
-        // The dedicated coverage below tests the `_at` helpers directly.
-        std::env::set_var("VECTORHAWK_DISABLE_CLAUDE_SKILLS_LINK", "1");
-
+        // The installer no longer touches ~/.claude/skills/ — that's owned by
+        // the F2 pusher. The legacy VECTORHAWK_DISABLE_CLAUDE_SKILLS_LINK
+        // escape hatch is therefore no longer needed.
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock before unix epoch")
@@ -664,71 +616,38 @@ mod tests {
         let _ = fs::remove_dir_all(&source_dir);
     }
 
+    /// Architectural invariant: install_unpacked_skill must NOT write into
+    /// `~/.claude/skills/`. That path is owned exclusively by the F2 pusher
+    /// in vectorhawkd-daemon. Regression test for the v1.0.51 architectural
+    /// fix where a second writer caused state to resurrect after F2 cleanup.
     #[test]
-    fn register_in_claude_skills_creates_symlink() {
-        let home = temp_root("claude-skills-register");
-        fs::create_dir_all(home.as_std_path()).expect("create fake home");
-        let active = home.join("some-version-dir");
-        fs::create_dir_all(active.as_std_path()).expect("create active dir");
+    fn install_does_not_touch_claude_skills_dir() {
+        let root = temp_root("install-no-claude-skills");
+        let state = AppState::bootstrap_in(root.clone()).expect("state bootstrap should succeed");
+        // Point HOME at a temp dir so we can observe whether anything got
+        // written under it. We do NOT set VECTORHAWK_DISABLE_CLAUDE_SKILLS_LINK
+        // — that's a legacy escape hatch and irrelevant now.
+        let fake_home = temp_root("install-no-claude-skills-home");
+        fs::create_dir_all(fake_home.as_std_path()).expect("create fake home");
+        let prev_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", fake_home.as_std_path());
 
-        register_in_claude_skills_at(home.as_std_path(), "demo-skill", &active);
+        let skill =
+            SkillPackage::load_from_dir(example_skill_path()).expect("example skill should load");
+        install_unpacked_skill(&state, &skill, InstallMode::Copy).expect("install should succeed");
 
-        let link = home
-            .as_std_path()
-            .join(".claude")
-            .join("skills")
-            .join("demo-skill");
-        assert!(link.is_symlink(), "should have written a symlink");
-        let target = fs::read_link(&link).expect("read_link should succeed");
-        assert_eq!(target, active.as_std_path());
+        let claude_skills = fake_home.as_std_path().join(".claude").join("skills");
+        assert!(
+            !claude_skills.exists(),
+            "installer must NOT create ~/.claude/skills/ — that's F2's job"
+        );
 
-        unregister_from_claude_skills_at(home.as_std_path(), "demo-skill");
-        assert!(!link.exists() && !link.is_symlink());
-
-        let _ = fs::remove_dir_all(home.as_std_path());
-    }
-
-    #[test]
-    fn register_preserves_real_user_directory() {
-        let home = temp_root("claude-skills-preserve");
-        let skills = home.as_std_path().join(".claude").join("skills");
-        let user_dir = skills.join("user-owned");
-        fs::create_dir_all(&user_dir).expect("seed user directory");
-        fs::write(user_dir.join("SKILL.md"), "user content").expect("write user SKILL.md");
-
-        let active = home.join("some-version-dir");
-        fs::create_dir_all(active.as_std_path()).expect("create active dir");
-
-        register_in_claude_skills_at(home.as_std_path(), "user-owned", &active);
-
-        // Real directory must be left untouched — never replaced with a symlink.
-        let preserved = fs::read_to_string(user_dir.join("SKILL.md")).unwrap();
-        assert_eq!(preserved, "user content");
-        assert!(!user_dir.is_symlink());
-
-        let _ = fs::remove_dir_all(home.as_std_path());
-    }
-
-    #[test]
-    fn register_replaces_existing_symlink() {
-        let home = temp_root("claude-skills-replace");
-        fs::create_dir_all(home.as_std_path()).expect("create fake home");
-        let v1 = home.join("v1");
-        let v2 = home.join("v2");
-        fs::create_dir_all(v1.as_std_path()).unwrap();
-        fs::create_dir_all(v2.as_std_path()).unwrap();
-
-        register_in_claude_skills_at(home.as_std_path(), "evolving", &v1);
-        register_in_claude_skills_at(home.as_std_path(), "evolving", &v2);
-
-        let link = home
-            .as_std_path()
-            .join(".claude")
-            .join("skills")
-            .join("evolving");
-        let target = fs::read_link(&link).unwrap();
-        assert_eq!(target, v2.as_std_path());
-
-        let _ = fs::remove_dir_all(home.as_std_path());
+        if let Some(v) = prev_home {
+            std::env::set_var("HOME", v);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        let _ = fs::remove_dir_all(&state.root_dir);
+        let _ = fs::remove_dir_all(fake_home.as_std_path());
     }
 }

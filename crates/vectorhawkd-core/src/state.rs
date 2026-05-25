@@ -127,6 +127,33 @@ impl AppState {
         Ok(ids)
     }
 
+    /// Return `(skill_id, install_root, active_version)` for every active
+    /// install. Used by the F2 reclaim pass on startup to materialise
+    /// `~/.claude/skills/<slug>/` as a real directory for any skill that
+    /// pre-dates the installer's removal from that path.
+    pub fn list_active_installed_skills(&self) -> Result<Vec<(String, String, String)>> {
+        let conn = Connection::open(&self.db_path).context("failed to open state DB")?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT skill_id, install_root, active_version \
+                 FROM installed_skills \
+                 WHERE current_status = 'active'",
+            )
+            .context("failed to prepare active skills query")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .context("failed to query active installed skills")?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to collect active installed skills")?;
+        Ok(rows)
+    }
+
     /// Convenience: return the path where the daemon Unix socket is expected.
     ///
     /// macOS: `~/Library/Application Support/VectorHawk/agent.sock`

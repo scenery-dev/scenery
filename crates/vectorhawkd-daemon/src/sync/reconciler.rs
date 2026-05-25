@@ -1348,11 +1348,11 @@ async fn flip_active_symlink(
         )
         .context("failed to update installed_skills after symlink flip")?;
 
-        // Mirror the active dir into ~/.claude/skills/<id> so Claude Code's
-        // native Skills mechanism picks it up alongside the runner's MCP
-        // exposure. install_unpacked_skill already does this; flip path
-        // must too so a "re-install of already-local version" stays in sync.
-        vectorhawkd_core::installer::register_in_claude_skills(&skill_id, &active_dir);
+        // ~/.claude/skills/<id> is owned by the F2 pusher (see managed_paths
+        // module) — installer no longer writes there, and neither does this
+        // flip path. The reconciler's install handler invokes push_skill
+        // separately for desired-state-installed skills.
+        let _ = &active_dir;
 
         Ok(())
     })
@@ -1683,9 +1683,9 @@ fn deactivate_skill_blocking(state: &AppState, skill_id: &str) -> Result<()> {
     )
     .context("failed to mark skill as deactivated in SQLite")?;
 
-    // Remove the Claude Code skills symlink so the skill stops appearing
-    // there. Mirror to `installer::deactivate_skill`'s behaviour.
-    vectorhawkd_core::installer::unregister_from_claude_skills(skill_id);
+    // F2 pusher owns ~/.claude/skills/<id>; the deactivate event also fires
+    // `ManagedPathsPusher::remove_skill` via the pusher hook in
+    // `handle_deactivate` further up the dispatch path.
 
     info!(skill_id, "reconciler: skill deactivated");
     Ok(())
@@ -1745,7 +1745,16 @@ fn purge_skill_blocking(state: &AppState, skill_id: &str) -> Result<()> {
     )
     .context("failed to remove skill_versions from SQLite")?;
 
-    vectorhawkd_core::installer::unregister_from_claude_skills(skill_id);
+    // F2 pusher owns `~/.claude/skills/<id>` — drop the managed dir + marker
+    // so a purge leaves nothing behind. Non-fatal if F2 cleanup fails.
+    let pusher = crate::managed_paths::ManagedPathsPusher::new(state);
+    if let Err(e) = pusher.remove_skill(skill_id) {
+        warn!(
+            skill_id,
+            error = %e,
+            "reconciler: F2 remove_skill failed during purge (non-fatal)"
+        );
+    }
 
     info!(skill_id, "reconciler: skill purged");
     Ok(())

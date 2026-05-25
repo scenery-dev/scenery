@@ -94,6 +94,25 @@ impl ManagedPathsPusher {
         let skills_dir = resolve_skills_dir()?;
         let skill_dir = skills_dir.join(slug);
 
+        // If a legacy symlink exists at the target path (left over from the
+        // pre-v1.0.51 installer that owned this path), unlink it so we can
+        // create a real directory we exclusively own. Writing files THROUGH
+        // a symlink would leak modifications back into the installer's
+        // versioned directory and let the legacy state machine resurrect
+        // itself on the next reconcile.
+        if skill_dir.is_symlink() {
+            fs::remove_file(&skill_dir).with_context(|| {
+                format!(
+                    "pusher: failed to remove legacy symlink at {}",
+                    skill_dir.display()
+                )
+            })?;
+            debug!(
+                slug,
+                "pusher: replaced legacy installer symlink with managed dir"
+            );
+        }
+
         fs::create_dir_all(&skill_dir).with_context(|| {
             format!(
                 "pusher: failed to create skill dir: {}",
@@ -402,6 +421,75 @@ impl ManagedPathsPusher {
         .context("pusher: failed to delete managed_path_markers row")?;
         Ok(())
     }
+}
+
+// ── Legacy reclaim ────────────────────────────────────────────────────────────
+
+/// One-shot startup pass: for every active skill in `installed_skills`, if
+/// `~/.claude/skills/<slug>` is still a legacy symlink left behind by the
+/// pre-v1.0.51 installer, materialize it as a real F2-managed directory.
+///
+/// Reads `<install_root>/active/SKILL.md` to source the canonical content
+/// (referenced files are not migrated — they'll be re-pushed on the next
+/// install of that skill). Sets the F2 marker so future drift scans treat
+/// the path as managed. Skills that are already F2-marked are skipped.
+///
+/// Failures for one skill are logged at WARN and do not abort the pass.
+///
+/// Returns the number of skills reclaimed.
+pub fn reclaim_active_skills(state: &AppState, pusher: &ManagedPathsPusher) -> Result<usize> {
+    if reconciler_disabled() {
+        return Ok(0);
+    }
+    let active = state
+        .list_active_installed_skills()
+        .context("reclaim: failed to list active installed skills")?;
+    if active.is_empty() {
+        return Ok(0);
+    }
+
+    let skills_dir = resolve_skills_dir()?;
+    let mut reclaimed: usize = 0;
+
+    for (skill_id, install_root, _active_version) in active {
+        let target = skills_dir.join(&skill_id);
+        // Only act on legacy symlinks. Existing real dirs are already F2's
+        // (either pushed by an earlier install or migrated by F1).
+        if !target.is_symlink() {
+            continue;
+        }
+        let skill_md_path = Path::new(&install_root).join("active").join("SKILL.md");
+        let bytes = match fs::read(&skill_md_path) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    skill_id = %skill_id,
+                    path = %skill_md_path.display(),
+                    error = %e,
+                    "reclaim: cannot read SKILL.md from legacy install — skipping"
+                );
+                continue;
+            }
+        };
+        match pusher.push_skill(&skill_id, None, &bytes, &[]) {
+            Ok(()) => {
+                reclaimed += 1;
+                info!(
+                    skill_id,
+                    "reclaim: legacy installer symlink replaced with F2-managed dir"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    skill_id = %skill_id,
+                    error = %e,
+                    "reclaim: F2 push_skill failed — leaving legacy symlink in place"
+                );
+            }
+        }
+    }
+
+    Ok(reclaimed)
 }
 
 // ── Path resolution ───────────────────────────────────────────────────────────

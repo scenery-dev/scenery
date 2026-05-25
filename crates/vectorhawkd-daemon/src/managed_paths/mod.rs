@@ -40,7 +40,7 @@ use vectorhawkd_core::state::AppState;
 
 pub use drift::DriftScanner;
 pub use marker::ManagedPathMarker;
-pub use pusher::ManagedPathsPusher;
+pub use pusher::{reclaim_active_skills, ManagedPathsPusher};
 pub use scanner::MigrationItem;
 
 /// Error recorded in `MigrationReport` for a single item that failed.

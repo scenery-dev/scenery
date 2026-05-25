@@ -360,6 +360,158 @@ fn hex_sha256_known_value() {
     );
 }
 
+// ── Legacy symlink replacement (v1.0.51) ──────────────────────────────────────
+
+/// When `~/.claude/skills/<slug>` is a legacy installer symlink, push_skill
+/// must remove it and create a real directory it owns — otherwise the file
+/// writes leak through the symlink into the legacy `versions/0.1.0` dir and
+/// the next reconcile can resurrect F2's view.
+#[test]
+fn push_skill_replaces_legacy_symlink_with_real_dir() {
+    let (pusher, _tmp) = make_pusher();
+
+    let fake_home = tempfile::tempdir().unwrap();
+    let target = fake_home.path().join("legacy-versioned-source");
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join("SKILL.md"), b"legacy content").unwrap();
+
+    let skills_dir = fake_home.path().join(".claude").join("skills");
+    fs::create_dir_all(&skills_dir).unwrap();
+    let slug_path = skills_dir.join("hello-world");
+    std::os::unix::fs::symlink(&target, &slug_path).unwrap();
+    assert!(slug_path.is_symlink(), "test precondition: legacy symlink");
+
+    let prev_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", fake_home.path());
+
+    let result = pusher.push_skill(
+        "hello-world",
+        Some("inst-1"),
+        b"---\nname: hello-world\n---\nfresh F2 content\n",
+        &[],
+    );
+
+    let was_ok = result.is_ok();
+    let post_symlink = slug_path.is_symlink();
+    let post_dir_is_real = slug_path.is_dir() && !slug_path.is_symlink();
+    let f2_skill_md = std::fs::read(slug_path.join("SKILL.md")).ok();
+    let legacy_target_md = std::fs::read(target.join("SKILL.md")).unwrap();
+
+    if let Some(v) = prev_home {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+
+    assert!(was_ok, "push_skill must succeed even over a legacy symlink");
+    assert!(!post_symlink, "the symlink must be unlinked");
+    assert!(post_dir_is_real, "the path must become a real directory");
+    assert_eq!(
+        f2_skill_md.as_deref(),
+        Some(b"---\nname: hello-world\n---\nfresh F2 content\n".as_ref()),
+        "F2's content must land at the real dir, not through the symlink"
+    );
+    assert_eq!(
+        legacy_target_md, b"legacy content",
+        "the legacy installer's source dir must NOT have been overwritten"
+    );
+}
+
+// ── reclaim_active_skills (v1.0.51 startup pass) ──────────────────────────────
+
+/// reclaim_active_skills must materialize legacy installer symlinks for every
+/// active row in `installed_skills`, set an F2 marker, and leave non-symlink
+/// paths alone.
+#[test]
+fn reclaim_active_skills_converts_legacy_symlinks_only() {
+    let fake_home = tempfile::tempdir().unwrap();
+    let prev_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", fake_home.path());
+
+    // Build state with an `installed_skills` table containing two active
+    // skills (one with a legacy symlink, one without) and one deactivated.
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = camino::Utf8PathBuf::from_path_buf(tmp.path().join("state.db")).unwrap();
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE managed_path_markers (
+            path TEXT PRIMARY KEY, kind TEXT NOT NULL, slug TEXT NOT NULL,
+            installation_id TEXT, source_sha256 TEXT NOT NULL, migrated_at TEXT NOT NULL
+        );
+        CREATE TABLE installed_skills (
+            skill_id TEXT PRIMARY KEY, active_version TEXT NOT NULL,
+            install_root TEXT NOT NULL, channel TEXT, current_status TEXT
+        );",
+    )
+    .unwrap();
+
+    // Active skill #1 — legacy symlink present.
+    let install_root_1 = fake_home
+        .path()
+        .join("app-support")
+        .join("skills")
+        .join("alpha");
+    fs::create_dir_all(install_root_1.join("active")).unwrap();
+    fs::write(
+        install_root_1.join("active").join("SKILL.md"),
+        b"alpha body",
+    )
+    .unwrap();
+    let skills_dir = fake_home.path().join(".claude").join("skills");
+    fs::create_dir_all(&skills_dir).unwrap();
+    std::os::unix::fs::symlink(install_root_1.join("active"), skills_dir.join("alpha")).unwrap();
+
+    // Active skill #2 — no symlink. Reclaim must skip it cleanly.
+    let install_root_2 = fake_home
+        .path()
+        .join("app-support")
+        .join("skills")
+        .join("beta");
+    fs::create_dir_all(install_root_2.join("active")).unwrap();
+    fs::write(install_root_2.join("active").join("SKILL.md"), b"beta body").unwrap();
+
+    // Deactivated skill — must be ignored entirely.
+    conn.execute(
+        "INSERT INTO installed_skills(skill_id, active_version, install_root, channel, current_status) VALUES
+            ('alpha','1.0.0',?1,'stable','active'),
+            ('beta','1.0.0',?2,'stable','active'),
+            ('gamma','1.0.0','/tmp/whatever','stable','deactivated')",
+        rusqlite::params![install_root_1.to_string_lossy(), install_root_2.to_string_lossy()],
+    )
+    .unwrap();
+    drop(conn);
+
+    let state = vectorhawkd_core::state::AppState {
+        root_dir: camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap(),
+        db_path,
+    };
+    let pusher = ManagedPathsPusher::new(&state);
+
+    let reclaimed = reclaim_active_skills(&state, &pusher).unwrap();
+
+    let alpha_path = skills_dir.join("alpha");
+    let alpha_is_dir = alpha_path.is_dir() && !alpha_path.is_symlink();
+    let alpha_marker_exists = alpha_path.join(".vectorhawk-managed.json").exists();
+    let beta_exists = skills_dir.join("beta").exists();
+
+    if let Some(v) = prev_home {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+
+    assert_eq!(
+        reclaimed, 1,
+        "only the symlinked alpha must count as reclaimed"
+    );
+    assert!(alpha_is_dir, "alpha must now be a real directory");
+    assert!(alpha_marker_exists, "alpha must have an F2 marker");
+    assert!(
+        !beta_exists,
+        "beta had no symlink — reclaim must not create one"
+    );
+}
+
 // ── VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER gate ─────────────────────────────
 
 #[test]
