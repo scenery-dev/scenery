@@ -376,11 +376,29 @@ impl BackendRegistry {
 
     /// Returns all namespaced tool definitions from all active (healthy) backends.
     pub fn all_tools(&self) -> Vec<Value> {
+        self.all_tools_excluding(&std::collections::HashSet::new())
+    }
+
+    /// Like [`all_tools`] but skips any backend whose `server_id` is in
+    /// `excluded_server_ids`.
+    ///
+    /// The daemon's MCP server passes the set of F2-pushed slugs here so that
+    /// backends already surfaced as per-server entries in `~/.claude.json`
+    /// don't get double-exposed under the `vectorhawk` aggregator namespace.
+    /// Without this filter, Claude Code sees the same tool twice — once as
+    /// `<slug>__tool` (native) and once as `vectorhawk__<slug>__tool` (nested).
+    pub fn all_tools_excluding(
+        &self,
+        excluded_server_ids: &std::collections::HashSet<String>,
+    ) -> Vec<Value> {
         let inner = self.inner.lock().unwrap();
         let mut out = Vec::new();
 
         for backend in inner.backends.values() {
             if backend.unhealthy {
+                continue;
+            }
+            if excluded_server_ids.contains(&backend.server_id) {
                 continue;
             }
             let server_id = &backend.server_id;
@@ -1101,6 +1119,23 @@ mod tests {
         let tools = registry.all_tools();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["name"], "healthy__tool_a");
+    }
+
+    #[test]
+    fn all_tools_excluding_skips_named_backends() {
+        let registry = BackendRegistry::new();
+        registry.register_backend(stub_backend("kept", &["tool_a"]));
+        registry.register_backend(stub_backend("skipme", &["tool_b", "tool_c"]));
+
+        // Without exclusion: all 3 tools across both backends.
+        assert_eq!(registry.all_tools().len(), 3);
+
+        // With "skipme" excluded: only the kept backend's single tool.
+        let excluded: std::collections::HashSet<String> =
+            std::iter::once("skipme".to_string()).collect();
+        let tools = registry.all_tools_excluding(&excluded);
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "kept__tool_a");
     }
 
     #[tokio::test]

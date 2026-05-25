@@ -179,6 +179,27 @@ impl AppState {
         .context("failed to write sync_state")?;
         Ok(())
     }
+
+    /// Return the slugs of every MCP server that has been F2-pushed to
+    /// `~/.claude.json` (i.e. it has a `managed_path_markers` row with
+    /// `kind='mcp'`).
+    ///
+    /// Used by the aggregator to filter out tools whose backend is already
+    /// surfaced as a per-server entry in Claude Code — otherwise the AI
+    /// client sees the same tool both natively (under its own server name)
+    /// and nested under the `vectorhawk` aggregator.
+    pub fn list_managed_mcp_slugs(&self) -> Result<Vec<String>> {
+        let conn = Connection::open(&self.db_path).context("failed to open state DB")?;
+        let mut stmt = conn
+            .prepare("SELECT slug FROM managed_path_markers WHERE kind = 'mcp'")
+            .context("failed to prepare managed mcp slug query")?;
+        let slugs = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .context("failed to query managed_path_markers")?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to collect managed mcp slugs")?;
+        Ok(slugs)
+    }
 }
 
 // ── MCP installation state (G3) ──────────────────────────────────────────────
