@@ -418,7 +418,10 @@ async fn dispatch_event(
                     )
                     .await
                     {
-                        warn!(error = %e, "publish: handler failed");
+                        // Use debug formatter (?e) to expand the full anyhow
+                        // error chain — stage, URL, HTTP status, and body are
+                        // all in the chain and would be silently dropped by %e.
+                        warn!(error = ?e, "publish: handler failed");
                     }
                 });
             }

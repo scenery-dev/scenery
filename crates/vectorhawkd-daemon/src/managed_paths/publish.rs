@@ -17,7 +17,7 @@
 
 use anyhow::{Context, Result};
 use std::{path::Path, sync::Arc};
-use tracing::info;
+use tracing::{info, warn};
 use vectorhawkd_core::{auth::load_all_tokens, registry::RegistryClient, state::AppState};
 
 // ── Env-var gate ──────────────────────────────────────────────────────────────
@@ -78,11 +78,27 @@ pub async fn handle_publish_requested(
     );
 
     // Upload in a blocking task (reqwest blocking client inside RegistryClient).
+    // Capture registry_url for the error context before moving it into the closure.
+    let upload_url = format!(
+        "{}/portal/skills/compile",
+        registry_url.trim_end_matches('/')
+    );
     let registry = RegistryClient::new(registry_url.clone()).with_auth(token);
     let resp = tokio::task::spawn_blocking(move || registry.compile_and_publish(gz_buf))
         .await
         .context("publish: upload task panicked")?
-        .context("publish: registry upload failed")?;
+        .with_context(|| {
+            format!("publish: stage=compile_and_publish url={upload_url} — registry upload failed")
+        })?;
+
+    if !resp.warnings.is_empty() {
+        warn!(
+            slug,
+            discovery_id,
+            warnings = ?resp.warnings,
+            "publish: compile warnings"
+        );
+    }
 
     info!(
         slug,
