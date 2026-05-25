@@ -345,6 +345,44 @@ async fn dispatch_event(
     // F3: admin resolved a drift event. Apply the resolution locally and ack
     // the backend. Spawned as its own task so SSE dispatch isn't blocked on
     // the disk + HTTP round-trip.
+    // T2 follow-up (v1.0.54): user adopted a discovery in the portal. The
+    // install row is already created server-side; the daemon now needs to
+    // copy `source_path` into `~/.claude/skills/<slug>/` and write the F2
+    // marker so Claude Code can actually see the skill. Spawned as its own
+    // task so SSE dispatch isn't blocked on disk I/O.
+    if event_type == "discovery_adopted" {
+        #[derive(serde::Deserialize)]
+        struct WireAdopted {
+            slug: String,
+            kind: String,
+            source_path: String,
+            #[allow(dead_code)]
+            canonical_hash: Option<String>,
+            #[allow(dead_code)]
+            discovery_id: Option<String>,
+        }
+        match serde_json::from_str::<WireAdopted>(event_data) {
+            Ok(w) => {
+                let state_arc: Arc<AppState> = Arc::new(state.clone());
+                tokio::spawn(async move {
+                    if let Err(e) = crate::managed_paths::pusher::push_adopted_discovery(
+                        &state_arc,
+                        &w.slug,
+                        &w.kind,
+                        &w.source_path,
+                    )
+                    .await
+                    {
+                        warn!(slug = %w.slug, error = %e, "adopt: push from source_path failed");
+                    }
+                });
+            }
+            Err(e) => {
+                warn!(error = %e, "adopt: malformed discovery_adopted payload");
+            }
+        }
+    }
+
     if event_type == "managed_paths_drift_resolution" {
         #[derive(serde::Deserialize)]
         struct WireDriftResolution {

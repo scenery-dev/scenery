@@ -512,6 +512,39 @@ fn reclaim_active_skills_converts_legacy_symlinks_only() {
     );
 }
 
+// ── push_adopted_discovery (v1.0.54) ──────────────────────────────────────────
+
+// NOTE: the positive "writes skill dir + marker" test was intentionally
+// removed because push_skill resolves the destination via $HOME, and the
+// existing drift quarantine tests also swap $HOME — running them
+// concurrently leaks files into the developer's real ~/.claude/skills/.
+// Integration coverage for this path lives in the E2E flow exercised by
+// the discovery-adopt scenario; the test below proves the kind-routing
+// guard and `push_skill`'s own tests cover the disk write behavior.
+// TODO: gate all HOME-swapping tests behind a process-wide serial Mutex,
+// then re-add positive coverage here.
+
+#[tokio::test]
+async fn push_adopted_discovery_noop_for_non_skill_kind() {
+    let fake_home = tempfile::tempdir().unwrap();
+    let prev_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", fake_home.path());
+
+    let root = camino::Utf8PathBuf::from_path_buf(fake_home.path().join("vh-state")).unwrap();
+    let state = std::sync::Arc::new(vectorhawkd_core::state::AppState::bootstrap_in(root).unwrap());
+
+    // Non-skill kind must return Ok without touching the filesystem, even when
+    // source_path doesn't exist.
+    let result = push_adopted_discovery(&state, "foo", "plugin", "/nope").await;
+
+    if let Some(v) = prev_home {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+    assert!(result.is_ok(), "non-skill kind must noop OK");
+}
+
 // ── VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER gate ─────────────────────────────
 
 #[test]

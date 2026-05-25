@@ -39,6 +39,7 @@ use sha2::{Digest, Sha256};
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 use tracing::{debug, info};
 use vectorhawkd_core::state::AppState;
@@ -490,6 +491,94 @@ pub fn reclaim_active_skills(state: &AppState, pusher: &ManagedPathsPusher) -> R
     }
 
     Ok(reclaimed)
+}
+
+// ── Adopt-discovery push ──────────────────────────────────────────────────────
+
+/// Push a skill from `source_path` (the discovery's on-disk location, e.g.
+/// `~/.agents/skills/<slug>`) into `~/.claude/skills/<slug>/` as a real
+/// F2-managed directory. Called from the SSE handler when the user adopts a
+/// discovery via the portal.
+///
+/// For `kind="skill"` we read `<source_path>/SKILL.md` plus any sibling files
+/// (prompts/, etc.) and hand them to `push_skill`. For other kinds we no-op
+/// for now — plugin/mcp adopt is deferred to the same future release as
+/// publish.
+pub async fn push_adopted_discovery(
+    state: &Arc<AppState>,
+    slug: &str,
+    kind: &str,
+    source_path: &str,
+) -> Result<()> {
+    if reconciler_disabled() {
+        return Ok(());
+    }
+    if kind != "skill" {
+        tracing::debug!(slug, kind, "adopt: kind is not 'skill' — push deferred");
+        return Ok(());
+    }
+
+    let slug = slug.to_string();
+    let source_path = source_path.to_string();
+    let state_clone = Arc::clone(state);
+
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let source_dir = PathBuf::from(&source_path);
+        let skill_md_path = source_dir.join("SKILL.md");
+        let skill_md_bytes = fs::read(&skill_md_path).with_context(|| {
+            format!("adopt: cannot read SKILL.md at {}", skill_md_path.display())
+        })?;
+
+        // Collect sibling files (everything except SKILL.md and our own
+        // marker) so prompts/ and other adjacent assets travel with the
+        // skill into the managed dir.
+        let mut refs: Vec<(String, Vec<u8>)> = Vec::new();
+        collect_extras(&source_dir, &source_dir, &mut refs);
+
+        let pusher = ManagedPathsPusher::new(&state_clone);
+        pusher
+            .push_skill(&slug, None, &skill_md_bytes, &refs)
+            .context("adopt: push_skill failed")?;
+        info!(
+            slug,
+            source = %source_path,
+            "adopt: discovery pushed into ~/.claude/skills/"
+        );
+        Ok(())
+    })
+    .await
+    .context("adopt: spawn_blocking panicked")?
+}
+
+/// Recursively walk `dir`, appending `(relative_path, bytes)` for every file
+/// except `SKILL.md` and `.vectorhawk-managed.json`. Errors on individual
+/// reads are skipped silently — adoption is best-effort.
+fn collect_extras(root: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+        if path.is_file() {
+            if name == "SKILL.md" || name == ".vectorhawk-managed.json" {
+                continue;
+            }
+            if let Ok(rel) = path.strip_prefix(root) {
+                if let Some(rel_str) = rel.to_str() {
+                    if let Ok(bytes) = fs::read(&path) {
+                        out.push((rel_str.to_string(), bytes));
+                    }
+                }
+            }
+        } else if path.is_dir() {
+            collect_extras(root, &path, out);
+        }
+    }
 }
 
 // ── Path resolution ───────────────────────────────────────────────────────────
