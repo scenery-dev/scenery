@@ -26,6 +26,7 @@
 //! itself returns `Ok(MigrationReport)` unless something catastrophic prevents
 //! even opening the DB.  Migration failure must NOT crash the daemon.
 
+pub mod discoveries;
 pub mod drift;
 pub mod marker;
 pub mod migrator;
@@ -38,6 +39,7 @@ use std::{path::PathBuf, sync::Arc};
 use tracing::{info, warn};
 use vectorhawkd_core::state::AppState;
 
+pub use discoveries::DiscoveriesScanner;
 pub use drift::DriftScanner;
 pub use marker::ManagedPathMarker;
 pub use pusher::{reclaim_active_skills, ManagedPathsPusher};

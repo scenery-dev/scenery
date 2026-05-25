@@ -210,7 +210,9 @@ async fn post_migrate(
         registry_url.trim_end_matches('/')
     );
 
+    let device_id = state.get_sync_state("device_id").ok().flatten();
     let request_body = serde_json::json!({
+        "device_id": device_id,
         "items": [{
             "kind": item.kind.to_string(),
             "slug": item.slug,
