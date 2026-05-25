@@ -4,7 +4,7 @@
 #![allow(clippy::unwrap_used)]
 
 use std::sync::Arc;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Notify};
 use vectorhawkd_mcp::{
     aggregator::{BackendEntry, BackendRegistry, BackendTransport, ToolDefinition, ToolVisibility},
     backend::RealBackend,
@@ -37,6 +37,7 @@ fn make_ctx() -> DaemonContext {
         oauth_state: Arc::new(OAuthState::new()),
         listener_port: Some(39127),
         list_changed_tx,
+        discoveries_kick: Arc::new(Notify::new()),
     }
 }
 
@@ -165,6 +166,7 @@ async fn dispatch_auth_get_oauth_listener_port_when_none() {
         oauth_state: Arc::new(OAuthState::new()),
         listener_port: None,
         list_changed_tx,
+        discoveries_kick: Arc::new(Notify::new()),
     };
     let resp = dispatch(
         &ctx,
@@ -173,4 +175,27 @@ async fn dispatch_auth_get_oauth_listener_port_when_none() {
     .await;
     use vectorhawkd_mcp::protocol::INTERNAL_ERROR;
     assert_eq!(resp.error.unwrap().code, INTERNAL_ERROR);
+}
+
+#[tokio::test]
+async fn dispatch_initialize_fires_kick() {
+    let ctx = make_ctx();
+    // Arm a notified() future before calling dispatch so that if notify_one()
+    // fires during dispatch we capture it.
+    let kick = Arc::clone(&ctx.discoveries_kick);
+    let notified = kick.notified();
+    tokio::pin!(notified);
+
+    let resp = dispatch(&ctx, make_request("initialize", serde_json::json!({}))).await;
+    assert!(
+        resp.error.is_none(),
+        "initialize should succeed: {:?}",
+        resp.error
+    );
+
+    // The kick should be completable without any further await — notify_one()
+    // was already called synchronously inside dispatch.
+    tokio::time::timeout(std::time::Duration::from_millis(100), &mut notified)
+        .await
+        .expect("discoveries_kick was not notified within 100 ms after initialize");
 }

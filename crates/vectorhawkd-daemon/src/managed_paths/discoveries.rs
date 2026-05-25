@@ -29,9 +29,9 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
-use tokio::time::interval;
+use tokio::{sync::Notify, time::interval};
 use tracing::{debug, info, warn};
 use vectorhawkd_core::{auth::load_all_tokens, state::AppState};
 
@@ -39,6 +39,11 @@ const ENV_DISABLE: &str = "VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER";
 const ENV_EXTRA_ROOTS: &str = "VECTORHAWK_EXTRA_SKILL_ROOTS";
 const ENV_INTERVAL: &str = "VECTORHAWK_DISCOVERIES_INTERVAL_SECS";
 const DEFAULT_INTERVAL_SECS: u64 = 300;
+
+/// Minimum elapsed time between kick-triggered scans. A kick that arrives
+/// within this window of the previous scan is silently dropped so that rapid
+/// client reconnects don't trigger a burst of scans.
+const KICK_DEBOUNCE: Duration = Duration::from_secs(10);
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -55,13 +60,15 @@ pub struct DiscoveryItem {
 pub struct DiscoveriesScanner {
     state: Arc<AppState>,
     registry_url: String,
+    kick: Arc<Notify>,
 }
 
 impl DiscoveriesScanner {
-    pub fn new(state: Arc<AppState>, registry_url: String) -> Self {
+    pub fn new(state: Arc<AppState>, registry_url: String, kick: Arc<Notify>) -> Self {
         Self {
             state,
             registry_url,
+            kick,
         }
     }
 
@@ -70,21 +77,58 @@ impl DiscoveriesScanner {
         run_once(Arc::clone(&self.state), self.registry_url.clone()).await
     }
 
-    /// Spawn the discoveries loop on the current tokio runtime.  Ticks every
-    /// `VECTORHAWK_DISCOVERIES_INTERVAL_SECS` seconds (default 300).  The
-    /// killswitch (`VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER`) is checked
-    /// inside `run_once` on every tick.
+    /// Spawn the discoveries loop on the current tokio runtime.
+    ///
+    /// Wakes on two signals:
+    /// - A periodic ticker (default 300 s, override via
+    ///   `VECTORHAWK_DISCOVERIES_INTERVAL_SECS`). Ticker fires always trigger a
+    ///   scan.
+    /// - A `kick` notification (fired when the MCP shim's `initialize` handshake
+    ///   succeeds). Kicks are debounced: if a kick arrives within `KICK_DEBOUNCE`
+    ///   (10 s) of the previous scan it is silently dropped. This prevents a burst
+    ///   of rapid reconnects from triggering multiple concurrent scans.
+    ///
+    /// The killswitch (`VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER`) is checked
+    /// inside `run_once` on every iteration.
     pub fn spawn_loop(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let kick = Arc::clone(&self.kick);
         tokio::spawn(async move {
             let secs = parse_interval_secs();
             info!(
                 interval_secs = secs,
-                "discoveries: periodic scanner spawned"
+                "discoveries: periodic scanner spawned (kick-on-initialize enabled)"
             );
             let mut ticker = interval(Duration::from_secs(secs));
+
+            // Start far in the past so the first kick (or first tick) always runs.
+            let mut last_scan_at = Instant::now()
+                .checked_sub(Duration::from_secs(3600))
+                .unwrap_or_else(Instant::now);
+
             loop {
-                ticker.tick().await;
-                debug!("discoveries: tick — starting scan");
+                enum Trigger {
+                    Tick,
+                    Kick,
+                }
+
+                let trigger = tokio::select! {
+                    _ = ticker.tick() => Trigger::Tick,
+                    _ = kick.notified() => Trigger::Kick,
+                };
+
+                if should_skip_debounced_kick(
+                    matches!(trigger, Trigger::Kick),
+                    last_scan_at.elapsed(),
+                ) {
+                    debug!(
+                        elapsed_ms = last_scan_at.elapsed().as_millis() as u64,
+                        "discoveries: kick debounced — skipping scan"
+                    );
+                    continue;
+                }
+
+                last_scan_at = Instant::now();
+                debug!("discoveries: starting scan");
                 match self.run_once().await {
                     Ok(0) => debug!("discoveries: no new items found"),
                     Ok(n) => info!(
@@ -96,6 +140,17 @@ impl DiscoveriesScanner {
             }
         })
     }
+}
+
+// ── Debounce helper (pure, testable) ─────────────────────────────────────────
+
+/// Return `true` when a kick-triggered scan should be skipped because the
+/// previous scan ran too recently.
+///
+/// The ticker arm always returns `false` (never skipped). The kick arm returns
+/// `true` only when `elapsed < KICK_DEBOUNCE`.
+pub fn should_skip_debounced_kick(trigger_is_kick: bool, elapsed: Duration) -> bool {
+    trigger_is_kick && elapsed < KICK_DEBOUNCE
 }
 
 // ── Free-function entry point (testable) ──────────────────────────────────────
@@ -622,5 +677,43 @@ mod tests {
             std::env::remove_var(ENV_INTERVAL);
         }
         assert_eq!(result, DEFAULT_INTERVAL_SECS);
+    }
+
+    // ── 7. should_skip_debounced_kick — pure debounce logic ───────────────────
+
+    #[test]
+    fn debounce_tick_never_skipped() {
+        // Ticker always runs regardless of elapsed time.
+        assert!(!should_skip_debounced_kick(false, Duration::ZERO));
+        assert!(!should_skip_debounced_kick(false, Duration::from_millis(1)));
+        assert!(!should_skip_debounced_kick(false, Duration::from_secs(5)));
+        assert!(!should_skip_debounced_kick(false, Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn debounce_kick_within_window_is_skipped() {
+        // A kick fired less than KICK_DEBOUNCE (10 s) after the previous scan
+        // must be suppressed.
+        assert!(should_skip_debounced_kick(true, Duration::ZERO));
+        assert!(should_skip_debounced_kick(true, Duration::from_secs(1)));
+        assert!(should_skip_debounced_kick(
+            true,
+            Duration::from_millis(9_999)
+        ));
+    }
+
+    #[test]
+    fn debounce_kick_exactly_at_window_boundary_runs() {
+        // At exactly KICK_DEBOUNCE the kick should be allowed through (elapsed
+        // is not strictly less than the window).
+        assert!(!should_skip_debounced_kick(true, KICK_DEBOUNCE));
+    }
+
+    #[test]
+    fn debounce_kick_after_window_runs() {
+        // A kick fired well after the debounce window must always proceed.
+        assert!(!should_skip_debounced_kick(true, Duration::from_secs(11)));
+        assert!(!should_skip_debounced_kick(true, Duration::from_secs(60)));
+        assert!(!should_skip_debounced_kick(true, Duration::from_secs(3600)));
     }
 }

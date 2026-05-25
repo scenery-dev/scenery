@@ -66,7 +66,7 @@ use std::{os::unix::fs::PermissionsExt, sync::Arc};
 use tokio::{
     net::UnixListener,
     signal::unix::{signal, SignalKind},
-    sync::broadcast,
+    sync::{broadcast, Notify},
 };
 use tracing::{error, info, warn};
 use vectorhawkd_core::{
@@ -436,6 +436,11 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     // Report-only: no local writes, no markers.
     // Default interval: 300s. Override: VECTORHAWK_DISCOVERIES_INTERVAL_SECS.
     // Killswitch: same VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER env var.
+    //
+    // `discoveries_kick` is also shared with every DaemonContext so that a
+    // successful MCP `initialize` handshake triggers an immediate scan instead
+    // of waiting for the next periodic tick. Debounced to 10 s inside the loop.
+    let discoveries_kick = Arc::new(Notify::new());
     if std::env::var("VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER").is_err() {
         let discoveries_state = Arc::new(AppState {
             root_dir: state.root_dir.clone(),
@@ -444,6 +449,7 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
         Arc::new(managed_paths::discoveries::DiscoveriesScanner::new(
             discoveries_state,
             registry_url.clone(),
+            Arc::clone(&discoveries_kick),
         ))
         .spawn_loop();
     }
@@ -599,6 +605,7 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
                             oauth_state: Arc::clone(&oauth_state),
                             listener_port,
                             list_changed_tx: list_changed_tx.clone(),
+                            discoveries_kick: Arc::clone(&discoveries_kick),
                         };
                         tokio::spawn(socket_dispatch::serve_connection(stream, ctx));
                     }

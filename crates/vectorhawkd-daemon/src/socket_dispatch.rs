@@ -44,7 +44,10 @@
 
 use anyhow::Result;
 use std::sync::Arc;
-use tokio::{net::UnixStream, sync::broadcast};
+use tokio::{
+    net::UnixStream,
+    sync::{broadcast, Notify},
+};
 use tracing::{debug, error, info, warn};
 use vectorhawkd_mcp::{
     backend::{read_framed, write_framed, Backend, RealBackend},
@@ -88,6 +91,11 @@ pub struct DaemonContext {
     /// subscribes at start; sending `()` triggers every subscriber to write a
     /// `notifications/tools/list_changed` frame to its client.
     pub list_changed_tx: broadcast::Sender<()>,
+    /// Kick signal for the discoveries scanner. Fired when an MCP client
+    /// completes the `initialize` handshake so the scanner runs immediately on
+    /// first connect rather than waiting for the next 5-minute tick.
+    /// Debounced inside `DiscoveriesScanner::spawn_loop` (10 s window).
+    pub discoveries_kick: Arc<Notify>,
 }
 
 /// Drive a single shim connection to completion.
@@ -207,6 +215,8 @@ pub(crate) async fn dispatch(ctx: &DaemonContext, request: JsonRpcRequest) -> Js
     match request.method.as_str() {
         "initialize" => match ctx.backend.initialize(request.params).await {
             Ok(result) => {
+                info!("discoveries: shim initialize → kicking scan");
+                ctx.discoveries_kick.notify_one();
                 let v = serde_json::to_value(result).unwrap_or_default();
                 JsonRpcResponse::success(id, v)
             }
