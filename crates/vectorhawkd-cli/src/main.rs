@@ -22,6 +22,8 @@
 //! vectorhawk daemon run [--foreground]
 //! vectorhawk daemon install
 //! vectorhawk daemon uninstall
+//! vectorhawk migrate list-backups
+//! vectorhawk migrate rollback --ts <ts> [--slug <slug>] [--yes]
 //! ```
 //!
 //! `mcp serve` is the AI-client entry point — what `mcp setup` writes into
@@ -32,6 +34,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
+mod commands_migrate;
 mod install;
 
 // ── CLI structure ─────────────────────────────────────────────────────────────
@@ -80,6 +83,10 @@ pub enum Command {
     /// Sync status subcommands — inspect the daemon reconciler state.
     #[command(subcommand)]
     Sync(SyncCommand),
+
+    /// Managed-paths backup and rollback.
+    #[command(subcommand)]
+    Migrate(commands_migrate::MigrateCommand),
 }
 
 #[derive(Debug, Subcommand)]
@@ -589,6 +596,8 @@ async fn run(cli: Cli) -> Result<()> {
         }
 
         Command::Sync(SyncCommand::Status) => cmd_sync_status().await,
+
+        Command::Migrate(args) => commands_migrate::run(args).await,
     }
 }
 

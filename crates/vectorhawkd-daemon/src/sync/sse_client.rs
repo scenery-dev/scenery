@@ -687,6 +687,15 @@ fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
                 mcp_installations: vec![],
             })
         }
+        "discovery_adopted" => {
+            // Handled in `dispatch_event` before this parser is called — no
+            // additional reconciler action needed.  Return an empty snapshot so
+            // the reconciler produces no diff actions.
+            Ok(SyncEvent::Snapshot {
+                installations: vec![],
+                mcp_installations: vec![],
+            })
+        }
         other => {
             anyhow::bail!("unknown SSE event type: '{other}'")
         }

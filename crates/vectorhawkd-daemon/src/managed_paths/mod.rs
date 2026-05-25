@@ -32,6 +32,7 @@ pub mod marker;
 pub mod migrator;
 pub mod paths;
 pub mod pusher;
+pub mod rollback;
 pub mod scanner;
 
 use anyhow::Result;
@@ -43,6 +44,7 @@ pub use discoveries::DiscoveriesScanner;
 pub use drift::DriftScanner;
 pub use marker::ManagedPathMarker;
 pub use pusher::{reclaim_active_skills, ManagedPathsPusher};
+pub use rollback::{list_backups, rollback, BackupSummary, RollbackReport};
 pub use scanner::MigrationItem;
 
 /// Error recorded in `MigrationReport` for a single item that failed.

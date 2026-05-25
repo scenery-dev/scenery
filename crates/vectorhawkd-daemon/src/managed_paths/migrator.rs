@@ -17,10 +17,107 @@ use super::{
 };
 use anyhow::{Context, Result};
 use rusqlite::Connection;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
 use tracing::{debug, warn};
 use vectorhawkd_core::{auth::load_all_tokens, state::AppState};
+
+// ── Backup manifest ───────────────────────────────────────────────────────────
+
+/// One item in the per-run backup `manifest.json`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestItem {
+    /// `"skill"`, `"plugin"`, or `"mcp"`.
+    pub kind: String,
+    /// Human-friendly identifier (dir name or MCP key).
+    pub slug: String,
+    /// Absolute path where the item lived at migration time.
+    pub original_path: String,
+    /// Where the backup copy lives.
+    pub backup_path: String,
+    /// The F2-marker path (equals `original_path` for skills/plugins).
+    pub f2_marker_path: String,
+    /// Backend catalog skill ID (UUID), if available.
+    pub catalog_skill_id: Option<String>,
+    /// Backend installation row ID (UUID), if available.
+    pub installation_id: Option<String>,
+}
+
+/// Full per-run backup manifest written to `<backup_root>/manifest.json`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupManifest {
+    pub manifest_version: u32,
+    /// ISO-8601 timestamp of the migration run (matches the backup directory name).
+    pub migration_ts: String,
+    pub items: Vec<ManifestItem>,
+}
+
+/// Append one `ManifestItem` to `<backup_root>/manifest.json`.
+///
+/// Reads the existing manifest if present, appends the new entry, then writes
+/// back atomically (temp file + rename).  If the backup directory does not
+/// exist yet it is created.
+pub fn append_manifest_item(backup_root: &Path, ts: &str, item: ManifestItem) -> Result<()> {
+    let manifest_path = backup_root.join("manifest.json");
+    let tmp_path = backup_root.join("manifest.json.tmp");
+
+    // Ensure the backup dir exists (may not have been created yet for MCP-only runs).
+    fs::create_dir_all(backup_root).with_context(|| {
+        format!(
+            "append_manifest_item: failed to create backup dir: {}",
+            backup_root.display()
+        )
+    })?;
+
+    // Read existing manifest or create a fresh one.
+    let mut manifest = if manifest_path.exists() {
+        let data = fs::read(&manifest_path).with_context(|| {
+            format!(
+                "append_manifest_item: failed to read existing manifest: {}",
+                manifest_path.display()
+            )
+        })?;
+        serde_json::from_slice::<BackupManifest>(&data).unwrap_or_else(|e| {
+            warn!(
+                error = %e,
+                path = %manifest_path.display(),
+                "append_manifest_item: could not parse existing manifest — starting fresh"
+            );
+            BackupManifest {
+                manifest_version: 1,
+                migration_ts: ts.to_string(),
+                items: vec![],
+            }
+        })
+    } else {
+        BackupManifest {
+            manifest_version: 1,
+            migration_ts: ts.to_string(),
+            items: vec![],
+        }
+    };
+
+    manifest.items.push(item);
+
+    let json = serde_json::to_vec_pretty(&manifest)
+        .context("append_manifest_item: failed to serialise manifest")?;
+
+    fs::write(&tmp_path, &json).with_context(|| {
+        format!(
+            "append_manifest_item: failed to write tmp manifest: {}",
+            tmp_path.display()
+        )
+    })?;
+
+    fs::rename(&tmp_path, &manifest_path).with_context(|| {
+        format!(
+            "append_manifest_item: failed to rename tmp manifest to: {}",
+            manifest_path.display()
+        )
+    })?;
+
+    Ok(())
+}
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
@@ -96,7 +193,48 @@ pub async fn migrate_item(
         }
     }
 
-    // ── 5. Audit event ────────────────────────────────────────────────────────
+    // ── 5. Manifest entry ─────────────────────────────────────────────────────
+    // Derive the backup path for this item so the rollback module can restore it.
+    let backup_path = match item.kind {
+        ItemKind::Skill => backup_root
+            .join("skills")
+            .join(&item.slug)
+            .to_string_lossy()
+            .to_string(),
+        ItemKind::Plugin => backup_root
+            .join("plugins")
+            .join(&item.slug)
+            .to_string_lossy()
+            .to_string(),
+        ItemKind::Mcp => backup_root
+            .join("claude.json")
+            .to_string_lossy()
+            .to_string(),
+    };
+
+    // Extract the run timestamp from the backup_root directory name.
+    let run_ts = backup_root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    let manifest_item = ManifestItem {
+        kind: item.kind.to_string(),
+        slug: item.slug.clone(),
+        original_path: item.source_path.to_string_lossy().to_string(),
+        backup_path,
+        f2_marker_path: item.source_path.to_string_lossy().to_string(),
+        catalog_skill_id: None, // backend does not return catalog_skill_id separately today
+        installation_id: maybe_installation_id.clone(),
+    };
+
+    if let Err(e) = append_manifest_item(backup_root, &run_ts, manifest_item) {
+        // Non-fatal: missing manifest does not break migration.
+        warn!(slug = %item.slug, error = %e, "managed_paths: failed to append to backup manifest (non-fatal)");
+    }
+
+    // ── 6. Audit event ────────────────────────────────────────────────────────
     buffer_audit_event(&conn, item, maybe_installation_id.as_deref())
         .unwrap_or_else(|e| warn!(slug = %item.slug, error = %e, "managed_paths: failed to buffer audit event (non-fatal)"));
 
