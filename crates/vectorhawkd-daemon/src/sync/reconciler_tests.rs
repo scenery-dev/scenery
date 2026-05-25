@@ -517,3 +517,42 @@ async fn skill_lock_does_not_serialize_different_skills() {
         "different-skill locks should not serialize (took {elapsed:?})",
     );
 }
+
+// ── marker_present_for_slug short-circuit (v1.0.53) ──────────────────────────
+
+/// `marker_present_for_slug` returns true when a `kind='skill'` row exists for
+/// the slug, false otherwise. Used by `do_install` to short-circuit the
+/// download step for skills that were imported by F1 (no artifact in the
+/// registry — trying to download flaps the row into `error`).
+#[tokio::test]
+async fn marker_present_returns_true_when_f2_marker_exists() {
+    use std::sync::Arc;
+    let root = temp_root("marker-present");
+    let state = Arc::new(AppState::bootstrap_in(root.clone()).unwrap());
+
+    // Initially absent.
+    assert!(!super::marker_present_for_slug(&state, "demo").await);
+
+    // Seed a marker row directly.
+    let conn = Connection::open(&state.db_path).unwrap();
+    conn.execute(
+        "INSERT INTO managed_path_markers (path, kind, slug, source_sha256, migrated_at) \
+         VALUES ('/x/demo', 'skill', 'demo', 'abc', 't')",
+        [],
+    )
+    .unwrap();
+
+    assert!(super::marker_present_for_slug(&state, "demo").await);
+    // Other slugs still absent.
+    assert!(!super::marker_present_for_slug(&state, "other").await);
+    // Wrong kind doesn't match.
+    conn.execute(
+        "INSERT INTO managed_path_markers (path, kind, slug, source_sha256, migrated_at) \
+         VALUES ('/x/mcp-slug', 'mcp', 'mcp-only', 'def', 't')",
+        [],
+    )
+    .unwrap();
+    assert!(!super::marker_present_for_slug(&state, "mcp-only").await);
+
+    cleanup(&root);
+}

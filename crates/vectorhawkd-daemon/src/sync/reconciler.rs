@@ -1174,6 +1174,28 @@ async fn do_install(
     let state_clone = Arc::clone(state);
     let reg_url = registry_url.to_string();
 
+    // Migrated-local short-circuit: if an F2 marker already exists for this
+    // slug, the skill is locally present (it was imported via F1, not
+    // downloaded from the registry). There is no artifact to fetch — trying
+    // to download would 404 and flap the row into `error`. Just PATCH back
+    // `installed` and return.
+    //
+    // This matters because F1's migrate endpoint creates a `user_device_installations`
+    // row with state='installed' and source='migrated:local' so the catalog
+    // sees the skill as installed. The next snapshot tick then derives an
+    // Install event for it; without this short-circuit we'd try to download
+    // `migrated/<slug>/0.0.0.cskill` which never exists in MinIO.
+    if marker_present_for_slug(&state_clone, &skill_id).await {
+        info!(
+            skill_id,
+            version,
+            "reconciler: skill already locally managed (F2 marker present) — skipping download"
+        );
+        report_installation_status(installation_id, "installed", None, &reg_url, &state_clone)
+            .await;
+        return Ok(());
+    }
+
     // Check if this version is already installed locally — if so, just flip symlink.
     let already_local = check_version_local(&state_clone, &skill_id, &version).await?;
     if already_local {
@@ -1298,6 +1320,30 @@ fn collect_referenced_files(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
     }
 
     out
+}
+
+/// Return true if `managed_path_markers` has a `kind='skill'` row for this slug.
+///
+/// The F2 marker is the canonical signal "VectorHawk already owns this skill's
+/// `~/.claude/skills/<slug>/` directory" — for example because F1 migrated it
+/// from local disk. In that case the registry has no artifact to download.
+async fn marker_present_for_slug(state: &Arc<AppState>, slug: &str) -> bool {
+    let state_clone = Arc::clone(state);
+    let slug = slug.to_string();
+    tokio::task::spawn_blocking(move || {
+        let conn = match rusqlite::Connection::open(&state_clone.db_path) {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        let row: rusqlite::Result<i64> = conn.query_row(
+            "SELECT 1 FROM managed_path_markers WHERE kind = 'skill' AND slug = ?1 LIMIT 1",
+            rusqlite::params![slug],
+            |r| r.get(0),
+        );
+        row.is_ok()
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// Check if a specific version of a skill is already installed in the versioned
