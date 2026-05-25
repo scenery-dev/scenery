@@ -17,8 +17,9 @@
 //!
 //! ## Cadence
 //!
-//! Called once at daemon startup. Discoveries are stable; users adopt or
-//! ignore at their own pace.
+//! Runs periodically (default 300 s). Override with
+//! `VECTORHAWK_DISCOVERIES_INTERVAL_SECS`. The killswitch is checked inside
+//! `run_once` on every tick, so the loop itself need not duplicate the check.
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
@@ -28,12 +29,16 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
+use tokio::time::interval;
 use tracing::{debug, info, warn};
 use vectorhawkd_core::{auth::load_all_tokens, state::AppState};
 
 const ENV_DISABLE: &str = "VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER";
 const ENV_EXTRA_ROOTS: &str = "VECTORHAWK_EXTRA_SKILL_ROOTS";
+const ENV_INTERVAL: &str = "VECTORHAWK_DISCOVERIES_INTERVAL_SECS";
+const DEFAULT_INTERVAL_SECS: u64 = 300;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -61,8 +66,35 @@ impl DiscoveriesScanner {
     }
 
     /// Run discovery once. Delegates to the free function.
-    pub async fn run(&self) -> Result<usize> {
+    pub async fn run_once(&self) -> Result<usize> {
         run_once(Arc::clone(&self.state), self.registry_url.clone()).await
+    }
+
+    /// Spawn the discoveries loop on the current tokio runtime.  Ticks every
+    /// `VECTORHAWK_DISCOVERIES_INTERVAL_SECS` seconds (default 300).  The
+    /// killswitch (`VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER`) is checked
+    /// inside `run_once` on every tick.
+    pub fn spawn_loop(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let secs = parse_interval_secs();
+            info!(
+                interval_secs = secs,
+                "discoveries: periodic scanner spawned"
+            );
+            let mut ticker = interval(Duration::from_secs(secs));
+            loop {
+                ticker.tick().await;
+                debug!("discoveries: tick — starting scan");
+                match self.run_once().await {
+                    Ok(0) => debug!("discoveries: no new items found"),
+                    Ok(n) => info!(
+                        count = n,
+                        "discoveries: reported new skill items to backend"
+                    ),
+                    Err(e) => warn!(error = %e, "discoveries: scan failed (non-fatal)"),
+                }
+            }
+        })
     }
 }
 
@@ -344,6 +376,33 @@ fn hex_sha256(bytes: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Parse the scan interval from `VECTORHAWK_DISCOVERIES_INTERVAL_SECS`.
+/// Falls back to `DEFAULT_INTERVAL_SECS` (300) for any invalid or zero value.
+fn parse_interval_secs() -> u64 {
+    match std::env::var(ENV_INTERVAL) {
+        Err(_) => DEFAULT_INTERVAL_SECS,
+        Ok(raw) => match raw.parse::<u64>() {
+            Ok(n) if n > 0 => n,
+            Ok(_) => {
+                warn!(
+                    env = ENV_INTERVAL,
+                    "discoveries: interval must be > 0; using default {}s", DEFAULT_INTERVAL_SECS
+                );
+                DEFAULT_INTERVAL_SECS
+            }
+            Err(_) => {
+                warn!(
+                    env = ENV_INTERVAL,
+                    value = %raw,
+                    "discoveries: failed to parse interval; using default {}s",
+                    DEFAULT_INTERVAL_SECS
+                );
+                DEFAULT_INTERVAL_SECS
+            }
+        },
+    }
+}
+
 fn reconciler_disabled() -> bool {
     std::env::var_os(ENV_DISABLE).is_some()
 }
@@ -504,5 +563,64 @@ mod tests {
         assert_eq!(items.len(), 1);
         let expected = hex_sha256(content.as_bytes());
         assert_eq!(items[0].canonical_hash, expected);
+    }
+
+    // ── 6. parse_interval_secs — env-var parsing ──────────────────────────────
+
+    #[test]
+    fn parse_interval_secs_unset_returns_default() {
+        unsafe {
+            std::env::remove_var(ENV_INTERVAL);
+        }
+        assert_eq!(parse_interval_secs(), DEFAULT_INTERVAL_SECS);
+    }
+
+    #[test]
+    fn parse_interval_secs_valid_value() {
+        unsafe {
+            std::env::set_var(ENV_INTERVAL, "60");
+        }
+        let result = parse_interval_secs();
+        unsafe {
+            std::env::remove_var(ENV_INTERVAL);
+        }
+        assert_eq!(result, 60);
+    }
+
+    #[test]
+    fn parse_interval_secs_zero_returns_default() {
+        unsafe {
+            std::env::set_var(ENV_INTERVAL, "0");
+        }
+        let result = parse_interval_secs();
+        unsafe {
+            std::env::remove_var(ENV_INTERVAL);
+        }
+        assert_eq!(result, DEFAULT_INTERVAL_SECS);
+    }
+
+    #[test]
+    fn parse_interval_secs_garbage_returns_default() {
+        unsafe {
+            std::env::set_var(ENV_INTERVAL, "garbage");
+        }
+        let result = parse_interval_secs();
+        unsafe {
+            std::env::remove_var(ENV_INTERVAL);
+        }
+        assert_eq!(result, DEFAULT_INTERVAL_SECS);
+    }
+
+    #[test]
+    fn parse_interval_secs_negative_returns_default() {
+        // "-1" does not parse as u64, so it falls through to the Err branch.
+        unsafe {
+            std::env::set_var(ENV_INTERVAL, "-1");
+        }
+        let result = parse_interval_secs();
+        unsafe {
+            std::env::remove_var(ENV_INTERVAL);
+        }
+        assert_eq!(result, DEFAULT_INTERVAL_SECS);
     }
 }

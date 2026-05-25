@@ -68,7 +68,7 @@ use tokio::{
     signal::unix::{signal, SignalKind},
     sync::broadcast,
 };
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 use vectorhawkd_core::{
     audit::{AuditBuffer, SqliteAuditBuffer},
     auth::{load_all_tokens, save_tokens, AuthClient},
@@ -429,27 +429,23 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
 
     // ── Tier-2: Local discoveries scanner ────────────────────────────────────
     //
-    // Scans extra skill roots (~/.agents/skills/ and VECTORHAWK_EXTRA_SKILL_ROOTS)
-    // for skills not yet tracked in managed_path_markers. Found items are POSTed
-    // to /portal/managed-paths/discoveries so the portal can offer adoption.
-    // Report-only: no local writes, no markers. Runs once at startup.
+    // Periodically scans extra skill roots (~/.agents/skills/ and
+    // VECTORHAWK_EXTRA_SKILL_ROOTS) for skills not yet tracked in
+    // managed_path_markers. Found items are POSTed to
+    // /portal/managed-paths/discoveries so the portal can offer adoption.
+    // Report-only: no local writes, no markers.
+    // Default interval: 300s. Override: VECTORHAWK_DISCOVERIES_INTERVAL_SECS.
     // Killswitch: same VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER env var.
     if std::env::var("VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER").is_err() {
         let discoveries_state = Arc::new(AppState {
             root_dir: state.root_dir.clone(),
             db_path: state.db_path.clone(),
         });
-        let discoveries_url = registry_url.clone();
-        tokio::spawn(async move {
-            match managed_paths::discoveries::run_once(discoveries_state, discoveries_url).await {
-                Ok(0) => debug!("discoveries: no new items found"),
-                Ok(n) => info!(
-                    count = n,
-                    "discoveries: reported new skill items to backend"
-                ),
-                Err(e) => warn!(error = %e, "discoveries: scan failed (non-fatal)"),
-            }
-        });
+        Arc::new(managed_paths::discoveries::DiscoveriesScanner::new(
+            discoveries_state,
+            registry_url.clone(),
+        ))
+        .spawn_loop();
     }
 
     if let Some(ref m) = managed_config {
