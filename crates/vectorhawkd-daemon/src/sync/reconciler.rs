@@ -1877,8 +1877,18 @@ fn build_derived_events_blocking(
                     .join(&record.skill_id)
                     .join("active")
                     .exists();
+                let locally_satisfied = db_match && fs_match;
+                let backend_in_sync = record.state == "installed";
 
-                if !(db_match && fs_match) {
+                // Skip only when both sides already agree. If the skill is
+                // locally installed but the backend's desired-state row is
+                // still "desired" or "installing" (e.g. this daemon paired
+                // with a previous registry, sees the skill on disk, and the
+                // new registry's installation_id has never been confirmed),
+                // emit an Install event anyway — the handler will short-
+                // circuit via check_version_local and PATCH "installed" with
+                // the snapshot's installation_id, converging the row.
+                if !(locally_satisfied && backend_in_sync) {
                     events.push(SyncEvent::Install {
                         installation_id: record.installation_id,
                         skill_id: record.skill_id.clone(),

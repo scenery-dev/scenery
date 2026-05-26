@@ -147,19 +147,61 @@ fn snapshot_no_op_when_skill_already_installed() {
     let state = AppState::bootstrap_in(root.clone()).unwrap();
     seed_skill_with_fs(&state, "installed-skill", "1.0.0", false);
 
+    // Both sides already agree (backend's row is "installed" and the skill
+    // is locally present) — nothing to converge.
     let installations = vec![InstallationRecord {
         installation_id: install_id(),
         skill_id: "installed-skill".to_string(),
         version: "1.0.0".to_string(),
-        state: "desired".to_string(),
+        state: "installed".to_string(),
     }];
 
     let events = build_derived_events_blocking(installations, &state);
 
     assert!(
         events.is_empty(),
-        "already-installed desired skill → no events"
+        "already-installed skill with backend row in 'installed' → no events"
     );
+
+    cleanup(&root);
+}
+
+#[test]
+fn snapshot_emits_install_when_locally_present_but_backend_not_yet_installed() {
+    // Cross-registry reconciliation: the daemon previously paired with a
+    // different backend and has the skill on disk. The new backend's
+    // desired-state row is still "desired" (Queued in the portal) because
+    // it has never received an "installed" PATCH from this daemon. The
+    // reconciler must emit an Install event so the install handler short-
+    // circuits via check_version_local and PATCHes "installed" with the
+    // new installation_id.
+    let root = temp_root("snapshot-cross-registry");
+    let state = AppState::bootstrap_in(root.clone()).unwrap();
+    seed_skill_with_fs(&state, "carryover-skill", "1.0.0", false);
+
+    let iid = install_id();
+    let installations = vec![InstallationRecord {
+        installation_id: iid,
+        skill_id: "carryover-skill".to_string(),
+        version: "1.0.0".to_string(),
+        state: "desired".to_string(),
+    }];
+
+    let events = build_derived_events_blocking(installations, &state);
+
+    assert_eq!(events.len(), 1);
+    match &events[0] {
+        SyncEvent::Install {
+            installation_id,
+            skill_id,
+            version,
+        } => {
+            assert_eq!(*installation_id, iid);
+            assert_eq!(skill_id, "carryover-skill");
+            assert_eq!(version, "1.0.0");
+        }
+        other => panic!("expected Install, got {other:?}"),
+    }
 
     cleanup(&root);
 }
@@ -248,7 +290,7 @@ fn snapshot_mixed_batch_generates_correct_events() {
     // install-me is not local (desired → Install)
     seed_skill_with_fs(&state, "deactivate-me", "1.0.0", false); // active → Deactivate
     seed_skill_with_fs(&state, "purge-me", "1.0.0", false); // present → Purge
-    seed_skill_with_fs(&state, "keep-me", "2.0.0", false); // active, desired → no-op
+    seed_skill_with_fs(&state, "keep-me", "2.0.0", false); // active, installed → no-op
 
     let installations = vec![
         InstallationRecord {
@@ -273,7 +315,7 @@ fn snapshot_mixed_batch_generates_correct_events() {
             installation_id: install_id(),
             skill_id: "keep-me".to_string(),
             version: "2.0.0".to_string(),
-            state: "desired".to_string(),
+            state: "installed".to_string(),
         },
     ];
 
