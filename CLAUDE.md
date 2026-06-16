@@ -2,6 +2,27 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working in this repo.
 
+## Task Tracking — read this to understand project state
+
+**All tasks are tracked on the GitHub Project board, not in this file.** It is the single source of truth for what's planned, in flight, and done across every VectorHawk repo.
+
+- **Board:** VectorHawk Roadmap → https://github.com/orgs/vectorhawk/projects/1 (org-level, private)
+- **Status flow:** Backlog → Todo → In Progress → Blocked → Done
+- **Component field:** `runner` · `backend` · `gateway` · `portal` · `harness` · `site` — runner work in this repo uses `runner`.
+
+At the start of a session, list open tasks to orient yourself; when you pick up or finish work, move the card. Do not maintain ad-hoc TODO lists in code or docs — file a card instead.
+
+```bash
+# Runner tasks, current state
+gh project item-list 1 --owner vectorhawk
+
+# File a new task
+gh project item-create 1 --owner vectorhawk --title "..." --body "..."
+
+# Open the board
+gh project view 1 --owner vectorhawk --web
+```
+
 ## What this is
 
 `vectorhawkd` is the **VectorHawk runner** — a per-user local Rust agent that delivers governed AI tools and skills to AI clients over MCP. It is the successor to `../skillrunner/` (now archived). The architecture pivot from per-AI-client stdio child process to long-running daemon + thin shim is documented in:
