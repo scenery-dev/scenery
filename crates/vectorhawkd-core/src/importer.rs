@@ -200,23 +200,7 @@ fn build_skill_md(display_name: &str, fm: &SkillMdFrontmatter, body: &str) -> St
     let publisher = fm.publisher.as_deref().unwrap_or("local");
 
     format!(
-        "---\n\
-         name: {display_name}\n\
-         description: {description}\n\
-         version: 0.1.0\n\
-         publisher: {publisher}\n\
-         vh_permissions:\n  \
-           network: none\n  \
-           filesystem: none\n  \
-           clipboard: none\n\
-         vh_execution:\n  \
-           sandbox: strict\n  \
-           timeout_ms: 120000\n  \
-           memory_mb: 512\n\
-         vh_workflow_ref: workflow.yaml\n\
-         ---\n\
-         \n\
-         {body}\n"
+        "---\nname: {display_name}\ndescription: {description}\nmetadata:\n  vectorhawk:\n    version: 0.1.0\n    publisher: {publisher}\n    permissions:\n      network: none\n      filesystem: none\n      clipboard: none\n    execution:\n      sandbox: strict\n      timeout_ms: 120000\n      memory_mb: 512\n    workflow_ref: workflow.yaml\n---\n\n{body}\n"
     )
 }
 

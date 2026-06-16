@@ -1,21 +1,23 @@
 ---
 name: contract-compare
 description: Compare two contracts, summarize changes, and assess risk level.
-version: 0.3.0
-publisher: skillclub
-vh_permissions:
-  network: none
-  filesystem: read-only
-  clipboard: none
-vh_execution:
-  sandbox: strict
-  timeout_ms: 90000
-  memory_mb: 1024
-vh_triggers:
-  - compare contracts
-  - diff legal documents
-  - review contract changes
-vh_workflow_ref: workflow.yaml
+metadata:
+  vectorhawk:
+    version: 0.3.0
+    publisher: skillclub
+    permissions:
+      network: none
+      filesystem: read-only
+      clipboard: none
+    execution:
+      sandbox: strict
+      timeout_ms: 90000
+      memory_mb: 1024
+    triggers:
+      - compare contracts
+      - diff legal documents
+      - review contract changes
+    workflow_ref: workflow.yaml
 ---
 
 # Contract Compare

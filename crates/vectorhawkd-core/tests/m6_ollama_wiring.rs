@@ -30,20 +30,22 @@ fn write_skill_bundle(root: &Utf8PathBuf) {
         "---\n",
         "name: Test Skill\n",
         "description: A test skill for M6.\n",
-        "version: 0.1.0\n",
-        "publisher: skillclub\n",
-        "vh_permissions:\n",
-        "  filesystem: none\n",
-        "  network: none\n",
-        "  clipboard: none\n",
-        "vh_execution:\n",
-        "  sandbox: strict\n",
-        "  timeout_ms: 30000\n",
-        "  memory_mb: 256\n",
-        "vh_schemas:\n",
-        "  inputs: {}\n",
-        "  outputs: {\"type\": \"object\"}\n",
-        "vh_workflow_ref: ./workflow.yaml\n",
+        "metadata:\n",
+        "  vectorhawk:\n",
+        "    version: 0.1.0\n",
+        "    publisher: skillclub\n",
+        "    permissions:\n",
+        "      filesystem: none\n",
+        "      network: none\n",
+        "      clipboard: none\n",
+        "    execution:\n",
+        "      sandbox: strict\n",
+        "      timeout_ms: 30000\n",
+        "      memory_mb: 256\n",
+        "    schemas:\n",
+        "      inputs: {}\n",
+        "      outputs: {\"type\": \"object\"}\n",
+        "    workflow_ref: ./workflow.yaml\n",
         "---\n\n",
         "Do the thing.\n"
     );
@@ -106,25 +108,9 @@ fn ollama_wired_skill_run_records_model_source_and_cost() {
         result.total_cost_usd
     );
 
-    // Verify the execution_history row in SQLite
-    let conn = Connection::open(&state.db_path).expect("open db");
-    let (db_model_source, db_cost_usd): (Option<String>, Option<f64>) = conn
-        .query_row(
-            "SELECT model_source, cost_usd FROM execution_history WHERE skill_id = 'test-skill' ORDER BY id DESC LIMIT 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .expect("query execution_history row");
-
-    assert_eq!(
-        db_model_source.as_deref(),
-        Some("local:test-model"),
-        "DB model_source: {db_model_source:?}"
-    );
-    assert!(
-        (db_cost_usd.unwrap_or(f64::NAN) - 0.0_f64).abs() < f64::EPSILON,
-        "DB cost_usd should be 0.0, got: {db_cost_usd:?}"
-    );
+    // Per-run execution_history was retired with the local-DB shrink; the
+    // model_source / cost_usd assertions now live on the returned
+    // RunResult above.
 
     let _ = fs::remove_dir_all(&state_root);
     let _ = fs::remove_dir_all(&skill_root);
@@ -193,35 +179,13 @@ fn model_source_str_maps_all_variants() {
     assert_eq!(model_source_str(&ModelSource::McpSampling), "mcp_sampling");
 }
 
-/// Test 4: bootstrap_in creates the new columns (idempotent ALTER TABLE).
+/// Test 4: bootstrap_in is idempotent (the execution_history columns this
+/// originally exercised were retired with the local-DB shrink — what we now
+/// care about is just that bootstrap can run twice without error).
 #[test]
-fn bootstrap_creates_model_source_and_cost_usd_columns() {
+fn bootstrap_is_idempotent() {
     let state_root = temp_root("bootstrap-cols");
-    let state = AppState::bootstrap_in(state_root.clone()).expect("bootstrap");
-
-    let conn = Connection::open(&state.db_path).expect("open db");
-
-    // Insert a row using the new columns to confirm they exist.
-    conn.execute(
-        "INSERT INTO execution_history (skill_id, version, status, model_source, cost_usd) \
-         VALUES ('s', '0.1.0', 'completed', 'local:x', 0.001)",
-        [],
-    )
-    .expect("insert with new columns should succeed");
-
-    let (src, cost): (Option<String>, Option<f64>) = conn
-        .query_row(
-            "SELECT model_source, cost_usd FROM execution_history WHERE skill_id = 's'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .expect("query new columns");
-
-    assert_eq!(src.as_deref(), Some("local:x"));
-    assert!((cost.unwrap_or(0.0) - 0.001).abs() < 1e-9);
-
-    // Second bootstrap must not fail (idempotent).
+    AppState::bootstrap_in(state_root.clone()).expect("first bootstrap");
     AppState::bootstrap_in(state_root.clone()).expect("second bootstrap should not fail");
-
     let _ = fs::remove_dir_all(&state_root);
 }

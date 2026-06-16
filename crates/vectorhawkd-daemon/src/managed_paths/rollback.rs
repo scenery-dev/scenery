@@ -823,7 +823,10 @@ mod tests {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS auth_tokens \
                 (id INTEGER PRIMARY KEY, registry_url TEXT, access_token TEXT, \
-                 refresh_token TEXT, expires_at INTEGER); \
+                 refresh_token TEXT, expires_at INTEGER, \
+                 refresh_failures INTEGER NOT NULL DEFAULT 0, \
+                 next_refresh_attempt_at INTEGER, \
+                 last_refresh_status TEXT); \
              CREATE TABLE IF NOT EXISTS sync_state (key TEXT PRIMARY KEY, value TEXT); \
              CREATE TABLE IF NOT EXISTS managed_path_markers \
                 (path TEXT PRIMARY KEY, kind TEXT, slug TEXT, installation_id TEXT, \

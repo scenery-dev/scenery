@@ -5,7 +5,6 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use camino::Utf8Path;
-use rusqlite::{params, Connection, OptionalExtension};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1069,32 +1068,72 @@ impl MockRegistryClient {
 
 // ── HttpPolicyClient ──────────────────────────────────────────────────────────
 
-/// A `PolicyClient` that fetches from the registry and caches results in
-/// the local SQLite `policy_cache` table.
+/// A `PolicyClient` that fetches from the registry and caches results in a
+/// single JSON file at `<root>/policy-cache.json`. Replaced the previous
+/// SQLite `policy_cache` table as part of the local-DB shrink.
 ///
 /// On network failure it falls back to the cached policy if one exists,
 /// implementing the spec's 7-day offline grace window.
 pub struct HttpPolicyClient {
     registry: RegistryClient,
-    db_path: camino::Utf8PathBuf,
+    cache_path: camino::Utf8PathBuf,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+struct CachedPolicyEntry {
+    policy_json: String,
+    expires_at: u64,
+    fetched_at: u64,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Default, Debug)]
+struct PolicyCacheFile {
+    entries: std::collections::HashMap<String, CachedPolicyEntry>,
+}
+
+fn policy_cache_path(root_dir: &camino::Utf8Path) -> camino::Utf8PathBuf {
+    root_dir.join("policy-cache.json")
+}
+
+fn read_policy_cache(path: &camino::Utf8Path) -> PolicyCacheFile {
+    match std::fs::read_to_string(path) {
+        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+        Err(_) => PolicyCacheFile::default(),
+    }
+}
+
+/// Write the cache file atomically: serialize to a sibling `.tmp` file and
+/// rename into place. The rename is atomic on POSIX filesystems, so a
+/// concurrent reader either sees the old contents or the new ones, never a
+/// torn write.
+fn write_policy_cache(path: &camino::Utf8Path, file: &PolicyCacheFile) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let tmp = path.with_extension("json.tmp");
+    let body = serde_json::to_string(file).context("failed to serialize policy cache")?;
+    std::fs::write(&tmp, body)
+        .with_context(|| format!("failed to write policy cache tmp file: {tmp}"))?;
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("failed to rename policy cache into place: {path}"))?;
+    Ok(())
 }
 
 impl HttpPolicyClient {
     pub fn new(registry: RegistryClient, state: &AppState) -> Self {
         Self {
             registry,
-            db_path: state.db_path.clone(),
+            cache_path: policy_cache_path(&state.root_dir),
         }
     }
 
-    /// Delete the cached policy for `skill_id` so the next `fetch_policy` call
+    /// Drop the cached entry for `skill_id` so the next `fetch_policy` call
     /// re-fetches from the registry. Best-effort: callers should ignore errors.
     pub fn invalidate(&self, skill_id: &str) -> Result<()> {
-        let conn = Connection::open(&self.db_path)?;
-        conn.execute(
-            "DELETE FROM policy_cache WHERE skill_id = ?1",
-            rusqlite::params![skill_id],
-        )?;
+        let mut file = read_policy_cache(&self.cache_path);
+        if file.entries.remove(skill_id).is_some() {
+            write_policy_cache(&self.cache_path, &file)?;
+        }
         Ok(())
     }
 }
@@ -1102,7 +1141,6 @@ impl HttpPolicyClient {
 impl PolicyClient for HttpPolicyClient {
     fn fetch_policy(&self, skill_id: &str) -> Result<Policy> {
         let now = unix_now();
-        let conn = Connection::open(&self.db_path).context("failed to open state DB")?;
 
         // Always try registry first so policy changes take effect immediately.
         match self.registry.fetch_policy_remote(skill_id) {
@@ -1111,32 +1149,27 @@ impl PolicyClient for HttpPolicyClient {
                 let json = serde_json::to_string(&wire).context("failed to serialize policy")?;
                 let expires_at = now + ttl;
 
-                conn.execute(
-                    "INSERT INTO policy_cache (skill_id, policy_json, expires_at, fetched_at)
-                     VALUES (?1, ?2, ?3, ?4)
-                     ON CONFLICT(skill_id) DO UPDATE SET
-                         policy_json = excluded.policy_json,
-                         expires_at  = excluded.expires_at,
-                         fetched_at  = excluded.fetched_at",
-                    params![skill_id, json, expires_at as i64, now as i64],
-                )
-                .context("failed to write policy cache")?;
+                let mut file = read_policy_cache(&self.cache_path);
+                file.entries.insert(
+                    skill_id.to_string(),
+                    CachedPolicyEntry {
+                        policy_json: json,
+                        expires_at,
+                        fetched_at: now,
+                    },
+                );
+                if let Err(e) = write_policy_cache(&self.cache_path, &file) {
+                    warn!(skill_id, error = %e, "failed to persist policy cache; continuing");
+                }
 
                 Ok(policy)
             }
             Err(fetch_err) => {
                 // Fallback: use cached policy within 7-day offline grace window.
-                let cached = conn
-                    .query_row(
-                        "SELECT policy_json, fetched_at FROM policy_cache WHERE skill_id = ?1",
-                        [skill_id],
-                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
-                    )
-                    .optional()?;
-
-                if let Some((json, fetched_at)) = cached {
+                let file = read_policy_cache(&self.cache_path);
+                if let Some(entry) = file.entries.get(skill_id) {
                     const GRACE_SECONDS: u64 = 7 * 86400;
-                    let within_grace = now < fetched_at as u64 + GRACE_SECONDS;
+                    let within_grace = now < entry.fetched_at + GRACE_SECONDS;
 
                     if within_grace {
                         warn!(
@@ -1144,7 +1177,7 @@ impl PolicyClient for HttpPolicyClient {
                             error = %fetch_err,
                             "policy fetch failed; using stale cache within 7-day grace window"
                         );
-                        let wire: PolicyApiResponse = serde_json::from_str(&json)
+                        let wire: PolicyApiResponse = serde_json::from_str(&entry.policy_json)
                             .context("failed to deserialize stale cached policy")?;
                         return policy_from_wire(wire);
                     }
@@ -1599,30 +1632,22 @@ mod tests {
         let policy = policy_client.fetch_policy("cached-skill").unwrap();
         assert_eq!(policy.status, PolicyStatus::Active);
 
-        // Verify the cache row was written.
-        let conn = rusqlite::Connection::open(&state.db_path).unwrap();
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM policy_cache WHERE skill_id = 'cached-skill'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(count, 1, "policy should be cached in SQLite");
+        // Verify the cache file was written and contains our skill.
+        let cache_file = read_policy_cache(&policy_cache_path(&state.root_dir));
+        assert!(
+            cache_file.entries.contains_key("cached-skill"),
+            "policy should be cached in policy-cache.json"
+        );
 
         mock.assert();
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    #[test]
-    fn http_policy_client_uses_cache_when_registry_unreachable() {
-        let root = temp_root("http-policy-grace");
-        let state = AppState::bootstrap_in(root.clone()).unwrap();
-
-        // Pre-seed the cache with a fresh entry.
-        let now = unix_now();
+    /// Seed the JSON policy cache directly for tests that exercise the
+    /// offline-fallback branch without making a network call.
+    fn seed_policy_cache_file(root: &camino::Utf8Path, skill_id: &str, fetched_at: u64) {
         let wire = PolicyApiResponse {
-            skill_id: "stale-skill".to_string(),
+            skill_id: skill_id.to_string(),
             status: "active".to_string(),
             channel: None,
             target_version: None,
@@ -1631,13 +1656,24 @@ mod tests {
             policy_ttl_seconds: Some(3600),
         };
         let json = serde_json::to_string(&wire).unwrap();
-        let conn = rusqlite::Connection::open(&state.db_path).unwrap();
-        conn.execute(
-            "INSERT INTO policy_cache (skill_id, policy_json, expires_at, fetched_at) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params!["stale-skill", json, now as i64 + 3600, now as i64],
-        )
-        .unwrap();
-        drop(conn);
+        let mut file = PolicyCacheFile::default();
+        file.entries.insert(
+            skill_id.to_string(),
+            CachedPolicyEntry {
+                policy_json: json,
+                expires_at: fetched_at + 3600,
+                fetched_at,
+            },
+        );
+        write_policy_cache(&policy_cache_path(root), &file).unwrap();
+    }
+
+    #[test]
+    fn http_policy_client_uses_cache_when_registry_unreachable() {
+        let root = temp_root("http-policy-grace");
+        let state = AppState::bootstrap_in(root.clone()).unwrap();
+
+        seed_policy_cache_file(&state.root_dir, "stale-skill", unix_now());
 
         // Point at a non-listening port so the registry fetch fails.
         let registry = RegistryClient::new("http://127.0.0.1:1");
@@ -1658,26 +1694,8 @@ mod tests {
         let root = temp_root("http-policy-expired");
         let state = AppState::bootstrap_in(root.clone()).unwrap();
 
-        // Seed cache with a fetched_at more than 7 days ago.
         let now = unix_now();
-        let ancient = now - (8 * 86400); // 8 days ago
-        let wire = PolicyApiResponse {
-            skill_id: "old-skill".to_string(),
-            status: "active".to_string(),
-            channel: None,
-            target_version: None,
-            minimum_allowed_version: None,
-            blocked_message: None,
-            policy_ttl_seconds: Some(3600),
-        };
-        let json = serde_json::to_string(&wire).unwrap();
-        let conn = rusqlite::Connection::open(&state.db_path).unwrap();
-        conn.execute(
-            "INSERT INTO policy_cache (skill_id, policy_json, expires_at, fetched_at) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params!["old-skill", json, ancient as i64 + 3600, ancient as i64],
-        )
-        .unwrap();
-        drop(conn);
+        seed_policy_cache_file(&state.root_dir, "old-skill", now - (8 * 86400));
 
         // Registry unreachable.
         let registry = RegistryClient::new("http://127.0.0.1:1");

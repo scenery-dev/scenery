@@ -53,14 +53,15 @@ impl AppState {
         // Idempotent column additions — these fail silently if the column
         // already exists (SQLITE_ERROR extended code 1 from the "duplicate column"
         // error). Any other error is a real problem and propagates.
-        add_column_if_missing(
-            &conn,
-            "ALTER TABLE execution_history ADD COLUMN model_source TEXT",
-        )?;
-        add_column_if_missing(
-            &conn,
-            "ALTER TABLE execution_history ADD COLUMN cost_usd REAL DEFAULT 0.0",
-        )?;
+        //
+        // Legacy tables retired with the local-DB shrink:
+        //   - execution_history: per-run telemetry, never uploaded
+        //   - policy_cache:      moved to <root>/policy-cache.json
+        // Opportunistically dropped here so upgraded daemons free the disk
+        // space; brand-new installs never see them since they're not in
+        // SCHEMA_SQL anymore.
+        let _ = conn.execute_batch("DROP TABLE IF EXISTS execution_history");
+        let _ = conn.execute_batch("DROP TABLE IF EXISTS policy_cache");
 
         // RUN2: desired-state reconciler columns on installed_skills.
         add_column_if_missing(
@@ -83,6 +84,24 @@ impl AppState {
         // RUN2: SSE resume state and device registration.
         conn.execute_batch(SCHEMA_RUN2_SQL)
             .context("failed to apply RUN2 schema additions")?;
+
+        // AUTH-BACKOFF: track refresh-token failure backoff state per registry.
+        // When the daemon repeatedly hits 401 on /portal/auth/refresh (e.g.
+        // user revoked their session), we escalate the retry interval instead
+        // of hammering the endpoint every 60s. Columns are nullable so any
+        // legacy row is treated as "fresh, no backoff".
+        add_column_if_missing(
+            &conn,
+            "ALTER TABLE auth_tokens ADD COLUMN refresh_failures INTEGER NOT NULL DEFAULT 0",
+        )?;
+        add_column_if_missing(
+            &conn,
+            "ALTER TABLE auth_tokens ADD COLUMN next_refresh_attempt_at INTEGER",
+        )?;
+        add_column_if_missing(
+            &conn,
+            "ALTER TABLE auth_tokens ADD COLUMN last_refresh_status TEXT",
+        )?;
 
         // G3: MCP installation desired-state table.
         conn.execute_batch(SCHEMA_G3_SQL)
@@ -369,29 +388,11 @@ CREATE TABLE IF NOT EXISTS skill_versions (
     PRIMARY KEY(skill_id, version)
 );
 
-CREATE TABLE IF NOT EXISTS policy_cache (
-    skill_id TEXT PRIMARY KEY,
-    policy_json TEXT NOT NULL,
-    expires_at INTEGER NOT NULL,
-    fetched_at INTEGER NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS auth_tokens (
     registry_url TEXT PRIMARY KEY,
     access_token TEXT NOT NULL,
     refresh_token TEXT NOT NULL,
     saved_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS execution_history (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    skill_id TEXT NOT NULL,
-    version TEXT NOT NULL,
-    status TEXT NOT NULL,
-    prompt_tokens INTEGER,
-    completion_tokens INTEGER,
-    latency_ms INTEGER,
-    executed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS audit_events (
@@ -515,14 +516,17 @@ mod tests {
         let table_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN \
-                 ('installed_skills','skill_versions','policy_cache','auth_tokens',\
-                  'execution_history','audit_events','skill_ratings','skill_execution_counts',\
+                 ('installed_skills','skill_versions','auth_tokens',\
+                  'audit_events','skill_ratings','skill_execution_counts',\
                   'sync_state','mcp_installations','managed_path_markers')",
                 [],
                 |row| row.get(0),
             )
             .expect("should query sqlite_master");
-        assert_eq!(table_count, 11, "all eleven tables should exist");
+        assert_eq!(
+            table_count, 9,
+            "all nine tables should exist (execution_history + policy_cache were retired)"
+        );
 
         cleanup(&state.root_dir);
     }

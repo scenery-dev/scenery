@@ -1,9 +1,11 @@
-//! SKILL.md loader — parses the extended `vh_*` frontmatter and builds an
-//! in-memory `SkillPackage` without writing any intermediate files to disk.
+//! SKILL.md loader — parses the `metadata.vectorhawk.*` frontmatter and builds
+//! an in-memory `SkillPackage` without writing any intermediate files to disk.
 //!
 //! The schema for the frontmatter lives at
 //! `vectorhawkd-manifest/schemas/skill_md_frontmatter.json`. The rules here
-//! mirror that schema (AUTH1b decisions document, decisions 1–10).
+//! mirror that schema. All VectorHawk-specific fields live under the
+//! `metadata.vectorhawk` namespace; top-level `vh_*` keys are rejected with
+//! a migration hint.
 
 use crate::{
     to_skill_id, ClipboardAccess, Execution, FilesystemAccess, Manifest, ManifestError,
@@ -14,45 +16,64 @@ use camino::{Utf8Path, Utf8PathBuf};
 use serde::Deserialize;
 use std::fs;
 
-// ── Top-level frontmatter struct ─────────────────────────────────────────────
+// ── Top-level frontmatter structs ────────────────────────────────────────────
 
 /// The YAML frontmatter block at the top of a SKILL.md file.
 ///
-/// Unknown `vh_*` fields are rejected at deserialize time by the pattern
-/// property guard in the JSON Schema. In Rust we enforce this by *not* using
-/// `#[serde(deny_unknown_fields)]` on the top-level struct (to allow
-/// forward-compatible non-`vh_` Anthropic fields), but explicitly checking
-/// for unknown `vh_*` keys after deserialization.
+/// Top-level keys are the minimal standard set: `name`, `description`,
+/// `license`. All VectorHawk-specific fields live under
+/// `metadata.vectorhawk.*`. Top-level `vh_*` keys are explicitly rejected
+/// with a migration error (see `reject_unknown_vh_keys`).
 #[derive(Debug, Deserialize)]
 struct SkillMdFrontmatter {
-    // ── Standard fields (required) ───────────────────────────────────────────
     name: String,
     description: String,
-
-    // ── VectorHawk core metadata ─────────────────────────────────────────────
-    #[serde(default, rename = "version")]
-    vh_version: Option<String>,
-    #[serde(default, rename = "publisher")]
-    vh_publisher: Option<String>,
-
-    // ── VectorHawk optional blocks ───────────────────────────────────────────
     #[serde(default)]
-    vh_permissions: Option<VhPermissions>,
+    license: Option<String>,
     #[serde(default)]
-    vh_execution: Option<VhExecution>,
-    #[serde(default)]
-    vh_model: Option<VhModel>,
-    #[serde(default)]
-    vh_schemas: Option<VhSchemas>,
-    #[serde(default)]
-    vh_workflow: Option<Vec<WorkflowStep>>,
-    #[serde(default)]
-    vh_workflow_ref: Option<String>,
-    #[serde(default)]
-    vh_triggers: Vec<String>,
+    metadata: Option<SkillMdMetadata>,
 }
 
-/// `vh_permissions` sub-object.
+#[derive(Debug, Deserialize)]
+struct SkillMdMetadata {
+    #[serde(default)]
+    vectorhawk: Option<VhExtensions>,
+}
+
+/// All VectorHawk-specific frontmatter fields, nested under
+/// `metadata.vectorhawk`.
+// JUSTIFICATION: skill_type and declared_tools are parsed and validated but
+// not yet consumed by the runner. They exist to prevent valid SKILL.md files
+// from being rejected and for future registry-side enforcement.
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+struct VhExtensions {
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
+    publisher: Option<String>,
+    #[serde(default)]
+    permissions: Option<VhPermissions>,
+    #[serde(default)]
+    execution: Option<VhExecution>,
+    #[serde(default)]
+    model: Option<VhModel>,
+    #[serde(default)]
+    schemas: Option<VhSchemas>,
+    #[serde(default)]
+    workflow: Option<Vec<WorkflowStep>>,
+    #[serde(default)]
+    workflow_ref: Option<String>,
+    #[serde(default)]
+    triggers: Vec<String>,
+    /// Skill type tag (e.g., "skill"). Renamed from the reserved word `type`.
+    #[serde(default, rename = "type")]
+    skill_type: Option<String>,
+    #[serde(default)]
+    declared_tools: Vec<String>,
+}
+
+/// `permissions` sub-object under `metadata.vectorhawk`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct VhPermissions {
@@ -64,7 +85,7 @@ struct VhPermissions {
     clipboard: Option<ClipboardAccess>,
 }
 
-/// `vh_execution` sub-object.
+/// `execution` sub-object under `metadata.vectorhawk`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct VhExecution {
@@ -76,7 +97,7 @@ struct VhExecution {
     sandbox: Option<SandboxProfile>,
 }
 
-/// `vh_model` sub-object.
+/// `model` sub-object under `metadata.vectorhawk`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct VhModel {
@@ -90,7 +111,7 @@ struct VhModel {
     prefer_local: Option<bool>,
 }
 
-/// `vh_schemas` sub-object.
+/// `schemas` sub-object under `metadata.vectorhawk`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct VhSchemas {
@@ -103,15 +124,17 @@ struct VhSchemas {
 // ── Public loader ─────────────────────────────────────────────────────────────
 
 /// Load a `SkillPackage` from a directory that contains a `SKILL.md` at its
-/// root. The workflow is sourced either from inline `vh_workflow` steps in the
-/// frontmatter or from the file referenced by `vh_workflow_ref`.
+/// root. The workflow is sourced either from inline `metadata.vectorhawk.workflow`
+/// steps in the frontmatter or from the file referenced by
+/// `metadata.vectorhawk.workflow_ref`.
 ///
 /// Returns a `ManifestError` if:
 /// - `SKILL.md` is missing or unparseable.
 /// - Required frontmatter fields are absent.
 /// - A referenced workflow file is missing.
-/// - An unknown `vh_*` field is present (mirrors JSON Schema reject rule).
-/// - Both `vh_workflow` and `vh_workflow_ref` are set simultaneously.
+/// - Any top-level `vh_*` key is present (migration error with hint).
+/// - Any unknown key appears under `metadata.vectorhawk`.
+/// - Both `workflow` and `workflow_ref` are set simultaneously.
 pub(crate) fn load_from_skill_md_dir(root: Utf8PathBuf) -> Result<SkillPackage, ManifestError> {
     let skill_md_path = root.join("SKILL.md");
     let content = fs::read_to_string(&skill_md_path)?;
@@ -123,7 +146,7 @@ pub(crate) fn load_from_skill_md_dir(root: Utf8PathBuf) -> Result<SkillPackage, 
         )
     })?;
 
-    // Reject unknown vh_* keys before structural deserialization.
+    // Reject top-level vh_* keys and unknown keys under metadata.vectorhawk.
     reject_unknown_vh_keys(raw_yaml)?;
 
     let frontmatter: SkillMdFrontmatter =
@@ -135,32 +158,43 @@ pub(crate) fn load_from_skill_md_dir(root: Utf8PathBuf) -> Result<SkillPackage, 
     let id = to_skill_id(&frontmatter.name);
 
     // Version defaults to "0.1.0" if omitted.
-    let version_str = frontmatter.vh_version.as_deref().unwrap_or("0.1.0");
-    let version = semver::Version::parse(version_str)
-        .map_err(|e| ManifestError::Invalid(format!("vh_version is not valid semver: {e}")))?;
+    let version_str = vh(&frontmatter)
+        .and_then(|v| v.version.as_deref())
+        .unwrap_or("0.1.0");
+    let version = semver::Version::parse(version_str).map_err(|e| {
+        ManifestError::Invalid(format!(
+            "metadata.vectorhawk.version is not valid semver: {e}"
+        ))
+    })?;
 
-    let publisher = frontmatter
-        .vh_publisher
-        .clone()
+    let publisher = vh(&frontmatter)
+        .and_then(|v| v.publisher.clone())
         .unwrap_or_else(|| "local".to_string());
 
-    let permissions = build_permissions(frontmatter.vh_permissions.as_ref());
-    let execution = build_execution(frontmatter.vh_execution.as_ref());
+    let permissions = build_permissions(vh(&frontmatter).and_then(|v| v.permissions.as_ref()));
+    let execution = build_execution(vh(&frontmatter).and_then(|v| v.execution.as_ref()));
 
-    let model_requirements = frontmatter.vh_model.as_ref().map(|m| ModelRequirements {
-        min_params_b: m.min_params_b,
-        recommended: m.recommended.clone(),
-        fallback: m.fallback,
-        prefer_local: m.prefer_local,
-    });
+    let model_requirements =
+        vh(&frontmatter)
+            .and_then(|v| v.model.as_ref())
+            .map(|m| ModelRequirements {
+                min_params_b: m.min_params_b,
+                recommended: m.recommended.clone(),
+                fallback: m.fallback,
+                prefer_local: m.prefer_local,
+            });
 
-    let (inputs_schema, outputs_schema) = match &frontmatter.vh_schemas {
+    let (inputs_schema, outputs_schema) = match vh(&frontmatter).and_then(|v| v.schemas.as_ref()) {
         Some(s) => (s.inputs.clone(), s.outputs.clone()),
         None => (None, None),
     };
 
     // Build a synthetic system prompt entrypoint name.
     let entrypoint = "workflow.yaml".to_string();
+
+    let raw_triggers = vh(&frontmatter)
+        .map(|v| v.triggers.clone())
+        .unwrap_or_default();
 
     let manifest = Manifest {
         schema_version: "1.0".to_string(),
@@ -169,7 +203,7 @@ pub(crate) fn load_from_skill_md_dir(root: Utf8PathBuf) -> Result<SkillPackage, 
         version,
         publisher,
         description: Some(frontmatter.description.clone()),
-        license: None,
+        license: frontmatter.license.clone(),
         entrypoint,
         inputs_schema,
         outputs_schema,
@@ -180,7 +214,7 @@ pub(crate) fn load_from_skill_md_dir(root: Utf8PathBuf) -> Result<SkillPackage, 
             channel: Some("stable".to_string()),
             auto_update: Some(true),
         }),
-        triggers: validate_and_normalize_triggers(frontmatter.vh_triggers.clone())?,
+        triggers: validate_and_normalize_triggers(raw_triggers)?,
     };
 
     let workflow = build_workflow(&root, &frontmatter, &manifest.name, body)?;
@@ -190,6 +224,11 @@ pub(crate) fn load_from_skill_md_dir(root: Utf8PathBuf) -> Result<SkillPackage, 
         manifest,
         workflow,
     })
+}
+
+/// Extract the `metadata.vectorhawk` block from a frontmatter struct, if present.
+fn vh(fm: &SkillMdFrontmatter) -> Option<&VhExtensions> {
+    fm.metadata.as_ref()?.vectorhawk.as_ref()
 }
 
 // ── Frontmatter parsing helpers ───────────────────────────────────────────────
@@ -205,29 +244,66 @@ fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
     Some((yaml_str, body))
 }
 
-/// Scan the raw YAML string for keys that start with `vh_` but are not in the
-/// explicit allowlist. This mirrors the JSON Schema's `patternProperties` guard.
+/// Validate the raw YAML for namespace compliance:
+///
+/// (a) Any top-level key beginning with `vh_` is rejected — these must be
+///     moved under `metadata.vectorhawk`.
+/// (b) Any key directly under `metadata.vectorhawk` that is not in
+///     `ALLOWED_VH_KEYS` is rejected as unknown.
 fn reject_unknown_vh_keys(yaml_str: &str) -> Result<(), ManifestError> {
     const ALLOWED_VH_KEYS: &[&str] = &[
-        "vh_permissions",
-        "vh_execution",
-        "vh_model",
-        "vh_schemas",
-        "vh_workflow",
-        "vh_workflow_ref",
-        "vh_triggers",
+        "version",
+        "publisher",
+        "permissions",
+        "execution",
+        "model",
+        "schemas",
+        "workflow",
+        "workflow_ref",
+        "triggers",
+        "type",
+        "declared_tools",
     ];
 
     let value: serde_yaml::Value =
         serde_yaml::from_str(yaml_str).map_err(|e| ManifestError::Invalid(e.to_string()))?;
 
-    if let serde_yaml::Value::Mapping(map) = &value {
-        for key in map.keys() {
+    let mapping = match &value {
+        serde_yaml::Value::Mapping(m) => m,
+        _ => return Ok(()),
+    };
+
+    // (a) Reject any top-level vh_* key.
+    for key in mapping.keys() {
+        if let serde_yaml::Value::String(k) = key {
+            if k.starts_with("vh_") {
+                return Err(ManifestError::Invalid(format!(
+                    "top-level 'vh_*' fields are no longer supported: '{k}' must be moved \
+                     under metadata.vectorhawk (e.g., 'metadata.vectorhawk.permissions' \
+                     not 'vh_permissions')"
+                )));
+            }
+        }
+    }
+
+    // (b) Validate keys under metadata.vectorhawk if the block is present.
+    let vh_map = mapping
+        .get(serde_yaml::Value::String("metadata".to_string()))
+        .and_then(|m| {
+            if let serde_yaml::Value::Mapping(inner) = m {
+                inner.get(serde_yaml::Value::String("vectorhawk".to_string()))
+            } else {
+                None
+            }
+        });
+
+    if let Some(serde_yaml::Value::Mapping(vh_fields)) = vh_map {
+        for key in vh_fields.keys() {
             if let serde_yaml::Value::String(k) = key {
-                if k.starts_with("vh_") && !ALLOWED_VH_KEYS.contains(&k.as_str()) {
+                if !ALLOWED_VH_KEYS.contains(&k.as_str()) {
                     return Err(ManifestError::Invalid(format!(
-                        "unknown vh_* field in SKILL.md frontmatter: '{k}' — \
-                         only {ALLOWED_VH_KEYS:?} are permitted"
+                        "unknown field under metadata.vectorhawk: '{k}' — \
+                         allowed: {ALLOWED_VH_KEYS:?}"
                     )));
                 }
             }
@@ -248,16 +324,19 @@ fn validate_frontmatter_basics(fm: &SkillMdFrontmatter) -> Result<(), ManifestEr
             "SKILL.md 'description' field must be non-empty".to_string(),
         ));
     }
-    if fm.vh_workflow.is_some() && fm.vh_workflow_ref.is_some() {
+    let workflow_conflict = vh(fm)
+        .map(|v| v.workflow.is_some() && v.workflow_ref.is_some())
+        .unwrap_or(false);
+    if workflow_conflict {
         return Err(ManifestError::Invalid(
-            "vh_workflow and vh_workflow_ref are mutually exclusive; use one or neither"
-                .to_string(),
+            "workflow and workflow_ref are mutually exclusive; use one or neither".to_string(),
         ));
     }
     Ok(())
 }
 
-/// Validate and normalize a raw `vh_triggers` list from the frontmatter.
+/// Validate and normalize a raw `metadata.vectorhawk.triggers` list from the
+/// frontmatter.
 ///
 /// Rules applied in order:
 /// 1. Strip empty strings.
@@ -280,7 +359,7 @@ fn validate_and_normalize_triggers(raw: Vec<String>) -> Result<Vec<String>, Mani
     // Step 4: max 10 triggers.
     if normalized.len() > 10 {
         return Err(ManifestError::Invalid(format!(
-            "vh_triggers may contain at most 10 items, got {}",
+            "metadata.vectorhawk.triggers may contain at most 10 items, got {}",
             normalized.len()
         )));
     }
@@ -289,13 +368,13 @@ fn validate_and_normalize_triggers(raw: Vec<String>) -> Result<Vec<String>, Mani
     for trigger in &normalized {
         if trigger.len() < 3 {
             return Err(ManifestError::Invalid(format!(
-                "vh_triggers item '{}' is too short (minimum 3 characters)",
+                "metadata.vectorhawk.triggers item '{}' is too short (minimum 3 characters)",
                 trigger
             )));
         }
         if trigger.len() > 200 {
             return Err(ManifestError::Invalid(format!(
-                "vh_triggers item is too long ({} characters, maximum 200)",
+                "metadata.vectorhawk.triggers item is too long ({} characters, maximum 200)",
                 trigger.len()
             )));
         }
@@ -344,7 +423,7 @@ fn build_workflow(
     skill_name: &str,
     body: &str,
 ) -> Result<Workflow, ManifestError> {
-    if let Some(ref_path) = &fm.vh_workflow_ref {
+    if let Some(ref_path) = vh(fm).and_then(|v| v.workflow_ref.as_ref()) {
         // Load workflow from a referenced YAML file.
         let workflow_path = root.join(ref_path.trim_start_matches("./"));
         if !workflow_path.exists() {
@@ -357,18 +436,13 @@ fn build_workflow(
         return Ok(workflow);
     }
 
-    if let Some(inline_steps) = &fm.vh_workflow {
-        validate_workflow_prompt_refs(
-            root,
-            &Workflow {
-                name: to_skill_id(skill_name),
-                steps: inline_steps.clone(),
-            },
-        )?;
-        return Ok(Workflow {
+    if let Some(inline_steps) = vh(fm).and_then(|v| v.workflow.as_ref()) {
+        let wf = Workflow {
             name: to_skill_id(skill_name),
             steps: inline_steps.clone(),
-        });
+        };
+        validate_workflow_prompt_refs(root, &wf)?;
+        return Ok(wf);
     }
 
     // No workflow defined — synthesize a single LLM step from the SKILL.md body.
@@ -449,7 +523,7 @@ mod tests {
     #[test]
     fn test_vh_triggers_parsed_into_manifest() {
         let content = minimal_skill_md(
-            "vh_triggers:\n  - compare contracts\n  - diff legal documents\n  - review contract changes\n",
+            "metadata:\n  vectorhawk:\n    triggers:\n      - compare contracts\n      - diff legal documents\n      - review contract changes\n",
         );
         let pkg = load_skill_md(&content).unwrap();
         assert_eq!(pkg.manifest.triggers.len(), 3);
@@ -476,10 +550,12 @@ mod tests {
 
     #[test]
     fn test_vh_triggers_max_10_rejects_11() {
-        let triggers = (1..=11)
-            .map(|i| format!("  - trigger phrase {i}\n"))
+        let trigger_items = (1..=11)
+            .map(|i| format!("      - trigger phrase {i}\n"))
             .collect::<String>();
-        let content = minimal_skill_md(&format!("vh_triggers:\n{triggers}"));
+        let content = minimal_skill_md(&format!(
+            "metadata:\n  vectorhawk:\n    triggers:\n{trigger_items}"
+        ));
         let err = load_skill_md(&content).unwrap_err();
         let msg = err.to_string();
         assert!(
@@ -491,7 +567,8 @@ mod tests {
     #[test]
     fn test_vh_triggers_too_short_rejected() {
         // Two-character trigger is below the 3-char minimum.
-        let content = minimal_skill_md("vh_triggers:\n  - ok\n  - ab\n");
+        let content =
+            minimal_skill_md("metadata:\n  vectorhawk:\n    triggers:\n      - ok\n      - ab\n");
         let err = load_skill_md(&content).unwrap_err();
         let msg = err.to_string();
         assert!(
@@ -504,7 +581,9 @@ mod tests {
     fn test_vh_triggers_too_long_rejected() {
         // 201-character trigger exceeds the 200-char limit.
         let long = "a".repeat(201);
-        let content = minimal_skill_md(&format!("vh_triggers:\n  - {long}\n"));
+        let content = minimal_skill_md(&format!(
+            "metadata:\n  vectorhawk:\n    triggers:\n      - {long}\n"
+        ));
         let err = load_skill_md(&content).unwrap_err();
         let msg = err.to_string();
         assert!(
@@ -516,7 +595,9 @@ mod tests {
     #[test]
     fn test_vh_triggers_deduplication() {
         // "compare", "COMPARE", and "compare" should collapse to a single entry.
-        let content = minimal_skill_md("vh_triggers:\n  - compare\n  - COMPARE\n  - compare\n");
+        let content = minimal_skill_md(
+            "metadata:\n  vectorhawk:\n    triggers:\n      - compare\n      - COMPARE\n      - compare\n",
+        );
         let pkg = load_skill_md(&content).unwrap();
         assert_eq!(
             pkg.manifest.triggers.len(),
@@ -530,7 +611,9 @@ mod tests {
     #[test]
     fn test_vh_triggers_empty_strings_stripped() {
         // Empty strings in the list must be silently dropped.
-        let content = minimal_skill_md("vh_triggers:\n  - \"\"\n  - valid trigger\n  - \"\"\n");
+        let content = minimal_skill_md(
+            "metadata:\n  vectorhawk:\n    triggers:\n      - \"\"\n      - valid trigger\n      - \"\"\n",
+        );
         let pkg = load_skill_md(&content).unwrap();
         assert_eq!(
             pkg.manifest.triggers.len(),
@@ -539,5 +622,17 @@ mod tests {
             pkg.manifest.triggers
         );
         assert_eq!(pkg.manifest.triggers[0], "valid trigger");
+    }
+
+    #[test]
+    fn test_top_level_vh_key_is_rejected() {
+        // A top-level vh_* key must now produce a clear migration error.
+        let content = minimal_skill_md("vh_permissions:\n  network: none\n");
+        let err = load_skill_md(&content).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("metadata.vectorhawk"),
+            "error should mention metadata.vectorhawk migration path, got: {msg}"
+        );
     }
 }

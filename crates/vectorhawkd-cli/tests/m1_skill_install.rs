@@ -35,10 +35,11 @@ fn write_skill_bundle(root: &Utf8PathBuf, name_suffix: &str, version: &str) {
         format!(
             concat!(
                 "---\nname: Test Skill {name_suffix}\ndescription: A test skill.\n",
-                "version: {version}\npublisher: skillclub\n",
-                "vh_permissions:\n  filesystem: none\n  network: none\n  clipboard: none\n",
-                "vh_execution:\n  sandbox: strict\n  timeout_ms: 30000\n  memory_mb: 256\n",
-                "vh_workflow_ref: ./workflow.yaml\n---\n\nDo the thing.\n"
+                "metadata:\n  vectorhawk:\n",
+                "    version: {version}\n    publisher: skillclub\n",
+                "    permissions:\n      filesystem: none\n      network: none\n      clipboard: none\n",
+                "    execution:\n      sandbox: strict\n      timeout_ms: 30000\n      memory_mb: 256\n",
+                "    workflow_ref: ./workflow.yaml\n---\n\nDo the thing.\n"
             ),
             name_suffix = name_suffix,
             version = version,

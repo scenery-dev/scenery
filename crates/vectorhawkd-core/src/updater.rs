@@ -526,7 +526,7 @@ mod tests {
         fs::write(
             root.join("SKILL.md"),
             format!(
-                "---\nname: Test Skill\ndescription: A test skill.\nversion: {version}\npublisher: skillclub\nvh_permissions:\n  filesystem: none\n  network: none\n  clipboard: none\nvh_execution:\n  sandbox: strict\n  timeout_ms: 30000\n  memory_mb: 256\nvh_workflow_ref: ./workflow.yaml\n---\n\nDo the thing.\n"
+                "---\nname: Test Skill\ndescription: A test skill.\nmetadata:\n  vectorhawk:\n    version: {version}\n    publisher: skillclub\n    permissions:\n      filesystem: none\n      network: none\n      clipboard: none\n    execution:\n      sandbox: strict\n      timeout_ms: 30000\n      memory_mb: 256\n    workflow_ref: ./workflow.yaml\n---\n\nDo the thing.\n"
             ),
         )
         .unwrap();

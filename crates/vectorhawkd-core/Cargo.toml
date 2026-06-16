@@ -37,6 +37,10 @@ base64.workspace = true
 getrandom.workspace = true
 hex = "0.4"
 urlencoding = "2"
+# Secure-by-default token storage: macOS Keychain, Windows Credential Manager,
+# Linux Secret Service (GNOME Keyring / KWallet). Falls back to SQLite when
+# the OS keystore is unavailable (headless boxes, CI, containers without D-Bus).
+keyring = { version = "3", features = ["apple-native", "linux-native-sync-persistent", "windows-native"] }
 
 [dev-dependencies]
 mockito = "1"

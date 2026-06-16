@@ -6,7 +6,6 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use camino::Utf8PathBuf;
-use rusqlite::Connection;
 use std::collections::HashMap;
 use std::fs;
 use vectorhawkd_manifest::{PromptSource, SkillPackage, WorkflowStep};
@@ -136,19 +135,16 @@ pub fn run_skill_with_scope(
         .find_map(|s| s.model_source.as_ref())
         .map(model_source_str);
 
-    // 6. Record execution history.
-    record_execution(
-        state,
-        ExecutionRecord {
-            skill_id,
-            version: &version,
-            prompt_tokens: total_prompt_tokens,
-            completion_tokens: total_completion_tokens,
-            latency_ms: total_latency_ms,
-            model_source: run_model_source.as_deref().unwrap_or(""),
-            cost_usd: total_cost_usd,
-        },
-    )?;
+    // Per-run execution history was previously persisted to a local
+    // `execution_history` SQLite table. It was only ever read by
+    // `vectorhawk skill info`, never uploaded anywhere — so we keep it in
+    // the returned RunResult for the immediate caller and drop the
+    // long-term local store. Aggregate counts still land in
+    // `skill_execution_counts` via `ratings.rs` and get synced to the
+    // registry.
+    let _ = run_model_source;
+    let _ = total_cost_usd;
+    let _ = state;
 
     Ok(RunResult {
         skill_id: skill_id.to_string(),
@@ -533,39 +529,6 @@ fn validate_output(
     Ok(())
 }
 
-// ── Execution history ─────────────────────────────────────────────────────────
-
-struct ExecutionRecord<'a> {
-    skill_id: &'a str,
-    version: &'a str,
-    prompt_tokens: u64,
-    completion_tokens: u64,
-    latency_ms: u64,
-    model_source: &'a str,
-    cost_usd: f64,
-}
-
-fn record_execution(state: &AppState, rec: ExecutionRecord<'_>) -> Result<()> {
-    let conn =
-        Connection::open(&state.db_path).context("failed to open state DB to record execution")?;
-    conn.execute(
-        "INSERT INTO execution_history \
-         (skill_id, version, status, prompt_tokens, completion_tokens, latency_ms, model_source, cost_usd) \
-         VALUES (?1, ?2, 'completed', ?3, ?4, ?5, ?6, ?7)",
-        rusqlite::params![
-            rec.skill_id,
-            rec.version,
-            rec.prompt_tokens,
-            rec.completion_tokens,
-            rec.latency_ms,
-            if rec.model_source.is_empty() { None } else { Some(rec.model_source) },
-            rec.cost_usd,
-        ],
-    )
-    .context("failed to insert execution_history row")?;
-    Ok(())
-}
-
 // ── Model requirements check ──────────────────────────────────────────────────
 
 fn check_model_requirements(
@@ -616,9 +579,9 @@ mod tests {
     fn write_skill_bundle(root: &Utf8PathBuf, input_schema_json: &str) {
         fs::create_dir_all(root.join("prompts")).expect("create prompts");
         let input_schema_yaml =
-            format!("  inputs: {input_schema_json}\n  outputs: {{\"type\": \"object\"}}");
+            format!("      inputs: {input_schema_json}\n      outputs: {{\"type\": \"object\"}}");
         let skill_md = format!(
-            "---\nname: Test Skill\ndescription: A test skill.\nversion: 0.1.0\npublisher: skillclub\nvh_permissions:\n  filesystem: none\n  network: none\n  clipboard: none\nvh_execution:\n  sandbox: strict\n  timeout_ms: 30000\n  memory_mb: 256\nvh_schemas:\n{input_schema_yaml}\nvh_workflow_ref: ./workflow.yaml\n---\n\nDo the thing.\n"
+            "---\nname: Test Skill\ndescription: A test skill.\nmetadata:\n  vectorhawk:\n    version: 0.1.0\n    publisher: skillclub\n    permissions:\n      filesystem: none\n      network: none\n      clipboard: none\n    execution:\n      sandbox: strict\n      timeout_ms: 30000\n      memory_mb: 256\n    schemas:\n{input_schema_yaml}\n    workflow_ref: ./workflow.yaml\n---\n\nDo the thing.\n"
         );
         fs::write(root.join("SKILL.md"), skill_md).expect("write SKILL.md");
         fs::write(

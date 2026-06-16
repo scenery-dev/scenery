@@ -527,12 +527,12 @@ fn build_tool_list_inner(
                     "type": "string",
                     "description": "Output directory path (default: current directory)"
                 },
-                "vh_triggers": {
+                "triggers": {
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "Trigger phrases for the skill"
                 },
-                "vh_permissions": {
+                "permissions": {
                     "type": "object",
                     "properties": {
                         "network": {"type": "string"},
@@ -541,7 +541,7 @@ fn build_tool_list_inner(
                     },
                     "description": "Permission settings (network, filesystem, clipboard)"
                 },
-                "vh_model": {
+                "model": {
                     "type": "object",
                     "properties": {
                         "min_params_b": {"type": "number"},
@@ -553,7 +553,7 @@ fn build_tool_list_inner(
                     },
                     "description": "Model requirements"
                 },
-                "vh_execution": {
+                "execution": {
                     "type": "object",
                     "properties": {
                         "timeout_ms": {"type": "integer"},
@@ -2260,39 +2260,39 @@ fn scaffold_skill_md(params: SkillMdParams<'_>) -> Result<String> {
     fs::create_dir_all(&skill_dir)
         .with_context(|| format!("failed to create directory '{skill_dir}'"))?;
 
-    // Produce the vh_triggers YAML block.
+    // Produce the triggers YAML block nested under metadata.vectorhawk.
     let triggers_yaml = if triggers.is_empty() {
         String::new()
     } else {
         let items = triggers
             .iter()
-            .map(|t| format!("  - {t}"))
+            .map(|t| format!("      - {t}"))
             .collect::<Vec<_>>()
             .join("\n");
-        format!("vh_triggers:\n{items}\n")
+        format!("    triggers:\n{items}\n")
     };
 
-    // Produce the vh_model YAML block.
+    // Produce the model recommended list (6-space indent: inside metadata.vectorhawk.model).
     let recommended_yaml = recommended_models
         .iter()
-        .map(|m| format!("  - {m}"))
+        .map(|m| format!("      - {m}"))
         .collect::<Vec<_>>()
         .join("\n");
 
     // Use skill_id as the name (the caller normalizes it from the user input).
-    let body_block = indent_block(system_prompt, 8);
+    let body_block = indent_block(system_prompt, 12);
     let skill_md = format!(
-        "---\nname: {skill_id}\ndescription: \"TODO: describe what this skill does\"\n\
-         version: 0.1.0\npublisher: {publisher_id}\n\
-         vh_permissions:\n  network: {network}\n  filesystem: {filesystem}\n  clipboard: {clipboard}\n\
-         vh_execution:\n  timeout_ms: {timeout_ms}\n  memory_mb: {memory_mb}\n  sandbox: {sandbox}\n\
-         vh_model:\n  min_params_b: {min_params_b}\n  recommended:\n{recommended_yaml}\n  fallback: {fallback}\n\
+        "---\nname: {skill_id}\ndescription: \"TODO: describe what this skill does\"\nlicense: MIT\n\
+         metadata:\n  vectorhawk:\n    version: 0.1.0\n    publisher: {publisher_id}\n\
          {triggers_yaml}\
-         vh_workflow:\n  - id: run\n    type: llm\n    prompt:\n      kind: inline\n      body: |\n\
+         \n    permissions:\n      network: {network}\n      filesystem: {filesystem}\n      clipboard: {clipboard}\n\
+         \n    execution:\n      timeout_ms: {timeout_ms}\n      memory_mb: {memory_mb}\n      sandbox: {sandbox}\n\
+         \n    model:\n      min_params_b: {min_params_b}\n      recommended:\n{recommended_yaml}\n      fallback: {fallback}\n\
+         \n    workflow:\n      - id: run\n        type: llm\n        prompt:\n          kind: inline\n          body: |\n\
          {body_block}\
-         \n    inputs:\n      text: input.text\n\
-         vh_schemas:\n  inputs:\n    type: object\n    properties:\n      text:\n        type: string\n\
-         \n    required:\n      - text\n---\n"
+         \n        inputs:\n          text: input.text\n\
+         \n    schemas:\n      inputs:\n        type: object\n        properties:\n          text:\n            type: string\n\
+         \n        required:\n          - text\n---\n"
     );
 
     let skill_md_path = skill_dir.join("SKILL.md");
@@ -2513,18 +2513,18 @@ fn handle_author(
                     "triggers": triggers_json,
                 },
                 "raw": {
-                    "vh_triggers": triggers_json,
-                    "vh_permissions": {
+                    "triggers": triggers_json,
+                    "permissions": {
                         "network": rec.permissions.network,
                         "filesystem": rec.permissions.filesystem,
                         "clipboard": rec.permissions.clipboard
                     },
-                    "vh_model": {
+                    "model": {
                         "min_params_b": rec.model.min_params_b,
                         "recommended": recommended_models,
                         "fallback": rec.model.fallback
                     },
-                    "vh_execution": {
+                    "execution": {
                         "timeout_ms": rec.execution.timeout_ms,
                         "memory_mb": rec.execution.memory_mb,
                         "sandbox": rec.execution.sandbox
@@ -2562,9 +2562,9 @@ fn handle_author_confirm(
         .and_then(|v| v.as_str())
         .unwrap_or(".");
 
-    // Extract vh_triggers.
+    // Extract triggers.
     let triggers: Vec<String> = arguments
-        .get("vh_triggers")
+        .get("triggers")
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
@@ -2573,8 +2573,8 @@ fn handle_author_confirm(
         })
         .unwrap_or_default();
 
-    // Extract vh_permissions with defaults.
-    let perms = arguments.get("vh_permissions");
+    // Extract permissions with defaults.
+    let perms = arguments.get("permissions");
     let network = perms
         .and_then(|p| p.get("network"))
         .and_then(|v| v.as_str())
@@ -2591,8 +2591,8 @@ fn handle_author_confirm(
         .unwrap_or("none")
         .to_string();
 
-    // Extract vh_model with defaults.
-    let model = arguments.get("vh_model");
+    // Extract model with defaults.
+    let model = arguments.get("model");
     let min_params_b = model
         .and_then(|m| m.get("min_params_b"))
         .and_then(|v| v.as_f64())
@@ -2612,8 +2612,8 @@ fn handle_author_confirm(
         .unwrap_or("error")
         .to_string();
 
-    // Extract vh_execution with defaults.
-    let exec = arguments.get("vh_execution");
+    // Extract execution with defaults.
+    let exec = arguments.get("execution");
     let timeout_ms = exec
         .and_then(|e| e.get("timeout_ms"))
         .and_then(|v| v.as_u64())
@@ -2687,33 +2687,7 @@ mod tests {
         fs::create_dir_all(root.join("prompts")).unwrap();
         fs::write(
             root.join("SKILL.md"),
-            "---\n\
-             name: Test Skill\n\
-             description: A test skill for MCP testing\n\
-             version: 0.1.0\n\
-             publisher: vectorhawk\n\
-             vh_permissions:\n  \
-               network: none\n  \
-               filesystem: none\n  \
-               clipboard: none\n\
-             vh_execution:\n  \
-               sandbox: strict\n  \
-               timeout_ms: 30000\n  \
-               memory_mb: 256\n\
-             vh_schemas:\n  \
-               inputs:\n    \
-                 type: object\n    \
-                 properties:\n      \
-                   query:\n        \
-                     type: string\n    \
-                 required:\n      \
-                   - query\n  \
-               outputs:\n    \
-                 type: object\n\
-             vh_workflow_ref: workflow.yaml\n\
-             ---\n\
-             \n\
-             Do the thing.\n",
+            "---\nname: Test Skill\ndescription: A test skill for MCP testing\nmetadata:\n  vectorhawk:\n    version: 0.1.0\n    publisher: vectorhawk\n    permissions:\n      network: none\n      filesystem: none\n      clipboard: none\n    execution:\n      sandbox: strict\n      timeout_ms: 30000\n      memory_mb: 256\n    schemas:\n      inputs:\n        type: object\n        properties:\n          query:\n            type: string\n        required:\n          - query\n      outputs:\n        type: object\n    workflow_ref: workflow.yaml\n---\n\nDo the thing.\n",
         )
         .unwrap();
         fs::write(

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://vectorhawk.ai/schemas/skill_md_frontmatter/v1.json",
   "title": "SKILL.md Frontmatter",
-  "description": "Schema for the YAML frontmatter block of a VectorHawk SKILL.md file.",
+  "description": "Schema for the YAML frontmatter block of a VectorHawk SKILL.md file. All VectorHawk-specific fields live under metadata.vectorhawk.*. Top-level vh_* keys are rejected.",
   "type": "object",
   "required": ["name", "description"],
   "additionalProperties": false,
@@ -11,7 +11,6 @@
       "type": "string",
       "minLength": 1,
       "maxLength": 64,
-      "pattern": "^[a-z0-9][a-z0-9-]*[a-z0-9]$",
       "description": "Unique skill identifier. Lowercase alphanumeric with hyphens; must start and end with alphanumeric."
     },
     "description": {
@@ -24,134 +23,153 @@
       "type": "string",
       "description": "SPDX license identifier (e.g. Apache-2.0, MIT). Defaults to Apache-2.0 if omitted."
     },
-    "vh_version": {
-      "type": "string",
-      "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-((?:0|[1-9]\\d*|\\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\\.(?:0|[1-9]\\d*|\\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\\+([0-9a-zA-Z-]+(?:\\.[0-9a-zA-Z-]+)*))?$",
-      "description": "Semantic version of the skill (semver 2.0). Defaults to 0.1.0 if omitted."
-    },
-    "vh_publisher": {
-      "type": "string",
-      "minLength": 1,
-      "maxLength": 64,
-      "description": "Publisher identifier. Must match an authenticated account in the registry."
-    },
-    "vh_permissions": {
+    "metadata": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "network": {
-          "type": "string",
-          "enum": ["none", "restricted", "full"],
-          "default": "none",
-          "description": "Network access level. 'none' = no outbound connections; 'restricted' = allow-listed hosts only; 'full' = unrestricted."
-        },
-        "filesystem": {
-          "type": "string",
-          "enum": ["none", "read-only", "full"],
-          "default": "none",
-          "description": "Local filesystem access."
-        },
-        "clipboard": {
-          "type": "string",
-          "enum": ["none", "read", "write", "full"],
-          "default": "none",
-          "description": "System clipboard access."
-        }
-      }
-    },
-    "vh_execution": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "timeout_ms": {
-          "type": "integer",
-          "minimum": 1000,
-          "maximum": 600000,
-          "default": 30000,
-          "description": "Maximum wall-clock time for a single skill run in milliseconds."
-        },
-        "memory_mb": {
-          "type": "integer",
-          "minimum": 64,
-          "maximum": 8192,
-          "default": 256,
-          "description": "Peak memory budget in MiB."
-        },
-        "sandbox": {
-          "type": "string",
-          "enum": ["strict", "relaxed", "unrestricted"],
-          "default": "strict",
-          "description": "Sandbox enforcement profile. 'strict' = deny-by-default; 'relaxed' = allow common syscalls; 'unrestricted' = no sandboxing."
-        }
-      }
-    },
-    "vh_triggers": {
-      "type": "array",
-      "items": {
-        "type": "string",
-        "minLength": 3,
-        "maxLength": 200
-      },
-      "maxItems": 10,
-      "uniqueItems": true,
-      "description": "Natural-language trigger phrases used by the MCP dispatcher to route requests to this skill."
-    },
-    "vh_workflow_ref": {
-      "type": "string",
-      "description": "Relative path to an external workflow.yaml file. Mutually exclusive with vh_workflow."
-    },
-    "vh_workflow": {
-      "type": "object",
-      "description": "Inline workflow definition. Mutually exclusive with vh_workflow_ref.",
-      "properties": {
-        "steps": {
-          "type": "array",
-          "items": {
-            "type": "object",
-            "required": ["name", "type"],
-            "properties": {
-              "name": { "type": "string" },
-              "type": {
+        "vectorhawk": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "VectorHawk-specific skill metadata.",
+          "properties": {
+            "version": {
+              "type": "string",
+              "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-((?:0|[1-9]\\d*|\\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\\.(?:0|[1-9]\\d*|\\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\\+([0-9a-zA-Z-]+(?:\\.[0-9a-zA-Z-]+)*))?$",
+              "description": "Semantic version of the skill (semver 2.0). Defaults to 0.1.0 if omitted."
+            },
+            "publisher": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64,
+              "description": "Publisher identifier. Must match an authenticated account in the registry."
+            },
+            "permissions": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "network": {
+                  "type": "string",
+                  "enum": ["none", "restricted", "full"],
+                  "default": "none",
+                  "description": "Network access level. 'none' = no outbound connections; 'restricted' = allow-listed hosts only; 'full' = unrestricted."
+                },
+                "filesystem": {
+                  "type": "string",
+                  "enum": ["none", "read-only", "full"],
+                  "default": "none",
+                  "description": "Local filesystem access."
+                },
+                "clipboard": {
+                  "type": "string",
+                  "enum": ["none", "read", "write", "full"],
+                  "default": "none",
+                  "description": "System clipboard access."
+                }
+              }
+            },
+            "execution": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "timeout_ms": {
+                  "type": "integer",
+                  "minimum": 1000,
+                  "maximum": 600000,
+                  "default": 30000,
+                  "description": "Maximum wall-clock time for a single skill run in milliseconds."
+                },
+                "memory_mb": {
+                  "type": "integer",
+                  "minimum": 64,
+                  "maximum": 8192,
+                  "default": 256,
+                  "description": "Peak memory budget in MiB."
+                },
+                "sandbox": {
+                  "type": "string",
+                  "enum": ["strict", "relaxed", "unrestricted"],
+                  "default": "strict",
+                  "description": "Sandbox enforcement profile. 'strict' = deny-by-default; 'relaxed' = allow common syscalls; 'unrestricted' = no sandboxing."
+                }
+              }
+            },
+            "model": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "min_params_b": {
+                  "type": "number",
+                  "minimum": 0,
+                  "description": "Minimum model size in billions of parameters (e.g. 7.0 for a 7B model)."
+                },
+                "recommended": {
+                  "type": "array",
+                  "items": { "type": "string" },
+                  "description": "Ordered list of recommended model identifiers."
+                },
+                "fallback": {
+                  "type": "string",
+                  "enum": ["mcp_sampling", "error"],
+                  "description": "Behavior when no recommended model is available locally."
+                },
+                "prefer_local": {
+                  "type": "boolean",
+                  "description": "When true, tries locally-running model first (Ollama) before falling back to MCP sampling."
+                }
+              }
+            },
+            "schemas": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "inputs": {
+                  "description": "JSON Schema for skill input validation."
+                },
+                "outputs": {
+                  "description": "JSON Schema for skill output validation."
+                }
+              }
+            },
+            "triggers": {
+              "type": "array",
+              "items": {
                 "type": "string",
-                "enum": ["llm", "tool", "transform", "validate"]
+                "minLength": 3,
+                "maxLength": 200
               },
-              "params": { "type": "object" }
+              "maxItems": 10,
+              "uniqueItems": true,
+              "description": "Natural-language trigger phrases used by the MCP dispatcher to route requests to this skill."
+            },
+            "workflow_ref": {
+              "type": "string",
+              "description": "Relative path to an external workflow.yaml file. Mutually exclusive with workflow."
+            },
+            "workflow": {
+              "type": "array",
+              "description": "Inline workflow step definitions. Mutually exclusive with workflow_ref.",
+              "items": {
+                "type": "object",
+                "required": ["id", "type"],
+                "properties": {
+                  "id": { "type": "string" },
+                  "type": {
+                    "type": "string",
+                    "enum": ["llm", "tool", "transform", "validate"]
+                  }
+                }
+              }
+            },
+            "type": {
+              "type": "string",
+              "description": "Skill type tag (e.g. 'skill'). Reserved for future use."
+            },
+            "declared_tools": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Explicit list of tool names this skill may invoke."
             }
           }
-        }
-      }
-    },
-    "vh_model": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "provider": {
-          "type": "string",
-          "enum": ["ollama", "mcp-sampling"],
-          "description": "Model provider. 'ollama' uses local Ollama; 'mcp-sampling' delegates to the MCP client."
-        },
-        "name": {
-          "type": "string",
-          "description": "Model tag (e.g. 'llama3.2', 'mistral')."
-        },
-        "min_context_tokens": {
-          "type": "integer",
-          "minimum": 1024,
-          "description": "Minimum context window required. Installer will warn if the selected model is smaller."
-        }
-      }
-    },
-    "vh_schemas": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "input": {
-          "type": "string",
-          "description": "Relative path to the JSON Schema file for skill input validation."
-        },
-        "output": {
-          "type": "string",
-          "description": "Relative path to the JSON Schema file for skill output validation."
         }
       }
     }

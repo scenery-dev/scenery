@@ -490,7 +490,7 @@ mod tests {
 
         fs::write(
             root.join("SKILL.md"),
-            "---\nname: Contract Compare\ndescription: Compare two contracts and summarize changes.\nversion: 0.1.0\npublisher: forge\nvh_permissions:\n  filesystem: read-only\n  network: none\n  clipboard: none\nvh_execution:\n  sandbox: strict\n  timeout_ms: 90000\n  memory_mb: 1024\nvh_workflow_ref: ./workflow.yaml\nvh_schemas:\n  inputs:\n    type: object\n  outputs:\n    type: object\n---\n\nCompare the contracts.\n",
+            "---\nname: Contract Compare\ndescription: Compare two contracts and summarize changes.\nlicense: MIT\nmetadata:\n  vectorhawk:\n    version: 0.1.0\n    publisher: forge\n    permissions:\n      filesystem: read-only\n      network: none\n      clipboard: none\n    execution:\n      sandbox: strict\n      timeout_ms: 90000\n      memory_mb: 1024\n    workflow_ref: ./workflow.yaml\n    schemas:\n      inputs:\n        type: object\n      outputs:\n        type: object\n---\n\nCompare the contracts.\n",
         )
         .expect("SKILL.md should be written");
         fs::write(
@@ -815,7 +815,7 @@ steps:
         fs::create_dir_all(root).expect("root dir should be created");
         fs::write(
             root.join("SKILL.md"),
-            "---\nname: hello-world\ndescription: A greeter skill.\nversion: 0.1.0\npublisher: test\n---\n\nYou are a greeter.\n",
+            "---\nname: hello-world\ndescription: A greeter skill.\nmetadata:\n  vectorhawk:\n    version: 0.1.0\n    publisher: test\n---\n\nYou are a greeter.\n",
         )
         .expect("SKILL.md should be written");
     }
@@ -828,36 +828,38 @@ steps:
             r#"---
 name: passage-analyzer
 description: Analyzes a passage and summarizes it.
-version: 1.0.0
-publisher: vectorhawk
-vh_permissions:
-  network: none
-  filesystem: read-only
-  clipboard: none
-vh_execution:
-  timeout_ms: 60000
-  memory_mb: 1024
-  sandbox: strict
-vh_model:
-  min_params_b: 7
-  recommended:
-    - llama3.1:8b
-    - claude-3-haiku
-  fallback: mcp_sampling
-vh_schemas:
-  inputs:
-    type: object
-    required: [passage]
-    properties:
-      passage: {type: string}
-  outputs:
-    type: object
-    properties:
-      summary: {type: string}
-vh_workflow:
-  - id: analyze
-    type: llm
-    prompt: prompts/analyze.md
+metadata:
+  vectorhawk:
+    version: 1.0.0
+    publisher: vectorhawk
+    permissions:
+      network: none
+      filesystem: read-only
+      clipboard: none
+    execution:
+      timeout_ms: 60000
+      memory_mb: 1024
+      sandbox: strict
+    model:
+      min_params_b: 7
+      recommended:
+        - llama3.1:8b
+        - claude-3-haiku
+      fallback: mcp_sampling
+    schemas:
+      inputs:
+        type: object
+        required: [passage]
+        properties:
+          passage: {type: string}
+      outputs:
+        type: object
+        properties:
+          summary: {type: string}
+    workflow:
+      - id: analyze
+        type: llm
+        prompt: prompts/analyze.md
 ---
 
 You are an expert text analyst.
@@ -929,6 +931,7 @@ You are an expert text analyst.
     fn skill_md_rejects_unknown_vh_field() {
         let root = temp_root("skill-md-unknown-vh");
         fs::create_dir_all(&root).expect("root dir should be created");
+        // A top-level vh_* key should be rejected with a migration hint.
         fs::write(
             root.join("SKILL.md"),
             "---\nname: bad-skill\ndescription: Test.\nlicense: MIT\nvh_unknown_extension: oops\n---\n\nPrompt.\n",
@@ -940,8 +943,8 @@ You are an expert text analyst.
         match err {
             ManifestError::Invalid(msg) => {
                 assert!(
-                    msg.contains("vh_unknown_extension"),
-                    "error should name the unknown field, got: {msg}"
+                    msg.contains("metadata.vectorhawk") || msg.contains("vh_unknown_extension"),
+                    "error should reference the migration path or field name, got: {msg}"
                 );
             }
             other => panic!("expected ManifestError::Invalid, got: {other:?}"),
@@ -954,9 +957,11 @@ You are an expert text analyst.
     fn skill_md_rejects_mutually_exclusive_vh_workflow_and_ref() {
         let root = temp_root("skill-md-workflow-conflict");
         fs::create_dir_all(&root).expect("root dir should be created");
+        // The mutual-exclusion check fires before the prompt-file check, so we
+        // don't need prompts/p.md to actually exist for this test.
         fs::write(
             root.join("SKILL.md"),
-            "---\nname: bad\ndescription: Test.\nlicense: MIT\nvh_workflow:\n  - {id: step1, type: llm, prompt: prompts/p.md}\nvh_workflow_ref: ./workflow.yaml\n---\n\nPrompt.\n",
+            "---\nname: bad\ndescription: Test.\nlicense: MIT\nmetadata:\n  vectorhawk:\n    workflow:\n      - {id: step1, type: llm, prompt: prompts/p.md}\n    workflow_ref: ./workflow.yaml\n---\n\nPrompt.\n",
         )
         .expect("SKILL.md should be written");
 

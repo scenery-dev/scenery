@@ -1,20 +1,22 @@
 ---
 name: pr-summary
 description: Summarize a GitHub pull request diff into a concise plain-English description.
-version: 0.2.0
-publisher: vectorhawk-examples
-vh_permissions:
-  network: none
-  filesystem: none
-  clipboard: none
-vh_execution:
-  timeout_ms: 60000
-  memory_mb: 512
-  sandbox: strict
-vh_triggers:
-  - summarize pull request
-  - explain diff
-  - describe code changes
+metadata:
+  vectorhawk:
+    version: 0.2.0
+    publisher: vectorhawk-examples
+    permissions:
+      network: none
+      filesystem: none
+      clipboard: none
+    execution:
+      timeout_ms: 60000
+      memory_mb: 512
+      sandbox: strict
+    triggers:
+      - summarize pull request
+      - explain diff
+      - describe code changes
 ---
 
 # PR Summary

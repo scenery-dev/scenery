@@ -75,6 +75,23 @@ pub fn uninstall() -> Result<()> {
     )
 }
 
+/// Restart the daemon in place: kills the running process and starts a fresh
+/// one without rewriting the unit file. Useful for picking up a new auth
+/// token, env vars, or to recover from a stuck state.
+pub fn restart() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    return macos::restart();
+
+    #[cfg(target_os = "linux")]
+    return linux::restart();
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    anyhow::bail!(
+        "vectorhawk daemon restart is not yet supported on this platform \
+         (macOS and Linux only)"
+    )
+}
+
 /// Idempotent install: install only when the unit is not already present.
 ///
 /// Used by `mcp setup` to provision the daemon transparently. Never errors if

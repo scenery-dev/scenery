@@ -237,25 +237,7 @@ mod tests {
         fs::create_dir_all(&skill_dir).unwrap();
         fs::write(
             skill_dir.join("SKILL.md"),
-            "---\n\
-             name: My Skill\n\
-             description: Does the thing\n\
-             version: 0.1.0\n\
-             publisher: test\n\
-             vh_permissions:\n\
-               filesystem: none\n\
-               network: none\n\
-               clipboard: none\n\
-             vh_execution:\n\
-               sandbox: strict\n\
-               timeout_ms: 30000\n\
-               memory_mb: 512\n\
-             vh_workflow_ref: workflow.yaml\n\
-             ---\n\
-             \n\
-             # My Skill\n\
-             \n\
-             You are a helpful assistant.\n",
+            "---\nname: My Skill\ndescription: Does the thing\nmetadata:\n  vectorhawk:\n    version: 0.1.0\n    publisher: test\n    permissions:\n      filesystem: none\n      network: none\n      clipboard: none\n    execution:\n      sandbox: strict\n      timeout_ms: 30000\n      memory_mb: 512\n    workflow_ref: workflow.yaml\n---\n\n# My Skill\n\nYou are a helpful assistant.\n",
         )
         .unwrap();
         fs::write(skill_dir.join("workflow.yaml"), "name: test\nsteps: []").unwrap();

@@ -260,6 +260,28 @@ pub fn uninstall() -> Result<()> {
     Ok(())
 }
 
+/// Stop and start the LaunchAgent in place.
+///
+/// Uses `launchctl kickstart -k gui/<uid>/com.vectorhawk.agent`, which kills
+/// the running process (if any) and starts a fresh one — equivalent to a
+/// restart without re-writing the plist. Returns an error if the service is
+/// not installed.
+pub fn restart() -> Result<()> {
+    let uid = current_uid();
+
+    if !service_is_loaded(uid) {
+        anyhow::bail!(
+            "VectorHawk daemon is not installed — run `vectorhawk daemon install` first."
+        );
+    }
+
+    launchctl(&["kickstart", "-k", &service_target(uid)])
+        .context("failed to restart LaunchAgent")?;
+
+    println!("VectorHawk daemon restarted.");
+    Ok(())
+}
+
 /// Return the current install/running status of the LaunchAgent.
 pub fn status() -> Result<InstallStatus> {
     let plist = plist_path().context("failed to resolve plist path")?;

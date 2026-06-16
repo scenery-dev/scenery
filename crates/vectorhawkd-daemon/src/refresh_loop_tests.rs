@@ -26,6 +26,26 @@ fn temp_root(label: &str) -> Utf8PathBuf {
     .expect("temp path should be utf-8")
 }
 
+/// Force the SQLite fallback so refresh-loop tests don't pollute the real
+/// macOS keychain. Holds a global mutex so concurrent tests can't race
+/// each other's env-var set/clear (cargo test runs in parallel by default).
+struct KeychainOff {
+    _g: std::sync::MutexGuard<'static, ()>,
+}
+static KEYCHAIN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+impl KeychainOff {
+    fn enable() -> Self {
+        let _g = KEYCHAIN_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("VECTORHAWK_DISABLE_KEYCHAIN", "1");
+        KeychainOff { _g }
+    }
+}
+impl Drop for KeychainOff {
+    fn drop(&mut self) {
+        std::env::remove_var("VECTORHAWK_DISABLE_KEYCHAIN");
+    }
+}
+
 /// Build a minimal JWT with a given `exp` Unix timestamp.
 /// No signature — only used to test expiry logic.
 fn make_jwt_with_exp(exp: u64) -> String {
@@ -39,6 +59,7 @@ fn make_jwt_with_exp(exp: u64) -> String {
 /// to call the refresh endpoint and overwrite the stored token.
 #[test]
 fn refresh_one_tick_rotates_near_expiry_token() {
+    let _guard = KeychainOff::enable();
     let root = temp_root("rotate");
     let state = AppState::bootstrap_in(root.clone()).expect("bootstrap");
 
@@ -88,6 +109,7 @@ fn refresh_one_tick_rotates_near_expiry_token() {
 /// A token that is NOT near expiry should not trigger a refresh call.
 #[test]
 fn refresh_one_tick_skips_healthy_token() {
+    let _guard = KeychainOff::enable();
     let root = temp_root("skip");
     let state = AppState::bootstrap_in(root.clone()).expect("bootstrap");
 
@@ -131,6 +153,7 @@ fn refresh_one_tick_skips_healthy_token() {
 /// should return Ok(()) even when the HTTP call fails.
 #[test]
 fn refresh_one_tick_continues_after_refresh_failure() {
+    let _guard = KeychainOff::enable();
     let root = temp_root("fail");
     let state = AppState::bootstrap_in(root.clone()).expect("bootstrap");
 
@@ -169,9 +192,123 @@ fn refresh_one_tick_continues_after_refresh_failure() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A persistent 401 from /portal/auth/refresh must drive backoff: the next
+/// tick must NOT hit the endpoint again until next_refresh_attempt_at passes.
+/// This protects against the 1-hot-loop-per-60s bug seen in production logs.
+#[test]
+fn refresh_one_tick_backs_off_after_401() {
+    let _guard = KeychainOff::enable();
+    let root = temp_root("backoff");
+    let state = AppState::bootstrap_in(root.clone()).expect("bootstrap");
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+
+    let near_expiry_access = make_jwt_with_exp(now + 120);
+
+    let mut server = Server::new();
+    let registry_url = server.url();
+
+    // The 401 mock must be hit exactly ONCE across both ticks. If backoff is
+    // broken the second tick will hit it too and the expectation fails.
+    let fail_mock = server
+        .mock("POST", "/portal/auth/refresh")
+        .with_status(401)
+        .with_body(r#"{"error":"invalid_refresh_token"}"#)
+        .expect(1)
+        .create();
+
+    save_tokens(&state, &registry_url, &near_expiry_access, "dead_refresh").expect("save_tokens");
+
+    // First tick: hits the endpoint, gets 401, records failure + 60s backoff.
+    refresh_one_tick(&state, &registry_url).expect("first tick");
+
+    let after_first = load_tokens(&state, &registry_url)
+        .expect("load")
+        .expect("row");
+    assert_eq!(after_first.refresh_failures, 1, "should record one failure");
+    assert_eq!(
+        after_first.last_refresh_status.as_deref(),
+        Some("auth_failed")
+    );
+    assert!(
+        after_first
+            .next_refresh_attempt_at
+            .map(|t| t > now as i64)
+            .unwrap_or(false),
+        "next_refresh_attempt_at must be in the future after a 401"
+    );
+
+    // Second tick (immediately): backoff window is still active, must skip
+    // the HTTP call entirely. The mockito `expect(1)` assertion below
+    // verifies the endpoint was hit only once total.
+    refresh_one_tick(&state, &registry_url).expect("second tick");
+
+    fail_mock.assert();
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A successful refresh after a prior failure must reset the backoff
+/// counters so future refreshes resume the normal cadence.
+#[test]
+fn refresh_one_tick_resets_backoff_on_success() {
+    let _guard = KeychainOff::enable();
+    let root = temp_root("reset");
+    let state = AppState::bootstrap_in(root.clone()).expect("bootstrap");
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+
+    let near_expiry_access = make_jwt_with_exp(now + 120);
+
+    let mut server = Server::new();
+    let registry_url = server.url();
+
+    let _ok_mock = server
+        .mock("POST", "/portal/auth/refresh")
+        .with_status(200)
+        .with_body(
+            serde_json::json!({
+                "access_token": make_jwt_with_exp(now + 7200),
+                "refresh_token": "fresh_refresh",
+            })
+            .to_string(),
+        )
+        .create();
+
+    save_tokens(&state, &registry_url, &near_expiry_access, "old_refresh").expect("save_tokens");
+
+    // Simulate a prior failure state on the row.
+    vectorhawkd_core::auth::record_refresh_failure(
+        &state,
+        &registry_url,
+        "auth_failed",
+        Some((now - 1) as i64), // already expired backoff window
+    )
+    .expect("record");
+
+    refresh_one_tick(&state, &registry_url).expect("tick");
+
+    let after = load_tokens(&state, &registry_url)
+        .expect("load")
+        .expect("row");
+    assert_eq!(after.refresh_failures, 0, "success must reset counter");
+    assert_eq!(after.last_refresh_status.as_deref(), Some("ok"));
+    assert!(after.next_refresh_attempt_at.is_none());
+    assert_eq!(after.refresh_token, "fresh_refresh");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// With no tokens stored, refresh_one_tick is a no-op.
 #[test]
 fn refresh_one_tick_with_no_tokens_is_noop() {
+    let _guard = KeychainOff::enable();
     let root = temp_root("empty");
     let state = AppState::bootstrap_in(root.clone()).expect("bootstrap");
 
@@ -188,6 +325,7 @@ fn refresh_one_tick_with_no_tokens_is_noop() {
 /// leaves healthy ones unchanged.
 #[test]
 fn refresh_one_tick_handles_multiple_rows() {
+    let _guard = KeychainOff::enable();
     let root = temp_root("multi");
     let state = AppState::bootstrap_in(root.clone()).expect("bootstrap");
 

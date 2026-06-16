@@ -1,22 +1,24 @@
 ---
 name: incident-triage
 description: Triage a production incident — classify severity, extract affected systems, and draft an initial incident report.
-version: 1.0.0
-publisher: vectorhawk-examples
-vh_permissions:
-  network: none
-  filesystem: none
-  clipboard: none
-vh_execution:
-  timeout_ms: 120000
-  memory_mb: 1024
-  sandbox: strict
-vh_triggers:
-  - triage incident
-  - classify alert
-  - draft incident report
-  - assess production impact
-vh_workflow_ref: ./workflow.yaml
+metadata:
+  vectorhawk:
+    version: 1.0.0
+    publisher: vectorhawk-examples
+    permissions:
+      network: none
+      filesystem: none
+      clipboard: none
+    execution:
+      timeout_ms: 120000
+      memory_mb: 1024
+      sandbox: strict
+    triggers:
+      - triage incident
+      - classify alert
+      - draft incident report
+      - assess production impact
+    workflow_ref: ./workflow.yaml
 ---
 
 # Incident Triage

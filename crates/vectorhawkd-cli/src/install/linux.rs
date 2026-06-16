@@ -400,6 +400,32 @@ fn uninstall_desktop_fallback() -> Result<()> {
     Ok(())
 }
 
+/// Stop and start the daemon in place via `systemctl --user restart`.
+/// Falls back to an error on systems without systemctl (autostart entries
+/// can't be programmatically restarted — the user would log out and back in).
+pub fn restart() -> Result<()> {
+    if !systemctl_available() {
+        anyhow::bail!(
+            "vectorhawk daemon restart requires systemd. On systems without \
+             systemctl, log out and back in (or kill the running process) to \
+             restart the daemon."
+        );
+    }
+
+    let output = Command::new("systemctl")
+        .args(["--user", "restart", SERVICE_NAME])
+        .output()
+        .context("failed to spawn systemctl")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("systemctl --user restart failed: {stderr}");
+    }
+
+    println!("VectorHawk daemon restarted.");
+    Ok(())
+}
+
 /// Return the current install/running status.
 pub fn status() -> Result<InstallStatus> {
     // Check systemd unit first; fall back to desktop entry.

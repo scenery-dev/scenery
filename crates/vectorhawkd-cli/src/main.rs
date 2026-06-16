@@ -413,6 +413,10 @@ pub enum DaemonCommand {
 
     /// Remove the vectorhawkd LaunchAgent / systemd user unit.
     Uninstall,
+
+    /// Stop and start the daemon in place. Picks up a refreshed auth token
+    /// or environment changes without re-running install.
+    Restart,
 }
 
 #[derive(Debug, Subcommand)]
@@ -585,6 +589,7 @@ async fn run(cli: Cli) -> Result<()> {
         }) => cmd_daemon_run(registry_url, ollama_url, ollama_model).await,
         Command::Daemon(DaemonCommand::Install) => cmd_daemon_install().await,
         Command::Daemon(DaemonCommand::Uninstall) => cmd_daemon_uninstall().await,
+        Command::Daemon(DaemonCommand::Restart) => cmd_daemon_restart().await,
 
         Command::Plugin(PluginCommand::Export {
             path,
@@ -1497,25 +1502,22 @@ async fn cmd_skill_info(id: &str) -> Result<()> {
         }
     }
 
-    // Show execution stats.
+    // Show execution stats. Sourced from skill_execution_counts (the
+    // aggregate counter the daemon syncs to the registry) — the per-run
+    // execution_history table was retired in the local-DB shrink.
     let mut stmt = conn
         .prepare(
-            "SELECT COUNT(*), COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), \
-             COALESCE(AVG(latency_ms),0) \
-             FROM execution_history WHERE skill_id = ?1",
+            "SELECT COALESCE(SUM(total_runs), 0), COALESCE(SUM(successful_runs), 0) \
+             FROM skill_execution_counts WHERE skill_id = ?1",
         )
         .context("failed to prepare stats query")?;
 
-    let (run_count, total_prompt, total_completion, avg_latency): (i64, i64, i64, f64) = stmt
-        .query_row([id], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-        })
+    let (total_runs, successful_runs): (i64, i64) = stmt
+        .query_row([id], |row| Ok((row.get(0)?, row.get(1)?)))
         .context("failed to query execution stats")?;
 
-    println!("Run count:      {run_count}");
-    println!("Total prompt tokens: {total_prompt}");
-    println!("Total completion tokens: {total_completion}");
-    println!("Avg latency (ms): {avg_latency:.0}");
+    println!("Run count:      {total_runs}");
+    println!("Successful:     {successful_runs}");
 
     Ok(())
 }
@@ -2413,31 +2415,31 @@ async fn cmd_skill_author(
     } else {
         let items = triggers
             .iter()
-            .map(|t| format!("  - {t}"))
+            .map(|t| format!("      - {t}"))
             .collect::<Vec<_>>()
             .join("\n");
-        format!("vh_triggers:\n{items}\n")
+        format!("    triggers:\n{items}\n")
     };
 
     let recommended_yaml = recommended_models
         .iter()
-        .map(|m| format!("  - {m}"))
+        .map(|m| format!("      - {m}"))
         .collect::<Vec<_>>()
         .join("\n");
 
-    let body_block = indent_block(&prompt_text, 8);
+    let body_block = indent_block(&prompt_text, 12);
     let skill_md = format!(
-        "---\nname: {skill_name}\ndescription: \"TODO: describe what this skill does\"\n\
-         version: 0.1.0\npublisher: {publisher_id}\n\
-         vh_permissions:\n  network: {net}\n  filesystem: {fs_perm}\n  clipboard: {clip}\n\
-         vh_execution:\n  timeout_ms: {timeout_ms}\n  memory_mb: {memory_mb}\n  sandbox: {sandbox}\n\
-         vh_model:\n  min_params_b: {min_params_b}\n  recommended:\n{recommended_yaml}\n  fallback: {fallback}\n\
+        "---\nname: {skill_name}\ndescription: \"TODO: describe what this skill does\"\nlicense: MIT\n\
+         metadata:\n  vectorhawk:\n    version: 0.1.0\n    publisher: {publisher_id}\n\
          {triggers_yaml}\
-         vh_workflow:\n  - id: run\n    type: llm\n    prompt:\n      kind: inline\n      body: |\n\
+         \n    permissions:\n      network: {net}\n      filesystem: {fs_perm}\n      clipboard: {clip}\n\
+         \n    execution:\n      timeout_ms: {timeout_ms}\n      memory_mb: {memory_mb}\n      sandbox: {sandbox}\n\
+         \n    model:\n      min_params_b: {min_params_b}\n      recommended:\n{recommended_yaml}\n      fallback: {fallback}\n\
+         \n    workflow:\n      - id: run\n        type: llm\n        prompt:\n          kind: inline\n          body: |\n\
          {body_block}\
-         \n    inputs:\n      text: input.text\n\
-         vh_schemas:\n  inputs:\n    type: object\n    properties:\n      text:\n        type: string\n\
-         \n    required:\n      - text\n---\n"
+         \n        inputs:\n          text: input.text\n\
+         \n    schemas:\n      inputs:\n        type: object\n        properties:\n          text:\n            type: string\n\
+         \n        required:\n          - text\n---\n"
     );
 
     fs::write(skill_dir.join("SKILL.md"), &skill_md).context("failed to write SKILL.md")?;
@@ -2491,17 +2493,17 @@ fn scaffold_with_defaults(
     fs::create_dir_all(&skill_dir)
         .with_context(|| format!("failed to create directory '{skill_dir}'"))?;
 
-    let body_block = indent_block(prompt_text, 8);
+    let body_block = indent_block(prompt_text, 12);
     let skill_md = format!(
-        "---\nname: {skill_name}\ndescription: \"TODO: describe what this skill does\"\n\
-         version: 0.1.0\npublisher: {publisher_id}\n\
-         vh_permissions:\n  network: none\n  filesystem: none\n  clipboard: none\n\
-         vh_execution:\n  timeout_ms: 30000\n  memory_mb: 256\n  sandbox: strict\n\
-         vh_workflow:\n  - id: run\n    type: llm\n    prompt:\n      kind: inline\n      body: |\n\
+        "---\nname: {skill_name}\ndescription: \"TODO: describe what this skill does\"\nlicense: MIT\n\
+         metadata:\n  vectorhawk:\n    version: 0.1.0\n    publisher: {publisher_id}\n\
+         \n    permissions:\n      network: none\n      filesystem: none\n      clipboard: none\n\
+         \n    execution:\n      timeout_ms: 30000\n      memory_mb: 256\n      sandbox: strict\n\
+         \n    workflow:\n      - id: run\n        type: llm\n        prompt:\n          kind: inline\n          body: |\n\
          {body_block}\
-         \n    inputs:\n      text: input.text\n\
-         vh_schemas:\n  inputs:\n    type: object\n    properties:\n      text:\n        type: string\n\
-         \n    required:\n      - text\n---\n"
+         \n        inputs:\n          text: input.text\n\
+         \n    schemas:\n      inputs:\n        type: object\n        properties:\n          text:\n            type: string\n\
+         \n        required:\n          - text\n---\n"
     );
 
     fs::write(skill_dir.join("SKILL.md"), &skill_md).context("failed to write SKILL.md")
@@ -2531,33 +2533,33 @@ fn scaffold_with_recommendations(
         let items = rec
             .triggers
             .iter()
-            .map(|t| format!("  - {t}"))
+            .map(|t| format!("      - {t}"))
             .collect::<Vec<_>>()
             .join("\n");
-        format!("vh_triggers:\n{items}\n")
+        format!("    triggers:\n{items}\n")
     };
 
     let recommended_yaml = rec
         .model
         .recommended
         .iter()
-        .map(|m| format!("  - {m}"))
+        .map(|m| format!("      - {m}"))
         .collect::<Vec<_>>()
         .join("\n");
 
-    let body_block = indent_block(prompt_text, 8);
+    let body_block = indent_block(prompt_text, 12);
     let skill_md = format!(
-        "---\nname: {skill_name}\ndescription: \"TODO: describe what this skill does\"\n\
-         version: 0.1.0\npublisher: {publisher_id}\n\
-         vh_permissions:\n  network: {net}\n  filesystem: {fs_perm}\n  clipboard: {clip}\n\
-         vh_execution:\n  timeout_ms: {timeout_ms}\n  memory_mb: {memory_mb}\n  sandbox: {sandbox}\n\
-         vh_model:\n  min_params_b: {min_params_b}\n  recommended:\n{recommended_yaml}\n  fallback: {fallback}\n\
+        "---\nname: {skill_name}\ndescription: \"TODO: describe what this skill does\"\nlicense: MIT\n\
+         metadata:\n  vectorhawk:\n    version: 0.1.0\n    publisher: {publisher_id}\n\
          {triggers_yaml}\
-         vh_workflow:\n  - id: run\n    type: llm\n    prompt:\n      kind: inline\n      body: |\n\
+         \n    permissions:\n      network: {net}\n      filesystem: {fs_perm}\n      clipboard: {clip}\n\
+         \n    execution:\n      timeout_ms: {timeout_ms}\n      memory_mb: {memory_mb}\n      sandbox: {sandbox}\n\
+         \n    model:\n      min_params_b: {min_params_b}\n      recommended:\n{recommended_yaml}\n      fallback: {fallback}\n\
+         \n    workflow:\n      - id: run\n        type: llm\n        prompt:\n          kind: inline\n          body: |\n\
          {body_block}\
-         \n    inputs:\n      text: input.text\n\
-         vh_schemas:\n  inputs:\n    type: object\n    properties:\n      text:\n        type: string\n\
-         \n    required:\n      - text\n---\n",
+         \n        inputs:\n          text: input.text\n\
+         \n    schemas:\n      inputs:\n        type: object\n        properties:\n          text:\n            type: string\n\
+         \n        required:\n          - text\n---\n",
         net = rec.permissions.network,
         fs_perm = rec.permissions.filesystem,
         clip = rec.permissions.clipboard,
@@ -4233,6 +4235,13 @@ async fn cmd_daemon_uninstall() -> Result<()> {
         .await
         .context("uninstall task panicked")?
         .context("daemon uninstall failed")
+}
+
+async fn cmd_daemon_restart() -> Result<()> {
+    tokio::task::spawn_blocking(install::restart)
+        .await
+        .context("restart task panicked")?
+        .context("daemon restart failed")
 }
 
 // ── sync status ───────────────────────────────────────────────────────────────

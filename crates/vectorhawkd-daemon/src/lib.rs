@@ -71,7 +71,7 @@ use tokio::{
 use tracing::{error, info, warn};
 use vectorhawkd_core::{
     audit::{AuditBuffer, SqliteAuditBuffer},
-    auth::{load_all_tokens, save_tokens, AuthClient},
+    auth::{load_all_tokens, record_refresh_failure, save_tokens, AuthClient},
     gateway_model::GatewayModelClient,
     model::ModelClient,
     ollama::OllamaClient,
@@ -683,9 +683,32 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
 pub fn refresh_one_tick(state: &AppState, registry_url: &str) -> Result<()> {
     let rows = load_all_tokens(state).context("refresh_one_tick: failed to load auth_tokens")?;
 
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
     for row in rows {
         if !AuthClient::needs_refresh(&row.access_token) {
             continue;
+        }
+
+        // Honor backoff: if a prior 401 set a future next_refresh_attempt_at,
+        // skip this row until that timestamp passes. Without this guard the
+        // 60-second loop would hammer a known-bad refresh token forever
+        // (the bug that prompted this change — 126 consecutive 401s in
+        // one hour seen in backend logs).
+        if let Some(next_at) = row.next_refresh_attempt_at {
+            if next_at > now_unix {
+                let secs_left = next_at - now_unix;
+                tracing::debug!(
+                    registry_url = %row.registry_url,
+                    refresh_failures = row.refresh_failures,
+                    secs_until_retry = secs_left,
+                    "skipping refresh — in backoff window after persistent auth failure"
+                );
+                continue;
+            }
         }
 
         tracing::debug!(
@@ -693,11 +716,10 @@ pub fn refresh_one_tick(state: &AppState, registry_url: &str) -> Result<()> {
             "token near expiry — attempting refresh"
         );
 
-        // Use the registry_url stored in the row (each row may target a
-        // different registry) rather than the daemon's primary registry_url.
         let client = AuthClient::new(&row.registry_url);
-        match client.refresh(&row.refresh_token) {
+        match client.refresh_detailed(&row.refresh_token) {
             Ok(new_tokens) => {
+                // save_tokens clears the backoff counters on success.
                 match save_tokens(
                     state,
                     &row.registry_url,
@@ -719,18 +741,65 @@ pub fn refresh_one_tick(state: &AppState, registry_url: &str) -> Result<()> {
                     }
                 }
             }
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    registry_url = %row.registry_url,
-                    "refresh_one_tick: token refresh HTTP call failed"
-                );
+            Err(err) => {
+                let (status_label, backoff) = classify_refresh_failure(&err, row.refresh_failures);
+                let next_attempt_at = backoff.map(|secs| now_unix + secs as i64);
+                if err.is_auth_failure() {
+                    warn!(
+                        registry_url = %row.registry_url,
+                        refresh_failures = row.refresh_failures + 1,
+                        backoff_secs = backoff.unwrap_or(0),
+                        "refresh_one_tick: refresh token rejected — user must re-login \
+                         (vectorhawk auth login && vectorhawk daemon restart)"
+                    );
+                } else {
+                    warn!(
+                        error = %err,
+                        registry_url = %row.registry_url,
+                        "refresh_one_tick: token refresh HTTP call failed"
+                    );
+                }
+                if let Err(e) =
+                    record_refresh_failure(state, &row.registry_url, status_label, next_attempt_at)
+                {
+                    warn!(
+                        error = %e,
+                        registry_url = %row.registry_url,
+                        "refresh_one_tick: failed to record refresh failure state"
+                    );
+                }
             }
         }
     }
 
     let _ = registry_url; // primary registry_url param kept for future rate-limit context
     Ok(())
+}
+
+/// Decide the next backoff window and the status label to persist for a
+/// refresh attempt that did not succeed. Transport errors keep the normal
+/// 60-second cadence (no backoff window applied); auth failures escalate
+/// exponentially up to a 1-hour ceiling.
+fn classify_refresh_failure(
+    err: &vectorhawkd_core::auth::RefreshError,
+    prior_failures: u32,
+) -> (&'static str, Option<u64>) {
+    use vectorhawkd_core::auth::RefreshError;
+    match err {
+        RefreshError::AuthFailed { .. } => {
+            // Exponential: 60s → 2m → 4m → 8m → 16m → 32m → 60m (capped).
+            // The first failure waits 60s — enough to absorb a flaky token
+            // rotation race — but rapid consecutive 401s walk the daemon
+            // up to 1-hour intervals so a permanently-dead refresh token
+            // doesn't generate 60 attempts/hour against the registry.
+            let next = prior_failures.saturating_add(1).min(7);
+            let secs = 60u64.saturating_mul(1u64 << next.saturating_sub(1));
+            ("auth_failed", Some(secs.min(3600)))
+        }
+        RefreshError::ServerError { .. } => ("server_error", None),
+        RefreshError::Transport { .. } => ("transport_error", None),
+        RefreshError::Decode(_) => ("decode_error", None),
+    }
 }
 
 // ── RUN2: Device registration + sync startup ─────────────────────────────────
