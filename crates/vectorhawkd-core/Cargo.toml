@@ -37,15 +37,20 @@ base64.workspace = true
 getrandom.workspace = true
 hex = "0.4"
 urlencoding = "2"
-# Secure-by-default token storage: macOS Keychain, Windows Credential Manager,
-# Linux Secret Service (GNOME Keyring / KWallet). Falls back to SQLite when
-# the OS keystore is unavailable (headless boxes, CI, containers without D-Bus).
-#
-# Linux uses `sync-secret-service` (zbus, pure Rust) rather than
-# `linux-native-sync-persistent` so the build doesn't require libdbus-1-dev
-# and the shipped binary doesn't depend on libdbus-1.so at runtime — matters
-# for static-binary distribution to a wide range of Linux installs.
-keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
+
+# Secure-by-default token storage:
+#   - macOS: Keychain unconditionally
+#   - Windows: Credential Manager unconditionally
+#   - Linux: not included — Linux Secret Service backends require libdbus-1
+#     at build time, and the binary then depends on libdbus-1.so at runtime
+#     on every install. Linux users fall through to the SQLite-with-0600
+#     storage path (same as headless macOS / CI / containers). Matches the
+#     convention used by `gh`, `kubectl`, `aws cli`.
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", default-features = false, features = ["apple-native"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", default-features = false, features = ["windows-native"] }
 
 [dev-dependencies]
 mockito = "1"

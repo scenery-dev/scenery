@@ -406,9 +406,11 @@ fn decode_jwt_exp(token: &str) -> Option<u64> {
 // We always insert a backoff-state row even when secrets are in the
 // keychain, so `load_all_tokens` has something to iterate over.
 
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 const KEYRING_SERVICE: &str = "com.vectorhawk.agent";
 
 /// Stable account name for a given registry URL inside the OS keychain.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn keyring_account(registry_url: &str) -> String {
     // The OS keychain is keyed by (service, account). We pick a stable,
     // human-readable account string so users can find the entry if they
@@ -420,12 +422,16 @@ fn keyring_account(registry_url: &str) -> String {
 /// is treated as if it were unavailable, forcing the SQLite fallback. Used
 /// by the test suite (so tests don't pollute the real macOS Keychain) and
 /// by users on shared boxes who prefer to keep tokens out of system stores.
+/// On Linux the helper is unreferenced because keychain_get/set/delete
+/// always return Unavailable there, so we gate it to silence the warning.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn keychain_disabled() -> bool {
     std::env::var("VECTORHAWK_DISABLE_KEYCHAIN")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
 }
 
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 #[derive(Serialize, Deserialize)]
 struct KeychainBlob<'a> {
     access_token: &'a str,
@@ -448,6 +454,13 @@ enum KeychainProbe {
     Unavailable,
 }
 
+// On macOS and Windows we link the `keyring` crate and use the OS-native
+// keystore. On Linux the crate is intentionally not pulled in (would force
+// a libdbus dep on the binary) — every call below returns Unavailable so
+// the SQLite fallback is used. Linux files keep 0600 perms; matches what
+// `gh`, `kubectl`, and `aws cli` do.
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn keychain_get(registry_url: &str) -> KeychainProbe {
     if keychain_disabled() {
         return KeychainProbe::Unavailable;
@@ -475,9 +488,15 @@ fn keychain_get(registry_url: &str) -> KeychainProbe {
     }
 }
 
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn keychain_get(_registry_url: &str) -> KeychainProbe {
+    KeychainProbe::Unavailable
+}
+
 /// Try to write the secrets to the OS keychain. Returns Ok(true) on success,
 /// Ok(false) when the keychain isn't usable (caller should fall back to
 /// SQLite), or Err on a programming error.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn keychain_set(registry_url: &str, access_token: &str, refresh_token: &str) -> Result<bool> {
     if keychain_disabled() {
         return Ok(false);
@@ -503,6 +522,12 @@ fn keychain_set(registry_url: &str, access_token: &str, refresh_token: &str) -> 
     }
 }
 
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn keychain_set(_registry_url: &str, _access_token: &str, _refresh_token: &str) -> Result<bool> {
+    Ok(false)
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn keychain_delete(registry_url: &str) {
     if keychain_disabled() {
         return;
@@ -511,6 +536,9 @@ fn keychain_delete(registry_url: &str) {
         let _ = entry.delete_credential();
     }
 }
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn keychain_delete(_registry_url: &str) {}
 
 /// Write secrets to the keychain (when available) or SQLite (fallback), and
 /// always update the SQLite backoff-state row so callers can iterate.
