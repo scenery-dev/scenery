@@ -332,8 +332,12 @@ fn decide_update_action_upgrades_on_patch_bump() {
 fn auth_login_parses() {
     use super::{AuthCommand, Command};
     match parse(&["auth", "login"]).command {
-        Command::Auth(AuthCommand::Login { registry_url }) => {
+        Command::Auth(AuthCommand::Login {
+            registry_url,
+            no_browser,
+        }) => {
             assert_eq!(registry_url, "https://app.vectorhawk.ai");
+            assert!(!no_browser, "no_browser should default to false");
         }
         other => panic!("expected Auth(Login), got {other:?}"),
     }
@@ -343,8 +347,23 @@ fn auth_login_parses() {
 fn auth_login_with_registry_url_parses() {
     use super::{AuthCommand, Command};
     match parse(&["auth", "login", "--registry-url", "http://localhost:8000"]).command {
-        Command::Auth(AuthCommand::Login { registry_url }) => {
+        Command::Auth(AuthCommand::Login {
+            registry_url,
+            no_browser,
+        }) => {
             assert_eq!(registry_url, "http://localhost:8000");
+            assert!(!no_browser);
+        }
+        other => panic!("expected Auth(Login), got {other:?}"),
+    }
+}
+
+#[test]
+fn auth_login_no_browser_parses() {
+    use super::{AuthCommand, Command};
+    match parse(&["auth", "login", "--no-browser"]).command {
+        Command::Auth(AuthCommand::Login { no_browser, .. }) => {
+            assert!(no_browser, "--no-browser should set the flag");
         }
         other => panic!("expected Auth(Login), got {other:?}"),
     }

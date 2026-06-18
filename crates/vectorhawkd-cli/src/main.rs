@@ -280,6 +280,12 @@ pub enum AuthCommand {
             default_value = "https://app.vectorhawk.ai"
         )]
         registry_url: String,
+
+        /// Don't open or wait on a local browser. Print a URL to open on any
+        /// device, then paste the resulting code back into the terminal.
+        /// Useful over SSH or on headless machines.
+        #[arg(long)]
+        no_browser: bool,
     },
 
     /// Log out of the VectorHawk registry.
@@ -562,7 +568,10 @@ async fn run(cli: Cli) -> Result<()> {
             .await
         }
 
-        Command::Auth(AuthCommand::Login { registry_url }) => cmd_auth_login(&registry_url).await,
+        Command::Auth(AuthCommand::Login {
+            registry_url,
+            no_browser,
+        }) => cmd_auth_login(&registry_url, no_browser).await,
         Command::Auth(AuthCommand::Logout { registry_url }) => cmd_auth_logout(&registry_url).await,
         Command::Auth(AuthCommand::Status { registry_url }) => cmd_auth_status(&registry_url).await,
         Command::Auth(AuthCommand::Pair { code, registry_url }) => {
@@ -3311,27 +3320,104 @@ async fn cmd_skill_update(id: Option<&str>, all: bool, registry_url: Option<&str
 
 // ── auth login ────────────────────────────────────────────────────────────────
 
-/// Connect to the daemon Unix socket and perform a JSON-RPC auth login flow.
+/// OAuth out-of-band redirect: the authorize page renders a copyable code
+/// instead of redirecting to a localhost callback the runner can't reach.
+const OOB_REDIRECT: &str = "urn:ietf:wg:oauth:2.0:oob";
+
+/// Build an `AuthClient` and initiate a PKCE flow on a blocking thread.
 ///
-/// Steps:
-///   1. Connect to the daemon socket (timeout 2 s). If unreachable, exit 2.
-///   2. Issue `auth/get_oauth_listener_port` to learn the bound HTTP port.
-///   3. Initiate PKCE flow with the loopback redirect URI.
-///   4. Open browser to the authorization URL.
-///   5. Issue `auth/wait_for_callback` and wait up to 300 s.
-///   6. Exchange the code via `AuthClient::exchange_oauth_code`.
-///   7. Save tokens and print user identity.
-///
-/// No stdin prompt remains. The paste-the-code path has been removed.
-async fn cmd_auth_login(registry_url: &str) -> Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::UnixStream;
-    use vectorhawkd_core::{
-        auth::{save_tokens, AuthClient},
-        state::AppState,
-    };
+/// `AuthClient` owns a `reqwest::blocking::Client` whose inner runtime must not
+/// be constructed or dropped inside the async (current-thread) runtime, so all
+/// `AuthClient` work is funneled through `spawn_blocking` (see the matching
+/// pattern elsewhere in this file).
+async fn oauth_initiate(
+    registry_url: &str,
+    redirect_uri: &str,
+) -> Result<vectorhawkd_core::auth::OAuthInitiation> {
+    let registry_url = registry_url.to_string();
+    let redirect_uri = redirect_uri.to_string();
+    tokio::task::spawn_blocking(move || {
+        vectorhawkd_core::auth::AuthClient::new(&registry_url)
+            .initiate_oauth_flow_with_redirect(&redirect_uri)
+    })
+    .await
+    .context("OAuth initiate task failed")?
+}
+
+/// Exchange an authorization code for tokens on a blocking thread.
+async fn oauth_exchange(
+    registry_url: &str,
+    code: &str,
+    code_verifier: &str,
+) -> Result<vectorhawkd_core::auth::TokenResponse> {
+    let registry_url = registry_url.to_string();
+    let code = code.to_string();
+    let code_verifier = code_verifier.to_string();
+    tokio::task::spawn_blocking(move || {
+        vectorhawkd_core::auth::AuthClient::new(&registry_url)
+            .exchange_oauth_code(&code, &code_verifier)
+    })
+    .await
+    .context("OAuth token exchange task failed")?
+}
+
+/// Fetch the authenticated user's identity on a blocking thread.
+async fn oauth_me(
+    registry_url: &str,
+    access_token: &str,
+) -> Result<vectorhawkd_core::auth::UserInfo> {
+    let registry_url = registry_url.to_string();
+    let access_token = access_token.to_string();
+    tokio::task::spawn_blocking(move || {
+        vectorhawkd_core::auth::AuthClient::new(&registry_url).me(&access_token)
+    })
+    .await
+    .context("user info task failed")?
+}
+
+/// Log in to the registry. Tries the automatic browser + localhost-callback flow
+/// first, then falls back to the manual paste-a-code flow when there's no
+/// browser / daemon (headless, SSH, or `--no-browser`).
+async fn cmd_auth_login(registry_url: &str, no_browser: bool) -> Result<()> {
+    use vectorhawkd_core::state::AppState;
 
     let state = AppState::bootstrap().context("failed to bootstrap state")?;
+
+    let is_ssh = std::env::var_os("SSH_CLIENT").is_some()
+        || std::env::var_os("SSH_TTY").is_some()
+        || std::env::var_os("SSH_CONNECTION").is_some();
+
+    // The automatic flow needs a local browser that can reach the daemon's
+    // localhost callback. Over SSH or with --no-browser that can't work, so go
+    // straight to the paste-a-code flow (needs no daemon, no local callback).
+    if no_browser || is_ssh {
+        if is_ssh && !no_browser {
+            println!("SSH session detected — using paste-a-code login.");
+            println!();
+        }
+        return login_manual(&state, registry_url).await;
+    }
+
+    // Otherwise try the automatic localhost-callback flow. If it can't even
+    // start (daemon down, or no browser to open), fall back to manual paste.
+    if login_auto(&state, registry_url).await? {
+        return Ok(());
+    }
+    println!();
+    println!("Falling back to paste-a-code login.");
+    println!();
+    login_manual(&state, registry_url).await
+}
+
+/// Automatic OAuth flow: open a local browser, receive the callback via the
+/// daemon's localhost listener. Returns `Ok(true)` on success, `Ok(false)` when
+/// the flow can't be started (daemon unreachable or no browser) so the caller
+/// can fall back to the manual paste flow.
+async fn login_auto(state: &vectorhawkd_core::state::AppState, registry_url: &str) -> Result<bool> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UnixStream;
+    use vectorhawkd_core::auth::save_tokens;
+
     let socket_path = state.socket_path();
 
     // Connect to the daemon socket with a 2-second timeout.
@@ -3344,10 +3430,10 @@ async fn cmd_auth_login(registry_url: &str) -> Result<()> {
         Ok(Ok(s)) => s,
         Ok(Err(_)) | Err(_) => {
             eprintln!(
-                "vectorhawk: auth login requires the running daemon — \
-                 run `vectorhawk daemon install` first"
+                "vectorhawk: daemon not reachable — \
+                 run `vectorhawk daemon install` for browser login."
             );
-            std::process::exit(2);
+            return Ok(false);
         }
     };
 
@@ -3410,7 +3496,7 @@ async fn cmd_auth_login(registry_url: &str) -> Result<()> {
                 .and_then(|m| m.as_str())
                 .unwrap_or("unknown error")
         );
-        std::process::exit(2);
+        return Ok(false);
     }
 
     let port = port_resp
@@ -3423,57 +3509,22 @@ async fn cmd_auth_login(registry_url: &str) -> Result<()> {
     // ── Step 3: initiate PKCE flow ────────────────────────────────────────────
 
     let redirect_uri = format!("http://127.0.0.1:{port}/oauth/cli/callback");
-    let client = AuthClient::new(registry_url);
-    let init = client
-        .initiate_oauth_flow_with_redirect(&redirect_uri)
+    let init = oauth_initiate(registry_url, &redirect_uri)
+        .await
         .context("failed to initiate OAuth PKCE flow")?;
 
     // ── Step 4: open browser ──────────────────────────────────────────────────
 
-    let is_ssh = std::env::var_os("SSH_CLIENT").is_some()
-        || std::env::var_os("SSH_TTY").is_some()
-        || std::env::var_os("SSH_CONNECTION").is_some();
-
-    if is_ssh {
-        println!("SSH session detected.");
-        println!();
-        println!("Option A — SSH tunnel (browser login):");
-        println!();
-        println!("  Step 1: In a NEW terminal on your LOCAL machine, run:");
-        let hostname = std::env::var("HOSTNAME")
-            .or_else(|_| std::fs::read_to_string("/etc/hostname").map(|s| s.trim().to_string()))
-            .unwrap_or_else(|_| "<this-machine>".to_string());
-        println!("    ssh -L {port}:localhost:{port} {hostname}");
-        println!();
-        println!("  Step 2: Open this URL in your browser:");
-        println!("    {}", init.auth_url);
-        println!();
-        println!("  Keep the tunnel open until login completes.");
-        println!();
-        println!("Option B — Personal Access Token (no tunnel needed):");
-        println!("  1. Open https://app.vectorhawk.ai/portal/settings in your browser.");
-        println!("  2. Create a token (starts with vh_pat_...).");
-        println!("  3. Run:  vectorhawk auth token <vh_pat_...>");
-        println!();
-    } else {
-        let browser_opened = try_open_browser(&init.auth_url);
-        if browser_opened {
-            println!("Opening browser for VectorHawk login...");
-            println!();
-            println!("If your browser does not open automatically, open this URL:");
-            println!("  {}", init.auth_url);
-        } else {
-            // Could not open browser — headless environment (no DISPLAY, no
-            // TERM_PROGRAM, or xdg-open / open returned an error).
-            // Print the URL so the user can copy it to any browser.
-            println!("Could not open browser automatically.");
-            println!();
-            println!("Open this URL in your browser to continue:");
-            println!("  {}", init.auth_url);
-            println!();
-            println!("Waiting for callback on http://127.0.0.1:{port}/oauth/cli/callback ...");
-        }
+    if !try_open_browser(&init.auth_url) {
+        // No browser to open (headless: no DISPLAY/TERM_PROGRAM, or open/xdg-open
+        // failed). A localhost callback would never arrive — signal the caller to
+        // fall back to the manual paste flow.
+        return Ok(false);
     }
+    println!("Opening browser for VectorHawk login...");
+    println!();
+    println!("If your browser does not open automatically, open this URL:");
+    println!("  {}", init.auth_url);
     println!();
 
     // ── Step 5: wait for callback via daemon ──────────────────────────────────
@@ -3513,22 +3564,92 @@ async fn cmd_auth_login(registry_url: &str) -> Result<()> {
 
     // ── Step 6: exchange code for tokens ─────────────────────────────────────
 
-    let tokens = client
-        .exchange_oauth_code(&code, &init.code_verifier)
+    let tokens = oauth_exchange(registry_url, &code, &init.code_verifier)
+        .await
         .context("OAuth token exchange failed")?;
 
     // ── Step 7: save tokens and print identity ────────────────────────────────
 
     save_tokens(
-        &state,
+        state,
         registry_url,
         &tokens.access_token,
         &tokens.refresh_token,
     )
     .context("failed to save auth tokens")?;
 
-    match client.me(&tokens.access_token) {
+    match oauth_me(registry_url, &tokens.access_token).await {
         Ok(user) => {
+            println!("Logged in as {} ({}).", user.display_name, user.email);
+        }
+        Err(e) => {
+            eprintln!("warning: could not fetch user info: {e:#}");
+            println!("Login succeeded (token saved).");
+        }
+    }
+
+    Ok(true)
+}
+
+/// Manual out-of-band flow: print a URL to open on any device, then read the
+/// pasted `code#state` back from the terminal and exchange it. Needs no daemon
+/// and no local callback, so it works headless / over SSH — mirroring how the
+/// Claude Code CLI falls back when it can't open a browser.
+async fn login_manual(state: &vectorhawkd_core::state::AppState, registry_url: &str) -> Result<()> {
+    use std::io::Write as _;
+    use vectorhawkd_core::auth::save_tokens;
+
+    let init = oauth_initiate(registry_url, OOB_REDIRECT)
+        .await
+        .context("failed to initiate OAuth PKCE flow")?;
+
+    println!("To sign in, open this URL in a browser on any device:");
+    println!();
+    println!("  {}", init.auth_url);
+    println!();
+    println!("After authorizing, copy the code shown and paste it here.");
+    print!("Code: ");
+    std::io::stdout().flush().ok();
+
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .context("failed to read pasted code from stdin")?;
+    let pasted = line.trim();
+    if pasted.is_empty() {
+        anyhow::bail!("no code entered — login cancelled");
+    }
+
+    // The page hands back `code#state`; split and verify the state matches this
+    // attempt to guard against pasting a code from a different login.
+    let (code, returned_state) = match pasted.split_once('#') {
+        Some((c, s)) => (c, Some(s)),
+        None => (pasted, None),
+    };
+    if let Some(s) = returned_state {
+        if s != init.state {
+            anyhow::bail!(
+                "state mismatch — the pasted code is from a different login attempt; \
+                 run `vectorhawk auth login` again"
+            );
+        }
+    }
+
+    let tokens = oauth_exchange(registry_url, code, &init.code_verifier)
+        .await
+        .context("OAuth token exchange failed")?;
+
+    save_tokens(
+        state,
+        registry_url,
+        &tokens.access_token,
+        &tokens.refresh_token,
+    )
+    .context("failed to save auth tokens")?;
+
+    match oauth_me(registry_url, &tokens.access_token).await {
+        Ok(user) => {
+            println!();
             println!("Logged in as {} ({}).", user.display_name, user.email);
         }
         Err(e) => {
