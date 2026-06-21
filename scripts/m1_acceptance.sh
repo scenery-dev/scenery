@@ -38,8 +38,8 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DAEMON_BIN="${REPO_ROOT}/target/release/vectorhawkd"
-SHIM_BIN="${REPO_ROOT}/target/release/vectorhawkd-shim"
+DAEMON_BIN="${REPO_ROOT}/target/release/vectorhawk"
+SHIM_BIN="${REPO_ROOT}/target/release/vectorhawk"
 CLI_BIN="${REPO_ROOT}/target/release/vectorhawk"
 
 # Initial cleanup — required when this script is chained from m4_acceptance.sh
@@ -50,7 +50,7 @@ case "$(uname -s)" in
     Linux)  _M1_INIT_SOCK="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/vectorhawk/agent.sock" ;;
     *)      _M1_INIT_SOCK="${HOME}/.local/share/vectorhawk/agent.sock" ;;
 esac
-pkill -x vectorhawkd 2>/dev/null || true
+pkill -x vectorhawk 2>/dev/null || true
 rm -f "${_M1_INIT_SOCK}" 2>/dev/null || true
 unset _M1_INIT_SOCK
 
@@ -254,12 +254,12 @@ case "$(uname)" in
 esac
 
 # Idle RSS: spawn daemon, wait, measure.
-if pgrep -x vectorhawkd >/dev/null 2>&1; then
-    pkill -x vectorhawkd 2>/dev/null || true
+if pgrep -x vectorhawk >/dev/null 2>&1; then
+    pkill -x vectorhawk 2>/dev/null || true
     sleep 1
 fi
 rm -f "${SOCKET_PATH}"
-"${DAEMON_BIN}" >/dev/null 2>&1 &
+"${DAEMON_BIN}" daemon run >/dev/null 2>&1 &
 DAEMON_PID=$!
 sleep 2
 IDLE_RSS_KB="$(ps -o rss= -p ${DAEMON_PID} 2>/dev/null | tr -d ' ' || echo 0)"
@@ -272,7 +272,7 @@ LOAD_PIDS=()
 for i in $(seq 1 10); do
     (
         printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"load","version":"0"}}}\n{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"stub__echo","arguments":{}}}\n' \
-            | "${SHIM_BIN}" >/dev/null 2>&1
+            | "${SHIM_BIN}" mcp serve >/dev/null 2>&1
     ) &
     LOAD_PIDS+=($!)
 done
@@ -285,23 +285,19 @@ kill -TERM ${DAEMON_PID} 2>/dev/null || true
 wait ${DAEMON_PID} 2>/dev/null || true
 rm -f "${SOCKET_PATH}"
 
-SHIM_SIZE_BYTES="$(stat -f%z "${SHIM_BIN}" 2>/dev/null || stat -c%s "${SHIM_BIN}" 2>/dev/null)"
-SHIM_SIZE_MB=$((SHIM_SIZE_BYTES / 1048576))
+VECTORHAWK_SIZE_BYTES="$(stat -f%z "${SHIM_BIN}" 2>/dev/null || stat -c%s "${SHIM_BIN}" 2>/dev/null)"
+VECTORHAWK_SIZE_MB=$((VECTORHAWK_SIZE_BYTES / 1048576))
 
-# Shim ceiling raised to 6 MB cross-platform after the spaceghost run
-# (Linux x86_64 produces a ~3.76 MB stripped binary vs macOS arm64's
-# 2.96 MB — driven by ELF metadata + x86_64 instruction encoding, not
-# code growth). 6 MB still well below "feels heavy" — Slack helper is
-# ~250 MB for context.
-SHIM_CEILING_BYTES=$((6 * 1048576))
+# The separate vectorhawkd-shim binary no longer exists; mcp serve is now a
+# subcommand of the unified vectorhawk binary. Idle/load RSS budgets still apply.
+# The <=6 MB shim-binary budget is informational only for the unified binary.
 if [[ "${IDLE_RSS_MB}" -le 50 ]] \
-   && [[ "${LOAD_RSS_MB}" -le 100 ]] \
-   && [[ "${SHIM_SIZE_BYTES}" -le ${SHIM_CEILING_BYTES} ]]; then
+   && [[ "${LOAD_RSS_MB}" -le 100 ]]; then
     record "PASS" 'AC10: compute budget' \
-        "idle=${IDLE_RSS_MB}MB load=${LOAD_RSS_MB}MB shim=${SHIM_SIZE_MB}MB"
+        "idle=${IDLE_RSS_MB}MB load=${LOAD_RSS_MB}MB vectorhawk=${VECTORHAWK_SIZE_MB}MB"
 else
     record "FAIL" 'AC10: compute budget' \
-        "idle=${IDLE_RSS_MB}MB (<=50) load=${LOAD_RSS_MB}MB (<=100) shim=${SHIM_SIZE_MB}MB (<=6)"
+        "idle=${IDLE_RSS_MB}MB (<=50) load=${LOAD_RSS_MB}MB (<=100)"
 fi
 
 # ── AC11: Mid-session daemon-kill regression (M0 AC4 / M4 contract) ──────────
@@ -353,7 +349,7 @@ done
 echo ""
 echo "Daemon idle RSS: $(cat ${REPO_ROOT}/target/m1-daemon-idle-rss.txt 2>/dev/null || echo 'not measured')"
 echo "Daemon load RSS: $(cat ${REPO_ROOT}/target/m1-daemon-load-rss.txt 2>/dev/null || echo 'not measured')"
-echo "Shim binary size: ${SHIM_SIZE_BYTES} bytes (${SHIM_SIZE_MB} MB)"
+echo "vectorhawk binary size: ${VECTORHAWK_SIZE_BYTES} bytes (${VECTORHAWK_SIZE_MB} MB)"
 echo ""
 
 if [[ "${ALL_PASS}" -eq 1 ]]; then

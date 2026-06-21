@@ -51,19 +51,15 @@ jobs:
       - name: build release binaries
         run: cargo build --workspace --release --target ${{ matrix.target }}
 
-      - name: strip binaries (macOS)
+      - name: strip binary (macOS)
         if: runner.os == 'macOS'
         run: |
           strip target/${{ matrix.target }}/release/vectorhawk
-          strip target/${{ matrix.target }}/release/vectorhawkd
-          strip target/${{ matrix.target }}/release/vectorhawkd-shim
 
-      - name: strip binaries (Linux)
+      - name: strip binary (Linux)
         if: runner.os == 'Linux'
         run: |
           strip target/${{ matrix.target }}/release/vectorhawk
-          strip target/${{ matrix.target }}/release/vectorhawkd
-          strip target/${{ matrix.target }}/release/vectorhawkd-shim
 
       - name: package tarball
         shell: bash
@@ -77,8 +73,6 @@ jobs:
           mkdir -p "${PKG_DIR}"
 
           cp target/${TRIPLE}/release/vectorhawk "${PKG_DIR}/"
-          cp target/${TRIPLE}/release/vectorhawkd "${PKG_DIR}/"
-          cp target/${TRIPLE}/release/vectorhawkd-shim "${PKG_DIR}/"
           cp LICENSE "${PKG_DIR}/"
           cp README.md "${PKG_DIR}/"
 

@@ -89,7 +89,7 @@ fn kill_child(child: &mut Child) {
 }
 
 fn kill_stale_daemon() {
-    let _ = Command::new("pkill").args(["-x", "vectorhawkd"]).status();
+    let _ = Command::new("pkill").args(["-x", "vectorhawk"]).status();
     std::thread::sleep(Duration::from_millis(300));
 }
 
@@ -179,16 +179,16 @@ const WALL_CLOCK_LIMIT_SECS: u64 = 30;
 #[test]
 #[ignore = "requires pre-built release binaries — run cargo build --workspace --release first"]
 fn m5_five_shims_1000_calls_all_succeed_rss_within_budget() {
-    let daemon_bin = release_bin("vectorhawkd");
-    let shim_bin = release_bin("vectorhawkd-shim");
+    let daemon_bin = release_bin("vectorhawk");
+    let shim_bin = release_bin("vectorhawk");
 
     assert!(
         daemon_bin.exists(),
-        "daemon binary not found at {daemon_bin:?} — run cargo build --workspace --release"
+        "vectorhawk binary not found at {daemon_bin:?} — run cargo build --workspace --release"
     );
     assert!(
         shim_bin.exists(),
-        "shim binary not found at {shim_bin:?} — run cargo build --workspace --release"
+        "vectorhawk binary not found at {shim_bin:?} — run cargo build --workspace --release"
     );
 
     let socket_path = daemon_socket_path();
@@ -198,11 +198,12 @@ fn m5_five_shims_1000_calls_all_succeed_rss_within_budget() {
 
     // Spawn daemon with 5 ms stub latency to exercise realistic concurrency.
     let mut daemon = Command::new(&daemon_bin)
+        .args(["daemon", "run"])
         .env("VECTORHAWK_STUB_LATENCY_MS", "5")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("failed to spawn vectorhawkd");
+        .expect("failed to spawn vectorhawk daemon run");
 
     let daemon_pid = daemon.id();
 
@@ -253,12 +254,15 @@ fn m5_five_shims_1000_calls_all_succeed_rss_within_budget() {
 
             std::thread::spawn(move || {
                 let mut shim = Command::new(&bin)
+                    .args(["mcp", "serve"])
                     .env("VECTORHAWK_STUB_LATENCY_MS", "5")
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
                     .spawn()
-                    .unwrap_or_else(|e| panic!("shim #{shim_idx}: spawn failed: {e}"));
+                    .unwrap_or_else(|e| {
+                        panic!("shim #{shim_idx}: spawn vectorhawk mcp serve failed: {e}")
+                    });
 
                 let mut stdin = shim.stdin.take().expect("shim stdin");
                 let stdout_raw = shim.stdout.take().expect("shim stdout");

@@ -69,7 +69,7 @@ fn wait_for_socket(path: &std::path::Path, timeout: Duration) -> bool {
 }
 
 fn kill_stale_daemon() {
-    let _ = Command::new("pkill").args(["-x", "vectorhawkd"]).status();
+    let _ = Command::new("pkill").args(["-x", "vectorhawk"]).status();
     std::thread::sleep(Duration::from_millis(300));
 }
 
@@ -167,7 +167,7 @@ fn http_get_raw(host: &str, port: u16, path: &str) -> u16 {
 fn m3_ac2_login_full_flow() {
     // We need the CLI binary, daemon binary, and a mockito token endpoint.
     let cli_bin = release_bin("vectorhawk");
-    let daemon_bin = release_bin("vectorhawkd");
+    let daemon_bin = release_bin("vectorhawk");
 
     assert!(
         cli_bin.exists(),
@@ -175,7 +175,7 @@ fn m3_ac2_login_full_flow() {
     );
     assert!(
         daemon_bin.exists(),
-        "vectorhawkd binary not found at {daemon_bin:?}"
+        "vectorhawk binary not found at {daemon_bin:?}"
     );
 
     let socket_path = daemon_socket_path();
@@ -204,10 +204,11 @@ fn m3_ac2_login_full_flow() {
 
     // Spawn daemon.
     let mut daemon = Command::new(&daemon_bin)
+        .args(["daemon", "run"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("failed to spawn vectorhawkd");
+        .expect("failed to spawn vectorhawk daemon run");
 
     let socket_appeared = wait_for_socket(&socket_path, Duration::from_secs(5));
     if !socket_appeared {

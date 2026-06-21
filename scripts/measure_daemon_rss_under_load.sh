@@ -18,15 +18,15 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DAEMON_BIN="${REPO_ROOT}/target/release/vectorhawkd"
+DAEMON_BIN="${REPO_ROOT}/target/release/vectorhawk"
 RSS_FILE="${REPO_ROOT}/target/m5-daemon-rss-under-load.txt"
 MAX_UNDER_LOAD_MB=100
 
 # ── Self-clean: kill stale daemon + remove socket (per 321ca06 pattern) ───────
 
-if pgrep -x vectorhawkd > /dev/null 2>&1; then
-    echo "INFO: killing stale vectorhawkd process(es) before test"
-    pkill -x vectorhawkd || true
+if pgrep -x vectorhawk > /dev/null 2>&1; then
+    echo "INFO: killing stale vectorhawk daemon process(es) before test"
+    pkill -x vectorhawk || true
     sleep 1
 fi
 

@@ -18,30 +18,30 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DAEMON_BIN="${REPO_ROOT}/target/release/vectorhawkd"
+DAEMON_BIN="${REPO_ROOT}/target/release/vectorhawk"
 RSS_FILE="${REPO_ROOT}/target/m0-daemon-rss.txt"
 MAX_RSS_MB=50
 
 # ── Preflight: binary must be built ──────────────────────────────────────────
 
 if [[ ! -x "${DAEMON_BIN}" ]]; then
-    echo "ERROR: daemon binary not built yet — run cargo build --workspace --release first" >&2
+    echo "ERROR: vectorhawk binary not built yet — run cargo build --workspace --release first" >&2
     echo "  Expected: ${DAEMON_BIN}" >&2
     exit 1
 fi
 
 # ── Kill any stale daemon from a previous run ─────────────────────────────────
 
-if pgrep -x vectorhawkd > /dev/null 2>&1; then
-    echo "INFO: killing stale vectorhawkd process(es) before measurement"
-    pkill -x vectorhawkd || true
+if pgrep -x vectorhawk > /dev/null 2>&1; then
+    echo "INFO: killing stale vectorhawk daemon process(es) before measurement"
+    pkill -x vectorhawk || true
     sleep 1
 fi
 
 # ── Spawn daemon in background ─────────────────────────────────────────────────
 
-echo "INFO: spawning ${DAEMON_BIN}"
-"${DAEMON_BIN}" &
+echo "INFO: spawning ${DAEMON_BIN} daemon run"
+"${DAEMON_BIN}" daemon run &
 DAEMON_PID=$!
 
 # Give the daemon 2 seconds to settle into idle state before sampling RSS.

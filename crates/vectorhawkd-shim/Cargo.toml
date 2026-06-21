@@ -8,10 +8,6 @@ license.workspace = true
 repository.workspace = true
 description = "VectorHawk runner — stdio↔socket relay shim"
 
-[[bin]]
-name = "vectorhawkd-shim"
-path = "src/main.rs"
-
 [lib]
 name = "vectorhawkd_shim"
 path = "src/lib.rs"

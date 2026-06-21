@@ -13,7 +13,7 @@
 //!   within 3 seconds. The AI client surfaces the error to the user.
 //!
 //! This test:
-//!   1. Spawns `vectorhawkd` (daemon) and `vectorhawkd-shim` (shim).
+//!   1. Spawns `vectorhawk daemon run` (daemon) and `vectorhawk mcp serve` (shim).
 //!   2. Performs a successful `initialize` + `tools/list` round-trip via
 //!      the daemon socket path (confirming the live path works).
 //!   3. Kills the daemon with SIGKILL (hard kill).
@@ -113,9 +113,9 @@ fn send_rpc(
 }
 
 fn kill_stale_daemon() {
-    // `-x` for exact process-name match — see m0_acceptance::kill_stale_daemon
+    // `-x vectorhawk` for exact process-name match — see m0_acceptance::kill_stale_daemon
     // for why `-f` was wrong on Linux.
-    let _ = Command::new("pkill").args(["-x", "vectorhawkd"]).status();
+    let _ = Command::new("pkill").args(["-x", "vectorhawk"]).status();
     std::thread::sleep(Duration::from_millis(300));
 }
 
@@ -155,16 +155,16 @@ fn libc_sigkill() -> i32 {
 #[test]
 #[ignore = "requires pre-built release binaries — run cargo build --workspace --release first"]
 fn ac4_daemon_kill_shim_returns_daemon_required_error_within_3s() {
-    let daemon_bin = release_bin("vectorhawkd");
-    let shim_bin = release_bin("vectorhawkd-shim");
+    let daemon_bin = release_bin("vectorhawk");
+    let shim_bin = release_bin("vectorhawk");
 
     assert!(
         daemon_bin.exists(),
-        "daemon binary not found at {daemon_bin:?} — run cargo build --workspace --release"
+        "vectorhawk binary not found at {daemon_bin:?} — run cargo build --workspace --release"
     );
     assert!(
         shim_bin.exists(),
-        "shim binary not found at {shim_bin:?} — run cargo build --workspace --release"
+        "vectorhawk binary not found at {shim_bin:?} — run cargo build --workspace --release"
     );
 
     let socket_path = daemon_socket_path();
@@ -174,10 +174,11 @@ fn ac4_daemon_kill_shim_returns_daemon_required_error_within_3s() {
 
     // Spawn daemon.
     let mut daemon = Command::new(&daemon_bin)
+        .args(["daemon", "run"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("failed to spawn vectorhawkd");
+        .expect("failed to spawn vectorhawk daemon run");
 
     let socket_appeared = wait_for_socket(&socket_path, Duration::from_secs(5));
     if !socket_appeared {
@@ -187,11 +188,12 @@ fn ac4_daemon_kill_shim_returns_daemon_required_error_within_3s() {
 
     // Spawn shim.
     let mut shim = Command::new(&shim_bin)
+        .args(["mcp", "serve"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .expect("failed to spawn vectorhawkd-shim");
+        .expect("failed to spawn vectorhawk mcp serve");
 
     let mut stdin = shim.stdin.take().expect("shim stdin");
     let stdout_raw = shim.stdout.take().expect("shim stdout");

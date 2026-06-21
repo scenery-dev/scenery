@@ -12,10 +12,6 @@ description = "vectorhawkd — VectorHawk runner daemon"
 name = "vectorhawkd_daemon"
 path = "src/lib.rs"
 
-[[bin]]
-name = "vectorhawkd"
-path = "src/main.rs"
-
 [dependencies]
 vectorhawkd-manifest = { path = "../vectorhawkd-manifest" }
 vectorhawkd-core = { path = "../vectorhawkd-core" }

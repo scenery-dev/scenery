@@ -90,7 +90,7 @@ fn kill_child(child: &mut Child) {
 }
 
 fn kill_stale_daemon() {
-    let _ = Command::new("pkill").args(["-x", "vectorhawkd"]).status();
+    let _ = Command::new("pkill").args(["-x", "vectorhawk"]).status();
     std::thread::sleep(Duration::from_millis(300));
 }
 
@@ -233,10 +233,10 @@ fn http_get(host: &str, port: u16, path: &str) -> (u16, String) {
 #[test]
 #[ignore = "requires pre-built release binaries — run cargo build --workspace --release first"]
 fn m3_ac1_oauth_listener_and_wait_for_callback() {
-    let daemon_bin = release_bin("vectorhawkd");
+    let daemon_bin = release_bin("vectorhawk");
     assert!(
         daemon_bin.exists(),
-        "daemon binary not found at {daemon_bin:?} — run cargo build --workspace --release"
+        "vectorhawk binary not found at {daemon_bin:?} — run cargo build --workspace --release"
     );
 
     let socket_path = daemon_socket_path();
@@ -246,10 +246,11 @@ fn m3_ac1_oauth_listener_and_wait_for_callback() {
 
     // Spawn daemon.
     let mut daemon = Command::new(&daemon_bin)
+        .args(["daemon", "run"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("failed to spawn vectorhawkd");
+        .expect("failed to spawn vectorhawk daemon run");
 
     let socket_appeared = wait_for_socket(&socket_path, Duration::from_secs(5));
     if !socket_appeared {
@@ -358,18 +359,19 @@ fn m3_ac1_oauth_listener_and_wait_for_callback() {
 #[test]
 #[ignore = "requires pre-built release binaries — run cargo build --workspace --release first"]
 fn m3_two_concurrent_wait_for_callback_independent() {
-    let daemon_bin = release_bin("vectorhawkd");
-    assert!(daemon_bin.exists(), "daemon binary not found");
+    let daemon_bin = release_bin("vectorhawk");
+    assert!(daemon_bin.exists(), "vectorhawk binary not found");
 
     let socket_path = daemon_socket_path();
     kill_stale_daemon();
     remove_socket_if_present(&socket_path);
 
     let mut daemon = Command::new(&daemon_bin)
+        .args(["daemon", "run"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("failed to spawn vectorhawkd");
+        .expect("failed to spawn vectorhawk daemon run");
 
     let appeared = wait_for_socket(&socket_path, Duration::from_secs(5));
     if !appeared {

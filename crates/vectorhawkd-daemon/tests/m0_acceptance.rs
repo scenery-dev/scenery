@@ -5,9 +5,9 @@
 //! This test exercises the full daemon + shim stack as required by M0 acceptance
 //! criteria AC2 and AC3:
 //!
-//!   AC2: `vectorhawkd` daemon boots, listens on a Unix socket at the platform
+//!   AC2: `vectorhawk daemon run` boots, listens on a Unix socket at the platform
 //!        data directory, and holds at least one stub backend.
-//!   AC3: `vectorhawkd-shim` (invoked as `vectorhawk mcp serve`) connects to
+//!   AC3: `vectorhawk mcp serve` connects to
 //!        the daemon socket, relays an MCP `initialize` handshake + `tools/list`
 //!        + >=5 `tools/call` invocations.  The AI client does not see an error.
 //!
@@ -129,14 +129,14 @@ fn send_rpc(
 
 // ── Pre-test helpers ──────────────────────────────────────────────────────────
 
-/// Kill any lingering `vectorhawkd` process that might be left from a prior run.
+/// Kill any lingering `vectorhawk` daemon process that might be left from a prior run.
 fn kill_stale_daemon() {
-    // `-x vectorhawkd` matches the process *name* exactly. The previous
+    // `-x vectorhawk` matches the process *name* exactly. The previous
     // `-f vectorhawkd` matched the full command line, which on Linux
     // matches `cargo test -p vectorhawkd-daemon` (the test runner's own
     // cmdline) and SIGTERMs it with exit 143. Surfaced by the spaceghost
     // Linux acceptance run.
-    let _ = Command::new("pkill").args(["-x", "vectorhawkd"]).status();
+    let _ = Command::new("pkill").args(["-x", "vectorhawk"]).status();
     std::thread::sleep(Duration::from_millis(300));
 }
 
@@ -152,16 +152,16 @@ fn kill_stale_daemon() {
 #[test]
 #[ignore = "requires pre-built release binaries — run cargo build --workspace --release first"]
 fn ac2_ac3_initialize_tools_list_and_five_tool_calls() {
-    let daemon_bin = release_bin("vectorhawkd");
-    let shim_bin = release_bin("vectorhawkd-shim");
+    let daemon_bin = release_bin("vectorhawk");
+    let shim_bin = release_bin("vectorhawk");
 
     assert!(
         daemon_bin.exists(),
-        "daemon binary not found at {daemon_bin:?} — run cargo build --workspace --release"
+        "vectorhawk binary not found at {daemon_bin:?} — run cargo build --workspace --release"
     );
     assert!(
         shim_bin.exists(),
-        "shim binary not found at {shim_bin:?} — run cargo build --workspace --release"
+        "vectorhawk binary not found at {shim_bin:?} — run cargo build --workspace --release"
     );
 
     let socket_path = daemon_socket_path();
@@ -172,10 +172,11 @@ fn ac2_ac3_initialize_tools_list_and_five_tool_calls() {
 
     // Spawn the daemon.
     let mut daemon = Command::new(&daemon_bin)
+        .args(["daemon", "run"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("failed to spawn vectorhawkd");
+        .expect("failed to spawn vectorhawk daemon run");
 
     // Wait up to 5 seconds for the socket file to appear.
     let socket_appeared = wait_for_socket(&socket_path, Duration::from_secs(5));
@@ -186,11 +187,12 @@ fn ac2_ac3_initialize_tools_list_and_five_tool_calls() {
 
     // Spawn the shim with stdin/stdout piped.
     let mut shim = Command::new(&shim_bin)
+        .args(["mcp", "serve"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .expect("failed to spawn vectorhawkd-shim");
+        .expect("failed to spawn vectorhawk mcp serve");
 
     let mut stdin = shim.stdin.take().expect("shim stdin");
     let stdout_raw = shim.stdout.take().expect("shim stdout");

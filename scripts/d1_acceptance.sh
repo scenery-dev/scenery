@@ -117,7 +117,7 @@ if [[ ${BUILD_STATUS} -ne 0 ]]; then
 else
     record "PASS" "AC1 (build): cargo build --workspace --release succeeded" ""
 
-    for BIN in vectorhawk vectorhawkd vectorhawkd-shim; do
+    for BIN in vectorhawk; do
         BIN_PATH="${REPO_ROOT}/target/release/${BIN}"
         if [[ -x "${BIN_PATH}" ]]; then
             record "PASS" "AC1 (build): binary exists: ${BIN}" "${BIN_PATH}"
@@ -177,7 +177,7 @@ mkdir -p "${PKG_DIR}"
 
 FAKE_RELEASE_OK=1
 
-for BIN in vectorhawk vectorhawkd vectorhawkd-shim; do
+for BIN in vectorhawk; do
     if [[ -x "${REPO_ROOT}/target/release/${BIN}" ]]; then
         cp "${REPO_ROOT}/target/release/${BIN}" "${PKG_DIR}/"
     else
@@ -212,7 +212,7 @@ if [[ ${FAKE_RELEASE_OK} -eq 1 ]]; then
     TARBALL_CONTENTS="$(tar -tzf "${ARCHIVE_PATH}" 2>/dev/null)"
     PKG_PREFIX="vectorhawk-${CARGO_VERSION}-${HOST_TRIPLE}"
     ALL_OK=1
-    for EXPECTED_FILE in vectorhawk vectorhawkd vectorhawkd-shim LICENSE README.md; do
+    for EXPECTED_FILE in vectorhawk LICENSE README.md; do
         if echo "${TARBALL_CONTENTS}" | grep -q "${PKG_PREFIX}/${EXPECTED_FILE}$"; then
             true
         else
@@ -221,7 +221,7 @@ if [[ ${FAKE_RELEASE_OK} -eq 1 ]]; then
     done
     if [[ ${ALL_OK} -eq 1 ]]; then
         record "PASS" "AC1 (tarball): tarball contains required files" \
-            "vectorhawk, vectorhawkd, vectorhawkd-shim, LICENSE, README.md"
+            "vectorhawk, LICENSE, README.md"
     else
         record "FAIL" "AC1 (tarball): tarball contents" \
             "missing files; got: $(echo "${TARBALL_CONTENTS}" | tr '\n' ' ')"

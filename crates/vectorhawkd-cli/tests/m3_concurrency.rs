@@ -72,7 +72,7 @@ fn wait_for_socket(path: &std::path::Path, timeout: Duration) -> bool {
 }
 
 fn kill_stale_daemon() {
-    let _ = Command::new("pkill").args(["-x", "vectorhawkd"]).status();
+    let _ = Command::new("pkill").args(["-x", "vectorhawk"]).status();
     std::thread::sleep(Duration::from_millis(300));
 }
 
@@ -175,10 +175,10 @@ fn http_get_status(host: &str, port: u16, path: &str) -> u16 {
 #[test]
 #[ignore = "requires pre-built release binaries — run cargo build --workspace --release first"]
 fn m3_concurrent_login_flows_no_cross_contamination() {
-    let daemon_bin = release_bin("vectorhawkd");
+    let daemon_bin = release_bin("vectorhawk");
     assert!(
         daemon_bin.exists(),
-        "vectorhawkd binary not found — run cargo build --workspace --release"
+        "vectorhawk binary not found — run cargo build --workspace --release"
     );
 
     let socket_path = daemon_socket_path();
@@ -189,10 +189,11 @@ fn m3_concurrent_login_flows_no_cross_contamination() {
 
     // Spawn daemon.
     let mut daemon = Command::new(&daemon_bin)
+        .args(["daemon", "run"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("failed to spawn vectorhawkd");
+        .expect("failed to spawn vectorhawk daemon run");
 
     let socket_appeared = wait_for_socket(&socket_path, Duration::from_secs(5));
     if !socket_appeared {
@@ -327,10 +328,10 @@ fn m3_concurrent_login_flows_no_cross_contamination() {
 #[test]
 #[ignore = "requires pre-built release binaries — run cargo build --workspace --release first"]
 fn m3_concurrent_same_state_second_subscriber_errors() {
-    let daemon_bin = release_bin("vectorhawkd");
+    let daemon_bin = release_bin("vectorhawk");
     assert!(
         daemon_bin.exists(),
-        "vectorhawkd binary not found — run cargo build --workspace --release"
+        "vectorhawk binary not found — run cargo build --workspace --release"
     );
 
     let socket_path = daemon_socket_path();
@@ -340,10 +341,11 @@ fn m3_concurrent_same_state_second_subscriber_errors() {
     }
 
     let mut daemon = Command::new(&daemon_bin)
+        .args(["daemon", "run"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("failed to spawn vectorhawkd");
+        .expect("failed to spawn vectorhawk daemon run");
 
     let appeared = wait_for_socket(&socket_path, Duration::from_secs(5));
     if !appeared {
