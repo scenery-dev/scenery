@@ -810,6 +810,117 @@ async fn probe_oauth_listener_port(_socket_path: &str) -> String {
     "not running (Unix sockets not supported on this platform)".to_string()
 }
 
+/// Result of asking a running daemon to reload credentials and start syncing.
+enum DaemonReload {
+    /// Daemon reloaded and the SSE sync subsystem is now active.
+    SyncActive,
+    /// Daemon reachable but sync did not start (e.g. device registration failed).
+    SyncInactive,
+    /// Daemon is not running / unreachable.
+    DaemonDown,
+}
+
+/// Ask a running daemon to pick up freshly-saved credentials: register this
+/// device and start the SSE sync subsystem immediately, with no daemon restart.
+///
+/// Best-effort with a short deadline — the caller has already persisted tokens,
+/// so a down daemon is not an error here; it will sync on its next start.
+#[cfg(unix)]
+async fn daemon_auth_reload(socket_path: &str) -> DaemonReload {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UnixStream;
+    use tokio::time::{timeout, Duration};
+
+    let connected = match timeout(
+        Duration::from_secs(2),
+        UnixStream::connect(socket_path.to_string()),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        _ => return DaemonReload::DaemonDown,
+    };
+
+    let (mut reader, mut writer) = connected.into_split();
+
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "auth/reload",
+        "params": {}
+    });
+
+    let body = match serde_json::to_vec(&request) {
+        Ok(b) => b,
+        Err(_) => return DaemonReload::DaemonDown,
+    };
+    let len = body.len() as u32;
+    if writer.write_all(&len.to_be_bytes()).await.is_err()
+        || writer.write_all(&body).await.is_err()
+        || writer.flush().await.is_err()
+    {
+        return DaemonReload::DaemonDown;
+    }
+
+    // Device registration involves a network round-trip on the daemon side;
+    // give it up to 15 s before giving up.
+    let read_result = timeout(Duration::from_secs(15), async {
+        let mut len_buf = [0u8; 4];
+        reader.read_exact(&mut len_buf).await?;
+        let resp_len = u32::from_be_bytes(len_buf) as usize;
+        let mut resp_body = vec![0u8; resp_len];
+        reader.read_exact(&mut resp_body).await?;
+        Ok::<Vec<u8>, tokio::io::Error>(resp_body)
+    })
+    .await;
+
+    let resp: serde_json::Value = match read_result {
+        Ok(Ok(b)) => match serde_json::from_slice(&b) {
+            Ok(v) => v,
+            Err(_) => return DaemonReload::DaemonDown,
+        },
+        _ => return DaemonReload::DaemonDown,
+    };
+
+    match resp
+        .get("result")
+        .and_then(|r| r.get("sync_active"))
+        .and_then(|a| a.as_bool())
+    {
+        Some(true) => DaemonReload::SyncActive,
+        _ => DaemonReload::SyncInactive,
+    }
+}
+
+#[cfg(not(unix))]
+async fn daemon_auth_reload(_socket_path: &str) -> DaemonReload {
+    DaemonReload::DaemonDown
+}
+
+/// Persist tokens, then nudge a running daemon to start syncing immediately and
+/// print a status line tailored to the outcome.  Shared by `auth login`,
+/// `auth pair`, and `auth token`.
+async fn finish_auth(state: &vectorhawkd_core::state::AppState) {
+    let socket_path = state.socket_path();
+    match daemon_auth_reload(socket_path.as_str()).await {
+        DaemonReload::SyncActive => {
+            println!("Daemon is syncing your governed skills now.");
+        }
+        DaemonReload::SyncInactive => {
+            println!(
+                "Saved, but the daemon could not start syncing yet. \
+                 Run `vectorhawk doctor` to diagnose."
+            );
+        }
+        DaemonReload::DaemonDown => {
+            println!(
+                "Saved. Start the daemon with `vectorhawk daemon install` and \
+                 your skills will sync automatically."
+            );
+        }
+    }
+}
+
 /// Probe the registry health endpoint with a 1 s timeout.
 /// Returns a human-readable status string.
 async fn probe_registry(base_url: &str) -> String {
@@ -3537,6 +3648,7 @@ async fn cmd_auth_login(registry_url: &str) -> Result<()> {
         }
     }
 
+    finish_auth(&state).await;
     Ok(())
 }
 
@@ -3670,6 +3782,7 @@ async fn cmd_auth_token(token: &str, registry_url: &str) -> Result<()> {
 
     println!("Authenticated as {} ({}).", user.display_name, user.email);
     println!("Token saved for {}.", registry_url);
+    finish_auth(&state).await;
     Ok(())
 }
 
@@ -3763,7 +3876,7 @@ async fn cmd_auth_pair(code: &str, registry_url: &str) -> Result<()> {
     )
     .context("failed to save auth token")?;
 
-    // Persist device_uuid and device_id so the daemon picks them up on next start.
+    // Persist device_uuid and device_id so the daemon uses this registration.
     state
         .set_sync_state("device_uuid", &device_uuid)
         .context("failed to save device_uuid")?;
@@ -3775,8 +3888,7 @@ async fn cmd_auth_pair(code: &str, registry_url: &str) -> Result<()> {
     println!("Device ID : {}", pair.device_id);
     println!("Registry  : {registry_url}");
     println!();
-    println!("Your skills will sync automatically once the daemon is running.");
-    println!("Run `vectorhawk doctor` to check status.");
+    finish_auth(&state).await;
 
     Ok(())
 }

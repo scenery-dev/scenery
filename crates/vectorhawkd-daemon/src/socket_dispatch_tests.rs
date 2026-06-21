@@ -15,6 +15,28 @@ use crate::oauth_state::OAuthState;
 
 use super::{dispatch, DaemonContext};
 
+/// Build a `SyncController` for tests. The controller's sync subsystem is never
+/// exercised by dispatch tests (no `auth/reload`), so a bare `AppState` pointing
+/// at the temp dir suffices — no DB is created or read.
+fn make_sync_controller(registry: Arc<BackendRegistry>) -> Arc<crate::SyncController> {
+    use camino::Utf8PathBuf;
+    use vectorhawkd_core::state::AppState;
+
+    let tmp = std::env::temp_dir();
+    let state = AppState {
+        root_dir: Utf8PathBuf::from_path_buf(tmp.clone()).unwrap(),
+        db_path: Utf8PathBuf::from_path_buf(tmp.join("vh-dispatch-test.db")).unwrap(),
+    };
+    let (tx, _rx) = broadcast::channel(16);
+    Arc::new(crate::SyncController::new(
+        "https://example.invalid".to_string(),
+        Arc::new(state),
+        tx,
+        registry,
+        None,
+    ))
+}
+
 fn make_ctx() -> DaemonContext {
     let registry = Arc::new(BackendRegistry::new());
     registry.register_backend(BackendEntry {
@@ -33,11 +55,12 @@ fn make_ctx() -> DaemonContext {
     });
     let (list_changed_tx, _) = broadcast::channel(16);
     DaemonContext {
-        backend: Arc::new(RealBackend::new(registry)),
+        backend: Arc::new(RealBackend::new(Arc::clone(&registry))),
         oauth_state: Arc::new(OAuthState::new()),
         listener_port: Some(39127),
         list_changed_tx,
         discoveries_kick: Arc::new(Notify::new()),
+        sync_controller: make_sync_controller(registry),
     }
 }
 
@@ -162,11 +185,12 @@ async fn dispatch_auth_get_oauth_listener_port_when_none() {
     let registry = Arc::new(BackendRegistry::new());
     let (list_changed_tx, _) = broadcast::channel(16);
     let ctx = DaemonContext {
-        backend: Arc::new(RealBackend::new(registry)),
+        backend: Arc::new(RealBackend::new(Arc::clone(&registry))),
         oauth_state: Arc::new(OAuthState::new()),
         listener_port: None,
         list_changed_tx,
         discoveries_kick: Arc::new(Notify::new()),
+        sync_controller: make_sync_controller(registry),
     };
     let resp = dispatch(
         &ctx,

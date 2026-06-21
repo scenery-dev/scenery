@@ -58,7 +58,7 @@ use vectorhawkd_mcp::{
 };
 
 use crate::{
-    auth_dispatch::{handle_get_oauth_listener_port, handle_wait_for_callback},
+    auth_dispatch::{handle_get_oauth_listener_port, handle_reload, handle_wait_for_callback},
     oauth_state::OAuthState,
 };
 
@@ -96,6 +96,10 @@ pub struct DaemonContext {
     /// first connect rather than waiting for the next 5-minute tick.
     /// Debounced inside `DiscoveriesScanner::spawn_loop` (10 s window).
     pub discoveries_kick: Arc<Notify>,
+    /// Controller for the SSE sync subsystem. Lets `auth/reload` (re)start sync
+    /// after the user authenticates against an already-running daemon, without
+    /// requiring a daemon restart.
+    pub sync_controller: Arc<crate::SyncController>,
 }
 
 /// Drive a single shim connection to completion.
@@ -267,6 +271,8 @@ pub(crate) async fn dispatch(ctx: &DaemonContext, request: JsonRpcRequest) -> Js
         "auth/wait_for_callback" => {
             handle_wait_for_callback(id, request.params, Arc::clone(&ctx.oauth_state)).await
         }
+
+        "auth/reload" => handle_reload(id, Arc::clone(&ctx.sync_controller)).await,
 
         other => {
             debug!(method = %other, "unknown method");
