@@ -44,8 +44,7 @@ use vectorhawkd_core::state::AppState;
 pub use discoveries::DiscoveriesScanner;
 pub use drift::DriftScanner;
 pub use marker::ManagedPathMarker;
-pub(crate) use pusher::native_skills_enabled;
-pub use pusher::{reclaim_active_skills, remove_managed_skills, ManagedPathsPusher};
+pub use pusher::{push_missing_active_skills, reclaim_active_skills, ManagedPathsPusher};
 pub use rollback::{list_backups, rollback, BackupSummary, RollbackReport};
 pub use scanner::MigrationItem;
 
@@ -129,21 +128,12 @@ impl ManagedPathsReconciler {
         };
 
         // ── Skills ────────────────────────────────────────────────────────────
-        //
-        // Skipped when native skills are disabled (the default): we no longer
-        // manage skills as native Claude Code skills, so adopting any leftover
-        // `~/.claude/skills/<slug>` dir into a marker would just let it linger.
-        // The startup `remove_managed_skills` cleanup removes those dirs instead.
-        let skill_items = if pusher::native_skills_enabled() {
-            match scanner::scan_skills_dir(&skills_dir) {
-                Ok(items) => items,
-                Err(e) => {
-                    warn!(error = %e, "managed_paths: failed to scan skills dir; skipping skills");
-                    vec![]
-                }
+        let skill_items = match scanner::scan_skills_dir(&skills_dir) {
+            Ok(items) => items,
+            Err(e) => {
+                warn!(error = %e, "managed_paths: failed to scan skills dir; skipping skills");
+                vec![]
             }
-        } else {
-            vec![]
         };
 
         for item in skill_items {

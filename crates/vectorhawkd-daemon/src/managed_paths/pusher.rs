@@ -51,18 +51,6 @@ fn reconciler_disabled() -> bool {
     std::env::var_os("VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER").is_some()
 }
 
-/// Return `true` when VectorHawk should write governed skills into
-/// `~/.claude/skills/` as native Claude Code skills.
-///
-/// Default is `false`: governed skills are surfaced to AI clients through the
-/// runner's MCP server (one tool per skill) and through the portal's web tool
-/// management, so writing them as native Claude Code skills only clutters the
-/// client's `/`-skills list. Set `VECTORHAWK_ENABLE_NATIVE_SKILLS=1` to restore
-/// the legacy push behaviour.
-pub(crate) fn native_skills_enabled() -> bool {
-    std::env::var_os("VECTORHAWK_ENABLE_NATIVE_SKILLS").is_some()
-}
-
 // ── ManagedPathsPusher ────────────────────────────────────────────────────────
 
 /// Pushes VectorHawk-managed items into Claude Code's native directories.
@@ -103,32 +91,7 @@ impl ManagedPathsPusher {
         if reconciler_disabled() {
             return Ok(());
         }
-        if !native_skills_enabled() {
-            debug!(
-                slug,
-                "pusher: native skills disabled (default) — skipping push to ~/.claude/skills/; \
-                 skill remains available via the runner MCP server"
-            );
-            return Ok(());
-        }
-        self.push_skill_inner(slug, installation_id, skill_md_bytes, referenced_files)
-    }
 
-    /// Always write the skill into `~/.claude/skills/<slug>/`, bypassing the
-    /// `native_skills_enabled()` gate.
-    ///
-    /// Separated from `push_skill` so callers that have already decided native
-    /// skills should be written (legacy reclaim, discovery adoption) — and unit
-    /// tests of the write mechanics — don't depend on the process-global env
-    /// gate. The `reconciler_disabled()` killswitch still applies to the public
-    /// entry points; this inner method assumes the caller honoured it.
-    fn push_skill_inner(
-        &self,
-        slug: &str,
-        installation_id: Option<&str>,
-        skill_md_bytes: &[u8],
-        referenced_files: &[(String, Vec<u8>)],
-    ) -> Result<()> {
         let skills_dir = resolve_skills_dir()?;
         let skill_dir = skills_dir.join(slug);
 
@@ -509,7 +472,7 @@ pub fn reclaim_active_skills(state: &AppState, pusher: &ManagedPathsPusher) -> R
                 continue;
             }
         };
-        match pusher.push_skill_inner(&skill_id, None, &bytes, &[]) {
+        match pusher.push_skill(&skill_id, None, &bytes, &[]) {
             Ok(()) => {
                 reclaimed += 1;
                 info!(
@@ -530,56 +493,73 @@ pub fn reclaim_active_skills(state: &AppState, pusher: &ManagedPathsPusher) -> R
     Ok(reclaimed)
 }
 
-// ── Managed-skill cleanup ──────────────────────────────────────────────────────
+// ── Active-skill self-heal ──────────────────────────────────────────────────────
 
-/// One-shot startup pass: remove every F2-managed native skill directory
-/// (`managed_path_markers` rows of `kind = 'skill'`) from `~/.claude/skills/`.
+/// One-shot startup pass: for every active skill in `installed_skills`, if its
+/// `~/.claude/skills/<slug>` directory is **entirely absent**, re-push it from
+/// the installed copy so the skill reappears in Claude Code's skills list.
 ///
-/// Run when native-skills pushing is disabled (the default) to clean up skill
-/// directories written by earlier runner versions so they stop cluttering
-/// Claude Code's `/`-skills list. The governed skill itself is unaffected — it
-/// stays installed under the runner state dir and is surfaced to AI clients via
-/// the MCP server. Marker + directory removal is idempotent (`remove_skill`).
+/// This heals machines whose native skill dirs were removed out-of-band — e.g.
+/// the v1.0.67 cleanup pass that (incorrectly) deleted installed skills along
+/// with VectorHawk's own command-skills. Going forward it also self-heals any
+/// user-installed skill dir that gets deleted while the daemon is down.
 ///
-/// Returns the number of skills removed. Per-skill failures are logged at WARN
-/// and do not abort the pass.
-pub fn remove_managed_skills(state: &AppState, pusher: &ManagedPathsPusher) -> Result<usize> {
+/// Only acts on missing paths: existing real dirs are left to F2/drift, and
+/// legacy symlinks are handled by [`reclaim_active_skills`]. Reads SKILL.md plus
+/// sibling files from `<install_root>/active/`. Per-skill failures are logged at
+/// WARN and do not abort the pass. Returns the number of skills re-pushed.
+pub fn push_missing_active_skills(state: &AppState, pusher: &ManagedPathsPusher) -> Result<usize> {
     if reconciler_disabled() {
         return Ok(0);
     }
-
-    let slugs: Vec<String> = {
-        let conn = Connection::open(&state.db_path)
-            .context("remove_managed_skills: failed to open state DB")?;
-        let mut stmt = conn
-            .prepare("SELECT slug FROM managed_path_markers WHERE kind = 'skill'")
-            .context("remove_managed_skills: failed to prepare marker query")?;
-        let rows = stmt
-            .query_map([], |row| row.get::<_, String>(0))
-            .context("remove_managed_skills: marker query failed")?;
-        rows.filter_map(|r| r.ok()).collect()
-    };
-
-    if slugs.is_empty() {
+    let active = state
+        .list_active_installed_skills()
+        .context("heal: failed to list active installed skills")?;
+    if active.is_empty() {
         return Ok(0);
     }
 
-    let mut removed = 0usize;
-    for slug in slugs {
-        match pusher.remove_skill(&slug) {
+    let skills_dir = resolve_skills_dir()?;
+    let mut healed: usize = 0;
+
+    for (skill_id, install_root, _active_version) in active {
+        let target = skills_dir.join(&skill_id);
+        // Skip anything that already exists on disk (real dir or symlink) —
+        // those are owned by F2/reclaim/drift, not this heal pass.
+        if target.exists() || target.is_symlink() {
+            continue;
+        }
+        let active_dir = Path::new(&install_root).join("active");
+        let skill_md_path = active_dir.join("SKILL.md");
+        let bytes = match fs::read(&skill_md_path) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    skill_id = %skill_id,
+                    path = %skill_md_path.display(),
+                    error = %e,
+                    "heal: cannot read SKILL.md from installed copy — skipping"
+                );
+                continue;
+            }
+        };
+        let mut refs: Vec<(String, Vec<u8>)> = Vec::new();
+        collect_extras(&active_dir, &active_dir, &mut refs);
+
+        match pusher.push_skill(&skill_id, None, &bytes, &refs) {
             Ok(()) => {
-                removed += 1;
-                info!(slug, "cleanup: removed F2-managed native skill dir");
+                healed += 1;
+                info!(skill_id, "heal: re-pushed missing installed skill dir");
             }
             Err(e) => tracing::warn!(
-                slug,
+                skill_id = %skill_id,
                 error = %e,
-                "cleanup: failed to remove managed skill dir (non-fatal)"
+                "heal: push_skill failed (non-fatal)"
             ),
         }
     }
 
-    Ok(removed)
+    Ok(healed)
 }
 
 // ── Adopt-discovery push ──────────────────────────────────────────────────────
@@ -606,13 +586,6 @@ pub async fn push_adopted_discovery(
         tracing::debug!(slug, kind, "adopt: kind is not 'skill' — push deferred");
         return Ok(());
     }
-    if !native_skills_enabled() {
-        tracing::debug!(
-            slug,
-            "adopt: native skills disabled (default) — skipping push to ~/.claude/skills/"
-        );
-        return Ok(());
-    }
 
     let slug = slug.to_string();
     let source_path = source_path.to_string();
@@ -633,7 +606,7 @@ pub async fn push_adopted_discovery(
 
         let pusher = ManagedPathsPusher::new(&state_clone);
         pusher
-            .push_skill_inner(&slug, None, &skill_md_bytes, &refs)
+            .push_skill(&slug, None, &skill_md_bytes, &refs)
             .context("adopt: push_skill failed")?;
         info!(
             slug,

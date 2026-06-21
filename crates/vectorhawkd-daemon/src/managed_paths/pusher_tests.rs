@@ -384,9 +384,7 @@ fn push_skill_replaces_legacy_symlink_with_real_dir() {
     let prev_home = std::env::var_os("HOME");
     std::env::set_var("HOME", fake_home.path());
 
-    // Exercise the write mechanics directly via the inner method so the test
-    // doesn't depend on the `native_skills_enabled()` env gate.
-    let result = pusher.push_skill_inner(
+    let result = pusher.push_skill(
         "hello-world",
         Some("inst-1"),
         b"---\nname: hello-world\n---\nfresh F2 content\n",
@@ -563,84 +561,84 @@ fn push_skill_is_noop_when_reconciler_disabled() {
     std::env::remove_var("VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER");
 }
 
-// ── native-skills gate (default off) ──────────────────────────────────────────
+// ── push_missing_active_skills (self-heal) ────────────────────────────────────
 
-/// By default (no `VECTORHAWK_ENABLE_NATIVE_SKILLS`) the public `push_skill`
-/// must be a no-op: governed skills are surfaced via MCP, not written into
-/// `~/.claude/skills/`. The gate returns *before* `resolve_skills_dir()` reads
-/// `$HOME`, so this test needs no HOME swap (keeping it free of the suite's
-/// env-var races) — a slug containing a path separator would error if the body
-/// ever ran, proving the early return.
+/// push_missing_active_skills must re-push active installed skills whose
+/// ~/.claude/skills dir is absent, and leave already-present dirs alone.
 #[test]
-fn push_skill_noop_when_native_skills_disabled() {
-    let (pusher, _tmp) = make_pusher();
-    // An invalid slug: if the write body executed it would try to create this as
-    // a directory under ~/.claude/skills and fail. Ok(()) proves we bailed early.
-    let result = pusher.push_skill("../escape/noop-skill", None, b"---\nname: x\n---\n", &[]);
-    assert!(
-        result.is_ok(),
-        "push_skill must no-op (Ok, no filesystem touch) when native skills are disabled"
-    );
-}
-
-/// `remove_managed_skills` must delete every `kind='skill'` marker directory
-/// (cleanup of skill dirs written by older runner versions) and leave non-skill
-/// markers untouched.
-#[test]
-fn remove_managed_skills_removes_skill_dirs_only() {
+fn push_missing_active_skills_repushes_only_absent() {
     let fake_home = tempfile::tempdir().unwrap();
     let prev_home = std::env::var_os("HOME");
     std::env::set_var("HOME", fake_home.path());
 
-    let (pusher, tmp) = make_pusher();
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = camino::Utf8PathBuf::from_path_buf(tmp.path().join("state.db")).unwrap();
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE managed_path_markers (
+            path TEXT PRIMARY KEY, kind TEXT NOT NULL, slug TEXT NOT NULL,
+            installation_id TEXT, source_sha256 TEXT NOT NULL, migrated_at TEXT NOT NULL
+        );
+        CREATE TABLE installed_skills (
+            skill_id TEXT PRIMARY KEY, active_version TEXT NOT NULL,
+            install_root TEXT NOT NULL, channel TEXT, current_status TEXT
+        );",
+    )
+    .unwrap();
+
+    // Active skill "alpha" — installed copy exists, but its ~/.claude/skills dir
+    // is MISSING (the v1.0.67-wipe scenario). Must be re-pushed.
+    let install_root_1 = fake_home
+        .path()
+        .join("app-support")
+        .join("skills")
+        .join("alpha");
+    fs::create_dir_all(install_root_1.join("active")).unwrap();
+    fs::write(
+        install_root_1.join("active").join("SKILL.md"),
+        b"---\nname: alpha\n---\nbody",
+    )
+    .unwrap();
+
+    // Active skill "beta" — already present in ~/.claude/skills. Must be skipped.
+    let install_root_2 = fake_home
+        .path()
+        .join("app-support")
+        .join("skills")
+        .join("beta");
+    fs::create_dir_all(install_root_2.join("active")).unwrap();
+    fs::write(
+        install_root_2.join("active").join("SKILL.md"),
+        b"---\nname: beta\n---\nbody",
+    )
+    .unwrap();
+    let skills_dir = fake_home.path().join(".claude").join("skills");
+    fs::create_dir_all(skills_dir.join("beta")).unwrap();
+    fs::write(skills_dir.join("beta").join("SKILL.md"), b"preexisting").unwrap();
+
+    conn.execute(
+        "INSERT INTO installed_skills(skill_id, active_version, install_root, channel, current_status) VALUES
+            ('alpha','1.0.0',?1,'stable','active'),
+            ('beta','1.0.0',?2,'stable','active')",
+        rusqlite::params![install_root_1.to_string_lossy(), install_root_2.to_string_lossy()],
+    )
+    .unwrap();
+    drop(conn);
+
     let state = vectorhawkd_core::state::AppState {
         root_dir: camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap(),
-        db_path: pusher.db_path.clone(),
+        db_path,
     };
+    let pusher = ManagedPathsPusher::new(&state);
 
-    // Seed two native skill dirs via the inner (gate-bypassing) writer, plus a
-    // plugin marker that must survive the cleanup.
-    pusher
-        .push_skill_inner("alpha", None, b"---\nname: alpha\n---\n", &[])
-        .unwrap();
-    pusher
-        .push_skill_inner("beta", None, b"---\nname: beta\n---\n", &[])
-        .unwrap();
-    pusher
-        .push_plugin("gamma", None, &serde_json::json!({"name": "gamma"}))
-        .unwrap();
+    let healed = push_missing_active_skills(&state, &pusher).unwrap();
 
-    let skills_dir = fake_home.path().join(".claude").join("skills");
-    assert!(skills_dir.join("alpha").is_dir());
-    assert!(skills_dir.join("beta").is_dir());
-
-    let removed = remove_managed_skills(&state, &pusher).unwrap();
-
-    let alpha_gone = !skills_dir.join("alpha").exists();
-    let beta_gone = !skills_dir.join("beta").exists();
-    let plugin_survives = fake_home
-        .path()
-        .join(".claude")
-        .join("plugins")
-        .join("gamma")
-        .exists();
-
-    // No skill markers should remain; the plugin marker should.
-    let conn = Connection::open(&pusher.db_path).unwrap();
-    let skill_markers: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM managed_path_markers WHERE kind = 'skill'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    let plugin_markers: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM managed_path_markers WHERE kind = 'plugin'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
+    let alpha_now = skills_dir.join("alpha");
+    let alpha_pushed = alpha_now.is_dir()
+        && alpha_now.join(".vectorhawk-managed.json").exists()
+        && fs::read(alpha_now.join("SKILL.md")).unwrap() == b"---\nname: alpha\n---\nbody";
+    let beta_untouched =
+        fs::read(skills_dir.join("beta").join("SKILL.md")).unwrap() == b"preexisting";
 
     if let Some(v) = prev_home {
         std::env::set_var("HOME", v);
@@ -648,9 +646,13 @@ fn remove_managed_skills_removes_skill_dirs_only() {
         std::env::remove_var("HOME");
     }
 
-    assert_eq!(removed, 2, "both skill dirs must be removed");
-    assert!(alpha_gone && beta_gone, "skill dirs must be deleted");
-    assert!(plugin_survives, "plugin dir must NOT be touched");
-    assert_eq!(skill_markers, 0, "skill markers must be cleared");
-    assert_eq!(plugin_markers, 1, "plugin marker must survive");
+    assert_eq!(healed, 1, "only the missing 'alpha' must be re-pushed");
+    assert!(
+        alpha_pushed,
+        "alpha must be materialized with content + marker"
+    );
+    assert!(
+        beta_untouched,
+        "beta already present — must not be overwritten"
+    );
 }

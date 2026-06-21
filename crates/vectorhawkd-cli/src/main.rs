@@ -3910,7 +3910,7 @@ async fn cmd_mcp_serve(server: Option<String>) -> Result<()> {
 
 async fn cmd_mcp_setup(client: Option<&str>, dry_run: bool) -> Result<()> {
     use vectorhawkd_mcp::setup::{
-        build_mcp_entry, detect_ai_clients, detect_claude_code, install_claude_skills,
+        build_mcp_entry, detect_ai_clients, detect_claude_code, uninstall_claude_skills,
         write_mcp_entry, MCP_SERVER_NAME,
     };
 
@@ -3996,21 +3996,23 @@ async fn cmd_mcp_setup(client: Option<&str>, dry_run: bool) -> Result<()> {
             }
         }
 
-        // Install slash commands whenever Claude Code is present (configured or not).
+        // Remove VectorHawk's own command-skills whenever Claude Code is present.
+        // These wrapped MCP tools as slash commands and cluttered the skills
+        // list; management now lives in the portal. User-installed skills are
+        // untouched.
         let has_claude_code = clients.iter().any(|c| c.name == "Claude Code");
         if has_claude_code || wrote_claude_code {
-            match install_claude_skills() {
-                Ok(installed) if !installed.is_empty() => {
+            match uninstall_claude_skills() {
+                Ok(removed) if !removed.is_empty() => {
                     println!(
-                        "Installed {} VectorHawk slash command(s) to ~/.claude/skills/.",
-                        installed.len()
+                        "Removed {} VectorHawk command-skill(s) from ~/.claude/skills/ \
+                         (manage skills in the portal or via the vectorhawk MCP tools).",
+                        removed.len()
                     );
                 }
-                Ok(_) => {
-                    println!("VectorHawk slash commands already up to date.");
-                }
+                Ok(_) => {}
                 Err(e) => {
-                    eprintln!("warning: failed to install slash commands: {e:#}");
+                    eprintln!("warning: failed to remove command-skills: {e:#}");
                 }
             }
         }
@@ -4087,16 +4089,16 @@ async fn cmd_mcp_setup(client: Option<&str>, dry_run: bool) -> Result<()> {
                 );
             }
 
-            match install_claude_skills() {
-                Ok(installed) if !installed.is_empty() => {
+            match uninstall_claude_skills() {
+                Ok(removed) if !removed.is_empty() => {
                     println!(
-                        "Installed {} VectorHawk slash command(s) to ~/.claude/skills/.",
-                        installed.len()
+                        "Removed {} VectorHawk command-skill(s) from ~/.claude/skills/.",
+                        removed.len()
                     );
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    eprintln!("warning: failed to install slash commands: {e:#}");
+                    eprintln!("warning: failed to remove command-skills: {e:#}");
                 }
             }
         }
