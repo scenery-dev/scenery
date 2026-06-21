@@ -450,6 +450,27 @@ pub enum PluginCommand {
         #[arg(long, value_name = "DIR")]
         output_dir: Option<camino::Utf8PathBuf>,
     },
+
+    /// Install a governed plugin from the registry.
+    ///
+    /// Requests the install via the portal; the daemon then registers it as a
+    /// self-contained Claude Code plugin (it appears in `/plugin list`, bundling
+    /// its skills). Requires `vectorhawk auth login`.
+    Install {
+        /// Plugin slug to install (as shown in the catalog).
+        slug: String,
+
+        /// Specific version to install; omit for the latest published version.
+        #[arg(long)]
+        version: Option<String>,
+
+        #[arg(
+            long,
+            env = "VECTORHAWK_REGISTRY_URL",
+            default_value = "https://app.vectorhawk.ai"
+        )]
+        registry_url: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -596,6 +617,11 @@ async fn run(cli: Cli) -> Result<()> {
             format,
             output_dir,
         }) => cmd_plugin_export(path, format, output_dir).await,
+        Command::Plugin(PluginCommand::Install {
+            slug,
+            version,
+            registry_url,
+        }) => cmd_plugin_install(&slug, version.as_deref(), &registry_url).await,
         Command::Plugin(PluginCommand::Import { path, output_dir }) => {
             cmd_plugin_import(path, output_dir).await
         }
@@ -3904,6 +3930,75 @@ async fn cmd_mcp_serve(server: Option<String>) -> Result<()> {
     // re-adds it for `tools/call`. This is used by the per-server entries
     // that F2 writes into ~/.claude.json.
     vectorhawkd_shim::run_shim(server).await
+}
+
+// ── plugin install ─────────────────────────────────────────────────────────────
+
+async fn cmd_plugin_install(slug: &str, version: Option<&str>, registry_url: &str) -> Result<()> {
+    use vectorhawkd_core::{auth::load_tokens, state::AppState};
+
+    let state = AppState::bootstrap().context("failed to bootstrap state")?;
+    let tokens = load_tokens(&state, registry_url)
+        .ok()
+        .flatten()
+        .ok_or_else(|| {
+            anyhow::anyhow!("Not logged in to {registry_url}. Run `vectorhawk auth login` first.")
+        })?;
+
+    let mut body = serde_json::json!({ "plugin_slug": slug });
+    if let Some(v) = version {
+        body["version"] = serde_json::Value::String(v.to_string());
+    }
+
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "{}/api/plugin-installations",
+            registry_url.trim_end_matches('/')
+        ))
+        .bearer_auth(&tokens.access_token)
+        .json(&body)
+        .send()
+        .await
+        .context("failed to reach registry")?;
+
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        anyhow::bail!("Authentication failed — run `vectorhawk auth login` and try again.");
+    }
+    if status == reqwest::StatusCode::NOT_FOUND {
+        anyhow::bail!("Plugin '{slug}' not found in the catalog.");
+    }
+    if status == reqwest::StatusCode::CONFLICT {
+        println!("Plugin '{slug}' is already installed.");
+        return Ok(());
+    }
+    if !status.is_success() {
+        anyhow::bail!("Install failed ({status}): {text}");
+    }
+
+    println!("Installing plugin '{slug}'…");
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+        if let Some(ver) = v.get("version").and_then(|s| s.as_str()) {
+            println!("  version: {ver}");
+        }
+        for w in v
+            .get("warnings")
+            .and_then(|w| w.as_array())
+            .into_iter()
+            .flatten()
+        {
+            if let Some(s) = w.as_str() {
+                println!("  warning: {s}");
+            }
+        }
+    }
+    println!(
+        "Requested. The daemon will register it as a Claude Code plugin shortly — \
+         run `claude plugin list` (restart Claude Code to pick it up)."
+    );
+    Ok(())
 }
 
 // ── mcp setup ────────────────────────────────────────────────────────────────
