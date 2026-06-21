@@ -1,0 +1,62 @@
+# ci.yml — VectorHawk runner CI
+#
+# fmt + clippy + unit tests on every push / PR. Complements release.yml
+# (which only builds tagged releases and ran no tests).
+#
+# Tests run SINGLE-THREADED: several daemon tests mutate process-global env
+# vars (HOME, VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER) that production code
+# reads, so they race under the default parallel test runner. Single-threaded
+# execution sidesteps that without per-test serialization.
+# VECTORHAWK_DISABLE_KEYCHAIN=1 keeps auth-token tests off any real keychain.
+
+name: ci
+
+on:
+  push:
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/ci.yml'
+  pull_request:
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/ci.yml'
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  VECTORHAWK_DISABLE_KEYCHAIN: "1"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt + clippy + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable + clippy + rustfmt)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      # Lint lib + bin targets (not --all-targets: test targets carry a
+      # pre-existing unused-import warning that would trip -D warnings).
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace -- -D warnings
+
+      # --lib only: integration tests under tests/ are environment-heavy
+      # (acceptance scripts, sockets, ports) and run on the dedicated test box,
+      # not generic CI. --test-threads=1 avoids the env-var test races above.
+      - name: Unit tests
+        run: cargo test --workspace --lib -- --test-threads=1
