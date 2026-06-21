@@ -445,6 +445,11 @@ struct OwnedKeychainBlob {
 }
 
 /// Result of probing the OS keychain for an entry.
+//
+// On Linux the `keyring` crate is not linked and `keychain_get` always returns
+// `Unavailable`, so `Found`/`NotFound` are never constructed there. Scope the
+// dead-code allowance to non-macOS/Windows so those platforms stay strict.
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 enum KeychainProbe {
     /// Keychain returned a value successfully.
     Found(OwnedKeychainBlob),
