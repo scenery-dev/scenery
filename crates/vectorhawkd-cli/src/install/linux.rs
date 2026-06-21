@@ -232,7 +232,7 @@ fn install_systemd(bin_path: &std::path::Path) -> Result<()> {
         use std::os::unix::process::CommandExt;
         let xdg_clone = xdg.clone();
         let _ = unsafe {
-            std::process::Command::new(&bin_path)
+            std::process::Command::new(bin_path)
                 .args(["daemon", "run", "--foreground"])
                 .env("XDG_RUNTIME_DIR", &xdg_clone)
                 .stdin(std::process::Stdio::null())
