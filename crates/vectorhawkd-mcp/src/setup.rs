@@ -29,17 +29,44 @@ pub const MCP_ARGS: &[&str] = &["mcp", "serve"];
 
 /// Build the JSON value for a single AI client's MCP server config entry.
 pub fn build_mcp_entry() -> serde_json::Value {
-    // Use the absolute path to the current binary so AI clients that spawn
-    // processes with a non-login shell (no Linuxbrew/Homebrew on PATH) can
-    // still find the executable.
-    let command = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.to_str().map(|s| s.to_string()))
-        .unwrap_or_else(|| MCP_COMMAND.to_string());
     serde_json::json!({
-        "command": command,
+        "command": resolve_mcp_command(),
         "args": MCP_ARGS,
     })
+}
+
+/// Resolve the absolute command path an AI client should spawn for the shim.
+///
+/// We write an absolute path (not bare `vectorhawk`) because AI clients launch
+/// MCP servers with a non-login shell that often lacks Homebrew/Linuxbrew on
+/// PATH. But `current_exe()` canonicalizes through symlinks to the *version-
+/// pinned* Homebrew Cellar path (`…/Cellar/vectorhawk/<ver>/bin/vectorhawk`),
+/// which `brew upgrade` deletes — leaving the client pointing at a dead binary.
+/// So when a Cellar layout is detected, rewrite to the stable `<prefix>/bin`
+/// symlink Homebrew keeps current across upgrades.
+fn resolve_mcp_command() -> String {
+    match std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(|s| s.to_string()))
+    {
+        Some(exe) => stable_command_from_exe(&exe, |p| std::path::Path::new(p).exists()),
+        None => MCP_COMMAND.to_string(),
+    }
+}
+
+/// Rewrite a Homebrew Cellar exe path (`<prefix>/Cellar/vectorhawk/<ver>/bin/<bin>`)
+/// to the version-independent `<prefix>/bin/<bin>` symlink when that symlink
+/// exists; otherwise return `exe` unchanged. Pure, with an injectable existence
+/// check so the rewrite is unit-testable without a real Homebrew install.
+fn stable_command_from_exe(exe: &str, exists: impl Fn(&str) -> bool) -> String {
+    const CELLAR: &str = "/Cellar/vectorhawk/";
+    if let Some(idx) = exe.find(CELLAR) {
+        let stable = format!("{}/bin/{}", &exe[..idx], MCP_COMMAND);
+        if exists(&stable) {
+            return stable;
+        }
+    }
+    exe.to_string()
 }
 
 /// Build the full `mcpServers` block suitable for merging into a client config.
@@ -669,6 +696,44 @@ mod tests {
         let args = entry["args"].as_array().unwrap();
         assert_eq!(args[0], "mcp");
         assert_eq!(args[1], "serve");
+    }
+
+    #[test]
+    fn stable_command_rewrites_homebrew_cellar() {
+        // Linuxbrew
+        assert_eq!(
+            stable_command_from_exe(
+                "/home/linuxbrew/.linuxbrew/Cellar/vectorhawk/1.0.65/bin/vectorhawk",
+                |_| true,
+            ),
+            "/home/linuxbrew/.linuxbrew/bin/vectorhawk"
+        );
+        // macOS Apple-silicon Homebrew
+        assert_eq!(
+            stable_command_from_exe(
+                "/opt/homebrew/Cellar/vectorhawk/1.0.65/bin/vectorhawk",
+                |_| true,
+            ),
+            "/opt/homebrew/bin/vectorhawk"
+        );
+    }
+
+    #[test]
+    fn stable_command_keeps_non_cellar_paths() {
+        // A plain install symlink is already stable — leave it.
+        let bin = "/usr/local/bin/vectorhawk";
+        assert_eq!(stable_command_from_exe(bin, |_| true), bin);
+        // A cargo dev build is not a Homebrew layout — leave it.
+        let dev = "/home/dev/vectorhawkd/target/release/vectorhawk";
+        assert_eq!(stable_command_from_exe(dev, |_| true), dev);
+    }
+
+    #[test]
+    fn stable_command_falls_back_when_symlink_missing() {
+        // If the <prefix>/bin symlink doesn't exist, keep the real Cellar path
+        // rather than inventing a dead one.
+        let cellar = "/opt/homebrew/Cellar/vectorhawk/1.0.65/bin/vectorhawk";
+        assert_eq!(stable_command_from_exe(cellar, |_| false), cellar);
     }
 
     #[test]
