@@ -33,7 +33,9 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::managed_paths::ManagedPathsPusher;
-use crate::sync::sse_client::{InstallationRecord, McpInstallationRecord, SyncEvent};
+use crate::sync::sse_client::{
+    InstallationRecord, McpInstallationRecord, PluginSkillRef, SyncEvent,
+};
 use vectorhawkd_core::{
     auth::load_all_tokens,
     registry::RegistryClient,
@@ -347,6 +349,42 @@ async fn dispatch_event(
                 pusher,
             );
         }
+        SyncEvent::InstallPlugin {
+            installation_id,
+            plugin_slug,
+            plugin_name,
+            description,
+            version,
+            author,
+            skills,
+        } => {
+            spawn_install_plugin(
+                installation_id,
+                plugin_slug,
+                plugin_name,
+                description,
+                version,
+                author,
+                skills,
+                state,
+                registry_url,
+                sem,
+                stats,
+                install_tasks,
+            );
+        }
+        SyncEvent::DeactivatePlugin {
+            installation_id,
+            plugin_slug,
+        } => {
+            spawn_deactivate_plugin(
+                installation_id,
+                plugin_slug,
+                state,
+                registry_url,
+                install_tasks,
+            );
+        }
         SyncEvent::Snapshot {
             installations,
             mcp_installations,
@@ -403,7 +441,10 @@ async fn dispatch_event(
                     SyncEvent::Snapshot { .. } => {
                         // Nested snapshots not expected; ignore.
                     }
-                    SyncEvent::InstallMcp { .. } | SyncEvent::DeactivateMcp { .. } => {}
+                    SyncEvent::InstallMcp { .. }
+                    | SyncEvent::DeactivateMcp { .. }
+                    | SyncEvent::InstallPlugin { .. }
+                    | SyncEvent::DeactivatePlugin { .. } => {}
                 }
             }
 
@@ -629,6 +670,209 @@ fn spawn_deactivate_mcp(
             pusher.as_deref(),
         )
         .await
+    });
+}
+
+// ── Plugin install/deactivate handlers ──────────────────────────────────────────
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_install_plugin(
+    installation_id: Uuid,
+    plugin_slug: String,
+    plugin_name: String,
+    description: String,
+    version: String,
+    author: String,
+    skills: Vec<PluginSkillRef>,
+    state: &Arc<AppState>,
+    registry_url: &str,
+    sem: &Arc<tokio::sync::Semaphore>,
+    stats: &Arc<Mutex<ReconcilerStats>>,
+    install_tasks: &mut tokio::task::JoinSet<bool>,
+) {
+    let st = Arc::clone(state);
+    let reg_url = registry_url.to_string();
+    let sem_clone = Arc::clone(sem);
+    let stats_clone = Arc::clone(stats);
+
+    increment_pending(stats);
+
+    install_tasks.spawn(async move {
+        let _permit = sem_clone.acquire().await;
+        handle_install_plugin(
+            installation_id,
+            &plugin_slug,
+            &plugin_name,
+            &description,
+            &version,
+            &author,
+            &skills,
+            &st,
+            &reg_url,
+            &stats_clone,
+        )
+        .await
+    });
+}
+
+/// Install a governed plugin as a self-contained Claude Code plugin: ensure each
+/// bundled skill is present in local state (downloading if needed — without a
+/// standalone native-skill push), assemble the bundle, and register/enable it in
+/// the local `vectorhawk` marketplace.
+#[allow(clippy::too_many_arguments)]
+async fn handle_install_plugin(
+    installation_id: Uuid,
+    plugin_slug: &str,
+    plugin_name: &str,
+    description: &str,
+    version: &str,
+    author: &str,
+    skills: &[PluginSkillRef],
+    state: &Arc<AppState>,
+    registry_url: &str,
+    stats: &Arc<Mutex<ReconcilerStats>>,
+) -> bool {
+    match do_install_plugin(
+        installation_id,
+        plugin_slug,
+        plugin_name,
+        description,
+        version,
+        author,
+        skills,
+        state,
+        registry_url,
+    )
+    .await
+    {
+        Ok(()) => {
+            decrement_pending_inc_installed(stats);
+            report_installation_status(installation_id, "installed", None, registry_url, state)
+                .await;
+            true
+        }
+        Err(e) => {
+            warn!(plugin_slug, error = %e, "reconciler: plugin install failed");
+            report_installation_status(
+                installation_id,
+                "error",
+                Some(&e.to_string()),
+                registry_url,
+                state,
+            )
+            .await;
+            decrement_pending_inc_errors(stats);
+            false
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn do_install_plugin(
+    installation_id: Uuid,
+    plugin_slug: &str,
+    plugin_name: &str,
+    description: &str,
+    version: &str,
+    author: &str,
+    skills: &[PluginSkillRef],
+    state: &Arc<AppState>,
+    registry_url: &str,
+) -> Result<()> {
+    // 1. Ensure each bundled skill is present in local state, then read its
+    //    content. Downloads happen on a blocking thread; no native-skill push —
+    //    the skill lives only inside the plugin bundle (self-contained model).
+    let mut bundled = Vec::with_capacity(skills.len());
+    for skill in skills {
+        let already = check_version_local(state, &skill.skill_id, &skill.version)
+            .await
+            .unwrap_or(false);
+        if !already {
+            let st = Arc::clone(state);
+            let reg = registry_url.to_string();
+            let sid = skill.skill_id.clone();
+            let ver = skill.version.clone();
+            tokio::task::spawn_blocking(move || {
+                install_from_registry_blocking(&st, &reg, &sid, &ver, installation_id)
+            })
+            .await
+            .context("plugin: skill download task panicked")?
+            .with_context(|| {
+                format!("plugin: failed to install bundled skill {}", skill.skill_id)
+            })?;
+        }
+
+        let active_dir = state
+            .root_dir
+            .join("skills")
+            .join(&skill.skill_id)
+            .join("active");
+        let skill_md = std::fs::read(active_dir.join("SKILL.md")).with_context(|| {
+            format!(
+                "plugin: cannot read SKILL.md for bundled skill {}",
+                skill.skill_id
+            )
+        })?;
+        let files = collect_referenced_files(active_dir.as_std_path());
+        bundled.push(crate::managed_paths::BundledSkill {
+            skill_id: skill.skill_id.clone(),
+            skill_md,
+            files,
+        });
+    }
+
+    // 2. Materialize + register the plugin (direct file writes) off the async
+    //    executor — the marketplace pusher does synchronous filesystem I/O.
+    let bundle = crate::managed_paths::PluginBundle {
+        slug: plugin_slug.to_string(),
+        name: plugin_name.to_string(),
+        description: description.to_string(),
+        version: version.to_string(),
+        author: author.to_string(),
+        skills: bundled,
+    };
+    tokio::task::spawn_blocking(move || crate::managed_paths::install_plugin_bundle(&bundle))
+        .await
+        .context("plugin: marketplace write task panicked")?
+        .context("plugin: failed to write plugin into vectorhawk marketplace")?;
+
+    info!(
+        plugin_slug,
+        version, "reconciler: plugin installed into /plugin list"
+    );
+    Ok(())
+}
+
+fn spawn_deactivate_plugin(
+    installation_id: Uuid,
+    plugin_slug: String,
+    state: &Arc<AppState>,
+    registry_url: &str,
+    install_tasks: &mut tokio::task::JoinSet<bool>,
+) {
+    let st = Arc::clone(state);
+    let reg_url = registry_url.to_string();
+    install_tasks.spawn(async move {
+        let slug = plugin_slug.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            crate::managed_paths::uninstall_plugin_bundle(&plugin_slug)
+        })
+        .await;
+        match res {
+            Ok(Ok(())) => {
+                report_installation_status(installation_id, "deactivated", None, &reg_url, &st)
+                    .await;
+                true
+            }
+            Ok(Err(e)) => {
+                warn!(plugin_slug = %slug, error = %e, "reconciler: plugin deactivate failed");
+                false
+            }
+            Err(e) => {
+                warn!(plugin_slug = %slug, error = %e, "reconciler: plugin deactivate task panicked");
+                false
+            }
+        }
     });
 }
 

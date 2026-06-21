@@ -540,6 +540,29 @@ pub enum SyncEvent {
         installation_id: Uuid,
         mcp_server_id: Uuid,
     },
+    /// Install a governed plugin as a self-contained Claude Code plugin
+    /// (registered in the local `vectorhawk` marketplace, bundling its skills).
+    InstallPlugin {
+        installation_id: Uuid,
+        plugin_slug: String,
+        plugin_name: String,
+        description: String,
+        version: String,
+        author: String,
+        skills: Vec<PluginSkillRef>,
+    },
+    /// Deactivate (remove) a governed plugin from Claude Code.
+    DeactivatePlugin {
+        installation_id: Uuid,
+        plugin_slug: String,
+    },
+}
+
+/// A skill reference carried by an `install_plugin` event.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct PluginSkillRef {
+    pub skill_id: String,
+    pub version: String,
 }
 
 /// One entry in a [`SyncEvent::Snapshot`] skill installations list.
@@ -619,6 +642,27 @@ pub struct WireDeactivateMcp {
     pub mcp_server_id: Uuid,
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct WireInstallPlugin {
+    installation_id: Uuid,
+    plugin_slug: String,
+    #[serde(default)]
+    plugin_name: String,
+    #[serde(default)]
+    description: String,
+    version: String,
+    #[serde(default)]
+    author: String,
+    #[serde(default)]
+    skills: Vec<PluginSkillRef>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct WireDeactivatePlugin {
+    installation_id: Uuid,
+    plugin_slug: String,
+}
+
 /// Wire payload for the `state` event. The daemon ignores `state` events with
 /// `kind == "mcp"` that it doesn't recognize — same pattern as skill state events.
 #[derive(Debug, serde::Deserialize)]
@@ -681,6 +725,27 @@ fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
             Ok(SyncEvent::DeactivateMcp {
                 installation_id: wire.installation_id,
                 mcp_server_id: wire.mcp_server_id,
+            })
+        }
+        "install_plugin" => {
+            let wire: WireInstallPlugin = serde_json::from_str(data)
+                .with_context(|| format!("failed to parse install_plugin event: {data}"))?;
+            Ok(SyncEvent::InstallPlugin {
+                installation_id: wire.installation_id,
+                plugin_slug: wire.plugin_slug,
+                plugin_name: wire.plugin_name,
+                description: wire.description,
+                version: wire.version,
+                author: wire.author,
+                skills: wire.skills,
+            })
+        }
+        "deactivate_plugin" => {
+            let wire: WireDeactivatePlugin = serde_json::from_str(data)
+                .with_context(|| format!("failed to parse deactivate_plugin event: {data}"))?;
+            Ok(SyncEvent::DeactivatePlugin {
+                installation_id: wire.installation_id,
+                plugin_slug: wire.plugin_slug,
             })
         }
         "state" => {
