@@ -149,7 +149,7 @@ tar -xzf "${TMPDIR}/${TARBALL}" -C "${TMPDIR}"
 
 mkdir -p "${INSTALL_DIR}"
 
-for _bin in vectorhawk vectorhawkd vectorhawkd-shim; do
+for _bin in vectorhawk; do
     # Support both flat tarballs (./binary) and subdirectoried ones
     # (vectorhawk-VERSION-TRIPLE/binary) by searching after extraction.
     _src="$(find "${TMPDIR}" -name "${_bin}" -type f | head -1)"

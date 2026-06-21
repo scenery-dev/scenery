@@ -58,8 +58,8 @@ echo ""
 
 # ── Initial cleanup — kill stale daemon + remove socket (321ca06 pattern) ────
 
-echo "Initial cleanup: killing any stale vectorhawkd and removing socket ..."
-pkill -x vectorhawkd >/dev/null 2>&1 || true
+echo "Initial cleanup: killing any stale vectorhawk daemon and removing socket ..."
+pkill -x vectorhawk >/dev/null 2>&1 || true
 sleep 0.5
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
@@ -90,7 +90,7 @@ for gate in m0 m1 m2 m3 m4 d1; do
             "${gate}_acceptance.sh returned non-zero — re-run it directly for details"
     fi
     # Re-kill stale processes after each gate (each gate may leave a daemon running).
-    pkill -x vectorhawkd >/dev/null 2>&1 || true
+    pkill -x vectorhawk >/dev/null 2>&1 || true
     sleep 0.5
     rm -f "${SOCK_PATH}" 2>/dev/null || true
 done
@@ -104,12 +104,12 @@ else
     record "FAIL" "Build: release workspace" "cargo build --workspace --release FAILED"
 fi
 
-SHIM_BIN="${REPO_ROOT}/target/release/vectorhawkd-shim"
+SHIM_BIN="${REPO_ROOT}/target/release/vectorhawk"
 
 # ── AC1: 5-shim 1000-call stress test ────────────────────────────────────────
 
 echo "AC1: m5_stress_multi_shim (5 shims, 1000 calls) ..."
-pkill -x vectorhawkd >/dev/null 2>&1 || true
+pkill -x vectorhawk >/dev/null 2>&1 || true
 sleep 0.3
 rm -f "${SOCK_PATH}" 2>/dev/null || true
 
@@ -124,14 +124,14 @@ else
 fi
 rm -f "${STRESS_OUT}"
 
-pkill -x vectorhawkd >/dev/null 2>&1 || true
+pkill -x vectorhawk >/dev/null 2>&1 || true
 sleep 0.3
 rm -f "${SOCK_PATH}" 2>/dev/null || true
 
 # ── AC2: mid-load kill test ───────────────────────────────────────────────────
 
 echo "AC2: m5_stress_kill (SIGKILL at 500 calls, -32001 contract) ..."
-pkill -x vectorhawkd >/dev/null 2>&1 || true
+pkill -x vectorhawk >/dev/null 2>&1 || true
 sleep 0.3
 rm -f "${SOCK_PATH}" 2>/dev/null || true
 
@@ -146,14 +146,14 @@ else
 fi
 rm -f "${KILL_OUT}"
 
-pkill -x vectorhawkd >/dev/null 2>&1 || true
+pkill -x vectorhawk >/dev/null 2>&1 || true
 sleep 0.3
 rm -f "${SOCK_PATH}" 2>/dev/null || true
 
 # ── AC3: idle RSS ─────────────────────────────────────────────────────────────
 
 echo "AC3: daemon idle RSS (<=50 MB) ..."
-pkill -x vectorhawkd >/dev/null 2>&1 || true
+pkill -x vectorhawk >/dev/null 2>&1 || true
 sleep 0.3
 rm -f "${SOCK_PATH}" 2>/dev/null || true
 
@@ -168,14 +168,14 @@ else
 fi
 rm -f "${IDLE_RSS_OUT}"
 
-pkill -x vectorhawkd >/dev/null 2>&1 || true
+pkill -x vectorhawk >/dev/null 2>&1 || true
 sleep 0.3
 rm -f "${SOCK_PATH}" 2>/dev/null || true
 
 # ── AC3: under-load RSS ───────────────────────────────────────────────────────
 
 echo "AC3: daemon under-load RSS (<=100 MB) via measure_daemon_rss_under_load.sh ..."
-pkill -x vectorhawkd >/dev/null 2>&1 || true
+pkill -x vectorhawk >/dev/null 2>&1 || true
 sleep 0.3
 rm -f "${SOCK_PATH}" 2>/dev/null || true
 
@@ -192,7 +192,7 @@ else
 fi
 rm -f "${UNDERLOAD_OUT}"
 
-pkill -x vectorhawkd >/dev/null 2>&1 || true
+pkill -x vectorhawk >/dev/null 2>&1 || true
 sleep 0.3
 rm -f "${SOCK_PATH}" 2>/dev/null || true
 
@@ -223,7 +223,7 @@ else
 
     for _run in 1 2 3; do
         # Use /usr/bin/time -p for portable real-time output on macOS + Linux.
-        TIME_OUT="$(/usr/bin/time -p "${SHIM_BIN}" </dev/null 2>&1 || true)"
+        TIME_OUT="$(/usr/bin/time -p "${SHIM_BIN}" mcp serve </dev/null 2>&1 || true)"
         # /usr/bin/time -p outputs: "real N.NN" on both macOS and Linux.
         REAL_LINE="$(echo "${TIME_OUT}" | grep '^real')"
         REAL_SECS="$(echo "${REAL_LINE}" | awk '{print $2}')"

@@ -106,9 +106,9 @@ fn kill_child(child: &mut Child) {
 }
 
 fn kill_stale_daemon() {
-    // `-x` for exact process-name match — see m0_acceptance::kill_stale_daemon
+    // `-x vectorhawk` for exact process-name match — see m0_acceptance::kill_stale_daemon
     // for why `-f` was wrong on Linux.
-    let _ = Command::new("pkill").args(["-x", "vectorhawkd"]).status();
+    let _ = Command::new("pkill").args(["-x", "vectorhawk"]).status();
     std::thread::sleep(Duration::from_millis(300));
 }
 
@@ -171,16 +171,16 @@ fn send_rpc(
 #[test]
 #[ignore = "requires pre-built release binaries — run cargo build --workspace --release first"]
 fn m1_fifty_concurrent_tool_calls_no_deadlock() {
-    let daemon_bin = release_bin("vectorhawkd");
-    let shim_bin = release_bin("vectorhawkd-shim");
+    let daemon_bin = release_bin("vectorhawk");
+    let shim_bin = release_bin("vectorhawk");
 
     assert!(
         daemon_bin.exists(),
-        "daemon binary not found at {daemon_bin:?} — run cargo build --workspace --release"
+        "vectorhawk binary not found at {daemon_bin:?} — run cargo build --workspace --release"
     );
     assert!(
         shim_bin.exists(),
-        "shim binary not found at {shim_bin:?} — run cargo build --workspace --release"
+        "vectorhawk binary not found at {shim_bin:?} — run cargo build --workspace --release"
     );
 
     let socket_path = daemon_socket_path();
@@ -189,10 +189,11 @@ fn m1_fifty_concurrent_tool_calls_no_deadlock() {
     remove_socket_if_present(&socket_path);
 
     let mut daemon = Command::new(&daemon_bin)
+        .args(["daemon", "run"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("failed to spawn vectorhawkd");
+        .expect("failed to spawn vectorhawk daemon run");
 
     let socket_appeared = wait_for_socket(&socket_path, Duration::from_secs(5));
     if !socket_appeared {
@@ -206,11 +207,12 @@ fn m1_fifty_concurrent_tool_calls_no_deadlock() {
     // ---- Establish shim + get the tool name ---------------------------------
 
     let mut primary_shim = Command::new(&shim_bin)
+        .args(["mcp", "serve"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .expect("failed to spawn shim");
+        .expect("failed to spawn vectorhawk mcp serve");
 
     let mut primary_stdin = primary_shim.stdin.take().expect("shim stdin");
     let primary_stdout_raw = primary_shim.stdout.take().expect("shim stdout");
@@ -284,11 +286,12 @@ fn m1_fifty_concurrent_tool_calls_no_deadlock() {
 
             std::thread::spawn(move || {
                 let mut shim = Command::new(&bin)
+                    .args(["mcp", "serve"])
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::null())
                     .spawn()
-                    .expect("spawn shim");
+                    .expect("spawn vectorhawk mcp serve");
 
                 let mut stdin = shim.stdin.take().expect("stdin");
                 let stdout_raw = shim.stdout.take().expect("stdout");
@@ -437,16 +440,16 @@ fn m1_fifty_concurrent_tool_calls_no_deadlock() {
 #[test]
 #[ignore = "requires pre-built release binaries — run cargo build --workspace --release first"]
 fn m1_slow_backend_does_not_block_independent_calls() {
-    let daemon_bin = release_bin("vectorhawkd");
-    let shim_bin = release_bin("vectorhawkd-shim");
+    let daemon_bin = release_bin("vectorhawk");
+    let shim_bin = release_bin("vectorhawk");
 
     assert!(
         daemon_bin.exists(),
-        "daemon binary not found at {daemon_bin:?} — run cargo build --workspace --release"
+        "vectorhawk binary not found at {daemon_bin:?} — run cargo build --workspace --release"
     );
     assert!(
         shim_bin.exists(),
-        "shim binary not found at {shim_bin:?} — run cargo build --workspace --release"
+        "vectorhawk binary not found at {shim_bin:?} — run cargo build --workspace --release"
     );
 
     let socket_path = daemon_socket_path();
@@ -457,11 +460,12 @@ fn m1_slow_backend_does_not_block_independent_calls() {
     // Spawn daemon with the stub-latency env var. Every stub backend
     // dispatch will sleep 1.5 s in spawn_blocking.
     let mut daemon = Command::new(&daemon_bin)
+        .args(["daemon", "run"])
         .env("VECTORHAWK_STUB_LATENCY_MS", "1500")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("failed to spawn vectorhawkd");
+        .expect("failed to spawn vectorhawk daemon run");
 
     let socket_appeared = wait_for_socket(&socket_path, Duration::from_secs(5));
     if !socket_appeared {
@@ -474,11 +478,12 @@ fn m1_slow_backend_does_not_block_independent_calls() {
     // Discover the stub tool name via a quick shim.
     let tool_name = {
         let mut probe = Command::new(&shim_bin)
+            .args(["mcp", "serve"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .expect("spawn probe shim");
+            .expect("spawn vectorhawk mcp serve (probe)");
         let mut stdin = probe.stdin.take().expect("stdin");
         let stdout_raw = probe.stdout.take().expect("stdout");
         let mut stdout = std::io::BufReader::new(stdout_raw);
@@ -517,11 +522,12 @@ fn m1_slow_backend_does_not_block_independent_calls() {
         let tool = tool_name.clone();
         slow_handles.push(std::thread::spawn(move || {
             let mut shim = Command::new(&bin)
+                .args(["mcp", "serve"])
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
                 .spawn()
-                .expect("spawn slow-call shim");
+                .expect("spawn vectorhawk mcp serve (slow-call)");
             let mut stdin = shim.stdin.take().expect("stdin");
             let stdout_raw = shim.stdout.take().expect("stdout");
             let mut stdout = std::io::BufReader::new(stdout_raw);
@@ -560,11 +566,12 @@ fn m1_slow_backend_does_not_block_independent_calls() {
 
     let fast_start = Instant::now();
     let mut fast_shim = Command::new(&shim_bin)
+        .args(["mcp", "serve"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn fast probe shim");
+        .expect("spawn vectorhawk mcp serve (fast probe)");
     let mut fast_stdin = fast_shim.stdin.take().expect("stdin");
     let fast_stdout_raw = fast_shim.stdout.take().expect("stdout");
     let mut fast_stdout = std::io::BufReader::new(fast_stdout_raw);

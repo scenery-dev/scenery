@@ -35,8 +35,10 @@ gh project view 1 --owner vectorhawk --web
 
 - Internal / code / repo: `vectorhawkd`
 - Public / marketing / user-facing docs: "the VectorHawk runner" or "the runner"
-- Daemon binary: `vectorhawkd` (from `vectorhawkd-daemon`)
-- User CLI binary: `vectorhawk` (from `vectorhawkd-cli`) — what users actually type. `vectorhawk mcp serve` is the shim.
+- Single shipped binary: `vectorhawk` (from `vectorhawkd-cli`) — what users actually type.
+  - `vectorhawk daemon run` starts the long-running daemon (previously a standalone `vectorhawkd` binary).
+  - `vectorhawk mcp serve` is the MCP relay/shim (previously a standalone `vectorhawkd-shim` binary).
+  - `vectorhawkd` is the repo/workspace name only, not a binary name.
 
 ## Architecture (M0 target)
 
@@ -63,9 +65,9 @@ crates/
 ├── vectorhawkd-manifest/   library — manifest types, ports skillrunner-manifest
 ├── vectorhawkd-core/       library — state, installer, registry, policy, executor (ports skillrunner-core)
 ├── vectorhawkd-mcp/        library — MCP protocol, aggregator, Backend trait (ports skillrunner-mcp protocol/tools/aggregator/sampling/setup)
-├── vectorhawkd-daemon/     binary — vectorhawkd long-running agent
-├── vectorhawkd-shim/       binary — stdio↔socket relay with EmbeddedBackend fallback
-└── vectorhawkd-cli/        binary — vectorhawk user CLI
+├── vectorhawkd-daemon/     library — daemon entry point (vectorhawkd_daemon::run_daemon); reused by vectorhawk CLI via `daemon run`
+├── vectorhawkd-shim/       library — stdio↔socket relay entry point (vectorhawkd_shim::run_shim); reused by vectorhawk CLI via `mcp serve`
+└── vectorhawkd-cli/        binary — vectorhawk (the only shipped binary; embeds daemon + shim via `daemon run` / `mcp serve` subcommands)
 ```
 
 ## Build & dev

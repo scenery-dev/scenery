@@ -41,7 +41,7 @@ case "$(uname -s)" in
     Linux)  _M2_INIT_SOCK="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/vectorhawk/agent.sock" ;;
     *)      _M2_INIT_SOCK="${HOME}/.local/share/vectorhawk/agent.sock" ;;
 esac
-pkill -x vectorhawkd 2>/dev/null || true
+pkill -x vectorhawk 2>/dev/null || true
 rm -f "${_M2_INIT_SOCK}" 2>/dev/null || true
 unset _M2_INIT_SOCK
 

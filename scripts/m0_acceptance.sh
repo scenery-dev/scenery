@@ -36,8 +36,6 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DAEMON_BIN="${REPO_ROOT}/target/release/vectorhawkd"
-SHIM_BIN="${REPO_ROOT}/target/release/vectorhawkd-shim"
 CLI_BIN="${REPO_ROOT}/target/release/vectorhawk"
 
 # Initial cleanup — required when chained from another gate. Each gate must
@@ -47,7 +45,7 @@ case "$(uname -s)" in
     Linux)  _M0_INIT_SOCK="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/vectorhawk/agent.sock" ;;
     *)      _M0_INIT_SOCK="${HOME}/.local/share/vectorhawk/agent.sock" ;;
 esac
-pkill -x vectorhawkd 2>/dev/null || true
+pkill -x vectorhawk 2>/dev/null || true
 rm -f "${_M0_INIT_SOCK}" 2>/dev/null || true
 unset _M0_INIT_SOCK
 
@@ -81,7 +79,7 @@ echo ""
 # ── Preflight: require built binaries ────────────────────────────────────────
 
 BINARIES_MISSING=0
-for bin in "${DAEMON_BIN}" "${SHIM_BIN}"; do
+for bin in "${CLI_BIN}"; do
     if [[ ! -x "${bin}" ]]; then
         BINARIES_MISSING=1
         echo "ERROR: binary not built yet: ${bin}" >&2
@@ -90,7 +88,7 @@ done
 
 if [[ "${BINARIES_MISSING}" -eq 1 ]]; then
     echo "" >&2
-    echo "ERROR: one or more required binaries are missing." >&2
+    echo "ERROR: vectorhawk binary is missing." >&2
     echo "       Run:  cargo build --workspace --release" >&2
     echo "       Then: bash scripts/m0_acceptance.sh" >&2
     echo "" >&2
@@ -225,7 +223,7 @@ for i in "${!RESULTS[@]}"; do
 done
 
 echo ""
-echo "Shim binary size: ${SHIM_SIZE} (budget <=6 MB)"
+echo "Unified vectorhawk binary size: ${SHIM_SIZE} (informational)"
 echo ""
 
 if [[ "${OVERALL_PASS}" -eq 1 ]]; then

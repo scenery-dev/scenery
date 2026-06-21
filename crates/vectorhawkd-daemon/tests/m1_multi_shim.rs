@@ -8,7 +8,7 @@
 //!
 //! This test:
 //! 1. Spawns `vectorhawkd` (daemon).
-//! 2. Spawns 3 `vectorhawkd-shim` processes concurrently, each piped for JSON-RPC.
+//! 2. Spawns 3 `vectorhawk mcp serve` processes concurrently, each piped for JSON-RPC.
 //! 3. Each shim performs: `initialize` + `tools/list` + 3 × `tools/call` (9 total).
 //! 4. Asserts all shims see the same sorted tool list.
 //! 5. Asserts all 9 tool calls succeed.
@@ -86,9 +86,9 @@ fn kill_child(child: &mut Child) {
 }
 
 fn kill_stale_daemon() {
-    // `-x` for exact process-name match — see m0_acceptance::kill_stale_daemon
+    // `-x vectorhawk` for exact process-name match — see m0_acceptance::kill_stale_daemon
     // for why `-f` was wrong on Linux.
-    let _ = Command::new("pkill").args(["-x", "vectorhawkd"]).status();
+    let _ = Command::new("pkill").args(["-x", "vectorhawk"]).status();
     std::thread::sleep(Duration::from_millis(300));
 }
 
@@ -139,11 +139,14 @@ fn send_rpc(
 /// number of successful tool calls.
 fn drive_shim(shim_bin: &PathBuf, shim_index: usize) -> (Vec<String>, usize) {
     let mut shim = Command::new(shim_bin)
+        .args(["mcp", "serve"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .unwrap_or_else(|e| panic!("shim #{shim_index}: failed to spawn: {e}"));
+        .unwrap_or_else(|e| {
+            panic!("shim #{shim_index}: failed to spawn vectorhawk mcp serve: {e}")
+        });
 
     let mut stdin = shim.stdin.take().expect("shim stdin");
     let stdout_raw = shim.stdout.take().expect("shim stdout");
@@ -272,16 +275,16 @@ fn drive_shim(shim_bin: &PathBuf, shim_index: usize) -> (Vec<String>, usize) {
 #[test]
 #[ignore = "requires pre-built release binaries — run cargo build --workspace --release first"]
 fn m1_three_concurrent_shims_shared_tool_list_and_audit() {
-    let daemon_bin = release_bin("vectorhawkd");
-    let shim_bin = release_bin("vectorhawkd-shim");
+    let daemon_bin = release_bin("vectorhawk");
+    let shim_bin = release_bin("vectorhawk");
 
     assert!(
         daemon_bin.exists(),
-        "daemon binary not found at {daemon_bin:?} — run cargo build --workspace --release"
+        "vectorhawk binary not found at {daemon_bin:?} — run cargo build --workspace --release"
     );
     assert!(
         shim_bin.exists(),
-        "shim binary not found at {shim_bin:?} — run cargo build --workspace --release"
+        "vectorhawk binary not found at {shim_bin:?} — run cargo build --workspace --release"
     );
 
     let socket_path = daemon_socket_path();
@@ -292,10 +295,11 @@ fn m1_three_concurrent_shims_shared_tool_list_and_audit() {
 
     // Spawn daemon.
     let mut daemon = Command::new(&daemon_bin)
+        .args(["daemon", "run"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("failed to spawn vectorhawkd");
+        .expect("failed to spawn vectorhawk daemon run");
 
     let socket_appeared = wait_for_socket(&socket_path, Duration::from_secs(5));
     if !socket_appeared {

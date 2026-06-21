@@ -32,7 +32,7 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SHIM_BIN="${REPO_ROOT}/target/release/vectorhawkd-shim"
+SHIM_BIN="${REPO_ROOT}/target/release/vectorhawk"
 CLI_BIN="${REPO_ROOT}/target/release/vectorhawk"
 
 if [[ -t 1 ]]; then
@@ -88,7 +88,7 @@ fi
 echo "AC1+AC2: shim emits daemon-required error when daemon is down ..."
 
 # Make absolutely sure no daemon is running so the test is deterministic.
-pkill -x vectorhawkd >/dev/null 2>&1 || true
+pkill -x vectorhawk >/dev/null 2>&1 || true
 sleep 0.3
 
 # Find a temp HOME so the shim can compute a socket path and find it absent.
@@ -105,7 +105,7 @@ trap 'rm -rf "${TMP_HOME}" "${SHIM_OUT}" "${SHIM_ERR}"' EXIT
 
 # Run shim in a subshell with HOME redirected; pipe in the request and EOF.
 HOME="${TMP_HOME}" XDG_RUNTIME_DIR="${TMP_HOME}/runtime" \
-    "${SHIM_BIN}" >"${SHIM_OUT}" 2>"${SHIM_ERR}" <<EOF &
+    "${SHIM_BIN}" mcp serve >"${SHIM_OUT}" 2>"${SHIM_ERR}" <<EOF &
 ${INIT_REQ}
 EOF
 SHIM_PID=$!
