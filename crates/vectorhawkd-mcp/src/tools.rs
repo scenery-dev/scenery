@@ -121,6 +121,29 @@ fn build_tool_list_inner(
         tools.extend(skill_tools);
     }
 
+    // Login is the bootstrap tool: always expose it when a registry URL exists
+    // and the user is not logged in — even when the builtin management tools are
+    // gated off — otherwise a fresh, unauthenticated runner returns zero tools
+    // and there is no way to authenticate over MCP (chicken-and-egg).
+    if registry_url.is_some() && !logged_in {
+        tools.push(ToolDefinition {
+            name: "vectorhawk_login".to_string(),
+            description: "Log in to the VectorHawk registry to unlock searching, installing, \
+                and governance features. Opens a browser-based OAuth login flow."
+                .to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "registry_url": {
+                        "type": "string",
+                        "description": "Optional registry URL override (defaults to the server's configured registry URL)"
+                    }
+                },
+                "required": []
+            }),
+        });
+    }
+
     if !expose_builtins {
         return tools;
     }
@@ -334,26 +357,6 @@ fn build_tool_list_inner(
                     }
                 },
                 "required": ["server_name"]
-            }),
-        });
-    }
-
-    // Login is available when a registry URL exists and user is not logged in
-    if registry_url.is_some() && !logged_in {
-        tools.push(ToolDefinition {
-            name: "vectorhawk_login".to_string(),
-            description: "Log in to the VectorHawk registry to unlock searching, installing, \
-                and governance features. Opens a browser-based OAuth login flow."
-                .to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "registry_url": {
-                        "type": "string",
-                        "description": "Optional registry URL override (defaults to the server's configured registry URL)"
-                    }
-                },
-                "required": []
             }),
         });
     }
@@ -2763,6 +2766,30 @@ mod tests {
         assert!(
             !names.contains(&"vectorhawk_logout"),
             "logout should not appear when not logged in"
+        );
+
+        let _ = fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn login_exposed_without_builtins_when_logged_out() {
+        // Regression: vectorhawk_login must surface even when builtin management
+        // tools are gated off (VECTORHAWK_EXPOSE_BUILTIN_TOOLS unset), otherwise
+        // a fresh unauthenticated runner exposes zero tools and cannot log in.
+        let state_root = temp_root("tool-list-login-no-builtins");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+        let url = "http://localhost:8000".to_string();
+
+        let tools = build_tool_list_inner(&state, &Some(url), false);
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+
+        assert!(
+            names.contains(&"vectorhawk_login"),
+            "login must appear when logged out even with builtins off: {names:?}"
+        );
+        assert!(
+            !names.contains(&"vectorhawk_list"),
+            "builtin management tools must remain gated off: {names:?}"
         );
 
         let _ = fs::remove_dir_all(&state_root);
