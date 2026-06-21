@@ -524,18 +524,20 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
         None
     };
 
-    let sync_handle = try_start_sync(
-        &registry_url,
+    let sync_controller = Arc::new(SyncController::new(
+        registry_url.clone(),
         Arc::clone(&sync_state_arc),
         list_changed_tx.clone(),
         Arc::clone(&vh_registry),
         f2_pusher,
-    )
-    .await;
-    if let Some(ref _handle) = sync_handle {
+    ));
+    if sync_controller.ensure_started().await {
         info!("sync subsystem started");
     } else {
-        info!("sync subsystem not started (no auth token or registration failed)");
+        info!(
+            "sync subsystem not started (no auth token or registration failed) — \
+             will start automatically on `auth login` / `auth pair`"
+        );
     }
 
     let mut backend = RealBackend::with_full_context(
@@ -606,6 +608,7 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
                             listener_port,
                             list_changed_tx: list_changed_tx.clone(),
                             discoveries_kick: Arc::clone(&discoveries_kick),
+                            sync_controller: Arc::clone(&sync_controller),
                         };
                         tokio::spawn(socket_dispatch::serve_connection(stream, ctx));
                     }
@@ -803,6 +806,73 @@ fn classify_refresh_failure(
 }
 
 // ── RUN2: Device registration + sync startup ─────────────────────────────────
+
+/// Runtime-controllable handle to the SSE sync subsystem.
+///
+/// At daemon boot we frequently have no auth token yet: the user runs
+/// `vectorhawk auth login` / `auth pair` *after* the daemon is already up.
+/// Without this controller, picking up the new credentials required a full
+/// daemon restart — until then device registration never happened and the SSE
+/// feed delivered nothing (no governed skills/MCP reached the machine).
+///
+/// The CLI calls the `auth/reload` JSON-RPC method after saving tokens, which
+/// invokes [`SyncController::ensure_started`].  The call is idempotent: if sync
+/// is already running it is a no-op, so it is safe to call from every auth path
+/// and on every invocation.
+pub struct SyncController {
+    registry_url: String,
+    state: Arc<AppState>,
+    list_changed_tx: broadcast::Sender<()>,
+    backend_registry: Arc<BackendRegistry>,
+    pusher: Option<Arc<managed_paths::ManagedPathsPusher>>,
+    /// Current reconciler handle, or `None` if sync has not started yet.
+    /// Holding it keeps the (detached) sync tasks' status queryable; the mutex
+    /// also serializes concurrent `ensure_started` callers.
+    handle: tokio::sync::Mutex<Option<sync::ReconcilerHandle>>,
+}
+
+impl SyncController {
+    pub(crate) fn new(
+        registry_url: String,
+        state: Arc<AppState>,
+        list_changed_tx: broadcast::Sender<()>,
+        backend_registry: Arc<BackendRegistry>,
+        pusher: Option<Arc<managed_paths::ManagedPathsPusher>>,
+    ) -> Self {
+        Self {
+            registry_url,
+            state,
+            list_changed_tx,
+            backend_registry,
+            pusher,
+            handle: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    /// Idempotently (re)start the sync subsystem: register the device (if not
+    /// already registered) and spin up the SSE client + reconciler.
+    ///
+    /// Returns `true` if sync is active after the call.  Returns `false` when
+    /// there is still no usable auth token or device registration failed — the
+    /// daemon keeps running and a later `ensure_started` can succeed.
+    pub(crate) async fn ensure_started(&self) -> bool {
+        let mut guard = self.handle.lock().await;
+        if guard.is_some() {
+            return true;
+        }
+        let started = try_start_sync(
+            &self.registry_url,
+            Arc::clone(&self.state),
+            self.list_changed_tx.clone(),
+            Arc::clone(&self.backend_registry),
+            self.pusher.clone(),
+        )
+        .await;
+        let active = started.is_some();
+        *guard = started;
+        active
+    }
+}
 
 /// Register this device with the backend and start the SSE sync subsystem.
 ///

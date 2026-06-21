@@ -10,6 +10,7 @@
 //! |--------|--------|---------|
 //! | `auth/get_oauth_listener_port` | `{}` | `{"port": <u16>}` |
 //! | `auth/wait_for_callback` | `{"state": str, "timeout_secs": u64}` | `{"code": str}` |
+//! | `auth/reload` | `{}` | `{"sync_active": bool}` |
 //!
 //! # Timeout semantics
 //!
@@ -24,6 +25,7 @@ use tracing::debug;
 use vectorhawkd_mcp::protocol::{JsonRpcError, JsonRpcResponse, INTERNAL_ERROR, INVALID_PARAMS};
 
 use crate::oauth_state::OAuthState;
+use crate::SyncController;
 
 /// Minimum acceptable `timeout_secs` value.
 const TIMEOUT_SECS_MIN: u64 = 1;
@@ -132,6 +134,22 @@ pub async fn handle_wait_for_callback(
             ),
         ),
     }
+}
+
+/// Handle `auth/reload`.
+///
+/// Called by `vectorhawk auth login` / `auth pair` / `auth token` right after
+/// saving new credentials.  Idempotently registers this device and starts the
+/// SSE sync subsystem so freshly-authenticated daemons begin syncing without a
+/// restart.  Returns `{"sync_active": bool}` — `false` means credentials are
+/// still missing/invalid or device registration failed.
+pub async fn handle_reload(
+    id: Option<serde_json::Value>,
+    sync_controller: Arc<SyncController>,
+) -> JsonRpcResponse {
+    let active = sync_controller.ensure_started().await;
+    debug!(sync_active = active, "auth/reload processed");
+    JsonRpcResponse::success(id, serde_json::json!({ "sync_active": active }))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
