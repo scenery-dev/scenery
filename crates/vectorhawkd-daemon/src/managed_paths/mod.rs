@@ -31,6 +31,7 @@ pub mod drift;
 pub mod marker;
 pub mod migrator;
 pub mod paths;
+pub mod plugin_marketplace;
 pub mod publish;
 pub mod pusher;
 pub mod rollback;
@@ -44,6 +45,9 @@ use vectorhawkd_core::state::AppState;
 pub use discoveries::DiscoveriesScanner;
 pub use drift::DriftScanner;
 pub use marker::ManagedPathMarker;
+pub use plugin_marketplace::{
+    install_plugin_bundle, uninstall_plugin_bundle, BundledSkill, PluginBundle,
+};
 pub use pusher::{push_missing_active_skills, reclaim_active_skills, ManagedPathsPusher};
 pub use rollback::{list_backups, rollback, BackupSummary, RollbackReport};
 pub use scanner::MigrationItem;
