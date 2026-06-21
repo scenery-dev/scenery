@@ -650,12 +650,22 @@ mod tests {
         std::env::temp_dir().join(format!("vh-setup-test-{label}-{nanos}"))
     }
 
+    /// The command `build_mcp_entry` writes: the absolute path to the current
+    /// executable, or the `MCP_COMMAND` fallback when it can't be resolved.
+    /// (Absolute path so AI clients spawning a non-login shell still find it.)
+    fn expected_command() -> String {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.to_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| MCP_COMMAND.to_string())
+    }
+
     // ── build_mcp_entry / block ────────────────────────────────────────────────
 
     #[test]
     fn mcp_entry_has_correct_command_and_args() {
         let entry = build_mcp_entry();
-        assert_eq!(entry["command"], "vectorhawk");
+        assert_eq!(entry["command"], expected_command());
         let args = entry["args"].as_array().unwrap();
         assert_eq!(args[0], "mcp");
         assert_eq!(args[1], "serve");
@@ -665,7 +675,7 @@ mod tests {
     fn mcp_servers_block_nests_correctly() {
         let block = build_mcp_servers_block();
         let entry = &block[MCP_SERVER_NAME];
-        assert_eq!(entry["command"], "vectorhawk");
+        assert_eq!(entry["command"], expected_command());
     }
 
     // ── write_mcp_entry ────────────────────────────────────────────────────────
@@ -687,7 +697,10 @@ mod tests {
 
         let json: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
-        assert_eq!(json["mcpServers"]["vectorhawk"]["command"], "vectorhawk");
+        assert_eq!(
+            json["mcpServers"]["vectorhawk"]["command"],
+            expected_command()
+        );
         assert_eq!(json["mcpServers"]["vectorhawk"]["args"][0], "mcp");
         assert_eq!(json["mcpServers"]["vectorhawk"]["args"][1], "serve");
 
@@ -723,7 +736,10 @@ mod tests {
         let json: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
 
-        assert_eq!(json["mcpServers"]["vectorhawk"]["command"], "vectorhawk");
+        assert_eq!(
+            json["mcpServers"]["vectorhawk"]["command"],
+            expected_command()
+        );
         assert_eq!(json["mcpServers"]["other-tool"]["command"], "other");
 
         let _ = fs::remove_dir_all(&tmp);
@@ -959,7 +975,10 @@ mod tests {
 
         let json: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
-        assert_eq!(json["mcpServers"]["vectorhawk"]["command"], "vectorhawk");
+        assert_eq!(
+            json["mcpServers"]["vectorhawk"]["command"],
+            expected_command()
+        );
 
         let _ = fs::remove_dir_all(&tmp);
     }
@@ -982,7 +1001,10 @@ mod tests {
 
         let json: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
-        assert_eq!(json["mcpServers"]["vectorhawk"]["command"], "vectorhawk");
+        assert_eq!(
+            json["mcpServers"]["vectorhawk"]["command"],
+            expected_command()
+        );
 
         let _ = fs::remove_dir_all(&tmp);
     }
