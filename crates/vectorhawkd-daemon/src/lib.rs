@@ -346,22 +346,37 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     let vh_registry = Arc::new(build_stub_registry());
     load_managed_mcp_into_registry(&state, &vh_registry, list_changed_tx.clone());
 
-    // ── Legacy install reclaim (pre-v1.0.51) ──────────────────────────────────
+    // ── Native skill reconciliation ───────────────────────────────────────────
     //
-    // Before v1.0.51 the core installer also wrote a symlink at
-    // `~/.claude/skills/<slug>` pointing at the runner-managed `active` dir.
-    // v1.0.51 makes the F2 pusher the SOLE writer of that path. On startup
-    // we materialize any surviving legacy symlinks as real F2-managed dirs
-    // (with markers) so the path has a single owner going forward.
+    // By default VectorHawk no longer writes governed skills into
+    // `~/.claude/skills/` — they are surfaced to AI clients via the MCP server
+    // and managed in the portal, so native skills only clutter Claude Code's
+    // `/`-skills list. On startup we remove any skill dirs written by earlier
+    // runner versions (`remove_managed_skills`).
+    //
+    // When `VECTORHAWK_ENABLE_NATIVE_SKILLS=1` is set we instead keep the legacy
+    // behaviour: materialize any surviving pre-v1.0.51 installer symlinks as
+    // real F2-managed dirs so the path has a single owner going forward.
     if std::env::var("VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER").is_err() {
         let one_shot_pusher = managed_paths::ManagedPathsPusher::new(&state);
-        match managed_paths::reclaim_active_skills(&state, &one_shot_pusher) {
-            Ok(n) if n > 0 => info!(
-                reclaimed = n,
-                "reclaim: converted legacy installer symlinks to F2-managed dirs"
-            ),
-            Ok(_) => {}
-            Err(e) => warn!(error = %e, "reclaim: legacy symlink reclaim failed (non-fatal)"),
+        if managed_paths::native_skills_enabled() {
+            match managed_paths::reclaim_active_skills(&state, &one_shot_pusher) {
+                Ok(n) if n > 0 => info!(
+                    reclaimed = n,
+                    "reclaim: converted legacy installer symlinks to F2-managed dirs"
+                ),
+                Ok(_) => {}
+                Err(e) => warn!(error = %e, "reclaim: legacy symlink reclaim failed (non-fatal)"),
+            }
+        } else {
+            match managed_paths::remove_managed_skills(&state, &one_shot_pusher) {
+                Ok(n) if n > 0 => info!(
+                    removed = n,
+                    "cleanup: removed F2-managed native skill dirs (native skills disabled)"
+                ),
+                Ok(_) => {}
+                Err(e) => warn!(error = %e, "cleanup: native skill removal failed (non-fatal)"),
+            }
         }
     }
 
