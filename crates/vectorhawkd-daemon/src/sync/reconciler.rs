@@ -747,13 +747,19 @@ async fn handle_install_plugin(
     {
         Ok(()) => {
             decrement_pending_inc_installed(stats);
-            report_installation_status(installation_id, "installed", None, registry_url, state)
-                .await;
+            report_plugin_installation_status(
+                installation_id,
+                "installed",
+                None,
+                registry_url,
+                state,
+            )
+            .await;
             true
         }
         Err(e) => {
             warn!(plugin_slug, error = %e, "reconciler: plugin install failed");
-            report_installation_status(
+            report_plugin_installation_status(
                 installation_id,
                 "error",
                 Some(&e.to_string()),
@@ -860,8 +866,14 @@ fn spawn_deactivate_plugin(
         .await;
         match res {
             Ok(Ok(())) => {
-                report_installation_status(installation_id, "deactivated", None, &reg_url, &st)
-                    .await;
+                report_plugin_installation_status(
+                    installation_id,
+                    "deactivated",
+                    None,
+                    &reg_url,
+                    &st,
+                )
+                .await;
                 true
             }
             Ok(Err(e)) => {
@@ -2414,7 +2426,54 @@ async fn report_installation_status(
         registry_url.trim_end_matches('/'),
         installation_id
     );
+    patch_state(
+        url,
+        installation_id,
+        status,
+        error_message,
+        registry_url,
+        state,
+    )
+    .await;
+}
 
+/// Report a **plugin** installation's terminal state to the backend. Plugin
+/// parent rows live in a different table than skill installs, so they have a
+/// dedicated runner-facing endpoint (`PATCH /plugin-installations/{id}/state`).
+async fn report_plugin_installation_status(
+    installation_id: Uuid,
+    status: &str,
+    error_message: Option<&str>,
+    registry_url: &str,
+    state: &Arc<AppState>,
+) {
+    let url = format!(
+        "{}/api/plugin-installations/{}/state",
+        registry_url.trim_end_matches('/'),
+        installation_id
+    );
+    patch_state(
+        url,
+        installation_id,
+        status,
+        error_message,
+        registry_url,
+        state,
+    )
+    .await;
+}
+
+/// PATCH a `{ "state": ... }` payload (with optional `error_message`) to an
+/// installation-status endpoint, authenticating with the stored access token.
+/// Failures are logged and swallowed — status reporting is best-effort.
+async fn patch_state(
+    url: String,
+    installation_id: Uuid,
+    status: &str,
+    error_message: Option<&str>,
+    registry_url: &str,
+    state: &Arc<AppState>,
+) {
     let mut body = serde_json::json!({ "state": status });
     if let Some(msg) = error_message {
         body["error_message"] = serde_json::Value::String(msg.to_string());
