@@ -827,6 +827,11 @@ async fn do_install_plugin(
         });
     }
 
+    // 1b. Imported plugins carry their declarative source tree in the registry
+    //     (components.files) — fetch and write it verbatim. Empty for
+    //     VectorHawk-published plugins, which bundle registry skills above.
+    let imported_files = fetch_plugin_version_files(registry_url, plugin_slug, version).await;
+
     // 2. Materialize + register the plugin (direct file writes) off the async
     //    executor — the marketplace pusher does synchronous filesystem I/O.
     let bundle = crate::managed_paths::PluginBundle {
@@ -836,6 +841,7 @@ async fn do_install_plugin(
         version: version.to_string(),
         author: author.to_string(),
         skills: bundled,
+        files: imported_files,
     };
     tokio::task::spawn_blocking(move || crate::managed_paths::install_plugin_bundle(&bundle))
         .await
@@ -847,6 +853,62 @@ async fn do_install_plugin(
         version, "reconciler: plugin installed into /plugin list"
     );
     Ok(())
+}
+
+/// Fetch an imported plugin's mirrored source tree from the registry
+/// (`components.files`). Returns `(relative_path, bytes)` pairs, or empty when
+/// the plugin has no inline files (VectorHawk-published) or the fetch fails —
+/// the install is best-effort and still lists the plugin.
+async fn fetch_plugin_version_files(
+    registry_url: &str,
+    slug: &str,
+    version: &str,
+) -> Vec<(String, Vec<u8>)> {
+    let url = format!(
+        "{}/api/runner/plugins/{}/versions/{}",
+        registry_url.trim_end_matches('/'),
+        slug,
+        version
+    );
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let body: serde_json::Value = match client.get(&url).send().await {
+        Ok(r) if r.status().is_success() => match r.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(slug, error = %e, "reconciler: plugin content parse failed");
+                return Vec::new();
+            }
+        },
+        Ok(r) => {
+            warn!(slug, http_status = %r.status(), "reconciler: plugin content fetch non-success");
+            return Vec::new();
+        }
+        Err(e) => {
+            warn!(slug, error = %e, "reconciler: plugin content fetch failed");
+            return Vec::new();
+        }
+    };
+    let Some(files) = body
+        .get("components")
+        .and_then(|c| c.get("files"))
+        .and_then(|f| f.as_object())
+    else {
+        return Vec::new();
+    };
+    files
+        .iter()
+        .filter_map(|(path, content)| {
+            content
+                .as_str()
+                .map(|s| (path.clone(), s.as_bytes().to_vec()))
+        })
+        .collect()
 }
 
 fn spawn_deactivate_plugin(
