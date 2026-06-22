@@ -52,7 +52,15 @@ pub struct PluginBundle {
     pub description: String,
     pub version: String,
     pub author: String,
+    /// Registry-skill bundling: skills referenced by id and downloaded from the
+    /// registry (used for VectorHawk-published plugins).
     pub skills: Vec<BundledSkill>,
+    /// Imported-plugin content: the plugin's declarative source tree mirrored
+    /// from GitHub (`relative_path -> bytes`), written verbatim into the plugin
+    /// dir. When non-empty this takes precedence over `skills` — the files
+    /// already include `.claude-plugin/plugin.json`, `commands/`, `agents/`,
+    /// `skills/`, etc.
+    pub files: Vec<(String, Vec<u8>)>,
 }
 
 fn reconciler_disabled() -> bool {
@@ -167,13 +175,47 @@ pub fn uninstall_plugin_bundle(slug: &str) -> Result<()> {
 // ── Marketplace source dir ──────────────────────────────────────────────────
 
 fn write_plugin_source(plugin_src: &Path, bundle: &PluginBundle) -> Result<()> {
-    // Start clean so removed skills don't linger.
+    // Start clean so removed content doesn't linger.
     if plugin_src.exists() {
         fs::remove_dir_all(plugin_src).ok();
     }
     let claude_plugin = plugin_src.join(".claude-plugin");
     fs::create_dir_all(&claude_plugin)
         .with_context(|| format!("plugin_marketplace: mkdir {claude_plugin:?}"))?;
+
+    // Imported plugins: write the mirrored source tree verbatim. It already
+    // carries .claude-plugin/plugin.json + commands/agents/skills.
+    if !bundle.files.is_empty() {
+        let mut wrote_plugin_json = false;
+        for (rel, bytes) in &bundle.files {
+            // Guard against path traversal in the relative paths.
+            if rel.contains("..") {
+                continue;
+            }
+            let dest = plugin_src.join(rel);
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent).ok();
+            }
+            atomic_write(&dest, bytes)?;
+            if rel == ".claude-plugin/plugin.json" {
+                wrote_plugin_json = true;
+            }
+        }
+        // Ensure a plugin.json exists even if the mirror somehow lacked one.
+        if !wrote_plugin_json {
+            let manifest = json!({
+                "name": bundle.slug,
+                "version": bundle.version,
+                "description": bundle.description,
+                "author": { "name": bundle.author },
+            });
+            atomic_write(
+                &claude_plugin.join("plugin.json"),
+                serde_json::to_vec_pretty(&manifest)?.as_slice(),
+            )?;
+        }
+        return Ok(());
+    }
 
     let manifest = json!({
         "name": bundle.slug,

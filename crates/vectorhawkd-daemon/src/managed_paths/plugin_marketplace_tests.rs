@@ -16,6 +16,7 @@ fn bundle() -> PluginBundle {
             skill_md: b"---\nname: tdd\n---\nWrite tests first.".to_vec(),
             files: vec![("prompts/x.md".to_string(), b"p".to_vec())],
         }],
+        files: vec![],
     }
 }
 
@@ -79,6 +80,72 @@ fn install_plugin_bundle_writes_full_state() {
     );
     assert!(enabled_ok, "settings enables the plugin");
     assert!(extra_mkt_ok, "settings declares the marketplace");
+}
+
+#[test]
+fn install_plugin_bundle_writes_imported_file_tree_verbatim() {
+    let fake_home = tempfile::tempdir().unwrap();
+    let prev = std::env::var_os("HOME");
+    std::env::set_var("HOME", fake_home.path());
+
+    let b = PluginBundle {
+        slug: "caveman".to_string(),
+        name: "caveman".to_string(),
+        description: "Talk like caveman".to_string(),
+        version: "0.1.0".to_string(),
+        author: "Julius Brussee".to_string(),
+        skills: vec![],
+        files: vec![
+            (
+                ".claude-plugin/plugin.json".to_string(),
+                br#"{"name":"caveman","description":"x"}"#.to_vec(),
+            ),
+            (
+                "commands/caveman.toml".to_string(),
+                b"prompt = 'ugh'".to_vec(),
+            ),
+            (
+                "agents/cavecrew-builder.md".to_string(),
+                b"---\nname: cavecrew-builder\n---\nbuild".to_vec(),
+            ),
+            (
+                "skills/caveman/SKILL.md".to_string(),
+                b"---\nname: caveman\n---\ncompress".to_vec(),
+            ),
+            // Path-traversal attempt must be ignored.
+            ("../evil.sh".to_string(), b"rm -rf".to_vec()),
+        ],
+    };
+
+    let result = install_plugin_bundle(&b);
+
+    let h = fake_home.path();
+    let src = h.join(".claude/plugins/marketplaces/vectorhawk/plugins/caveman");
+    let pj_ok = src.join(".claude-plugin/plugin.json").exists();
+    let cmd_ok = std::fs::read(src.join("commands/caveman.toml")).unwrap() == b"prompt = 'ugh'";
+    let agent_ok = src.join("agents/cavecrew-builder.md").exists();
+    let skill_ok = src.join("skills/caveman/SKILL.md").exists();
+    let cache_ok = h
+        .join(".claude/plugins/cache/vectorhawk/caveman/0.1.0/commands/caveman.toml")
+        .exists();
+    let traversal_blocked = !h
+        .join(".claude/plugins/marketplaces/vectorhawk/evil.sh")
+        .exists()
+        && !h.join(".claude/plugins/marketplaces/evil.sh").exists();
+
+    if let Some(v) = prev {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+
+    assert!(result.is_ok(), "install must succeed");
+    assert!(pj_ok, "mirrored plugin.json written");
+    assert!(cmd_ok, "command file written verbatim");
+    assert!(agent_ok, "agent file written");
+    assert!(skill_ok, "skill file written");
+    assert!(cache_ok, "tree copied into cache");
+    assert!(traversal_blocked, "path traversal entry must be skipped");
 }
 
 #[test]
