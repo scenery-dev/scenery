@@ -71,7 +71,7 @@ use tokio::{
 use tracing::{error, info, warn};
 use vectorhawkd_core::{
     audit::{AuditBuffer, SqliteAuditBuffer},
-    auth::{load_all_tokens, record_refresh_failure, save_tokens, AuthClient},
+    auth::{load_all_tokens, load_tokens, record_refresh_failure, save_tokens, AuthClient},
     gateway_model::GatewayModelClient,
     model::ModelClient,
     ollama::OllamaClient,
@@ -1091,12 +1091,15 @@ pub fn run_sync_tick(
     // execution stats, skill ratings) send the device Bearer token.
     // The token-refresh loop may have rotated it since the last tick; reading
     // fresh from SQLite each tick ensures we use the current token.
-    match load_all_tokens(&state_view) {
-        Ok(rows) => {
-            // The daemon has a single registry_url; use the first non-empty token.
-            if let Some(row) = rows.into_iter().find(|r| !r.access_token.is_empty()) {
-                registry.set_auth(&row.access_token);
-            }
+    match load_tokens(&state_view, &registry.base_url) {
+        Ok(Some(tokens)) if !tokens.access_token.is_empty() => {
+            registry.set_auth(&tokens.access_token);
+        }
+        Ok(_) => {
+            // No token stored for the configured registry URL — clear any stale
+            // token that may have been set by a previous tick or a different
+            // registry URL, so we do not accidentally send the wrong credentials.
+            registry.clear_auth();
         }
         Err(e) => {
             warn!(error = %e, "sync: failed to load auth token; audit upload will be unauthenticated");
