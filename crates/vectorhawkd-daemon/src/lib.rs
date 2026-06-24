@@ -1085,6 +1085,41 @@ pub fn run_sync_tick(
         db_path: db_path.clone(),
     };
 
+    // ── 0. Auth token + device ID sync ───────────────────────────────────────
+    // Load the current access token from SQLite and install it on the shared
+    // RegistryClient so that all authenticated calls in this tick (audit upload,
+    // execution stats, skill ratings) send the device Bearer token.
+    // The token-refresh loop may have rotated it since the last tick; reading
+    // fresh from SQLite each tick ensures we use the current token.
+    match load_all_tokens(&state_view) {
+        Ok(rows) => {
+            // The daemon has a single registry_url; use the first non-empty token.
+            if let Some(row) = rows.into_iter().find(|r| !r.access_token.is_empty()) {
+                registry.set_auth(&row.access_token);
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, "sync: failed to load auth token; audit upload will be unauthenticated");
+        }
+    }
+
+    // Load the backend-assigned device UUID (stored in sync_state["device_id"]
+    // at registration time) and install it on the registry client so audit
+    // uploads include X-Device-ID.  Without this header the backend cannot
+    // attribute events to an org and they are invisible in the admin Activity Log.
+    match state_view.get_sync_state("device_id") {
+        Ok(Some(id)) => {
+            registry.set_device_id(&id);
+        }
+        Ok(None) => {
+            // Device not yet registered — events will upload without X-Device-ID
+            // and be unattributed until registration completes.
+        }
+        Err(e) => {
+            warn!(error = %e, "sync: failed to load device_id for X-Device-ID audit header");
+        }
+    }
+
     // ── 1. Audit flush ────────────────────────────────────────────────────────
     match audit.flush(&state_view) {
         Ok(n) if n > 0 => info!(count = n, "sync: audit flush uploaded events"),

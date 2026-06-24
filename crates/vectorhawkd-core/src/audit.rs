@@ -243,6 +243,43 @@ impl AuditBuffer for SqliteAuditBuffer {
     }
 }
 
+// ── Offline-safe direct write ─────────────────────────────────────────────────
+
+/// Write one audit event row directly to the SQLite store at `db_path`.
+///
+/// This is the escape hatch for callers (CLI commands) that do not hold a
+/// `SqliteAuditBuffer` — typically because the daemon is not running and there
+/// is no `RegistryClient` in scope.  The row survives in `audit_events` with
+/// `uploaded = 0`; the daemon's `SqliteAuditBuffer::flush()` on its next sync
+/// tick will upload it and delete the row.
+///
+/// On failure the error is logged at WARN level and swallowed.  Audit recording
+/// must never block or abort a CLI command.
+pub fn write_audit_event_direct(db_path: &camino::Utf8Path, event: &AuditEvent) {
+    let result = write_audit_event_direct_inner(db_path, event);
+    if let Err(e) = result {
+        warn!(error = %e, event_type = %event.event_type, "failed to record audit event to local store");
+    }
+}
+
+fn write_audit_event_direct_inner(
+    db_path: &camino::Utf8Path,
+    event: &AuditEvent,
+) -> Result<()> {
+    let conn = Connection::open(db_path).context("failed to open state DB for audit")?;
+    let payload_json = serde_json::to_string(&event.payload)
+        .context("failed to serialize audit event payload")?;
+    let now = unix_now() as i64;
+    conn.execute(
+        "INSERT INTO audit_events (event_type, payload, created_at, uploaded) \
+         VALUES (?1, ?2, ?3, 0)",
+        params![event.event_type, payload_json, now],
+    )
+    .context("failed to insert audit event")?;
+    debug!(event_type = %event.event_type, "audit event written directly to local store");
+    Ok(())
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn unix_now() -> u64 {

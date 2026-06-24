@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     io::{Read, Write},
+    sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
 use tracing::{debug, warn};
@@ -234,10 +235,21 @@ pub struct AuditEventPayload {
 ///
 /// Handles policy lookup, artifact metadata, package downloads, and audit
 /// upload. Has no local state — use [`HttpPolicyClient`] for cached policy.
+///
+/// `auth_token` and `device_id` are interior-mutable (`Mutex<Option<String>>`)
+/// so the daemon's sync loop can update them on a shared `Arc<RegistryClient>`
+/// without needing exclusive ownership.  Contention is negligible: both fields
+/// are read only by HTTP call sites (one at a time in the blocking sync thread)
+/// and written only by the sync/refresh loops.
 pub struct RegistryClient {
     pub base_url: String,
     pub http: reqwest::blocking::Client,
-    auth_token: Option<String>,
+    auth_token: Mutex<Option<String>>,
+    /// Backend-assigned device UUID stored in `sync_state` under key
+    /// `"device_id"`.  Sent as `X-Device-ID` on audit uploads so the backend
+    /// can attribute events to an org even when the Bearer token is scoped to
+    /// a user rather than a device.
+    device_id: Mutex<Option<String>>,
 }
 
 impl RegistryClient {
@@ -249,19 +261,60 @@ impl RegistryClient {
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .expect("HTTP client should build"),
-            auth_token: None,
+            auth_token: Mutex::new(None),
+            device_id: Mutex::new(None),
         }
     }
 
     /// Set the Bearer auth token for authenticated requests (consuming).
-    pub fn with_auth(mut self, token: impl Into<String>) -> Self {
-        self.auth_token = Some(token.into());
+    pub fn with_auth(self, token: impl Into<String>) -> Self {
+        if let Ok(mut guard) = self.auth_token.lock() {
+            *guard = Some(token.into());
+        }
         self
     }
 
-    /// Set the auth token on an existing client (non-consuming).
-    pub fn set_auth(&mut self, token: impl Into<String>) {
-        self.auth_token = Some(token.into());
+    /// Set the auth token on an existing client.
+    ///
+    /// Safe to call from any thread even when the client is behind `Arc<…>`.
+    pub fn set_auth(&self, token: impl Into<String>) {
+        if let Ok(mut guard) = self.auth_token.lock() {
+            *guard = Some(token.into());
+        }
+    }
+
+    /// Clear the stored auth token (e.g. on logout or token expiry).
+    pub fn clear_auth(&self) {
+        if let Ok(mut guard) = self.auth_token.lock() {
+            *guard = None;
+        }
+    }
+
+    /// Set the backend device UUID used as `X-Device-ID` on audit uploads.
+    ///
+    /// This is the UUID the backend assigned at device registration and stored
+    /// in `sync_state` under key `"device_id"`.  It must be set by the daemon
+    /// sync loop so audit events are attributed to the correct org.
+    pub fn set_device_id(&self, id: impl Into<String>) {
+        if let Ok(mut guard) = self.device_id.lock() {
+            *guard = Some(id.into());
+        }
+    }
+
+    /// Return a clone of the stored auth token, if any.
+    fn get_auth_token(&self) -> Option<String> {
+        self.auth_token
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+    }
+
+    /// Return a clone of the stored device ID, if any.
+    fn get_device_id(&self) -> Option<String> {
+        self.device_id
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
     }
 
     /// Fetch the list of approved backend MCP servers for this device.
@@ -352,6 +405,11 @@ impl RegistryClient {
     }
 
     /// Report an audit batch to the registry.
+    ///
+    /// Sends the device Bearer token if one has been set via [`set_auth`].
+    /// The backend requires authentication on `POST /api/runner/audit`; if no
+    /// token is present the request is sent unauthenticated and will be
+    /// rejected with 401 once the backend enables auth enforcement.
     pub fn upload_audit_batch(&self, events: &[AuditEventPayload]) -> Result<()> {
         if events.is_empty() {
             return Ok(());
@@ -361,8 +419,15 @@ impl RegistryClient {
         debug!(url, count = events.len(), "uploading audit batch");
 
         let mut req = self.http.post(&url).json(events);
-        if let Some(token) = &self.auth_token {
+        if let Some(token) = self.get_auth_token() {
             req = req.bearer_auth(token);
+        }
+        // X-Device-ID enables the backend to attribute audit events to an org.
+        // Without it, events persist but are invisible in the admin Activity Log
+        // because the org FK is null.  The value is the backend-assigned device
+        // UUID stored in sync_state under "device_id".
+        if let Some(id) = self.get_device_id() {
+            req = req.header("X-Device-ID", id);
         }
 
         let resp = req
@@ -572,7 +637,7 @@ impl RegistryClient {
         source_tar_gz_bytes: Vec<u8>,
         publish_from_discovery_id: Option<&str>,
     ) -> Result<CompilePublishResponse> {
-        let token = self.auth_token.as_ref().ok_or_else(|| {
+        let token = self.get_auth_token().ok_or_else(|| {
             anyhow::anyhow!("not authenticated; run `vectorhawk auth login` first")
         })?;
 
@@ -639,7 +704,7 @@ impl RegistryClient {
         debug!(url, "fetching preinstall governance");
 
         let mut req = self.http.get(&url);
-        if let Some(token) = &self.auth_token {
+        if let Some(token) = self.get_auth_token() {
             req = req.bearer_auth(token);
         }
 
@@ -668,7 +733,7 @@ impl RegistryClient {
     /// Calls `POST /runner/import/preview` with Bearer auth.
     /// Requires that `auth_token` be set.
     pub fn runner_import_preview(&self, raw_input: &str) -> Result<ImportPreview> {
-        let token = self.auth_token.as_ref().ok_or_else(|| {
+        let token = self.get_auth_token().ok_or_else(|| {
             anyhow::anyhow!(
                 "not authenticated; run `vectorhawk auth login` before using registry import"
             )
@@ -720,7 +785,7 @@ impl RegistryClient {
     /// Calls `POST /runner/import/submit` with Bearer auth.
     /// Requires that `auth_token` be set.
     pub fn runner_import_submit(&self, preview: &ImportPreview) -> Result<ImportOutcome> {
-        let token = self.auth_token.as_ref().ok_or_else(|| {
+        let token = self.get_auth_token().ok_or_else(|| {
             anyhow::anyhow!(
                 "not authenticated; run `vectorhawk auth login` before using registry import"
             )
@@ -778,7 +843,7 @@ impl RegistryClient {
     ///
     /// Requires that `auth_token` be set.
     pub fn import_preview(&self, input: &str) -> Result<serde_json::Value> {
-        let token = self.auth_token.as_ref().ok_or_else(|| {
+        let token = self.get_auth_token().ok_or_else(|| {
             anyhow::anyhow!(
                 "not authenticated; run `vectorhawk auth login` before using import preview"
             )
@@ -828,7 +893,7 @@ impl RegistryClient {
     ///
     /// Requires that `auth_token` be set.
     pub fn import_submit(&self, input: &str) -> Result<serde_json::Value> {
-        let token = self.auth_token.as_ref().ok_or_else(|| {
+        let token = self.get_auth_token().ok_or_else(|| {
             anyhow::anyhow!(
                 "not authenticated; run `vectorhawk auth login` before using import submit"
             )
@@ -901,7 +966,7 @@ impl RegistryClient {
             .collect();
 
         let mut req = self.http.post(&url).json(&payload);
-        if let Some(token) = &self.auth_token {
+        if let Some(token) = self.get_auth_token() {
             req = req.bearer_auth(token);
         }
 
@@ -936,7 +1001,7 @@ impl RegistryClient {
         debug!(url, count = stats.len(), "uploading execution stats");
 
         let mut req = self.http.post(&url).json(stats);
-        if let Some(token) = &self.auth_token {
+        if let Some(token) = self.get_auth_token() {
             req = req.bearer_auth(token);
         }
 

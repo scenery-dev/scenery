@@ -1369,7 +1369,10 @@ const REGISTRY_INSTALL_POLL_TIMEOUT_SECS: u64 = 120;
 const REGISTRY_INSTALL_POLL_INTERVAL_MS: u64 = 500;
 
 async fn cmd_skill_install(skill_ref: &str, link: bool, registry_url: Option<&str>) -> Result<()> {
-    use vectorhawkd_core::state::AppState;
+    use vectorhawkd_core::{
+        audit::{write_audit_event_direct, AuditEvent},
+        state::AppState,
+    };
 
     let state = AppState::bootstrap().context("failed to bootstrap state")?;
 
@@ -1377,7 +1380,7 @@ async fn cmd_skill_install(skill_ref: &str, link: bool, registry_url: Option<&st
     // flag is set (--link only makes sense with local paths).
     let path = camino::Utf8Path::new(skill_ref);
     if path.exists() {
-        // ── Local / offline install (unchanged behavior) ──────────────────────
+        // ── Local / offline install ───────────────────────────────────────────
         use vectorhawkd_core::installer::{install_unpacked_skill, InstallMode};
         use vectorhawkd_manifest::SkillPackage;
 
@@ -1393,14 +1396,32 @@ async fn cmd_skill_install(skill_ref: &str, link: bool, registry_url: Option<&st
         install_unpacked_skill(&state, &pkg, mode)
             .with_context(|| format!("failed to install skill '{}'", pkg.manifest.id))?;
 
+        // Audit: skill installed from a local directory (fail-open: never block install).
+        let mode_str = if link { "symlink" } else { "copy" };
+        let ts = chrono::Utc::now().to_rfc3339();
+        write_audit_event_direct(
+            &state.db_path,
+            &AuditEvent {
+                event_type: "skill_installed".to_string(),
+                payload: serde_json::json!({
+                    "skill_id": pkg.manifest.id,
+                    "version":  pkg.manifest.version.to_string(),
+                    "source":   "cli-local",
+                    "mode":     mode_str,
+                    "ts":       ts,
+                }),
+            },
+        );
+
         println!(
             "Installed skill '{}' version {} (local).",
             pkg.manifest.id, pkg.manifest.version
         );
     } else {
-        // ── Registry install via desired-state (RUN2) ─────────────────────────
-        // Call POST /api/installations and wait for the daemon reconciler to
-        // confirm the installed state in local SQLite (max 30 s).
+        // ── Registry install ─────────────────────────────────────────────────
+        // Audit is emitted inside the helpers below so the correct source
+        // label is recorded regardless of which path fires (desired-state,
+        // cli-registry direct, or desired-state's inner direct fallback).
         let url = registry_url.unwrap_or("https://app.vectorhawk.ai");
 
         // Check if the daemon has an auth token.  If not, fall through to
@@ -1411,7 +1432,7 @@ async fn cmd_skill_install(skill_ref: &str, link: bool, registry_url: Option<&st
             install_via_desired_state(skill_ref, url, &state).await?;
         } else {
             // No daemon registration → direct install path (pre-RUN2 behaviour).
-            direct_registry_install(skill_ref, url, state).await?;
+            direct_registry_install(skill_ref, url, state.db_path.clone()).await?;
         }
     }
 
@@ -1441,20 +1462,13 @@ async fn install_via_desired_state(
     let token = match token {
         Some(t) => t,
         None => {
-            // No token → fall back to direct install.
+            // No token → fall back to direct install.  The direct install
+            // helper emits its own audit event with source="cli-registry".
             eprintln!(
                 "note: not logged in — installing directly from registry (run \
                  'vectorhawk auth login' to enable portal-driven installs)"
             );
-            return direct_registry_install(
-                skill_id,
-                registry_url,
-                vectorhawkd_core::state::AppState {
-                    root_dir: state.root_dir.clone(),
-                    db_path: state.db_path.clone(),
-                },
-            )
-            .await;
+            return direct_registry_install(skill_id, registry_url, state.db_path.clone()).await;
         }
     };
 
@@ -1530,6 +1544,20 @@ async fn install_via_desired_state(
             Some((status, 0)) if status == "active" => {
                 eprintln!();
                 println!("Installed skill '{skill_id}' from registry.");
+                // Audit: daemon confirmed the desired-state install succeeded.
+                // Fail-open: never block on audit write failure.
+                let ts = chrono::Utc::now().to_rfc3339();
+                vectorhawkd_core::audit::write_audit_event_direct(
+                    &state.db_path,
+                    &vectorhawkd_core::audit::AuditEvent {
+                        event_type: "skill_installed".to_string(),
+                        payload: serde_json::json!({
+                            "skill_id": skill_id,
+                            "source":   "desired-state",
+                            "ts":       ts,
+                        }),
+                    },
+                );
                 return Ok(());
             }
             Some((status, _)) if status == "error" => {
@@ -1552,17 +1580,35 @@ async fn install_via_desired_state(
 
 /// Direct registry install — pre-RUN2 behaviour, used when the daemon is not
 /// running or the user is not logged in.
+///
+/// Emits a `skill_installed` audit event with `source = "cli-registry"` on
+/// success.  On failure the install error propagates; the audit event is only
+/// recorded for successful installs.
 async fn direct_registry_install(
     skill_ref: &str,
     registry_url: &str,
-    state: vectorhawkd_core::state::AppState,
+    db_path: camino::Utf8PathBuf,
 ) -> Result<()> {
-    use vectorhawkd_core::registry::RegistryClient;
-    use vectorhawkd_core::updater::install_from_registry;
+    use vectorhawkd_core::{
+        audit::{write_audit_event_direct, AuditEvent},
+        registry::RegistryClient,
+        state::AppState,
+        updater::install_from_registry,
+    };
 
     let url = registry_url.to_string();
     let registry = RegistryClient::new(&url);
     let skill_id = skill_ref.to_string();
+    // Reconstruct the minimal AppState from db_path — AppState::bootstrap()
+    // was already called by the outer command; we just need the struct fields.
+    let root_dir = db_path
+        .parent()
+        .map(|p| p.to_owned())
+        .ok_or_else(|| anyhow::anyhow!("db_path has no parent directory"))?;
+    let state = AppState {
+        root_dir,
+        db_path: db_path.clone(),
+    };
 
     let version = tokio::task::spawn_blocking(move || {
         install_from_registry(&state, &registry, &skill_id, None)
@@ -1570,6 +1616,22 @@ async fn direct_registry_install(
     .await
     .context("install task panicked")?
     .with_context(|| format!("failed to install '{skill_ref}' from registry"))?;
+
+    // Audit: successful direct-registry install (fail-open).
+    let ts = chrono::Utc::now().to_rfc3339();
+    write_audit_event_direct(
+        &db_path,
+        &AuditEvent {
+            event_type: "skill_installed".to_string(),
+            payload: serde_json::json!({
+                "skill_id": skill_ref,
+                "version":  version,
+                "source":   "cli-registry",
+                "mode":     "copy",
+                "ts":       ts,
+            }),
+        },
+    );
 
     println!("Installed skill '{skill_ref}' version {version} from registry.");
     Ok(())
@@ -1745,7 +1807,11 @@ async fn cmd_skill_run(
     explicit_model: Option<&str>,
 ) -> Result<()> {
     use vectorhawkd_core::{
-        executor::run_skill, ollama::OllamaClient, policy::MockPolicyClient, state::AppState,
+        audit::{write_audit_event_direct, AuditEvent},
+        executor::run_skill,
+        ollama::OllamaClient,
+        policy::MockPolicyClient,
+        state::AppState,
     };
 
     let state = AppState::bootstrap().context("failed to bootstrap state")?;
@@ -1756,9 +1822,8 @@ async fn cmd_skill_run(
     let input: serde_json::Value = serde_json::from_str(&raw)
         .with_context(|| format!("input file {input_path} is not valid JSON"))?;
 
-    let result = if stub {
+    let run_outcome = if stub {
         run_skill(&state, &policy, id, &input, None)
-            .with_context(|| format!("failed to run skill '{id}' in stub mode"))?
     } else {
         let ollama_url = std::env::var("VECTORHAWK_OLLAMA_URL")
             .or_else(|_| std::env::var("OLLAMA_BASE_URL"))
@@ -1766,8 +1831,44 @@ async fn cmd_skill_run(
         let ollama_model = select_model_for_skill(&ollama_url, id, &state, explicit_model);
         let model = OllamaClient::new(ollama_url, ollama_model);
         run_skill(&state, &policy, id, &input, Some(&model))
-            .with_context(|| format!("failed to run skill '{id}'"))?
     };
+
+    // Audit and execution counter: always emit, whether the run succeeded or
+    // failed.  Fail-open — a broken audit write must not abort the run result.
+    let (run_status, run_version) = match &run_outcome {
+        Ok(r) => ("ok", r.version.clone()),
+        Err(_) => ("error", String::new()),
+    };
+
+    let ts = chrono::Utc::now().to_rfc3339();
+    write_audit_event_direct(
+        &state.db_path,
+        &AuditEvent {
+            event_type: "skill_run".to_string(),
+            payload: serde_json::json!({
+                "skill_id": id,
+                "version":  run_version,
+                "status":   run_status,
+                "invoker":  "cli",
+                "ts":       ts,
+            }),
+        },
+    );
+
+    // Increment execution counter for parity with the MCP path.
+    // Only on success, matching the semantics of increment_execution_count.
+    if let Ok(ref r) = run_outcome {
+        if let Ok(conn) = rusqlite::Connection::open(&state.db_path) {
+            if let Err(e) =
+                vectorhawkd_core::ratings::increment_execution_count(&conn, id, &r.version)
+            {
+                tracing::warn!(error = %e, "failed to increment execution count on CLI run");
+            }
+        }
+    }
+
+    let result = run_outcome
+        .with_context(|| format!("failed to run skill '{id}'"))?;
 
     println!("Skill:    {}", result.skill_id);
     println!("Version:  {}", result.version);
