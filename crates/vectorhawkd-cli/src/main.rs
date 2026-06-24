@@ -212,6 +212,29 @@ pub enum SkillCommand {
         output_dir: Option<camino::Utf8PathBuf>,
     },
 
+    /// Uninstall (remove) a locally installed skill.
+    ///
+    /// Removes the skill's versioned install directory, the active/ symlink,
+    /// and the installed_skills / skill_versions DB rows.  Execution counts
+    /// and ratings are preserved for historical audit purposes.
+    ///
+    /// If the skill was installed via a managed backend desired-state record,
+    /// the backend installation is also deactivated so the reconciler will not
+    /// reinstall it on the next sync.
+    #[command(alias = "remove")]
+    Uninstall {
+        /// Skill ID to remove.
+        id: String,
+
+        /// Registry base URL (used to deactivate managed installs).
+        #[arg(
+            long,
+            env = "VECTORHAWK_REGISTRY_URL",
+            default_value = "https://app.vectorhawk.ai"
+        )]
+        registry_url: Option<String>,
+    },
+
     /// Update an installed skill to the latest registry version.
     ///
     /// With <id>: check the registry for the latest version of that skill
@@ -471,6 +494,25 @@ pub enum PluginCommand {
         )]
         registry_url: String,
     },
+
+    /// Uninstall (remove) a locally installed plugin.
+    ///
+    /// Removes the plugin from the local Claude Code marketplace (marketplace
+    /// source dir, install cache, installed_plugins.json, settings.json
+    /// enabledPlugins entry) and deactivates the backend installation so the
+    /// reconciler does not reinstall it on the next sync.
+    #[command(alias = "remove")]
+    Uninstall {
+        /// Plugin slug to remove (as shown in `claude plugin list`).
+        slug: String,
+
+        #[arg(
+            long,
+            env = "VECTORHAWK_REGISTRY_URL",
+            default_value = "https://app.vectorhawk.ai"
+        )]
+        registry_url: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -559,6 +601,9 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Skill(SkillCommand::Convert { path, output_dir }) => {
             cmd_skill_convert(path, output_dir.as_deref()).await
         }
+        Command::Skill(SkillCommand::Uninstall { id, registry_url }) => {
+            cmd_skill_uninstall(&id, registry_url.as_deref()).await
+        }
         Command::Skill(SkillCommand::Update {
             id,
             all,
@@ -622,6 +667,9 @@ async fn run(cli: Cli) -> Result<()> {
             version,
             registry_url,
         }) => cmd_plugin_install(&slug, version.as_deref(), &registry_url).await,
+        Command::Plugin(PluginCommand::Uninstall { slug, registry_url }) => {
+            cmd_plugin_uninstall(&slug, registry_url.as_deref()).await
+        }
         Command::Plugin(PluginCommand::Import { path, output_dir }) => {
             cmd_plugin_import(path, output_dir).await
         }
@@ -4662,6 +4710,370 @@ async fn cmd_sync_status() -> Result<()> {
     }
 
     Ok(())
+}
+
+// ── skill uninstall ───────────────────────────────────────────────────────────
+
+/// Uninstall a locally installed skill.
+///
+/// Removes:
+/// - `<root>/skills/<skill_id>/` (all version dirs + active/ symlink)
+/// - `installed_skills` row
+/// - `skill_versions` rows (skill_ratings and skill_execution_counts are kept)
+///
+/// If a managed `installation_id` is present, also PATCHes the backend to
+/// `"deactivated"` so the reconciler does not reinstall on the next sync.
+async fn cmd_skill_uninstall(id: &str, registry_url: Option<&str>) -> Result<()> {
+    use rusqlite::{Connection, OptionalExtension};
+    use vectorhawkd_core::{
+        audit::{write_audit_event_direct, AuditEvent},
+        installer::uninstall_skill,
+        state::AppState,
+    };
+
+    let state = AppState::bootstrap().context("failed to bootstrap state")?;
+    let conn = Connection::open(&state.db_path).context("failed to open state DB")?;
+
+    // Read the row BEFORE we delete it, to capture installation_id + version.
+    struct SkillRow {
+        active_version: String,
+        installation_id: Option<String>,
+    }
+
+    let row: Option<SkillRow> = conn
+        .query_row(
+            "SELECT active_version, installation_id \
+             FROM installed_skills WHERE skill_id = ?1",
+            [id],
+            |row| {
+                Ok(SkillRow {
+                    active_version: row.get(0)?,
+                    installation_id: row.get(1)?,
+                })
+            },
+        )
+        .optional()
+        .context("failed to query installed_skills")?;
+
+    let info = match row {
+        Some(r) => r,
+        None => {
+            anyhow::bail!("skill '{id}' is not installed");
+        }
+    };
+
+    // Perform the local removal (files + DB rows).
+    uninstall_skill(&state, id)
+        .with_context(|| format!("failed to remove skill '{id}'"))?;
+
+    // Emit audit event.
+    let ts = chrono::Utc::now().to_rfc3339();
+    write_audit_event_direct(
+        &state.db_path,
+        &AuditEvent {
+            event_type: "skill_uninstalled".to_string(),
+            payload: serde_json::json!({
+                "skill_id":  id,
+                "version":   info.active_version,
+                "source":    "cli",
+                "ts":        ts,
+            }),
+        },
+    );
+
+    // Managed-install coordination: if this device had a backend desired-state
+    // installation, PATCH it to "deactivated" so the reconciler doesn't
+    // reinstall the skill on the next SSE sync tick.
+    match &info.installation_id {
+        Some(iid) if !iid.is_empty() => {
+            let url = registry_url.unwrap_or("https://app.vectorhawk.ai");
+            match deactivate_backend_installation(iid, url, &state).await {
+                Ok(()) => {
+                    println!(
+                        "Uninstalled skill '{id}' (version {}) and deactivated managed installation.",
+                        info.active_version
+                    );
+                }
+                Err(e) => {
+                    // Non-fatal: the local removal already succeeded.
+                    eprintln!(
+                        "warning: local removal succeeded, but could not deactivate managed \
+                         installation {iid} on the backend: {e:#}"
+                    );
+                    eprintln!(
+                        "  The skill may be reinstalled by the reconciler on the next sync. \
+                         To prevent this, remove it from the portal."
+                    );
+                    println!("Uninstalled skill '{id}' (version {}) locally.", info.active_version);
+                }
+            }
+        }
+        _ => {
+            // No managed installation — purely local, no backend call needed.
+            println!("Uninstalled skill '{id}' (version {}).", info.active_version);
+        }
+    }
+
+    Ok(())
+}
+
+/// PATCH `state: "deactivated"` to `PATCH /api/installations/{id}`.
+///
+/// Used by the CLI uninstall path so the reconciler does not immediately
+/// reinstall a just-removed skill on its next SSE sync tick.
+async fn deactivate_backend_installation(
+    installation_id: &str,
+    registry_url: &str,
+    state: &vectorhawkd_core::state::AppState,
+) -> Result<()> {
+    let url = format!(
+        "{}/api/installations/{}",
+        registry_url.trim_end_matches('/'),
+        installation_id
+    );
+
+    let db_path = state.db_path.clone();
+    let reg_url = registry_url.to_string();
+    let token = tokio::task::spawn_blocking(move || {
+        load_all_tokens_from_db(&db_path, &reg_url)
+    })
+    .await
+    .context("token-load task panicked")?
+    .context("failed to load auth tokens")?;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .context("failed to build HTTP client")?;
+
+    let body = serde_json::json!({ "state": "deactivated" });
+
+    let req = match token {
+        Some(t) => client.patch(&url).bearer_auth(t).json(&body),
+        None => client.patch(&url).json(&body),
+    };
+
+    let resp = req
+        .send()
+        .await
+        .with_context(|| format!("PATCH {url} failed"))?;
+
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        // Installation already removed on the backend — that's fine.
+        return Ok(());
+    }
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body_text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("PATCH {url} returned {status}: {body_text}");
+    }
+
+    Ok(())
+}
+
+/// PATCH `state: "deactivated"` to `PATCH /api/plugin-installations/{id}/state`.
+async fn deactivate_backend_plugin_installation(
+    installation_id: &str,
+    registry_url: &str,
+    state: &vectorhawkd_core::state::AppState,
+) -> Result<()> {
+    let url = format!(
+        "{}/api/plugin-installations/{}/state",
+        registry_url.trim_end_matches('/'),
+        installation_id
+    );
+
+    let db_path = state.db_path.clone();
+    let reg_url = registry_url.to_string();
+    let token = tokio::task::spawn_blocking(move || {
+        load_all_tokens_from_db(&db_path, &reg_url)
+    })
+    .await
+    .context("token-load task panicked")?
+    .context("failed to load auth tokens")?;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .context("failed to build HTTP client")?;
+
+    let body = serde_json::json!({ "state": "deactivated" });
+
+    let req = match token {
+        Some(t) => client.patch(&url).bearer_auth(t).json(&body),
+        None => client.patch(&url).json(&body),
+    };
+
+    let resp = req
+        .send()
+        .await
+        .with_context(|| format!("PATCH {url} failed"))?;
+
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(());
+    }
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body_text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("PATCH {url} returned {status}: {body_text}");
+    }
+
+    Ok(())
+}
+
+/// Load the Bearer token for `registry_url` from the local auth DB.
+///
+/// Returns `Ok(None)` when the user is not logged in (no token row), and
+/// `Ok(Some(token))` when a token is found. Errors only on DB failures.
+fn load_all_tokens_from_db(
+    db_path: &camino::Utf8Path,
+    registry_url: &str,
+) -> Result<Option<String>> {
+    use vectorhawkd_core::auth::load_all_tokens;
+    use vectorhawkd_core::state::AppState;
+
+    // Reconstruct a minimal AppState from just the db_path (we only need
+    // load_all_tokens which uses state.db_path).
+    let root_dir = db_path
+        .parent()
+        .map(|p| p.to_owned())
+        .ok_or_else(|| anyhow::anyhow!("db_path has no parent"))?;
+    let state = AppState { root_dir, db_path: db_path.to_owned() };
+
+    let tokens = load_all_tokens(&state).context("failed to load auth tokens")?;
+    let token = tokens
+        .into_iter()
+        .find(|r| r.registry_url == registry_url)
+        .map(|r| r.access_token);
+    Ok(token)
+}
+
+// ── plugin uninstall ──────────────────────────────────────────────────────────
+
+/// Uninstall a locally installed plugin.
+///
+/// Removes:
+/// - `~/.claude/plugins/marketplaces/vectorhawk/plugins/<slug>/`
+/// - `~/.claude/plugins/cache/vectorhawk/<slug>/`
+/// - Entry in `~/.claude/plugins/marketplaces/vectorhawk/.claude-plugin/marketplace.json`
+/// - Entry in `~/.claude/plugins/installed_plugins.json`
+/// - `enabledPlugins["<slug>@vectorhawk"]` in `~/.claude/settings.json`
+///
+/// Also PATCHes the backend plugin-installation to "deactivated" if an
+/// installation_id is discoverable from the managed_path_markers table.
+async fn cmd_plugin_uninstall(slug: &str, registry_url: Option<&str>) -> Result<()> {
+    use rusqlite::{Connection, OptionalExtension};
+    use vectorhawkd_core::{
+        audit::{write_audit_event_direct, AuditEvent},
+        state::AppState,
+    };
+    use vectorhawkd_daemon::managed_paths::uninstall_plugin_bundle;
+
+    let state = AppState::bootstrap().context("failed to bootstrap state")?;
+
+    // Check whether this plugin is locally installed by probing the marketplace
+    // directory.  This is the canonical signal rather than a SQLite table
+    // (plugins don't have an installed_skills row).
+    let plugin_installed = is_plugin_installed_locally(slug)?;
+    if !plugin_installed {
+        anyhow::bail!(
+            "plugin '{slug}' is not installed locally. \
+             Run `claude plugin list` to see installed plugins."
+        );
+    }
+
+    // Retrieve managed installation_id from managed_path_markers if present.
+    let conn = Connection::open(&state.db_path).context("failed to open state DB")?;
+    let installation_id: Option<String> = conn
+        .query_row(
+            "SELECT installation_id FROM managed_path_markers \
+             WHERE kind = 'plugin' AND slug = ?1 LIMIT 1",
+            [slug],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("failed to query managed_path_markers")?
+        .flatten();
+    drop(conn);
+
+    // Run the local removal (filesystem + Claude Code JSON files).
+    tokio::task::spawn_blocking({
+        let slug_owned = slug.to_string();
+        move || uninstall_plugin_bundle(&slug_owned)
+    })
+    .await
+    .context("plugin uninstall task panicked")?
+    .with_context(|| format!("failed to remove plugin '{slug}' from local marketplace"))?;
+
+    // Emit audit event.
+    let ts = chrono::Utc::now().to_rfc3339();
+    write_audit_event_direct(
+        &state.db_path,
+        &AuditEvent {
+            event_type: "plugin_uninstalled".to_string(),
+            payload: serde_json::json!({
+                "slug":   slug,
+                "source": "cli",
+                "ts":     ts,
+            }),
+        },
+    );
+
+    // Managed-install coordination.
+    let url = registry_url.unwrap_or("https://app.vectorhawk.ai");
+    match &installation_id {
+        Some(iid) if !iid.is_empty() => {
+            match deactivate_backend_plugin_installation(iid, url, &state).await {
+                Ok(()) => {
+                    println!(
+                        "Uninstalled plugin '{slug}' and deactivated managed installation."
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "warning: local removal succeeded, but could not deactivate managed \
+                         plugin installation {iid} on the backend: {e:#}"
+                    );
+                    eprintln!(
+                        "  The plugin may be reinstalled by the reconciler on the next sync. \
+                         To prevent this, remove it from the portal."
+                    );
+                    println!("Uninstalled plugin '{slug}' locally.");
+                }
+            }
+        }
+        _ => {
+            // No managed installation record — warn the user if they are logged in.
+            let has_token = state.get_sync_state("device_id").ok().flatten().is_some();
+            if has_token {
+                eprintln!(
+                    "warning: no managed installation record found for plugin '{slug}'. \
+                     If it was installed via the portal, remove it there too to prevent \
+                     the reconciler from reinstalling it."
+                );
+            }
+            println!("Uninstalled plugin '{slug}' locally.");
+        }
+    }
+
+    Ok(())
+}
+
+/// Returns `true` if the plugin's marketplace source directory exists under
+/// `~/.claude/plugins/marketplaces/vectorhawk/plugins/<slug>/`.
+fn is_plugin_installed_locally(slug: &str) -> Result<bool> {
+    let home = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
+    let plugin_src = home
+        .join(".claude")
+        .join("plugins")
+        .join("marketplaces")
+        .join("vectorhawk")
+        .join("plugins")
+        .join(slug);
+    Ok(plugin_src.exists())
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
