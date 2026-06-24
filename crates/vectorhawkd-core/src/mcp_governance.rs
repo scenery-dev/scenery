@@ -369,7 +369,7 @@ pub fn install_from_registry(
     use crate::registry::RegistryClient;
     use crate::updater;
 
-    let mut registry = RegistryClient::new(base_url);
+    let registry = RegistryClient::new(base_url);
     if let Ok(Some(tokens)) = auth::load_tokens(state, base_url) {
         registry.set_auth(&tokens.access_token);
     }
