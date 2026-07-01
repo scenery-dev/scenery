@@ -120,6 +120,7 @@ fn snapshot_installs_missing_desired_skill() {
         skill_id: "new-skill".to_string(),
         version: "1.0.0".to_string(),
         state: "desired".to_string(),
+        source: None,
     }];
 
     let events = build_derived_events_blocking(installations, &state);
@@ -130,6 +131,7 @@ fn snapshot_installs_missing_desired_skill() {
             installation_id,
             skill_id,
             version,
+            ..
         } => {
             assert_eq!(*installation_id, iid);
             assert_eq!(skill_id, "new-skill");
@@ -154,6 +156,7 @@ fn snapshot_no_op_when_skill_already_installed() {
         skill_id: "installed-skill".to_string(),
         version: "1.0.0".to_string(),
         state: "installed".to_string(),
+        source: None,
     }];
 
     let events = build_derived_events_blocking(installations, &state);
@@ -185,6 +188,7 @@ fn snapshot_emits_install_when_locally_present_but_backend_not_yet_installed() {
         skill_id: "carryover-skill".to_string(),
         version: "1.0.0".to_string(),
         state: "desired".to_string(),
+        source: None,
     }];
 
     let events = build_derived_events_blocking(installations, &state);
@@ -195,6 +199,7 @@ fn snapshot_emits_install_when_locally_present_but_backend_not_yet_installed() {
             installation_id,
             skill_id,
             version,
+            ..
         } => {
             assert_eq!(*installation_id, iid);
             assert_eq!(skill_id, "carryover-skill");
@@ -220,6 +225,7 @@ fn snapshot_deactivates_active_skill_when_state_is_deactivated() {
         skill_id: "active-skill".to_string(),
         version: "1.0.0".to_string(),
         state: "deactivated".to_string(),
+        source: None,
     }];
 
     let events = build_derived_events_blocking(installations, &state);
@@ -249,6 +255,7 @@ fn snapshot_purges_present_skill_when_state_is_removed() {
         skill_id: "old-skill".to_string(),
         version: "1.0.0".to_string(),
         state: "removed".to_string(),
+        source: None,
     }];
 
     let events = build_derived_events_blocking(installations, &state);
@@ -275,6 +282,7 @@ fn snapshot_no_purge_when_skill_not_locally_present() {
         skill_id: "ghost-skill".to_string(),
         version: "1.0.0".to_string(),
         state: "removed".to_string(),
+        source: None,
     }];
 
     let events = build_derived_events_blocking(installations, &state);
@@ -298,24 +306,28 @@ fn snapshot_mixed_batch_generates_correct_events() {
             skill_id: "install-me".to_string(),
             version: "1.0.0".to_string(),
             state: "desired".to_string(),
+            source: None,
         },
         InstallationRecord {
             installation_id: install_id(),
             skill_id: "deactivate-me".to_string(),
             version: "1.0.0".to_string(),
             state: "deactivated".to_string(),
+            source: None,
         },
         InstallationRecord {
             installation_id: install_id(),
             skill_id: "purge-me".to_string(),
             version: "1.0.0".to_string(),
             state: "removed".to_string(),
+            source: None,
         },
         InstallationRecord {
             installation_id: install_id(),
             skill_id: "keep-me".to_string(),
             version: "2.0.0".to_string(),
             state: "installed".to_string(),
+            source: None,
         },
     ];
 
@@ -358,6 +370,7 @@ fn snapshot_installed_state_treated_like_desired_when_missing_locally() {
         skill_id: "needs-install".to_string(),
         version: "1.2.3".to_string(),
         state: "installed".to_string(),
+        source: None,
     }];
 
     let events = build_derived_events_blocking(installations, &state);
@@ -368,6 +381,7 @@ fn snapshot_installed_state_treated_like_desired_when_missing_locally() {
             installation_id,
             skill_id,
             version,
+            ..
         } => {
             assert_eq!(*installation_id, iid);
             assert_eq!(skill_id, "needs-install");
@@ -390,6 +404,7 @@ fn snapshot_installed_state_noop_when_already_present_locally() {
         skill_id: "already-here".to_string(),
         version: "1.0.0".to_string(),
         state: "installed".to_string(),
+        source: None,
     }];
 
     let events = build_derived_events_blocking(installations, &state);
@@ -412,12 +427,14 @@ fn snapshot_skips_rows_with_unresolved_latest_version() {
             skill_id: "latest-row".to_string(),
             version: "latest".to_string(),
             state: "desired".to_string(),
+            source: None,
         },
         InstallationRecord {
             installation_id: install_id(),
             skill_id: "empty-row".to_string(),
             version: String::new(),
             state: "desired".to_string(),
+            source: None,
         },
     ];
 
@@ -437,10 +454,88 @@ fn snapshot_skips_error_state_rows() {
         skill_id: "errored".to_string(),
         version: "1.0.0".to_string(),
         state: "error".to_string(),
+        source: None,
     }];
 
     let events = build_derived_events_blocking(installations, &state);
     assert!(events.is_empty(), "error-state rows → no auto-retry");
+
+    cleanup(&root);
+}
+
+// ── Phantom-artifact source propagation tests ────────────────────────────────
+
+#[test]
+fn snapshot_propagates_migrated_local_source_to_install_event() {
+    // When a snapshot record carries source="migrated:local", the derived
+    // Install event must carry the same value so the do_install backstop can
+    // use the explicit signal rather than falling back to the version sentinel.
+    let root = temp_root("snapshot-migrated-local-source");
+    let state = AppState::bootstrap_in(root.clone()).unwrap();
+    // No local skill present — should derive an Install event.
+
+    let iid = install_id();
+    let installations = vec![InstallationRecord {
+        installation_id: iid,
+        skill_id: "handoff".to_string(),
+        version: "0.0.0".to_string(),
+        state: "installed".to_string(),
+        source: Some("migrated:local".to_string()),
+    }];
+
+    let events = build_derived_events_blocking(installations, &state);
+
+    assert_eq!(events.len(), 1, "should derive one Install event");
+    match &events[0] {
+        SyncEvent::Install {
+            skill_id,
+            version,
+            source,
+            ..
+        } => {
+            assert_eq!(skill_id, "handoff");
+            assert_eq!(version, "0.0.0");
+            assert_eq!(
+                source.as_deref(),
+                Some("migrated:local"),
+                "source must be propagated from InstallationRecord to Install event"
+            );
+        }
+        other => panic!("expected Install, got {other:?}"),
+    }
+
+    cleanup(&root);
+}
+
+#[test]
+fn snapshot_propagates_none_source_when_backend_omits_it() {
+    // Old backends do not include source in snapshot records.  The Install
+    // event must carry source=None so the backstop falls back to the version
+    // sentinel / marker checks.
+    let root = temp_root("snapshot-none-source");
+    let state = AppState::bootstrap_in(root.clone()).unwrap();
+
+    let iid = install_id();
+    let installations = vec![InstallationRecord {
+        installation_id: iid,
+        skill_id: "normal-skill".to_string(),
+        version: "1.0.0".to_string(),
+        state: "desired".to_string(),
+        source: None,
+    }];
+
+    let events = build_derived_events_blocking(installations, &state);
+
+    assert_eq!(events.len(), 1);
+    match &events[0] {
+        SyncEvent::Install { source, .. } => {
+            assert!(
+                source.is_none(),
+                "source must be None when backend omits it"
+            );
+        }
+        other => panic!("expected Install, got {other:?}"),
+    }
 
     cleanup(&root);
 }

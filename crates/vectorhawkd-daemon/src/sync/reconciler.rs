@@ -61,6 +61,27 @@ pub(crate) fn skill_lock(locks: &SkillLockMap, skill_id: &str) -> Arc<tokio::syn
 
 const MAX_CONCURRENT_INSTALLS: usize = 4;
 
+// ── Phantom-artifact error ────────────────────────────────────────────────────
+
+/// Returned by `do_install` when the skill has no downloadable artifact.
+///
+/// This covers skills adopted from local discovery: the catalog stub uses
+/// `artifact_key="migrated/{slug}/0.0.0.cskill"` with no bytes ever uploaded
+/// to object storage. Attempting to download would 404 and flap the row into a
+/// confusing generic `error` state.
+///
+/// `handle_install` recognises this type and treats it as terminal — no retry,
+/// a single clear `error` PATCH with an actionable message.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "skill {skill_id}@{version} was adopted from a local path and has no downloadable artifact; \
+     re-adopt on this device or wait for the publisher to release a distributable version"
+)]
+struct PhantomArtifactError {
+    skill_id: String,
+    version: String,
+}
+
 /// How long to wait before retrying a failed install.
 const RETRY_DELAY_SECS: u64 = 30;
 
@@ -263,11 +284,13 @@ async fn dispatch_event(
             installation_id,
             skill_id,
             version,
+            source,
         } => {
             spawn_install(
                 installation_id,
                 skill_id,
                 version,
+                source,
                 state,
                 registry_url,
                 sem,
@@ -397,11 +420,13 @@ async fn dispatch_event(
                         installation_id,
                         skill_id,
                         version,
+                        source,
                     } => {
                         spawn_install(
                             installation_id,
                             skill_id,
                             version,
+                            source,
                             state,
                             registry_url,
                             sem,
@@ -517,6 +542,7 @@ fn spawn_install(
     installation_id: Uuid,
     skill_id: String,
     version: String,
+    source: Option<String>,
     state: &Arc<AppState>,
     registry_url: &str,
     sem: &Arc<tokio::sync::Semaphore>,
@@ -543,6 +569,7 @@ fn spawn_install(
             installation_id,
             &skill_id,
             &version,
+            source.as_deref(),
             &st,
             &reg_url,
             &stats_clone,
@@ -1398,10 +1425,12 @@ fn increment_mcp_errors(stats: &Arc<Mutex<ReconcilerStats>>) {
 // ── Install handler ───────────────────────────────────────────────────────────
 
 /// Handle one `Install` event.  Returns `true` if the tool list changed.
+#[allow(clippy::too_many_arguments)]
 async fn handle_install(
     installation_id: Uuid,
     skill_id: &str,
     version: &str,
+    source: Option<&str>,
     state: &Arc<AppState>,
     registry_url: &str,
     stats: &Arc<Mutex<ReconcilerStats>>,
@@ -1411,6 +1440,7 @@ async fn handle_install(
         installation_id,
         skill_id,
         version,
+        source,
         state,
         registry_url,
         pusher,
@@ -1423,6 +1453,29 @@ async fn handle_install(
             true
         }
         Err(e) => {
+            // Phantom-artifact installs are terminal: there is no real artifact to
+            // download, so retrying would never succeed.  Report a single clear error
+            // with an actionable message and leave the row in `error` state for the
+            // portal to surface.  Do NOT retry.
+            if e.downcast_ref::<PhantomArtifactError>().is_some() {
+                warn!(
+                    skill_id,
+                    version,
+                    error = %e,
+                    "reconciler: phantom-artifact install — not retrying"
+                );
+                report_installation_status(
+                    installation_id,
+                    "error",
+                    Some(&e.to_string()),
+                    registry_url,
+                    state,
+                )
+                .await;
+                decrement_pending_inc_errors(stats);
+                return false;
+            }
+
             warn!(
                 skill_id,
                 version,
@@ -1445,6 +1498,7 @@ async fn handle_install(
                 installation_id,
                 skill_id,
                 version,
+                source,
                 state,
                 registry_url,
                 pusher,
@@ -1483,6 +1537,7 @@ async fn do_install(
     installation_id: Uuid,
     skill_id: &str,
     version: &str,
+    source: Option<&str>,
     state: &Arc<AppState>,
     registry_url: &str,
     pusher: Option<&ManagedPathsPusher>,
@@ -1492,26 +1547,56 @@ async fn do_install(
     let state_clone = Arc::clone(state);
     let reg_url = registry_url.to_string();
 
-    // Migrated-local short-circuit: if an F2 marker already exists for this
-    // slug, the skill is locally present (it was imported via F1, not
-    // downloaded from the registry). There is no artifact to fetch — trying
-    // to download would 404 and flap the row into `error`. Just PATCH back
-    // `installed` and return.
+    // ── Phantom-artifact backstop ────────────────────────────────────────────
+    // Skills adopted from local discovery have a catalog stub with
+    // `artifact_key="migrated/{slug}/0.0.0.cskill"` that has no bytes in
+    // object storage.  Attempting to download produces a 404 / hash-mismatch
+    // error and flaps the install row into a confusing `error` state.
     //
-    // This matters because F1's migrate endpoint creates a `user_device_installations`
-    // row with state='installed' and source='migrated:local' so the catalog
-    // sees the skill as installed. The next snapshot tick then derives an
-    // Install event for it; without this short-circuit we'd try to download
-    // `migrated/<slug>/0.0.0.cskill` which never exists in MinIO.
-    if marker_present_for_slug(&state_clone, &skill_id).await {
-        info!(
-            skill_id,
-            version,
-            "reconciler: skill already locally managed (F2 marker present) — skipping download"
-        );
-        report_installation_status(installation_id, "installed", None, &reg_url, &state_clone)
-            .await;
-        return Ok(());
+    // Detection priority (first match wins):
+    //   1. Explicit `source == "migrated:local"` from the SSE event — sent by
+    //      the backend once the backend fix ships; older backends leave it None.
+    //   2. Version sentinel `"0.0.0"` — used exclusively by migrated:local stubs;
+    //      no real published skill ever uses this version.
+    //   3. Legacy F2 marker — present on the origin device after the initial
+    //      `discovery_adopted` push, but wiped by remove/deactivate.  Kept as a
+    //      third-priority fallback for backwards compatibility.
+    //
+    // If skill content is locally accessible: report `installed` (no download).
+    // If skill content is absent: fail terminally with a clear, actionable
+    // message.  `handle_install` sees `PhantomArtifactError` and skips the retry.
+    let is_phantom = source == Some("migrated:local")
+        || version == "0.0.0"
+        || marker_present_for_slug(&state_clone, &skill_id).await;
+
+    if is_phantom {
+        let content_present = check_local_skill_content(&state_clone, &skill_id).await;
+        if content_present {
+            let detection_signal = if source == Some("migrated:local") {
+                "source field"
+            } else if version == "0.0.0" {
+                "version sentinel"
+            } else {
+                "F2 marker"
+            };
+            info!(
+                skill_id,
+                version,
+                detection_signal,
+                "reconciler: phantom-artifact skill is locally present — reporting installed without download"
+            );
+            report_installation_status(installation_id, "installed", None, &reg_url, &state_clone)
+                .await;
+            return Ok(());
+        }
+
+        // No local content and no real artifact — fail terminally so the portal
+        // shows one clear, actionable error rather than a generic retry loop.
+        return Err(PhantomArtifactError {
+            skill_id: skill_id.clone(),
+            version: version.clone(),
+        }
+        .into());
     }
 
     // Check if this version is already installed locally — if so, just flip symlink.
@@ -1662,6 +1747,37 @@ async fn marker_present_for_slug(state: &Arc<AppState>, slug: &str) -> bool {
     })
     .await
     .unwrap_or(false)
+}
+
+/// Check whether skill content is locally accessible on this device.
+///
+/// Returns `true` if either:
+/// - VectorHawk's versioned layout has an `active/` entry for the skill
+///   (`<root>/skills/{id}/active/`), or
+/// - Claude Code's native skills directory holds the skill
+///   (`~/.claude/skills/{id}/`).
+///
+/// Used by the phantom-artifact backstop to decide whether to report
+/// `installed` (content present) or fail terminally (genuinely absent).
+/// Returns `false` on any I/O error, treating absence as false.
+async fn check_local_skill_content(state: &Arc<AppState>, skill_id: &str) -> bool {
+    // VectorHawk versioned layout — active symlink points at the installed version.
+    let active_dir = state.root_dir.join("skills").join(skill_id).join("active");
+    if active_dir.exists() {
+        return true;
+    }
+
+    // Claude Code native skills directory (~/.claude/skills/<slug>/).
+    // Resolve via dirs::home_dir() — the same resolver used by the F2 pusher —
+    // so the path is correct on macOS, Linux, and future targets.
+    if let Some(home) = dirs::home_dir() {
+        let claude_skill_dir = home.join(".claude").join("skills").join(skill_id);
+        if claude_skill_dir.exists() {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Check if a specific version of a skill is already installed in the versioned
@@ -2211,6 +2327,9 @@ fn build_derived_events_blocking(
                         installation_id: record.installation_id,
                         skill_id: record.skill_id.clone(),
                         version: record.version.clone(),
+                        // Propagate source so the phantom-artifact backstop in
+                        // do_install can use the explicit signal when available.
+                        source: record.source.clone(),
                     });
                 }
             }

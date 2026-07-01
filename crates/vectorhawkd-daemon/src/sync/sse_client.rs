@@ -513,6 +513,11 @@ pub enum SyncEvent {
         installation_id: Uuid,
         skill_id: String,
         version: String,
+        /// Installation source, if the backend sends it. `"migrated:local"` signals that
+        /// this skill was adopted from a local path and has no downloadable artifact in the
+        /// registry (the catalog stub uses a phantom `migrated/<slug>/0.0.0.cskill` key).
+        /// `None` when the backend does not yet include this field (older backend versions).
+        source: Option<String>,
     },
     /// Deactivate a skill (keep files; remove active symlink).
     Deactivate {
@@ -573,6 +578,10 @@ pub struct InstallationRecord {
     pub version: String,
     /// `"desired"` | `"installing"` | `"installed"` | `"deactivated"` | `"removed"` | `"error"`
     pub state: String,
+    /// Installation source. `"migrated:local"` for locally-adopted skills with no artifact in
+    /// the registry. `None` when the backend does not yet emit this field (older backends).
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 /// One entry in a [`SyncEvent::Snapshot`] MCP installations list.
@@ -610,6 +619,9 @@ struct WireInstall {
     installation_id: Uuid,
     skill_id: String,
     version: String,
+    /// Optional source field; omitted by older backends → `None`.
+    #[serde(default)]
+    source: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -687,6 +699,7 @@ fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
                 installation_id: wire.installation_id,
                 skill_id: wire.skill_id,
                 version: wire.version,
+                source: wire.source,
             })
         }
         "deactivate" => {
