@@ -31,10 +31,42 @@ fn parses_install_event() {
     let event = parse_sync_event("install", data).unwrap();
     match event {
         super::SyncEvent::Install {
-            skill_id, version, ..
+            skill_id,
+            version,
+            source,
+            ..
         } => {
             assert_eq!(skill_id, "new-skill");
             assert_eq!(version, "2.3.0");
+            assert!(
+                source.is_none(),
+                "source must be None when backend omits it"
+            );
+        }
+        other => panic!("expected Install, got {other:?}"),
+    }
+}
+
+#[test]
+fn parses_install_event_with_migrated_local_source() {
+    // Newer backends include source="migrated:local" in the install event payload.
+    // The runner must parse and propagate it for the phantom-artifact backstop.
+    let data = r#"{"installation_id":"550e8400-e29b-41d4-a716-446655440001","skill_id":"handoff","version":"0.0.0","source":"migrated:local"}"#;
+    let event = parse_sync_event("install", data).unwrap();
+    match event {
+        super::SyncEvent::Install {
+            skill_id,
+            version,
+            source,
+            ..
+        } => {
+            assert_eq!(skill_id, "handoff");
+            assert_eq!(version, "0.0.0");
+            assert_eq!(
+                source.as_deref(),
+                Some("migrated:local"),
+                "source must be parsed from the install event payload"
+            );
         }
         other => panic!("expected Install, got {other:?}"),
     }
