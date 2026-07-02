@@ -110,6 +110,66 @@ pub struct CompilePublishResponse {
     pub download_url: String,
 }
 
+/// Body of a 200 JSON response from `POST /runner/skills/adopt-publish`.
+///
+/// Unlike [`CompilePublishResponse`] (always-publish, CLI/T3-publish path),
+/// this endpoint routes through the org's normal scan/approval gate, so the
+/// outcome may be `"pending_review"` rather than an immediate publish.
+#[derive(Debug, Deserialize, Clone)]
+pub struct AdoptPublishResponse {
+    /// `"published"` | `"pending_review"`. Kept as a plain `String` (rather
+    /// than an enum) so an unrecognized future value deserializes fine —
+    /// [`RegistryClient::adopt_publish`] matches on it explicitly and treats
+    /// anything other than `"published"` conservatively (as if pending
+    /// review), never inferring an outcome from anything else (e.g.
+    /// discovery status has a known quirk where it can read `"published"`
+    /// even in the pending-review case — the response `outcome` field here
+    /// is the only source of truth).
+    pub outcome: String,
+    pub skill_id: String,
+    pub version: String,
+    /// The endpoint does not create install rows — this is only populated
+    /// when the backend already has one on file for the origin device (e.g.
+    /// from the original discovery adopt). Callers must not depend on it
+    /// being present even when `outcome == "published"`.
+    #[serde(default)]
+    pub installation_id: Option<String>,
+}
+
+/// Body of an HTTP 422 response from `POST /runner/skills/adopt-publish`:
+/// strict-mode policy rejected the skill outright based on the scan verdict.
+///
+/// This is a legitimate, expected outcome of the org's scan gate — not a
+/// transport or auth failure — so [`RegistryClient::adopt_publish`] surfaces
+/// it as [`AdoptPublishOutcome::Rejected`] rather than an `Err`. Treated
+/// exactly like `pending_review` for takeover purposes: the local discovered
+/// copy must stay in place.
+#[derive(Debug, Deserialize, Clone)]
+pub struct AdoptPublishRejection {
+    pub message: String,
+    pub reason: String,
+    pub verdict: String,
+    #[serde(default)]
+    pub findings: serde_json::Value,
+}
+
+/// Outcome of [`RegistryClient::adopt_publish`].
+///
+/// Both the 200 (`published` / `pending_review`) and 422 (`rejected`) cases
+/// are legitimate results of the org's scan/approval gate, so all three are
+/// modeled here rather than treating 422 as an `Err`. Only [`Self::Published`]
+/// means a real registry artifact exists; the other two mean the local
+/// discovered copy must be left untouched.
+#[derive(Debug, Clone)]
+pub enum AdoptPublishOutcome {
+    /// A real registry artifact now exists; safe to install + take over.
+    Published(AdoptPublishResponse),
+    /// Queued for IT review; no artifact yet.
+    PendingReview(AdoptPublishResponse),
+    /// Strict-mode policy rejected the skill outright (HTTP 422).
+    Rejected(AdoptPublishRejection),
+}
+
 /// Skill detail returned by `GET /portal/skills/{skill_id}`.
 #[derive(Debug, Deserialize, Clone)]
 pub struct SkillDetail {
@@ -303,18 +363,12 @@ impl RegistryClient {
 
     /// Return a clone of the stored auth token, if any.
     fn get_auth_token(&self) -> Option<String> {
-        self.auth_token
-            .lock()
-            .ok()
-            .and_then(|g| g.clone())
+        self.auth_token.lock().ok().and_then(|g| g.clone())
     }
 
     /// Return a clone of the stored device ID, if any.
     fn get_device_id(&self) -> Option<String> {
-        self.device_id
-            .lock()
-            .ok()
-            .and_then(|g| g.clone())
+        self.device_id.lock().ok().and_then(|g| g.clone())
     }
 
     /// Fetch the list of approved backend MCP servers for this device.
@@ -692,6 +746,95 @@ impl RegistryClient {
 
         resp.json()
             .context("failed to deserialize compile publish response")
+    }
+
+    /// Upload a discovered skill's SKILL.md tree to the adopt-publish endpoint.
+    ///
+    /// Posts a gzipped tar to `POST /runner/skills/adopt-publish` along with
+    /// the discovered `slug`. Requires auth token to be set via [`with_auth`]
+    /// (the daemon's portal JWT — the same auth dependency `/runner/audit`
+    /// uses).
+    ///
+    /// Unlike [`compile_and_publish`](Self::compile_and_publish), this call
+    /// routes through the org's normal scan/approval gate — there is no
+    /// bypass — so the result may be `pending_review` or, for a strict-mode
+    /// reject, an HTTP 422. Both are folded into [`AdoptPublishOutcome`]
+    /// rather than returned as `Err`; only a transport/auth/5xx failure
+    /// returns `Err`. See the shared contract at
+    /// `context/adopt-publish-contract.md`.
+    pub fn adopt_publish(
+        &self,
+        source_tar_gz_bytes: Vec<u8>,
+        slug: &str,
+    ) -> Result<AdoptPublishOutcome> {
+        let token = self.get_auth_token().ok_or_else(|| {
+            anyhow::anyhow!("not authenticated; run `vectorhawk auth login` first")
+        })?;
+
+        let base = self.base_url.trim_end_matches('/');
+        let url = format!("{base}/runner/skills/adopt-publish");
+        debug!(
+            url,
+            size_bytes = source_tar_gz_bytes.len(),
+            slug,
+            "adopt-publish: uploading discovered skill"
+        );
+
+        let file_part = reqwest::blocking::multipart::Part::bytes(source_tar_gz_bytes)
+            .file_name("skill-source.tar.gz")
+            .mime_str("application/gzip")
+            .context("invalid MIME type for adopt-publish upload")?;
+
+        let form = reqwest::blocking::multipart::Form::new()
+            .part("file", file_part)
+            .text("slug", slug.to_string());
+
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(token)
+            .multipart(form)
+            .send()
+            .with_context(|| format!("failed to reach registry at {url}"))?;
+
+        let status = resp.status();
+
+        // Strict-mode reject: a legitimate scan-gate outcome, not a failure.
+        // The local discovered copy must be left in place, same as pending_review.
+        if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+            let rejection: AdoptPublishRejection = resp
+                .json()
+                .context("failed to deserialize adopt-publish rejection (422) response")?;
+            return Ok(AdoptPublishOutcome::Rejected(rejection));
+        }
+
+        if !status.is_success() {
+            let body = resp.text().unwrap_or_default();
+            anyhow::bail!("adopt-publish failed (HTTP {status}): {body}");
+        }
+
+        let parsed: AdoptPublishResponse = resp
+            .json()
+            .context("failed to deserialize adopt-publish response")?;
+
+        // The `outcome` field is the ONLY source of truth for what happened —
+        // never infer it from discovery status, which has a known quirk of
+        // reading "published" even in the pending_review case. Anything other
+        // than an exact "published" match is treated conservatively as
+        // pending_review so the caller never removes the local copy without
+        // positive confirmation of a real artifact.
+        match parsed.outcome.as_str() {
+            "published" => Ok(AdoptPublishOutcome::Published(parsed)),
+            "pending_review" => Ok(AdoptPublishOutcome::PendingReview(parsed)),
+            other => {
+                warn!(
+                    slug,
+                    outcome = other,
+                    "adopt-publish: unrecognized outcome — treating as pending_review (conservative)"
+                );
+                Ok(AdoptPublishOutcome::PendingReview(parsed))
+            }
+        }
     }
 
     /// Fetch aggregated pre-install governance data for a skill.
@@ -1875,6 +2018,206 @@ mod tests {
         };
         let result = client.compile_and_publish(gz_bytes, None);
         assert!(result.is_ok(), "compile_and_publish(None) should succeed");
+        mock.assert();
+    }
+
+    // ── adopt_publish ───────────────────────────────────────────────────────────
+
+    fn minimal_gz_bytes() -> Vec<u8> {
+        use flate2::{write::GzEncoder, Compression};
+        use std::io::Write;
+        let mut buf = Vec::new();
+        let mut enc = GzEncoder::new(&mut buf, Compression::default());
+        enc.write_all(b"").unwrap();
+        enc.finish().unwrap();
+        buf
+    }
+
+    /// Verify the request shape: POST to `/runner/skills/adopt-publish` with
+    /// Bearer auth and a `slug` form field carrying the discovered slug.
+    #[test]
+    fn adopt_publish_sends_slug_and_bearer_auth() {
+        use mockito::Server;
+
+        let mut server = Server::new();
+        let body = serde_json::json!({
+            "outcome": "published",
+            "skill_id": "hello-world",
+            "version": "0.1.0",
+            "installation_id": "8b3f6b8a-6e1e-4f39-9b8a-000000000001"
+        });
+
+        let mock = server
+            .mock("POST", "/runner/skills/adopt-publish")
+            .match_header("authorization", "Bearer tok")
+            .match_body(mockito::Matcher::Regex("hello-world".to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body.to_string())
+            .create();
+
+        let client = RegistryClient::new(server.url()).with_auth("tok");
+        let result = client.adopt_publish(minimal_gz_bytes(), "hello-world");
+
+        assert!(
+            result.is_ok(),
+            "adopt_publish should succeed; got: {:#?}",
+            result.unwrap_err()
+        );
+        match result.unwrap() {
+            AdoptPublishOutcome::Published(resp) => {
+                assert_eq!(resp.version, "0.1.0");
+                assert_eq!(
+                    resp.installation_id.as_deref(),
+                    Some("8b3f6b8a-6e1e-4f39-9b8a-000000000001")
+                );
+            }
+            other => panic!("expected Published, got {other:?}"),
+        }
+        mock.assert();
+    }
+
+    /// `pending_review` is a normal, successful response (not an error) —
+    /// the scan/approval gate deferred publication, it did not fail.
+    #[test]
+    fn adopt_publish_parses_pending_review_outcome_with_null_installation_id() {
+        use mockito::Server;
+
+        let mut server = Server::new();
+        let body = serde_json::json!({
+            "outcome": "pending_review",
+            "skill_id": "hello-world",
+            "version": "0.1.0",
+            "installation_id": null
+        });
+
+        let mock = server
+            .mock("POST", "/runner/skills/adopt-publish")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body.to_string())
+            .create();
+
+        let client = RegistryClient::new(server.url()).with_auth("tok");
+        let result = client.adopt_publish(minimal_gz_bytes(), "hello-world");
+
+        assert!(result.is_ok(), "pending_review is a success response");
+        match result.unwrap() {
+            AdoptPublishOutcome::PendingReview(resp) => {
+                assert!(resp.installation_id.is_none());
+            }
+            other => panic!("expected PendingReview, got {other:?}"),
+        }
+        mock.assert();
+    }
+
+    /// An unrecognized `outcome` value must be treated conservatively as
+    /// `pending_review` — never as `Published` — since only an exact
+    /// `"published"` match may trigger local-copy removal downstream.
+    #[test]
+    fn adopt_publish_treats_unknown_outcome_as_pending_review() {
+        use mockito::Server;
+
+        let mut server = Server::new();
+        let body = serde_json::json!({
+            "outcome": "some_future_outcome",
+            "skill_id": "hello-world",
+            "version": "0.1.0",
+            "installation_id": null
+        });
+
+        let mock = server
+            .mock("POST", "/runner/skills/adopt-publish")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body.to_string())
+            .create();
+
+        let client = RegistryClient::new(server.url()).with_auth("tok");
+        let result = client.adopt_publish(minimal_gz_bytes(), "hello-world");
+
+        assert!(result.is_ok());
+        match result.unwrap() {
+            AdoptPublishOutcome::PendingReview(_) => {}
+            other => panic!("expected PendingReview fallback, got {other:?}"),
+        }
+        mock.assert();
+    }
+
+    /// HTTP 422 (strict-mode reject) is a legitimate scan-gate outcome, not
+    /// an error — it must deserialize into `AdoptPublishOutcome::Rejected`
+    /// rather than bailing with `Err`.
+    #[test]
+    fn adopt_publish_parses_422_as_rejected_outcome() {
+        use mockito::Server;
+
+        let mut server = Server::new();
+        let body = serde_json::json!({
+            "message": "skill rejected by policy",
+            "reason": "high-risk findings",
+            "verdict": "critical",
+            "findings": [{"rule": "eval-use", "severity": "critical"}]
+        });
+
+        let mock = server
+            .mock("POST", "/runner/skills/adopt-publish")
+            .with_status(422)
+            .with_header("content-type", "application/json")
+            .with_body(body.to_string())
+            .create();
+
+        let client = RegistryClient::new(server.url()).with_auth("tok");
+        let result = client.adopt_publish(minimal_gz_bytes(), "hello-world");
+
+        assert!(
+            result.is_ok(),
+            "422 should be Ok(Rejected), not Err; got: {result:?}"
+        );
+        match result.unwrap() {
+            AdoptPublishOutcome::Rejected(rej) => {
+                assert_eq!(rej.verdict, "critical");
+                assert_eq!(rej.reason, "high-risk findings");
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+        mock.assert();
+    }
+
+    /// No auth token set — should fail fast without making an HTTP call.
+    #[test]
+    fn adopt_publish_requires_auth_token() {
+        let client = RegistryClient::new("http://127.0.0.1:1");
+        let result = client.adopt_publish(minimal_gz_bytes(), "hello-world");
+        assert!(result.is_err(), "should require an auth token");
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            msg.contains("not authenticated"),
+            "error should mention authentication; got: {msg}"
+        );
+    }
+
+    /// A non-2xx response should surface the HTTP status and body rather
+    /// than panicking on JSON deserialization of an error page.
+    #[test]
+    fn adopt_publish_surfaces_http_errors() {
+        use mockito::Server;
+
+        let mut server = Server::new();
+        let mock = server
+            .mock("POST", "/runner/skills/adopt-publish")
+            .with_status(500)
+            .with_body("internal error")
+            .create();
+
+        let client = RegistryClient::new(server.url()).with_auth("tok");
+        let result = client.adopt_publish(minimal_gz_bytes(), "hello-world");
+
+        assert!(result.is_err(), "HTTP 500 should surface as an error");
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            msg.contains("500") || msg.contains("adopt-publish failed"),
+            "error should mention the failure; got: {msg}"
+        );
         mock.assert();
     }
 }

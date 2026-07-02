@@ -1533,6 +1533,14 @@ async fn handle_install(
 }
 
 /// Perform the actual install: download artifact, verify SHA-256, install, update SQLite.
+///
+/// Runs the phantom-artifact backstop check first, then delegates the real
+/// work to [`install_verified_version`]. Callers that already *know* a real
+/// artifact exists (the adopt-publish immediate-install path — see
+/// `managed_paths::adopt_publish`) call [`install_verified_version`] directly
+/// to skip this check: it can misfire on the F2 marker the adopt flow's own
+/// local-copy push already wrote for the slug (see `is_phantom`'s marker
+/// fallback below), even though the backend just confirmed real bytes exist.
 async fn do_install(
     installation_id: Uuid,
     skill_id: &str,
@@ -1587,6 +1595,27 @@ async fn do_install(
             );
             report_installation_status(installation_id, "installed", None, &reg_url, &state_clone)
                 .await;
+
+            // Adopt-takeover convergence (deferred-approval path): this branch is
+            // what a real, non-phantom `Install` event hits when a marker was
+            // already written for this slug by the adopt flow's own local-copy
+            // push (see `do_install`'s doc comment). If IT has since approved
+            // publication — signalled here by a real (non-"0.0.0") version — and
+            // this slug has a lingering discovered `source_path` recorded by
+            // `managed_paths::adopt_publish`, this is the confirmation needed to
+            // safely remove it. No-ops if nothing is pending for this slug.
+            if version != "0.0.0" {
+                if let Err(e) =
+                    crate::managed_paths::takeover::perform_if_pending(&state_clone, &skill_id)
+                {
+                    warn!(
+                        skill_id,
+                        error = %e,
+                        "reconciler: adopt takeover check failed (non-fatal)"
+                    );
+                }
+            }
+
             return Ok(());
         }
 
@@ -1598,6 +1627,44 @@ async fn do_install(
         }
         .into());
     }
+
+    install_verified_version(
+        installation_id,
+        &skill_id,
+        &version,
+        state,
+        registry_url,
+        pusher,
+    )
+    .await
+}
+
+/// Install a version already known (or just confirmed) to have a real,
+/// downloadable artifact — download-or-reuse, install into the versioned
+/// layout, flip the active symlink, and F2-push into `~/.claude/skills/`.
+///
+/// Shared by two callers:
+/// - [`do_install`], after its phantom-artifact check passes for a normal SSE
+///   `Install` event.
+/// - `managed_paths::adopt_publish`, which calls this **directly** — bypassing
+///   `do_install`'s phantom check entirely — right after the backend's
+///   adopt-publish endpoint returns `outcome: "published"`. At that point a
+///   real artifact is known to exist even though the slug may already carry
+///   an F2 marker (written by the adopt flow's own immediate local-copy push)
+///   that would otherwise make `do_install`'s marker-based phantom fallback
+///   misfire.
+pub(crate) async fn install_verified_version(
+    installation_id: Uuid,
+    skill_id: &str,
+    version: &str,
+    state: &Arc<AppState>,
+    registry_url: &str,
+    pusher: Option<&ManagedPathsPusher>,
+) -> Result<()> {
+    let skill_id = skill_id.to_string();
+    let version = version.to_string();
+    let state_clone = Arc::clone(state);
+    let reg_url = registry_url.to_string();
 
     // Check if this version is already installed locally — if so, just flip symlink.
     let already_local = check_version_local(&state_clone, &skill_id, &version).await?;
@@ -1684,6 +1751,20 @@ fn push_skill_to_claude(
             skill_id,
             error = %e,
             "reconciler: F2 push_skill failed (non-fatal)"
+        );
+        return;
+    }
+
+    // Adopt-takeover convergence (immediate-publish + any other normal
+    // install of an already-managed slug): the managed copy we just wrote is
+    // exactly the confirmation `managed_paths::takeover::perform_if_pending`
+    // needs before removing the slug's original discovered `source_path`.
+    // No-ops unless a takeover is actually pending for this slug.
+    if let Err(e) = crate::managed_paths::takeover::perform_if_pending(state, skill_id) {
+        warn!(
+            skill_id,
+            error = %e,
+            "reconciler: adopt takeover check failed (non-fatal)"
         );
     }
 }

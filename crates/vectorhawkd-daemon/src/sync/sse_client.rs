@@ -350,6 +350,16 @@ async fn dispatch_event(
     // copy `source_path` into `~/.claude/skills/<slug>/` and write the F2
     // marker so Claude Code can actually see the skill. Spawned as its own
     // task so SSE dispatch isn't blocked on disk I/O.
+    //
+    // Adopt auto-upload + takeover: alongside that immediate local-copy push
+    // (which gives the user an instant, usable copy regardless of how long
+    // the scan/approval gate takes), also route the bytes through
+    // `POST /runner/skills/adopt-publish` so the skill gets a real registry
+    // artifact under the org's normal policy gate. Once that resolves to
+    // `published`, `managed_paths::adopt_publish` installs the real artifact
+    // and takes over from `source_path`; for `pending_review` / a strict-mode
+    // reject it leaves both copies alone until IT approves later. Spawned as
+    // its own task, independent of the local-copy push above.
     if event_type == "discovery_adopted" {
         #[derive(serde::Deserialize)]
         struct WireAdopted {
@@ -364,16 +374,43 @@ async fn dispatch_event(
         match serde_json::from_str::<WireAdopted>(event_data) {
             Ok(w) => {
                 let state_arc: Arc<AppState> = Arc::new(state.clone());
+                let slug = w.slug.clone();
+                let kind = w.kind.clone();
+                let source_path = w.source_path.clone();
                 tokio::spawn(async move {
                     if let Err(e) = crate::managed_paths::pusher::push_adopted_discovery(
                         &state_arc,
-                        &w.slug,
-                        &w.kind,
-                        &w.source_path,
+                        &slug,
+                        &kind,
+                        &source_path,
                     )
                     .await
                     {
-                        warn!(slug = %w.slug, error = %e, "adopt: push from source_path failed");
+                        warn!(slug = %slug, error = %e, "adopt: push from source_path failed");
+                    }
+                });
+
+                let state_arc: Arc<AppState> = Arc::new(state.clone());
+                let registry_url = state
+                    .get_sync_state("registry_url")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                tokio::spawn(async move {
+                    if registry_url.is_empty() {
+                        warn!("adopt-publish: no registry_url in sync_state — cannot upload");
+                        return;
+                    }
+                    if let Err(e) = crate::managed_paths::adopt_publish::handle_discovery_adopted(
+                        state_arc,
+                        registry_url,
+                        w.slug,
+                        w.kind,
+                        w.source_path,
+                    )
+                    .await
+                    {
+                        warn!(error = ?e, "adopt-publish: handler failed");
                     }
                 });
             }
