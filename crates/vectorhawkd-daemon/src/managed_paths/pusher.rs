@@ -660,6 +660,17 @@ fn resolve_skills_dir() -> Result<PathBuf> {
     Ok(resolve_home()?.join(".claude").join("skills"))
 }
 
+/// Return `true` if the F2-managed copy for `slug` is present on disk, i.e.
+/// `~/.claude/skills/<slug>/SKILL.md` exists.
+///
+/// Used by the adopt-publish takeover flow (`managed_paths::takeover`) to
+/// confirm the VectorHawk-managed replacement actually landed before removing
+/// the original discovered `source_path` it is replacing.
+pub fn managed_skill_present(slug: &str) -> Result<bool> {
+    let skills_dir = resolve_skills_dir()?;
+    Ok(skills_dir.join(slug).join("SKILL.md").exists())
+}
+
 fn resolve_plugins_dir() -> Result<PathBuf> {
     Ok(resolve_home()?.join(".claude").join("plugins"))
 }

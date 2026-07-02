@@ -26,6 +26,7 @@
 //! itself returns `Ok(MigrationReport)` unless something catastrophic prevents
 //! even opening the DB.  Migration failure must NOT crash the daemon.
 
+pub mod adopt_publish;
 pub mod discoveries;
 pub mod drift;
 pub mod marker;
@@ -36,6 +37,7 @@ pub mod publish;
 pub mod pusher;
 pub mod rollback;
 pub mod scanner;
+pub mod takeover;
 
 use anyhow::Result;
 use std::{path::PathBuf, sync::Arc};

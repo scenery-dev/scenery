@@ -111,6 +111,10 @@ impl AppState {
         conn.execute_batch(SCHEMA_F1_SQL)
             .context("failed to apply F1 schema additions")?;
 
+        // Adopt-publish auto-upload takeover tracking.
+        conn.execute_batch(SCHEMA_ADOPT_SQL)
+            .context("failed to apply adopt-takeover schema additions")?;
+
         Ok(Self { root_dir, db_path })
     }
 
@@ -347,6 +351,61 @@ impl AppState {
     }
 }
 
+// ── Adopt-publish takeover tracking ──────────────────────────────────────────
+
+impl AppState {
+    /// Record that `slug` has a discovered `source_path` awaiting removal
+    /// ("takeover") once a real VectorHawk-managed install for that slug is
+    /// confirmed present on disk.
+    ///
+    /// Upsert — safe to call repeatedly for the same slug (e.g. on SSE
+    /// redelivery of `discovery_adopted`, or a retried adopt). The most
+    /// recently reported `source_path` wins.
+    pub fn record_pending_adopt_takeover(&self, slug: &str, source_path: &str) -> Result<()> {
+        let conn = Connection::open(&self.db_path)
+            .context("failed to open state DB for pending-takeover upsert")?;
+        conn.execute(
+            "INSERT INTO adopt_pending_takeovers (slug, source_path) VALUES (?1, ?2) \
+             ON CONFLICT(slug) DO UPDATE SET source_path = excluded.source_path",
+            rusqlite::params![slug, source_path],
+        )
+        .context("failed to upsert adopt_pending_takeovers row")?;
+        Ok(())
+    }
+
+    /// Return the discovered `source_path` pending takeover for `slug`, if any.
+    ///
+    /// `None` means there is nothing to take over — either `slug` was never
+    /// adopted from local discovery, or its takeover already completed.
+    pub fn pending_adopt_takeover_source(&self, slug: &str) -> Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+        let conn = Connection::open(&self.db_path)
+            .context("failed to open state DB for pending-takeover lookup")?;
+        let result = conn
+            .query_row(
+                "SELECT source_path FROM adopt_pending_takeovers WHERE slug = ?1",
+                [slug],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .context("failed to read adopt_pending_takeovers")?;
+        Ok(result)
+    }
+
+    /// Clear the pending-takeover record for `slug`, e.g. after its
+    /// `source_path` has been removed. No-ops if no row exists.
+    pub fn clear_pending_adopt_takeover(&self, slug: &str) -> Result<()> {
+        let conn = Connection::open(&self.db_path)
+            .context("failed to open state DB for pending-takeover clear")?;
+        conn.execute(
+            "DELETE FROM adopt_pending_takeovers WHERE slug = ?1",
+            rusqlite::params![slug],
+        )
+        .context("failed to delete adopt_pending_takeovers row")?;
+        Ok(())
+    }
+}
+
 // ── Schema helpers ────────────────────────────────────────────────────────────
 
 /// Execute an `ALTER TABLE … ADD COLUMN …` statement, ignoring the error if
@@ -478,6 +537,22 @@ CREATE TABLE IF NOT EXISTS managed_path_markers (
 );
 "#;
 
+/// Adopt-publish auto-upload takeover tracking.
+///
+/// Records skills adopted from local discovery whose original `source_path`
+/// (e.g. `~/.agents/skills/<slug>`) has not yet been removed because a real
+/// VectorHawk-managed install was not confirmed present on disk at adopt
+/// time (outcome was `pending_review`, or the immediate publish+install had
+/// not yet completed). The row is deleted once takeover (source removal)
+/// completes — see `managed_paths::takeover` in the daemon crate.
+const SCHEMA_ADOPT_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS adopt_pending_takeovers (
+    slug        TEXT PRIMARY KEY,
+    source_path TEXT NOT NULL,
+    recorded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+"#;
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -518,14 +593,15 @@ mod tests {
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN \
                  ('installed_skills','skill_versions','auth_tokens',\
                   'audit_events','skill_ratings','skill_execution_counts',\
-                  'sync_state','mcp_installations','managed_path_markers')",
+                  'sync_state','mcp_installations','managed_path_markers',\
+                  'adopt_pending_takeovers')",
                 [],
                 |row| row.get(0),
             )
             .expect("should query sqlite_master");
         assert_eq!(
-            table_count, 9,
-            "all nine tables should exist (execution_history + policy_cache were retired)"
+            table_count, 10,
+            "all ten tables should exist (execution_history + policy_cache were retired)"
         );
 
         cleanup(&state.root_dir);
@@ -553,6 +629,83 @@ mod tests {
             sock.as_str().contains("VectorHawk") || sock.as_str().contains("vh-state-tests"),
             "socket path should be under the data dir: {sock}"
         );
+        cleanup(&root);
+    }
+
+    // ── Adopt-publish takeover tracking ──────────────────────────────────────
+
+    #[test]
+    fn pending_adopt_takeover_roundtrips() {
+        let root = temp_root("adopt-takeover-roundtrip");
+        let state = AppState::bootstrap_in(root.clone()).expect("bootstrap");
+
+        assert_eq!(
+            state
+                .pending_adopt_takeover_source("hello-world")
+                .expect("lookup should not error"),
+            None,
+            "no record until one is written"
+        );
+
+        state
+            .record_pending_adopt_takeover("hello-world", "/home/user/.agents/skills/hello-world")
+            .expect("record should succeed");
+
+        assert_eq!(
+            state
+                .pending_adopt_takeover_source("hello-world")
+                .expect("lookup should succeed"),
+            Some("/home/user/.agents/skills/hello-world".to_string())
+        );
+
+        state
+            .clear_pending_adopt_takeover("hello-world")
+            .expect("clear should succeed");
+
+        assert_eq!(
+            state
+                .pending_adopt_takeover_source("hello-world")
+                .expect("lookup after clear should succeed"),
+            None,
+            "record should be gone after clear"
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn record_pending_adopt_takeover_upserts_latest_source_path() {
+        let root = temp_root("adopt-takeover-upsert");
+        let state = AppState::bootstrap_in(root.clone()).expect("bootstrap");
+
+        state
+            .record_pending_adopt_takeover("hello-world", "/first/path")
+            .expect("first record should succeed");
+        state
+            .record_pending_adopt_takeover("hello-world", "/second/path")
+            .expect("re-recording the same slug should upsert, not error");
+
+        assert_eq!(
+            state
+                .pending_adopt_takeover_source("hello-world")
+                .expect("lookup should succeed"),
+            Some("/second/path".to_string()),
+            "the most recently recorded source_path should win"
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn clear_pending_adopt_takeover_is_idempotent_when_absent() {
+        let root = temp_root("adopt-takeover-clear-absent");
+        let state = AppState::bootstrap_in(root.clone()).expect("bootstrap");
+
+        // No row was ever recorded for this slug — clearing must not error.
+        state
+            .clear_pending_adopt_takeover("never-recorded")
+            .expect("clearing an absent record should be a no-op, not an error");
+
         cleanup(&root);
     }
 }

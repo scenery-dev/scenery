@@ -122,7 +122,10 @@ pub async fn handle_publish_requested(
 ///
 /// Returns `Err` (rather than `None`) so the caller can propagate a meaningful
 /// error message when no token is stored.
-fn load_token_for_registry(state: &AppState, registry_url: &str) -> Result<String> {
+///
+/// `pub(crate)` — reused by [`super::adopt_publish`], which uploads through
+/// the same `RegistryClient` auth as this admin-triggered publish flow.
+pub(crate) fn load_token_for_registry(state: &AppState, registry_url: &str) -> Result<String> {
     let rows = load_all_tokens(state).context("publish: failed to read auth token store")?;
     rows.into_iter()
         .find(|r| r.registry_url == registry_url)
@@ -138,7 +141,10 @@ fn load_token_for_registry(state: &AppState, registry_url: &str) -> Result<Strin
 /// Pack the directory at `dir` into an in-memory gzipped tar archive.
 ///
 /// Run inside `spawn_blocking` because `tar::Builder` uses sync I/O.
-async fn build_tar_gz(dir: std::path::PathBuf) -> Result<Vec<u8>> {
+///
+/// `pub(crate)` — reused by [`super::adopt_publish`] to pack the same
+/// SKILL.md-tree shape for the `/runner/skills/adopt-publish` upload.
+pub(crate) async fn build_tar_gz(dir: std::path::PathBuf) -> Result<Vec<u8>> {
     tokio::task::spawn_blocking(move || pack_dir_to_tar_gz(&dir))
         .await
         .context("publish: tar task panicked")?
