@@ -799,13 +799,36 @@ impl RegistryClient {
 
         let status = resp.status();
 
-        // Strict-mode reject: a legitimate scan-gate outcome, not a failure.
-        // The local discovered copy must be left in place, same as pending_review.
+        // A 422 from FastAPI wraps `HTTPException.detail` under a top-level
+        // "detail" key. This endpoint emits two shapes:
+        //   * scan-gate reject → detail is an OBJECT matching
+        //     AdoptPublishRejection (a legitimate policy outcome — the local
+        //     discovered copy must be left in place, same as pending_review).
+        //   * ownership / compile error → detail is a STRING (or FastAPI
+        //     request-validation errors → a LIST); these are genuine failures.
         if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
-            let rejection: AdoptPublishRejection = resp
+            let body: serde_json::Value = resp
                 .json()
-                .context("failed to deserialize adopt-publish rejection (422) response")?;
-            return Ok(AdoptPublishOutcome::Rejected(rejection));
+                .context("failed to deserialize adopt-publish 422 response")?;
+            // Unwrap FastAPI's "detail" envelope; fall back to the whole body
+            // if some other layer returned an unwrapped payload.
+            let detail = body.get("detail").cloned().unwrap_or(body);
+            if detail.is_object() {
+                if let Ok(rejection) =
+                    serde_json::from_value::<AdoptPublishRejection>(detail.clone())
+                {
+                    return Ok(AdoptPublishOutcome::Rejected(rejection));
+                }
+            }
+            // String detail (e.g. "not yours to publish") or an unexpected
+            // shape: a real failure, not a scan-gate policy outcome. Leave the
+            // local copy in place (this is an Err → no takeover) and surface
+            // the message.
+            let msg = detail
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| detail.to_string());
+            anyhow::bail!("adopt-publish rejected (HTTP 422): {msg}");
         }
 
         if !status.is_success() {
@@ -2152,11 +2175,14 @@ mod tests {
         use mockito::Server;
 
         let mut server = Server::new();
+        // Real FastAPI shape: HTTPException.detail nested under "detail".
         let body = serde_json::json!({
-            "message": "skill rejected by policy",
-            "reason": "high-risk findings",
-            "verdict": "critical",
-            "findings": [{"rule": "eval-use", "severity": "critical"}]
+            "detail": {
+                "message": "skill rejected by policy",
+                "reason": "high-risk findings",
+                "verdict": "critical",
+                "findings": [{"rule": "eval-use", "severity": "critical"}]
+            }
         });
 
         let mock = server
@@ -2180,6 +2206,38 @@ mod tests {
             }
             other => panic!("expected Rejected, got {other:?}"),
         }
+        mock.assert();
+    }
+
+    /// A 422 whose `detail` is a plain string (ownership / compile error, e.g.
+    /// "not yours to publish") is a genuine failure, not a scan-gate policy
+    /// outcome — it must surface as Err (so no local takeover) with the message.
+    #[test]
+    fn adopt_publish_422_string_detail_is_error() {
+        use mockito::Server;
+
+        let mut server = Server::new();
+        let body = serde_json::json!({ "detail": "not yours to publish" });
+
+        let mock = server
+            .mock("POST", "/runner/skills/adopt-publish")
+            .with_status(422)
+            .with_header("content-type", "application/json")
+            .with_body(body.to_string())
+            .create();
+
+        let client = RegistryClient::new(server.url()).with_auth("tok");
+        let result = client.adopt_publish(minimal_gz_bytes(), "hello-world");
+
+        assert!(
+            result.is_err(),
+            "string-detail 422 should be Err; got: {result:?}"
+        );
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            msg.contains("not yours to publish"),
+            "error should surface the detail message; got: {msg}"
+        );
         mock.assert();
     }
 
