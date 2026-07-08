@@ -123,6 +123,50 @@ async fn migrate_item_idempotent_second_run_is_noop() {
     assert!(!result, "already-marked item should return false");
 }
 
+// ── Replace-with-managed: adoption marks the item as VectorHawk-managed ─────────
+
+/// B3: adopting a custom skill takes local ownership — it writes the
+/// `.vectorhawk-managed.json` marker in place (the "managed copy") and a DB
+/// marker row, so the drift reconciler now governs it. Runs offline: with no
+/// auth token the backend POST is skipped, but ownership is still taken.
+#[tokio::test]
+async fn migrate_item_marks_adopted_skill_as_managed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (state, _guard) = temp_state();
+    let item = skill_item("adopt-me", tmp.path());
+    let backup_root = tmp.path().join("backup");
+
+    let client = reqwest::Client::new();
+    let migrated = migrate_item(&item, &backup_root, &state, "http://unused", &client)
+        .await
+        .unwrap();
+    assert!(migrated, "a fresh custom skill should be newly adopted");
+
+    // Local ownership marker written in place (replace-with-managed).
+    let marker = item
+        .source_path
+        .join(vectorhawkd_mcp::ownership::MANAGED_MARKER_FILENAME);
+    assert!(
+        marker.exists(),
+        "adopted skill must carry the managed marker"
+    );
+    assert!(
+        vectorhawkd_mcp::ownership::is_vectorhawk_managed(&item.source_path),
+        "adopted skill dir must classify as VectorHawk-managed"
+    );
+
+    // DB marker row present (authoritative idempotency key).
+    let conn = rusqlite::Connection::open(&state.db_path).unwrap();
+    assert!(
+        crate::managed_paths::marker::is_already_marked(
+            &conn,
+            &item.source_path.to_string_lossy(),
+        )
+        .unwrap(),
+        "adopted skill must have a managed_path_markers row"
+    );
+}
+
 // ── Audit event ───────────────────────────────────────────────────────────────
 
 #[test]

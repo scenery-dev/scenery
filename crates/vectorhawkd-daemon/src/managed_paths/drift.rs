@@ -43,6 +43,7 @@ use tokio::time::interval;
 use tracing::{debug, info, warn};
 use vectorhawkd_core::auth::load_all_tokens;
 use vectorhawkd_core::state::AppState;
+use vectorhawkd_mcp::ownership;
 
 const DEFAULT_INTERVAL_SECS: u64 = 300;
 const SCAN_BUDGET_SECS: u64 = 30;
@@ -512,6 +513,9 @@ fn remove_path_for(marker: &ManagedPathMarker) -> Result<()> {
     match marker.kind.as_str() {
         "skill" | "plugin" => {
             let dir = PathBuf::from(&marker.path);
+            // Defense-in-depth: never delete Anthropic-native content, even if a
+            // stale marker row points at it.
+            ownership::ensure_not_native(&dir)?;
             if dir.exists() {
                 fs::remove_dir_all(&dir)
                     .with_context(|| format!("drift: failed to remove {}", dir.display()))?;
@@ -520,6 +524,10 @@ fn remove_path_for(marker: &ManagedPathMarker) -> Result<()> {
         }
         "mcp" => {
             let (json_path, slug) = split_mcp_path(&marker.path)?;
+            // Never remove our own aggregator entry via drift.
+            if ownership::is_vectorhawk_mcp_key(&slug) {
+                anyhow::bail!("drift: refusing to remove the vectorhawk aggregator entry");
+            }
             if !json_path.exists() {
                 return Ok(());
             }
@@ -557,6 +565,8 @@ fn quarantine_item(outcome: &DriftOutcome) -> Result<PathBuf> {
     match outcome.kind.as_str() {
         "skill" | "plugin" => {
             let src = PathBuf::from(&outcome.path);
+            // Defense-in-depth: never move/delete Anthropic-native content.
+            ownership::ensure_not_native(&src)?;
             if !src.exists() {
                 return Ok(dest_root);
             }
@@ -570,6 +580,9 @@ fn quarantine_item(outcome: &DriftOutcome) -> Result<PathBuf> {
         }
         "mcp" => {
             let (json_path, slug) = split_mcp_path(&outcome.path)?;
+            if ownership::is_vectorhawk_mcp_key(&slug) {
+                anyhow::bail!("drift: refusing to quarantine the vectorhawk aggregator entry");
+            }
             if !json_path.exists() {
                 return Ok(dest_root);
             }

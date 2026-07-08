@@ -388,8 +388,9 @@ async fn relay_via_socket(
             } else {
                 // Aggregator shim: hide backends already surfaced as
                 // per-server entries in ~/.claude.json so the AI client
-                // doesn't see them under both namespaces.
-                let exclusions = load_aggregator_exclusions_from_claude_json();
+                // doesn't see them under both namespaces. The native-key rule
+                // lives in `vectorhawkd_mcp::ownership` (single source of truth).
+                let exclusions = vectorhawkd_mcp::ownership::native_mcp_keys_from_claude_json();
                 result = filter_tools_for_aggregator(result, &exclusions);
             }
 
@@ -470,40 +471,6 @@ fn filter_tools_for_aggregator(
         }
     });
     result
-}
-
-/// Read `~/.claude.json` and return the set of `mcpServers` keys, excluding
-/// the `vectorhawk` aggregator entry itself.
-///
-/// Each remaining key represents a backend that the AI client reaches
-/// natively (via its own per-server shim), so those slugs should NOT also
-/// be exposed under the aggregator's namespace.
-///
-/// Returns an empty set if `~/.claude.json` is missing or malformed — fail
-/// open so the shim is never blocked from serving tools/list.
-#[cfg(unix)]
-fn load_aggregator_exclusions_from_claude_json() -> std::collections::HashSet<String> {
-    let path = match dirs::home_dir() {
-        Some(h) => h.join(".claude.json"),
-        None => return std::collections::HashSet::new(),
-    };
-    let bytes = match std::fs::read(&path) {
-        Ok(b) => b,
-        Err(_) => return std::collections::HashSet::new(),
-    };
-    let root: serde_json::Value = match serde_json::from_slice(&bytes) {
-        Ok(v) => v,
-        Err(_) => return std::collections::HashSet::new(),
-    };
-    let mut out = std::collections::HashSet::new();
-    if let Some(map) = root.get("mcpServers").and_then(|v| v.as_object()) {
-        for key in map.keys() {
-            if key != "vectorhawk" {
-                out.insert(key.clone());
-            }
-        }
-    }
-    out
 }
 
 // ── DaemonRequired error response ─────────────────────────────────────────────

@@ -1915,8 +1915,7 @@ async fn cmd_skill_run(
         }
     }
 
-    let result = run_outcome
-        .with_context(|| format!("failed to run skill '{id}'"))?;
+    let result = run_outcome.with_context(|| format!("failed to run skill '{id}'"))?;
 
     println!("Skill:    {}", result.skill_id);
     println!("Version:  {}", result.version);
@@ -4763,8 +4762,7 @@ async fn cmd_skill_uninstall(id: &str, registry_url: Option<&str>) -> Result<()>
     };
 
     // Perform the local removal (files + DB rows).
-    uninstall_skill(&state, id)
-        .with_context(|| format!("failed to remove skill '{id}'"))?;
+    uninstall_skill(&state, id).with_context(|| format!("failed to remove skill '{id}'"))?;
 
     // Emit audit event.
     let ts = chrono::Utc::now().to_rfc3339();
@@ -4804,13 +4802,19 @@ async fn cmd_skill_uninstall(id: &str, registry_url: Option<&str>) -> Result<()>
                         "  The skill may be reinstalled by the reconciler on the next sync. \
                          To prevent this, remove it from the portal."
                     );
-                    println!("Uninstalled skill '{id}' (version {}) locally.", info.active_version);
+                    println!(
+                        "Uninstalled skill '{id}' (version {}) locally.",
+                        info.active_version
+                    );
                 }
             }
         }
         _ => {
             // No managed installation — purely local, no backend call needed.
-            println!("Uninstalled skill '{id}' (version {}).", info.active_version);
+            println!(
+                "Uninstalled skill '{id}' (version {}).",
+                info.active_version
+            );
         }
     }
 
@@ -4834,12 +4838,10 @@ async fn deactivate_backend_installation(
 
     let db_path = state.db_path.clone();
     let reg_url = registry_url.to_string();
-    let token = tokio::task::spawn_blocking(move || {
-        load_all_tokens_from_db(&db_path, &reg_url)
-    })
-    .await
-    .context("token-load task panicked")?
-    .context("failed to load auth tokens")?;
+    let token = tokio::task::spawn_blocking(move || load_all_tokens_from_db(&db_path, &reg_url))
+        .await
+        .context("token-load task panicked")?
+        .context("failed to load auth tokens")?;
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
@@ -4886,12 +4888,10 @@ async fn deactivate_backend_plugin_installation(
 
     let db_path = state.db_path.clone();
     let reg_url = registry_url.to_string();
-    let token = tokio::task::spawn_blocking(move || {
-        load_all_tokens_from_db(&db_path, &reg_url)
-    })
-    .await
-    .context("token-load task panicked")?
-    .context("failed to load auth tokens")?;
+    let token = tokio::task::spawn_blocking(move || load_all_tokens_from_db(&db_path, &reg_url))
+        .await
+        .context("token-load task panicked")?
+        .context("failed to load auth tokens")?;
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
@@ -4940,7 +4940,10 @@ fn load_all_tokens_from_db(
         .parent()
         .map(|p| p.to_owned())
         .ok_or_else(|| anyhow::anyhow!("db_path has no parent"))?;
-    let state = AppState { root_dir, db_path: db_path.to_owned() };
+    let state = AppState {
+        root_dir,
+        db_path: db_path.to_owned(),
+    };
 
     let tokens = load_all_tokens(&state).context("failed to load auth tokens")?;
     let token = tokens
@@ -5027,9 +5030,7 @@ async fn cmd_plugin_uninstall(slug: &str, registry_url: Option<&str>) -> Result<
         Some(iid) if !iid.is_empty() => {
             match deactivate_backend_plugin_installation(iid, url, &state).await {
                 Ok(()) => {
-                    println!(
-                        "Uninstalled plugin '{slug}' and deactivated managed installation."
-                    );
+                    println!("Uninstalled plugin '{slug}' and deactivated managed installation.");
                 }
                 Err(e) => {
                     eprintln!(
@@ -5064,8 +5065,8 @@ async fn cmd_plugin_uninstall(slug: &str, registry_url: Option<&str>) -> Result<
 /// Returns `true` if the plugin's marketplace source directory exists under
 /// `~/.claude/plugins/marketplaces/vectorhawk/plugins/<slug>/`.
 fn is_plugin_installed_locally(slug: &str) -> Result<bool> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
     let plugin_src = home
         .join(".claude")
         .join("plugins")

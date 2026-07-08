@@ -5,7 +5,6 @@
 //! directory does not abort the whole scan.
 
 use super::ItemKind;
-use crate::managed_paths::paths::is_excluded_plugin_dir;
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::{
@@ -13,6 +12,7 @@ use std::{
     path::{Path, PathBuf},
 };
 use tracing::warn;
+use vectorhawkd_mcp::ownership::{self, is_excluded_plugin_dir, is_vectorhawk_mcp_key};
 
 /// One discovered item ready for migration.
 #[derive(Debug, Clone)]
@@ -209,6 +209,137 @@ pub fn scan_plugins_dir(plugins_dir: &Path) -> Result<Vec<MigrationItem>> {
     Ok(items)
 }
 
+// ── Plugin marketplaces (nested layout) ─────────────────────────────────────────
+
+/// Walk the Claude Code plugin **marketplace** tree and return one
+/// `MigrationItem` per *custom* plugin found on disk.
+///
+/// Claude Code does not store plugins as immediate children of
+/// `~/.claude/plugins/`; they live nested under
+/// `~/.claude/plugins/marketplaces/<marketplace>/{plugins,external_plugins}/<plugin>/`.
+/// `scan_plugins_dir` only sees the top level (and skips the plumbing dirs), so
+/// this function is what actually discovers third-party plugins.
+///
+/// Skipped:
+/// - **Anthropic-native** plugins — the internal `plugins/` subtree of the
+///   official marketplace (see [`ownership::is_anthropic_native_in`]).
+/// - **Already-managed** plugins — those carrying a `.vectorhawk-managed.json`.
+///
+/// Classification reads `known_marketplaces.json` from the *passed* `plugins_dir`
+/// so it stays self-consistent (and unit-testable) regardless of `$HOME`.
+pub fn scan_plugin_marketplaces(plugins_dir: &Path) -> Result<Vec<MigrationItem>> {
+    let marketplaces_dir = plugins_dir.join("marketplaces");
+    if !marketplaces_dir.exists() {
+        return Ok(vec![]);
+    }
+
+    let marketplaces =
+        ownership::read_known_marketplaces_at(&plugins_dir.join("known_marketplaces.json"));
+
+    let mut items = Vec::new();
+
+    let mkt_entries = fs::read_dir(&marketplaces_dir).with_context(|| {
+        format!(
+            "failed to read marketplaces dir: {}",
+            marketplaces_dir.display()
+        )
+    })?;
+
+    for mkt in mkt_entries {
+        let mkt = match mkt {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "managed_paths/scanner: error reading marketplace entry");
+                continue;
+            }
+        };
+        let mkt_path = mkt.path();
+        if !mkt_path.is_dir() {
+            continue;
+        }
+
+        // Plugins live under `plugins/` (bundled) and `external_plugins/` (third-party).
+        for sub in ["plugins", "external_plugins"] {
+            let sub_dir = mkt_path.join(sub);
+            if !sub_dir.exists() {
+                continue;
+            }
+            let plugin_entries = match fs::read_dir(&sub_dir) {
+                Ok(e) => e,
+                Err(e) => {
+                    warn!(path = %sub_dir.display(), error = %e, "managed_paths/scanner: cannot read plugin subdir");
+                    continue;
+                }
+            };
+
+            for pe in plugin_entries {
+                let pe = match pe {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+                let pdir = pe.path();
+                if !pdir.is_dir() {
+                    continue;
+                }
+
+                let slug = match pdir.file_name().and_then(|n| n.to_str()) {
+                    Some(s) => s.to_string(),
+                    None => {
+                        warn!(path = %pdir.display(), "managed_paths/scanner: non-UTF-8 plugin dir name — skipping");
+                        continue;
+                    }
+                };
+
+                let manifest_path = pdir.join(".claude-plugin").join("plugin.json");
+                if !manifest_path.exists() {
+                    continue;
+                }
+
+                // Already ours — nothing to adopt.
+                if ownership::is_vectorhawk_managed(&pdir) {
+                    continue;
+                }
+                // Anthropic first-party — strictly out of scope.
+                if ownership::is_anthropic_native_in(&pdir, plugins_dir, marketplaces.as_ref()) {
+                    continue;
+                }
+
+                let manifest_bytes = match fs::read(&manifest_path) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        warn!(slug = %slug, error = %e, "managed_paths/scanner: cannot read plugin manifest — skipping");
+                        continue;
+                    }
+                };
+
+                let manifest_value: serde_json::Value = match serde_json::from_slice(
+                    &manifest_bytes,
+                ) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(slug = %slug, error = %e, "managed_paths/scanner: plugin manifest not valid JSON — skipping");
+                        continue;
+                    }
+                };
+
+                let canonical_hash = sha256_bytes(&manifest_bytes);
+                let payload = serde_json::json!({ "manifest_json": manifest_value });
+
+                items.push(MigrationItem {
+                    kind: ItemKind::Plugin,
+                    slug,
+                    source_path: pdir,
+                    files: vec![manifest_path],
+                    canonical_hash,
+                    payload,
+                });
+            }
+        }
+    }
+
+    Ok(items)
+}
+
 // ── MCP servers ───────────────────────────────────────────────────────────────
 
 /// Parse `~/.claude.json` and return one `MigrationItem` per `mcpServers` entry
@@ -239,7 +370,7 @@ pub fn scan_claude_json(claude_json: &Path) -> Result<Vec<MigrationItem>> {
 
     for (key, value) in &mcp_servers {
         // Always skip the VectorHawk aggregator entry.
-        if key == "vectorhawk" {
+        if is_vectorhawk_mcp_key(key) {
             continue;
         }
 

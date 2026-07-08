@@ -27,6 +27,7 @@
 
 pub mod aggregator;
 pub mod backend;
+pub mod ownership;
 pub mod protocol;
 pub mod server;
 pub mod setup;

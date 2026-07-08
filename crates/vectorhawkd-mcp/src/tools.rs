@@ -574,6 +574,15 @@ fn build_tool_list_inner(
 }
 
 /// Load installed skills from SQLite and convert to MCP tool definitions.
+///
+/// # Invariant: never enumerates the filesystem
+///
+/// This is strictly DB-bound — it reads only `installed_skills` (skills that
+/// VectorHawk itself installed and tracks). It never scans `~/.claude/skills/`
+/// or `~/.claude/plugins/`, so Anthropic-native content (which VectorHawk never
+/// records in `installed_skills`) can never be surfaced as a VectorHawk tool.
+/// Do not add a filesystem walk here; native-vs-managed classification lives in
+/// [`crate::ownership`] and adoption goes through the daemon reconciler.
 fn skill_tools_from_db(state: &AppState) -> Result<Vec<ToolDefinition>> {
     let conn = Connection::open(&state.db_path)?;
     let mut stmt = conn.prepare(

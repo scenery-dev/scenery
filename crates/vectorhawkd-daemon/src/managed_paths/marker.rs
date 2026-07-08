@@ -10,6 +10,7 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tracing::warn;
+use vectorhawkd_mcp::ownership::MANAGED_MARKER_FILENAME;
 
 /// Current schema version for `.vectorhawk-managed.json`.
 pub const MARKER_FILE_VERSION: u32 = 1;
@@ -57,7 +58,7 @@ pub fn write_file_marker(
     let json = serde_json::to_string_pretty(&marker)
         .context("failed to serialise .vectorhawk-managed.json")?;
 
-    let marker_path = dir_path.join(".vectorhawk-managed.json");
+    let marker_path = dir_path.join(MANAGED_MARKER_FILENAME);
     std::fs::write(&marker_path, json)
         .with_context(|| format!("failed to write marker file: {}", marker_path.display()))?;
 
@@ -71,7 +72,7 @@ pub fn write_file_marker(
 /// tolerated and returned as `Ok(Some(...))` with the raw struct so the caller
 /// can decide.
 pub fn read_file_marker(dir_path: &Path) -> Result<Option<ManagedMarkerFile>> {
-    let marker_path = dir_path.join(".vectorhawk-managed.json");
+    let marker_path = dir_path.join(MANAGED_MARKER_FILENAME);
     if !marker_path.exists() {
         return Ok(None);
     }
