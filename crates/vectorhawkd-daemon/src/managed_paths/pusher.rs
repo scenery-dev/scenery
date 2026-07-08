@@ -43,6 +43,7 @@ use std::{
 };
 use tracing::{debug, info};
 use vectorhawkd_core::state::AppState;
+use vectorhawkd_mcp::ownership;
 
 // ── Env-var gate ──────────────────────────────────────────────────────────────
 
@@ -181,6 +182,8 @@ impl ManagedPathsPusher {
 
         // Remove the directory.
         if skill_dir.exists() {
+            // Defense-in-depth: never delete Anthropic-native content.
+            ownership::ensure_not_native(&skill_dir)?;
             fs::remove_dir_all(&skill_dir).with_context(|| {
                 format!(
                     "pusher: failed to remove skill dir: {}",
@@ -355,6 +358,8 @@ impl ManagedPathsPusher {
             .context("pusher: failed to delete managed_path_markers for plugin")?;
 
         if plugin_dir.exists() {
+            // Defense-in-depth: never delete Anthropic-native content.
+            ownership::ensure_not_native(&plugin_dir)?;
             fs::remove_dir_all(&plugin_dir).with_context(|| {
                 format!(
                     "pusher: failed to remove plugin dir: {}",

@@ -134,6 +134,128 @@ fn scan_plugins_valid_plugin_captured() {
     assert!(!item.canonical_hash.is_empty());
 }
 
+// ── Plugin marketplaces (nested layout) ─────────────────────────────────────────
+
+/// Write a nested plugin at `<plugins>/marketplaces/<mp>/<sub>/<slug>/.claude-plugin/plugin.json`.
+fn write_marketplace_plugin(
+    plugins: &std::path::Path,
+    mp: &str,
+    sub: &str,
+    slug: &str,
+    manifest: &str,
+) -> std::path::PathBuf {
+    let dir = plugins.join("marketplaces").join(mp).join(sub).join(slug);
+    let cp = dir.join(".claude-plugin");
+    fs::create_dir_all(&cp).unwrap();
+    fs::write(cp.join("plugin.json"), manifest).unwrap();
+    dir
+}
+
+fn write_known_marketplaces(plugins: &std::path::Path, entries: &[(&str, &str)]) {
+    // entries: (marketplace_name, repo)
+    let mut map = serde_json::Map::new();
+    for (name, repo) in entries {
+        let install = plugins.join("marketplaces").join(name);
+        map.insert(
+            (*name).to_string(),
+            serde_json::json!({
+                "source": { "source": "github", "repo": repo },
+                "installLocation": install.to_string_lossy(),
+            }),
+        );
+    }
+    fs::create_dir_all(plugins).unwrap();
+    fs::write(
+        plugins.join("known_marketplaces.json"),
+        serde_json::Value::Object(map).to_string(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn marketplace_walk_no_marketplaces_dir_returns_empty() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plugins = tmp.path().join("plugins");
+    fs::create_dir_all(&plugins).unwrap();
+    assert!(scan_plugin_marketplaces(&plugins).unwrap().is_empty());
+}
+
+#[test]
+fn marketplace_walk_skips_native_adopts_custom() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plugins = tmp.path().join("plugins");
+    write_known_marketplaces(
+        &plugins,
+        &[
+            (
+                "claude-plugins-official",
+                "anthropics/claude-plugins-official",
+            ),
+            ("acme-mp", "acme/acme-mp"),
+        ],
+    );
+
+    // Anthropic-native: internal plugin of the official marketplace → skipped.
+    write_marketplace_plugin(
+        &plugins,
+        "claude-plugins-official",
+        "plugins",
+        "code-review",
+        r#"{"name":"code-review","author":{"name":"Anthropic"}}"#,
+    );
+    // Custom: external plugin within the official marketplace → adopted.
+    write_marketplace_plugin(
+        &plugins,
+        "claude-plugins-official",
+        "external_plugins",
+        "github",
+        r#"{"name":"github","author":{"name":"GitHub"}}"#,
+    );
+    // Custom: plugin in a third-party marketplace → adopted.
+    write_marketplace_plugin(
+        &plugins,
+        "acme-mp",
+        "plugins",
+        "acme-tool",
+        r#"{"name":"acme-tool","author":{"name":"Acme"}}"#,
+    );
+
+    let items = scan_plugin_marketplaces(&plugins).unwrap();
+    let slugs: std::collections::HashSet<&str> = items.iter().map(|i| i.slug.as_str()).collect();
+
+    assert_eq!(items.len(), 2, "got: {slugs:?}");
+    assert!(slugs.contains("github"));
+    assert!(slugs.contains("acme-tool"));
+    assert!(
+        !slugs.contains("code-review"),
+        "native plugin must be skipped"
+    );
+    assert!(items.iter().all(|i| i.kind == ItemKind::Plugin));
+}
+
+#[test]
+fn marketplace_walk_skips_already_managed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plugins = tmp.path().join("plugins");
+    write_known_marketplaces(&plugins, &[("acme-mp", "acme/acme-mp")]);
+
+    let pdir = write_marketplace_plugin(
+        &plugins,
+        "acme-mp",
+        "plugins",
+        "acme-tool",
+        r#"{"name":"acme-tool"}"#,
+    );
+    // Stamp it as already VectorHawk-managed.
+    fs::write(
+        pdir.join(vectorhawkd_mcp::ownership::MANAGED_MARKER_FILENAME),
+        "{}",
+    )
+    .unwrap();
+
+    assert!(scan_plugin_marketplaces(&plugins).unwrap().is_empty());
+}
+
 // ── MCP / claude.json ─────────────────────────────────────────────────────────
 
 #[test]

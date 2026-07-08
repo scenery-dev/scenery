@@ -172,13 +172,22 @@ impl ManagedPathsReconciler {
         }
 
         // ── Plugins ───────────────────────────────────────────────────────────
-        let plugin_items = match scanner::scan_plugins_dir(&plugins_dir) {
+        // Two layouts: legacy immediate-child dirs under ~/.claude/plugins/, and
+        // the real nested marketplace tree (marketplaces/<mp>/{plugins,external_plugins}/).
+        // The marketplace walk classifies each plugin and skips Anthropic-native ones.
+        let mut plugin_items = match scanner::scan_plugins_dir(&plugins_dir) {
             Ok(items) => items,
             Err(e) => {
                 warn!(error = %e, "managed_paths: failed to scan plugins dir; skipping plugins");
                 vec![]
             }
         };
+        match scanner::scan_plugin_marketplaces(&plugins_dir) {
+            Ok(items) => plugin_items.extend(items),
+            Err(e) => {
+                warn!(error = %e, "managed_paths: failed to scan plugin marketplaces; skipping nested plugins");
+            }
+        }
 
         for item in plugin_items {
             let slug = item.slug.clone();

@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
 use tracing::{debug, warn};
 use vectorhawkd_core::{auth::load_all_tokens, state::AppState};
+use vectorhawkd_mcp::ownership;
 
 // ── Backup manifest ───────────────────────────────────────────────────────────
 
@@ -136,6 +137,20 @@ pub async fn migrate_item(
 ) -> Result<bool> {
     let path_key = item.source_path.to_string_lossy().to_string();
 
+    // ── 0. Never adopt Anthropic-native content ───────────────────────────────
+    // Defense-in-depth: the scanner already filters native plugins out, but a
+    // second, unconditional check here guarantees Anthropic first-party content
+    // is never backed up, uploaded, marked, or otherwise touched — even if a
+    // future scanner path forgets to classify.
+    if ownership::is_anthropic_native_path(&item.source_path) {
+        debug!(
+            slug = %item.slug,
+            path = %path_key,
+            "managed_paths: refusing to adopt Anthropic-native item (out of scope)"
+        );
+        return Ok(false);
+    }
+
     // ── 1. Idempotency check ──────────────────────────────────────────────────
     {
         let conn = Connection::open(&state.db_path).context("migrator: failed to open state DB")?;
@@ -159,7 +174,17 @@ pub async fn migrate_item(
             e
         })?;
 
-    // ── 4. Write marker ───────────────────────────────────────────────────────
+    // ── 4. Write marker (replace-with-managed) ────────────────────────────────
+    // Writing the marker is how VectorHawk "replaces the local copy with a
+    // managed copy": the item becomes VectorHawk-owned in place, and the drift
+    // reconciler governs it from here (keep-in-sync, quarantine, or kill).
+    //
+    // NOTE: fully destructive sole-source replacement for MCP servers (rewriting
+    // ~/.claude.json to route the server through the gateway) is intentionally
+    // NOT done here — the daemon cannot yet serve adopted MCP backends via the
+    // aggregator until the approved-servers/gateway pipeline lands
+    // (`/runner/approved-servers` is currently a stub). Removing the user's
+    // direct entry before then would break the tool. See the board card.
     let now_ts = chrono::Utc::now().to_rfc3339();
     let conn = Connection::open(&state.db_path)
         .context("migrator: failed to open state DB for marker write")?;

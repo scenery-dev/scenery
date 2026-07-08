@@ -6,28 +6,24 @@
 
 use std::path::PathBuf;
 
-/// Subdirectory names under `~/.claude/plugins/` that are Anthropic plumbing
-/// and must never be touched by the reconciler.
-pub const EXCLUDED_PLUGIN_DIRS: &[&str] = &["marketplaces", "cache", "data"];
+// The canonical definitions of the exclusion list and the plumbing-dir predicate
+// live in `vectorhawkd_mcp::ownership` (single source of truth, shared with the
+// shim). Re-exported here so existing `paths::…` callers keep working.
+pub use vectorhawkd_mcp::ownership::{is_excluded_plugin_dir, EXCLUDED_PLUGIN_DIRS};
 
 /// Resolve `~/.claude/skills/`.
 pub fn skills_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".claude").join("skills"))
+    vectorhawkd_mcp::ownership::claude_skills_dir()
 }
 
 /// Resolve `~/.claude/plugins/`.
 pub fn plugins_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".claude").join("plugins"))
+    vectorhawkd_mcp::ownership::claude_plugins_dir()
 }
 
 /// Resolve `~/.claude.json`.
 pub fn claude_json_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".claude.json"))
-}
-
-/// Return true if `dir_name` is an excluded Anthropic plumbing directory.
-pub fn is_excluded_plugin_dir(dir_name: &str) -> bool {
-    EXCLUDED_PLUGIN_DIRS.contains(&dir_name)
+    vectorhawkd_mcp::ownership::claude_json_path()
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

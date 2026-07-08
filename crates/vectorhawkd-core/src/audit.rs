@@ -262,13 +262,10 @@ pub fn write_audit_event_direct(db_path: &camino::Utf8Path, event: &AuditEvent) 
     }
 }
 
-fn write_audit_event_direct_inner(
-    db_path: &camino::Utf8Path,
-    event: &AuditEvent,
-) -> Result<()> {
+fn write_audit_event_direct_inner(db_path: &camino::Utf8Path, event: &AuditEvent) -> Result<()> {
     let conn = Connection::open(db_path).context("failed to open state DB for audit")?;
-    let payload_json = serde_json::to_string(&event.payload)
-        .context("failed to serialize audit event payload")?;
+    let payload_json =
+        serde_json::to_string(&event.payload).context("failed to serialize audit event payload")?;
     let now = unix_now() as i64;
     conn.execute(
         "INSERT INTO audit_events (event_type, payload, created_at, uploaded) \
