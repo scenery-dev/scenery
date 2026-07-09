@@ -396,6 +396,13 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     // anything not already tracked in `managed_path_markers`.  Run once at
     // startup.  Failure is non-fatal — the daemon continues regardless.
     //
+    // One-shot adoption alert surfaced to the first connecting MCP client.
+    // Headless installs (e.g. openclaw) set VECTORHAWK_HEADLESS=1 to suppress the
+    // in-client alert and rely on the portal banner instead.
+    let pending_alert: Arc<std::sync::Mutex<Option<String>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let headless = std::env::var("VECTORHAWK_HEADLESS").is_ok();
+
     // Set VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER=1 to skip entirely (useful
     // in tests, CI, and operator opt-out scenarios).
     if std::env::var("VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER").is_err() {
@@ -406,13 +413,29 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
         let registry_url_f1 = registry_url.clone();
         match managed_paths::ManagedPathsReconciler::new(state_arc_f1, registry_url_f1) {
             Ok(reconciler) => match reconciler.migrate_existing().await {
-                Ok(report) => info!(
-                    skills = report.skills_migrated,
-                    plugins = report.plugins_migrated,
-                    mcps = report.mcps_migrated,
-                    errors = report.errors.len(),
-                    "managed_paths: first-run migration complete"
-                ),
+                Ok(report) => {
+                    info!(
+                        skills = report.skills_migrated,
+                        plugins = report.plugins_migrated,
+                        mcps = report.mcps_migrated,
+                        errors = report.errors.len(),
+                        "managed_paths: first-run migration complete"
+                    );
+                    let adopted =
+                        report.skills_migrated + report.plugins_migrated + report.mcps_migrated;
+                    if adopted > 0 && !headless {
+                        let msg = format!(
+                            "VectorHawk adopted {adopted} tool(s) for governance \
+                             ({} skill(s), {} plugin(s), {} MCP server(s)). They are private \
+                             and pending IT review — review them in the portal, or run \
+                             `vectorhawk migrate rollback` to undo.",
+                            report.skills_migrated, report.plugins_migrated, report.mcps_migrated
+                        );
+                        if let Ok(mut guard) = pending_alert.lock() {
+                            *guard = Some(msg);
+                        }
+                    }
+                }
                 Err(e) => warn!(
                     error = %e,
                     "managed_paths: migration failed; daemon continues without ownership"
@@ -634,6 +657,7 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
                             list_changed_tx: list_changed_tx.clone(),
                             discoveries_kick: Arc::clone(&discoveries_kick),
                             sync_controller: Arc::clone(&sync_controller),
+                            pending_alert: Arc::clone(&pending_alert),
                         };
                         tokio::spawn(socket_dispatch::serve_connection(stream, ctx));
                     }

@@ -233,11 +233,19 @@ pub async fn rollback(
                 });
             }
             Some(ref token) => {
-                let catalog_url = format!(
-                    "{}/portal/managed-paths/catalog/{}",
-                    registry_url.trim_end_matches('/'),
-                    item.slug
-                );
+                // Skills delete via the migrated-catalog endpoint (by slug).
+                // Plugins/MCP delete via the custom-tools endpoint (by kind +
+                // backend row id) — the catalog endpoint is skills-only and would
+                // 404 for them, silently leaving the adopted row behind.
+                let base = registry_url.trim_end_matches('/');
+                let catalog_url = match item.kind.as_str() {
+                    "plugin" | "mcp" if item.installation_id.is_some() => format!(
+                        "{base}/portal/custom-tools/{}/{}",
+                        item.kind,
+                        item.installation_id.as_ref().unwrap()
+                    ),
+                    _ => format!("{base}/portal/managed-paths/catalog/{}", item.slug),
+                };
                 match http_client
                     .delete(&catalog_url)
                     .bearer_auth(token)
