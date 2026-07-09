@@ -399,7 +399,7 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     // One-shot adoption alert surfaced to the first connecting MCP client.
     // Headless installs (e.g. openclaw) set VECTORHAWK_HEADLESS=1 to suppress the
     // in-client alert and rely on the portal banner instead.
-    let pending_alert: Arc<std::sync::Mutex<Option<String>>> =
+    let pending_alert: Arc<std::sync::Mutex<Option<(String, std::time::Instant)>>> =
         Arc::new(std::sync::Mutex::new(None));
     let headless = std::env::var("VECTORHAWK_HEADLESS").is_ok();
 
@@ -432,7 +432,7 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
                             report.skills_migrated, report.plugins_migrated, report.mcps_migrated
                         );
                         if let Ok(mut guard) = pending_alert.lock() {
-                            *guard = Some(msg);
+                            *guard = Some((msg, std::time::Instant::now()));
                         }
                     }
                 }

@@ -100,12 +100,21 @@ pub struct DaemonContext {
     /// after the user authenticates against an already-running daemon, without
     /// requiring a daemon restart.
     pub sync_controller: Arc<crate::SyncController>,
-    /// One-shot adoption alert delivered to the first connecting client as an
-    /// MCP `notifications/message`. Set once at startup by the F1 reconciler
-    /// when it auto-adopts tools (suppressed in headless mode). `take()`n by the
-    /// first connection so the user is told, in-client, that tools were adopted.
-    pub pending_alert: Arc<std::sync::Mutex<Option<String>>>,
+    /// Adoption alert delivered as an MCP `notifications/message`. Set once at
+    /// startup by the F1 reconciler when it auto-adopts tools (suppressed in
+    /// headless mode), stamped with the time it was set. Delivered to EVERY new
+    /// connection while still within [`ALERT_WINDOW`] — the shim only forwards
+    /// notifications to its client via its dedicated notification-pump
+    /// connection, so a one-shot take by the first (relay) connection would be
+    /// dropped. After the window it is cleared and no longer sent.
+    pub pending_alert: Arc<std::sync::Mutex<Option<(String, std::time::Instant)>>>,
 }
+
+/// How long after adoption an alert keeps being delivered to newly-connecting
+/// clients. Covers the gap between daemon startup (when adoption runs) and the
+/// AI client launching its shim + notification pump, without re-alerting on
+/// later reconnects.
+const ALERT_WINDOW: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Drive a single shim connection to completion.
 ///
@@ -138,11 +147,25 @@ async fn run_loop(
 
     let (mut reader, mut writer) = stream.into_split();
 
-    // Deliver a one-shot adoption alert to this client, if one is pending.
-    // Taken so exactly one connection surfaces it; the portal banner is the
-    // durable record for other clients / later sessions.
-    let pending = ctx.pending_alert.lock().ok().and_then(|mut g| g.take());
-    if let Some(message) = pending {
+    // Deliver the adoption alert to this connection if one is pending and still
+    // fresh. Delivered to every connection in the window (not taken) so the
+    // shim's notification-pump connection — the only one it forwards to its
+    // client — receives it; the relay connection's copy is harmlessly dropped
+    // by the shim. Stale alerts are cleared.
+    let alert_message = {
+        match ctx.pending_alert.lock() {
+            Ok(mut guard) => match guard.as_ref() {
+                Some((msg, set_at)) if set_at.elapsed() < ALERT_WINDOW => Some(msg.clone()),
+                Some(_) => {
+                    *guard = None; // expired — stop delivering
+                    None
+                }
+                None => None,
+            },
+            Err(_) => None,
+        }
+    };
+    if let Some(message) = alert_message {
         send_alert_frame(&mut writer, &message).await;
     }
 
