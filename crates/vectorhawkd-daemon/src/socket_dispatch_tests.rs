@@ -13,7 +13,7 @@ use vectorhawkd_mcp::{
 
 use crate::oauth_state::OAuthState;
 
-use super::{dispatch, DaemonContext};
+use super::{dispatch, send_alert_frame, DaemonContext};
 
 /// Build a `SyncController` for tests. The controller's sync subsystem is never
 /// exercised by dispatch tests (no `auth/reload`), so a bare `AppState` pointing
@@ -61,6 +61,7 @@ fn make_ctx() -> DaemonContext {
         list_changed_tx,
         discoveries_kick: Arc::new(Notify::new()),
         sync_controller: make_sync_controller(registry),
+        pending_alert: Arc::new(std::sync::Mutex::new(None)),
     }
 }
 
@@ -181,6 +182,21 @@ async fn dispatch_auth_get_oauth_listener_port_returns_port() {
 }
 
 #[tokio::test]
+async fn adoption_alert_frame_is_a_wellformed_mcp_notification() {
+    let mut buf: Vec<u8> = Vec::new();
+    send_alert_frame(&mut buf, "VectorHawk adopted 3 tool(s)").await;
+    let s = String::from_utf8_lossy(&buf);
+    // Framing may add a length prefix/newline, but the JSON body is UTF-8.
+    assert!(
+        s.contains("\"method\":\"notifications/message\""),
+        "got: {s}"
+    );
+    assert!(s.contains("VectorHawk adopted 3 tool(s)"), "got: {s}");
+    assert!(s.contains("\"logger\":\"vectorhawk\""), "got: {s}");
+    assert!(s.contains("\"level\":\"info\""), "got: {s}");
+}
+
+#[tokio::test]
 async fn dispatch_auth_get_oauth_listener_port_when_none() {
     let registry = Arc::new(BackendRegistry::new());
     let (list_changed_tx, _) = broadcast::channel(16);
@@ -191,6 +207,7 @@ async fn dispatch_auth_get_oauth_listener_port_when_none() {
         list_changed_tx,
         discoveries_kick: Arc::new(Notify::new()),
         sync_controller: make_sync_controller(registry),
+        pending_alert: Arc::new(std::sync::Mutex::new(None)),
     };
     let resp = dispatch(
         &ctx,

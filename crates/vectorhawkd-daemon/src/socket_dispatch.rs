@@ -100,6 +100,11 @@ pub struct DaemonContext {
     /// after the user authenticates against an already-running daemon, without
     /// requiring a daemon restart.
     pub sync_controller: Arc<crate::SyncController>,
+    /// One-shot adoption alert delivered to the first connecting client as an
+    /// MCP `notifications/message`. Set once at startup by the F1 reconciler
+    /// when it auto-adopts tools (suppressed in headless mode). `take()`n by the
+    /// first connection so the user is told, in-client, that tools were adopted.
+    pub pending_alert: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 /// Drive a single shim connection to completion.
@@ -132,6 +137,14 @@ async fn run_loop(
     use tokio::io::AsyncWriteExt;
 
     let (mut reader, mut writer) = stream.into_split();
+
+    // Deliver a one-shot adoption alert to this client, if one is pending.
+    // Taken so exactly one connection surfaces it; the portal banner is the
+    // durable record for other clients / later sessions.
+    let pending = ctx.pending_alert.lock().ok().and_then(|mut g| g.take());
+    if let Some(message) = pending {
+        send_alert_frame(&mut writer, &message).await;
+    }
 
     loop {
         tokio::select! {
@@ -318,6 +331,29 @@ where
     };
     if let Err(e) = write_framed(writer, &body).await {
         debug!(error = %e, "failed to write list_changed notification frame");
+    }
+}
+
+/// Send an MCP `notifications/message` (logging notification) carrying a
+/// human-readable adoption alert. AI clients surface these to the user.
+async fn send_alert_frame<W>(writer: &mut W, message: &str)
+where
+    W: tokio::io::AsyncWriteExt + Unpin,
+{
+    let notification = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/message",
+        "params": { "level": "info", "logger": "vectorhawk", "data": message },
+    });
+    let body = match serde_json::to_vec(&notification) {
+        Ok(b) => b,
+        Err(e) => {
+            error!(error = %e, "failed to serialize adoption alert notification");
+            return;
+        }
+    };
+    if let Err(e) = write_framed(writer, &body).await {
+        debug!(error = %e, "failed to write adoption alert frame");
     }
 }
 
