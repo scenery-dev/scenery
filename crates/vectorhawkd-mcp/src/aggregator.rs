@@ -147,6 +147,23 @@ impl ToolVisibility {
 /// Number of consecutive errors before a backend is marked unhealthy.
 const UNHEALTHY_THRESHOLD: u32 = 3;
 
+/// A live, shared bearer token read fresh at each call. Used for
+/// gateway-brokered backends so a rotated portal JWT is picked up without
+/// re-registering the backend (the daemon keeps the inner value current).
+pub type LiveToken = Arc<std::sync::RwLock<Option<String>>>;
+
+/// Resolve the effective bearer for an HTTP backend: a live token handle takes
+/// precedence over a captured static token.
+pub fn resolve_live_token(
+    handle: &Option<LiveToken>,
+    static_token: &Option<String>,
+) -> Option<String> {
+    handle
+        .as_ref()
+        .and_then(|h| h.read().ok().and_then(|g| g.clone()))
+        .or_else(|| static_token.clone())
+}
+
 /// Transport variant for a backend MCP server.
 #[derive(Debug)]
 pub enum BackendTransport {
@@ -156,8 +173,12 @@ pub enum BackendTransport {
     /// Lazy dial: no connection opened until first tool call.
     Http {
         url: String,
-        /// Optional Bearer token for gateway-authenticated backends.
+        /// Optional static Bearer token for gateway-authenticated backends.
         auth_token: Option<String>,
+        /// Optional live token handle (gateway backends). When present, read
+        /// fresh per call and preferred over `auth_token` — avoids 401s after
+        /// the portal JWT rotates.
+        token_handle: Option<LiveToken>,
     },
     /// Stdio child-process backend.
     ///
@@ -180,9 +201,14 @@ impl Clone for BackendTransport {
     fn clone(&self) -> Self {
         match self {
             BackendTransport::Stub => BackendTransport::Stub,
-            BackendTransport::Http { url, auth_token } => BackendTransport::Http {
+            BackendTransport::Http {
+                url,
+                auth_token,
+                token_handle,
+            } => BackendTransport::Http {
                 url: url.clone(),
                 auth_token: auth_token.clone(),
+                token_handle: token_handle.clone(),
             },
             BackendTransport::Stdio {
                 command,
@@ -474,9 +500,15 @@ impl BackendRegistry {
                 BackendTransport::Stub => DispatchTarget::Stub {
                     response: format!("stub response for {namespaced_tool}: {args}"),
                 },
-                BackendTransport::Http { url, auth_token } => DispatchTarget::Http {
+                BackendTransport::Http {
+                    url,
+                    auth_token,
+                    token_handle,
+                } => DispatchTarget::Http {
                     url: url.clone(),
-                    auth_token: auth_token.clone(),
+                    // Resolve the live token now (call time) so a rotated JWT
+                    // is used instead of a stale one captured at registration.
+                    auth_token: resolve_live_token(token_handle, auth_token),
                 },
                 BackendTransport::Stdio {
                     command,

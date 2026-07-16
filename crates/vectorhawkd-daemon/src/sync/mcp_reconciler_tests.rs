@@ -630,7 +630,7 @@ fn startup_with_two_entries_registers_two_backends() {
     // Act: run the startup loader.
     let registry = fresh_registry();
     let (list_changed_tx, _) = tokio::sync::broadcast::channel(16);
-    crate::load_managed_mcp_into_registry(&state, "https://registry.test", &registry, list_changed_tx);
+    crate::load_managed_mcp_into_registry(&state, &registry, list_changed_tx);
 
     // Assert: both backends are registered by their UUID server_id.
     let backends = registry.list_backends();
@@ -670,7 +670,7 @@ fn startup_with_null_server_config_skips_entry() {
     // Act.
     let registry = fresh_registry();
     let (list_changed_tx, _) = tokio::sync::broadcast::channel(16);
-    crate::load_managed_mcp_into_registry(&state, "https://registry.test", &registry, list_changed_tx);
+    crate::load_managed_mcp_into_registry(&state, &registry, list_changed_tx);
 
     // Assert: no backends registered (null config → skip with warning).
     let backends = registry.list_backends();
@@ -756,7 +756,7 @@ async fn handle_deactivate_mcp_removes_backend_from_aggregator() {
     let registry = fresh_registry();
     // Pre-register so we can verify it gets removed.
     let (list_changed_tx, _) = tokio::sync::broadcast::channel(16);
-    crate::load_managed_mcp_into_registry(&state, "https://registry.test", &registry, list_changed_tx);
+    crate::load_managed_mcp_into_registry(&state, &registry, list_changed_tx);
     assert!(
         registry.has_backend("github-mcp"),
         "backend must be registered before deactivate"

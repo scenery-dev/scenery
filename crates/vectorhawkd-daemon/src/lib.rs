@@ -343,8 +343,11 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     );
     let model_client: Option<Arc<dyn ModelClient>> = Some(Arc::new(hybrid) as Arc<dyn ModelClient>);
 
+    // Prime the shared gateway token handle before registering backends, then
+    // keep it current so gateway calls survive portal-JWT rotation.
+    init_gateway_token_refresh(&state, &registry_url);
     let vh_registry = Arc::new(build_stub_registry());
-    load_managed_mcp_into_registry(&state, &registry_url, &vh_registry, list_changed_tx.clone());
+    load_managed_mcp_into_registry(&state, &vh_registry, list_changed_tx.clone());
 
     // ── Legacy install reclaim (pre-v1.0.51) ──────────────────────────────────
     //
@@ -1398,7 +1401,6 @@ fn flush_ratings_and_scan(
 /// Called once from `run_daemon` after `build_stub_registry()`.
 fn load_managed_mcp_into_registry(
     state: &AppState,
-    base_url: &str,
     registry: &Arc<BackendRegistry>,
     list_changed_tx: tokio::sync::broadcast::Sender<()>,
 ) {
@@ -1410,17 +1412,11 @@ fn load_managed_mcp_into_registry(
         }
     };
 
-    // Portal JWT used to authenticate to the gateway proxy for brokered
-    // backends. Read once at startup; rotation is picked up on the next sync
-    // re-registration.
-    let gateway_token = vectorhawkd_core::auth::load_tokens(state, base_url)
-        .ok()
-        .flatten()
-        .map(|t| t.access_token);
-
+    // Gateway-brokered backends authenticate via the shared live token handle
+    // (kept current by the refresh task), so no token is captured here.
     let mut loaded = 0usize;
     for row in &rows {
-        match mcp_row_to_backend_entry(row, gateway_token.as_deref()) {
+        match mcp_row_to_backend_entry(row) {
             Some(entry) => {
                 let server_id = entry.server_id.clone();
                 registry.register_backend(entry.clone());
@@ -1470,8 +1466,13 @@ pub fn spawn_tool_discovery(
             BackendTransport::Stdio {
                 command, args, env, ..
             } => BackendRegistry::fetch_tools_stdio(command, args, env).await,
-            BackendTransport::Http { url, auth_token } => {
-                registry.fetch_tools_http(url, auth_token.as_deref()).await
+            BackendTransport::Http {
+                url,
+                auth_token,
+                token_handle,
+            } => {
+                let tok = vectorhawkd_mcp::aggregator::resolve_live_token(token_handle, auth_token);
+                registry.fetch_tools_http(url, tok.as_deref()).await
             }
             BackendTransport::Stub => return,
         };
@@ -1558,22 +1559,82 @@ pub fn mcp_server_slug(name: &str) -> String {
     }
 }
 
+/// Process-global live portal-JWT handle for gateway-brokered MCP backends.
+/// Initialised + refreshed at daemon startup (see `run_daemon`) so gateway
+/// calls always read a current token, avoiding 401s after the JWT rotates.
+static GATEWAY_TOKEN: std::sync::OnceLock<vectorhawkd_mcp::aggregator::LiveToken> =
+    std::sync::OnceLock::new();
+
+/// The shared gateway token handle (created empty on first access).
+pub fn gateway_token_handle() -> vectorhawkd_mcp::aggregator::LiveToken {
+    GATEWAY_TOKEN
+        .get_or_init(|| std::sync::Arc::new(std::sync::RwLock::new(None)))
+        .clone()
+}
+
+/// Prime the shared gateway token handle from SQLite and keep it current.
+///
+/// Gateway-brokered backends read this handle fresh on every tool call and
+/// discovery, so a rotated portal JWT is used without re-registering the
+/// backend. The background poll runs every 60s; because the refresh loop
+/// rotates the token ~5 minutes before expiry (and the old token stays valid
+/// through that window), the ≤60s lag never exposes an expired token.
+fn init_gateway_token_refresh(state: &AppState, registry_url: &str) {
+    fn current_token(state: &AppState, registry_url: &str) -> Option<String> {
+        vectorhawkd_core::auth::load_tokens(state, registry_url)
+            .ok()
+            .flatten()
+            .map(|t| t.access_token)
+            .filter(|t| !t.is_empty())
+    }
+
+    let handle = gateway_token_handle();
+    if let Some(tok) = current_token(state, registry_url) {
+        if let Ok(mut g) = handle.write() {
+            *g = Some(tok);
+        }
+    }
+
+    // No runtime in synchronous tests — skip the background refresher.
+    if tokio::runtime::Handle::try_current().is_err() {
+        return;
+    }
+    let state = state.clone();
+    let registry_url = registry_url.to_string();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            let st = state.clone();
+            let url = registry_url.clone();
+            let tok = tokio::task::spawn_blocking(move || current_token(&st, &url))
+                .await
+                .ok()
+                .flatten();
+            if let Some(tok) = tok {
+                if let Ok(mut g) = handle.write() {
+                    *g = Some(tok);
+                }
+            }
+        }
+    });
+}
+
 pub fn mcp_row_to_backend_entry(
     row: &vectorhawkd_core::state::McpInstallRow,
-    gateway_token: Option<&str>,
 ) -> Option<BackendEntry> {
     // Gateway-brokered servers take precedence: the daemon connects to the
-    // gateway proxy URL with its own portal JWT (passed as `gateway_token`).
-    // The credential broker injects the real upstream credential, and the
-    // gateway bridges legacy SSE backends — so `server_config` is irrelevant
-    // and a URL-shaped `command` is never spawned as a subprocess.
+    // gateway proxy URL with the shared live portal JWT (read fresh per call
+    // via the token handle). The credential broker injects the real upstream
+    // credential, and the gateway bridges legacy SSE backends — so
+    // `server_config` is irrelevant and a URL-shaped `command` is never spawned.
     if let Some(url) = row.gateway_url.as_deref().filter(|u| !u.is_empty()) {
         return Some(BackendEntry {
             server_id: mcp_server_slug(&row.mcp_server_name),
             name: row.mcp_server_name.clone(),
             transport: BackendTransport::Http {
                 url: url.to_string(),
-                auth_token: gateway_token.map(str::to_string),
+                auth_token: None,
+                token_handle: Some(gateway_token_handle()),
             },
             tools: vec![],
             tool_visibility: ToolVisibility::All,
@@ -1633,6 +1694,7 @@ pub fn mcp_row_to_backend_entry(
         BackendTransport::Http {
             url: url.to_string(),
             auth_token: None,
+            token_handle: None,
         }
     } else {
         return None;
@@ -1705,8 +1767,8 @@ mod slug_tests {
 
 #[cfg(test)]
 mod backend_entry_tests {
-    use super::mcp_row_to_backend_entry;
-    use vectorhawkd_mcp::aggregator::BackendTransport;
+    use super::{gateway_token_handle, mcp_row_to_backend_entry};
+    use vectorhawkd_mcp::aggregator::{resolve_live_token, BackendTransport};
     use vectorhawkd_core::state::McpInstallRow;
 
     fn row_with(gateway_url: Option<&str>, server_config: Option<&str>) -> McpInstallRow {
@@ -1724,14 +1786,27 @@ mod backend_entry_tests {
     }
 
     #[test]
-    fn gateway_url_routes_through_gateway_with_token() {
+    fn gateway_url_routes_through_gateway_with_live_token() {
+        // Prime the shared live token handle; the gateway backend must resolve
+        // the CURRENT value (not a captured one) so rotation is picked up.
+        *gateway_token_handle().write().unwrap() = Some("jwt-abc".to_string());
         let row = row_with(Some("https://app.vectorhawk.ai/gateway/home-assistant/mcp"), None);
-        let entry = mcp_row_to_backend_entry(&row, Some("jwt-abc")).expect("entry");
+        let entry = mcp_row_to_backend_entry(&row).expect("entry");
         assert_eq!(entry.server_id, "home-assistant");
-        match entry.transport {
-            BackendTransport::Http { url, auth_token } => {
+        match &entry.transport {
+            BackendTransport::Http { url, auth_token, token_handle } => {
                 assert_eq!(url, "https://app.vectorhawk.ai/gateway/home-assistant/mcp");
-                assert_eq!(auth_token.as_deref(), Some("jwt-abc"));
+                assert!(token_handle.is_some(), "gateway backend must carry the live handle");
+                assert_eq!(
+                    resolve_live_token(token_handle, auth_token).as_deref(),
+                    Some("jwt-abc")
+                );
+                // Rotate the shared handle → the same backend resolves the new value.
+                *gateway_token_handle().write().unwrap() = Some("jwt-rotated".to_string());
+                assert_eq!(
+                    resolve_live_token(token_handle, auth_token).as_deref(),
+                    Some("jwt-rotated")
+                );
             }
             other => panic!("expected Http transport, got {other:?}"),
         }
@@ -1743,7 +1818,7 @@ mod backend_entry_tests {
         // gateway_url present the daemon must NOT spawn the URL as a subprocess.
         let bad = r#"{"command":"https://ha.example/mcp_server/sse","args":[]}"#;
         let row = row_with(Some("https://app.vectorhawk.ai/gateway/home-assistant/mcp"), Some(bad));
-        let entry = mcp_row_to_backend_entry(&row, Some("jwt")).expect("entry");
+        let entry = mcp_row_to_backend_entry(&row).expect("entry");
         assert!(matches!(entry.transport, BackendTransport::Http { .. }));
     }
 
@@ -1751,7 +1826,7 @@ mod backend_entry_tests {
     fn no_gateway_url_falls_back_to_server_config() {
         let cfg = r#"{"command":"npx","args":["@scope/server"]}"#;
         let row = row_with(None, Some(cfg));
-        let entry = mcp_row_to_backend_entry(&row, None).expect("entry");
+        let entry = mcp_row_to_backend_entry(&row).expect("entry");
         match entry.transport {
             BackendTransport::Stdio { command, .. } => assert_eq!(command, "npx"),
             other => panic!("expected Stdio transport, got {other:?}"),
