@@ -1073,13 +1073,9 @@ async fn handle_install_mcp(
                 gateway_server_id: gateway_server_id.clone(),
                 gateway_url: gateway_url.clone(),
             };
-            // Gateway-brokered backends connect to the proxy with the daemon's
-            // own portal JWT; load it once here so the aggregator can inject it.
-            let gw_token = vectorhawkd_core::auth::load_tokens(state, registry_url)
-                .ok()
-                .flatten()
-                .map(|t| t.access_token);
-            match crate::mcp_row_to_backend_entry(&row, gw_token.as_deref()) {
+            // Gateway-brokered backends read the shared live token handle at
+            // call time (kept current by the daemon's refresh task).
+            match crate::mcp_row_to_backend_entry(&row) {
                 Some(entry) => {
                     let sid = entry.server_id.clone();
                     backend_registry.register_backend(entry.clone());
