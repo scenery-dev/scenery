@@ -106,6 +106,12 @@ impl AppState {
         // G3: MCP installation desired-state table.
         conn.execute_batch(SCHEMA_G3_SQL)
             .context("failed to apply G3 schema additions")?;
+        // Gateway-brokered remote servers: proxy URL the daemon connects to
+        // with its own portal JWT. Nullable → legacy rows route via server_config.
+        add_column_if_missing(
+            &conn,
+            "ALTER TABLE mcp_installations ADD COLUMN gateway_url TEXT",
+        )?;
 
         // F1: managed-paths reconciler marker table.
         conn.execute_batch(SCHEMA_F1_SQL)
@@ -266,6 +272,9 @@ pub struct McpInstallRow {
     pub server_config: Option<String>,
     pub auth_type: String,
     pub gateway_server_id: Option<String>,
+    /// Full gateway proxy URL for credential-brokered servers. When present the
+    /// daemon connects here with its portal JWT instead of using `server_config`.
+    pub gateway_url: Option<String>,
 }
 
 impl AppState {
@@ -279,8 +288,8 @@ impl AppState {
         conn.execute(
             "INSERT INTO mcp_installations \
              (mcp_server_id, installation_id, mcp_server_name, package_source, \
-              version_pin, server_config, auth_type, gateway_server_id) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+              version_pin, server_config, auth_type, gateway_server_id, gateway_url) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
              ON CONFLICT(mcp_server_id) DO UPDATE SET \
                installation_id  = excluded.installation_id, \
                mcp_server_name  = excluded.mcp_server_name, \
@@ -288,7 +297,8 @@ impl AppState {
                version_pin      = excluded.version_pin, \
                server_config    = excluded.server_config, \
                auth_type        = excluded.auth_type, \
-               gateway_server_id = excluded.gateway_server_id",
+               gateway_server_id = excluded.gateway_server_id, \
+               gateway_url      = excluded.gateway_url",
             rusqlite::params![
                 row.mcp_server_id,
                 row.installation_id,
@@ -298,6 +308,7 @@ impl AppState {
                 row.server_config,
                 row.auth_type,
                 row.gateway_server_id,
+                row.gateway_url,
             ],
         )
         .context("failed to upsert mcp_installations row")?;
@@ -325,7 +336,7 @@ impl AppState {
         let mut stmt = conn
             .prepare(
                 "SELECT mcp_server_id, installation_id, mcp_server_name, package_source, \
-                 version_pin, server_config, auth_type, gateway_server_id \
+                 version_pin, server_config, auth_type, gateway_server_id, gateway_url \
                  FROM mcp_installations",
             )
             .context("failed to prepare mcp_installations list query")?;
@@ -341,6 +352,7 @@ impl AppState {
                     server_config: row.get(5)?,
                     auth_type: row.get(6)?,
                     gateway_server_id: row.get(7)?,
+                    gateway_url: row.get(8)?,
                 })
             })
             .context("failed to query mcp_installations")?
@@ -515,6 +527,7 @@ CREATE TABLE IF NOT EXISTS mcp_installations (
     server_config    TEXT,
     auth_type        TEXT NOT NULL,
     gateway_server_id TEXT,
+    gateway_url      TEXT,
     installed_at     TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 "#;

@@ -66,6 +66,7 @@ fn install_mcp_upserts_row_and_writes_managed_mcp_json() {
         server_config: Some(server_config_json().to_string()),
         auth_type: "oauth_pkce".to_string(),
         gateway_server_id: Some("g1-github".to_string()),
+        gateway_url: None,
     };
 
     state_arc.upsert_mcp_install(&row).unwrap();
@@ -107,6 +108,7 @@ fn deactivate_mcp_removes_row_and_entry_from_managed_mcp_json() {
         server_config: None,
         auth_type: "none".to_string(),
         gateway_server_id: None,
+        gateway_url: None,
     };
     state.upsert_mcp_install(&row).unwrap();
     super::write_managed_mcp_json_for_test(&state).unwrap();
@@ -148,6 +150,7 @@ fn reinstall_mcp_is_idempotent() {
         server_config: None,
         auth_type: "none".to_string(),
         gateway_server_id: None,
+        gateway_url: None,
     };
     state.upsert_mcp_install(&row1).unwrap();
     super::write_managed_mcp_json_for_test(&state).unwrap();
@@ -163,6 +166,7 @@ fn reinstall_mcp_is_idempotent() {
         server_config: None,
         auth_type: "none".to_string(),
         gateway_server_id: None,
+        gateway_url: None,
     };
     state.upsert_mcp_install(&row2).unwrap();
     super::write_managed_mcp_json_for_test(&state).unwrap();
@@ -195,6 +199,7 @@ fn managed_mcp_json_contains_all_installed_servers() {
             server_config: None,
             auth_type: "none".to_string(),
             gateway_server_id: None,
+        gateway_url: None,
         };
         state.upsert_mcp_install(&row).unwrap();
     }
@@ -304,6 +309,7 @@ fn make_mcp_snapshot_record(
         server_config: None,
         auth_type: "none".to_string(),
         gateway_server_id: None,
+        gateway_url: None,
         state: state.to_string(),
     }
 }
@@ -319,6 +325,7 @@ fn seed_mcp_row(state: &AppState, mcp_server_id: Uuid, name: &str) {
         server_config: None,
         auth_type: "none".to_string(),
         gateway_server_id: None,
+        gateway_url: None,
     };
     state.upsert_mcp_install(&row).unwrap();
 }
@@ -604,6 +611,7 @@ fn seed_mcp_row_with_config(
         server_config: server_config.as_ref().map(|v| v.to_string()),
         auth_type: "none".to_string(),
         gateway_server_id: None,
+        gateway_url: None,
     };
     state.upsert_mcp_install(&row).unwrap();
 }
@@ -622,7 +630,7 @@ fn startup_with_two_entries_registers_two_backends() {
     // Act: run the startup loader.
     let registry = fresh_registry();
     let (list_changed_tx, _) = tokio::sync::broadcast::channel(16);
-    crate::load_managed_mcp_into_registry(&state, &registry, list_changed_tx);
+    crate::load_managed_mcp_into_registry(&state, "https://registry.test", &registry, list_changed_tx);
 
     // Assert: both backends are registered by their UUID server_id.
     let backends = registry.list_backends();
@@ -662,7 +670,7 @@ fn startup_with_null_server_config_skips_entry() {
     // Act.
     let registry = fresh_registry();
     let (list_changed_tx, _) = tokio::sync::broadcast::channel(16);
-    crate::load_managed_mcp_into_registry(&state, &registry, list_changed_tx);
+    crate::load_managed_mcp_into_registry(&state, "https://registry.test", &registry, list_changed_tx);
 
     // Assert: no backends registered (null config → skip with warning).
     let backends = registry.list_backends();
@@ -711,6 +719,7 @@ async fn handle_install_mcp_registers_backend_in_aggregator() {
         Some(stdio_server_config()),
         "none".to_string(),
         None,
+        None,
         &state_arc,
         &mock_server.url(),
         &stats,
@@ -747,7 +756,7 @@ async fn handle_deactivate_mcp_removes_backend_from_aggregator() {
     let registry = fresh_registry();
     // Pre-register so we can verify it gets removed.
     let (list_changed_tx, _) = tokio::sync::broadcast::channel(16);
-    crate::load_managed_mcp_into_registry(&state, &registry, list_changed_tx);
+    crate::load_managed_mcp_into_registry(&state, "https://registry.test", &registry, list_changed_tx);
     assert!(
         registry.has_backend("github-mcp"),
         "backend must be registered before deactivate"

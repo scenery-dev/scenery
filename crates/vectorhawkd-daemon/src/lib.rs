@@ -344,7 +344,7 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     let model_client: Option<Arc<dyn ModelClient>> = Some(Arc::new(hybrid) as Arc<dyn ModelClient>);
 
     let vh_registry = Arc::new(build_stub_registry());
-    load_managed_mcp_into_registry(&state, &vh_registry, list_changed_tx.clone());
+    load_managed_mcp_into_registry(&state, &registry_url, &vh_registry, list_changed_tx.clone());
 
     // ── Legacy install reclaim (pre-v1.0.51) ──────────────────────────────────
     //
@@ -1398,6 +1398,7 @@ fn flush_ratings_and_scan(
 /// Called once from `run_daemon` after `build_stub_registry()`.
 fn load_managed_mcp_into_registry(
     state: &AppState,
+    base_url: &str,
     registry: &Arc<BackendRegistry>,
     list_changed_tx: tokio::sync::broadcast::Sender<()>,
 ) {
@@ -1409,9 +1410,17 @@ fn load_managed_mcp_into_registry(
         }
     };
 
+    // Portal JWT used to authenticate to the gateway proxy for brokered
+    // backends. Read once at startup; rotation is picked up on the next sync
+    // re-registration.
+    let gateway_token = vectorhawkd_core::auth::load_tokens(state, base_url)
+        .ok()
+        .flatten()
+        .map(|t| t.access_token);
+
     let mut loaded = 0usize;
     for row in &rows {
-        match mcp_row_to_backend_entry(row) {
+        match mcp_row_to_backend_entry(row, gateway_token.as_deref()) {
             Some(entry) => {
                 let server_id = entry.server_id.clone();
                 registry.register_backend(entry.clone());
@@ -1551,7 +1560,29 @@ pub fn mcp_server_slug(name: &str) -> String {
 
 pub fn mcp_row_to_backend_entry(
     row: &vectorhawkd_core::state::McpInstallRow,
+    gateway_token: Option<&str>,
 ) -> Option<BackendEntry> {
+    // Gateway-brokered servers take precedence: the daemon connects to the
+    // gateway proxy URL with its own portal JWT (passed as `gateway_token`).
+    // The credential broker injects the real upstream credential, and the
+    // gateway bridges legacy SSE backends — so `server_config` is irrelevant
+    // and a URL-shaped `command` is never spawned as a subprocess.
+    if let Some(url) = row.gateway_url.as_deref().filter(|u| !u.is_empty()) {
+        return Some(BackendEntry {
+            server_id: mcp_server_slug(&row.mcp_server_name),
+            name: row.mcp_server_name.clone(),
+            transport: BackendTransport::Http {
+                url: url.to_string(),
+                auth_token: gateway_token.map(str::to_string),
+            },
+            tools: vec![],
+            tool_visibility: ToolVisibility::All,
+            priority: 50,
+            consecutive_errors: 0,
+            unhealthy: false,
+        });
+    }
+
     let config: serde_json::Value = match &row.server_config {
         Some(s) => match serde_json::from_str(s) {
             Ok(v) => v,
@@ -1669,5 +1700,61 @@ mod slug_tests {
     fn slug_empty_collapses_to_server() {
         assert_eq!(mcp_server_slug(""), "server");
         assert_eq!(mcp_server_slug("---"), "server");
+    }
+}
+
+#[cfg(test)]
+mod backend_entry_tests {
+    use super::mcp_row_to_backend_entry;
+    use vectorhawkd_mcp::aggregator::BackendTransport;
+    use vectorhawkd_core::state::McpInstallRow;
+
+    fn row_with(gateway_url: Option<&str>, server_config: Option<&str>) -> McpInstallRow {
+        McpInstallRow {
+            mcp_server_id: "id-1".to_string(),
+            installation_id: "inst-1".to_string(),
+            mcp_server_name: "Home Assistant".to_string(),
+            package_source: "https://ha.example/mcp_server/sse".to_string(),
+            version_pin: None,
+            server_config: server_config.map(str::to_string),
+            auth_type: "service_account".to_string(),
+            gateway_server_id: Some("home-assistant".to_string()),
+            gateway_url: gateway_url.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn gateway_url_routes_through_gateway_with_token() {
+        let row = row_with(Some("https://app.vectorhawk.ai/gateway/home-assistant/mcp"), None);
+        let entry = mcp_row_to_backend_entry(&row, Some("jwt-abc")).expect("entry");
+        assert_eq!(entry.server_id, "home-assistant");
+        match entry.transport {
+            BackendTransport::Http { url, auth_token } => {
+                assert_eq!(url, "https://app.vectorhawk.ai/gateway/home-assistant/mcp");
+                assert_eq!(auth_token.as_deref(), Some("jwt-abc"));
+            }
+            other => panic!("expected Http transport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gateway_url_wins_over_url_shaped_command() {
+        // The ha-claude bug: a remote URL stored as a stdio `command`. With a
+        // gateway_url present the daemon must NOT spawn the URL as a subprocess.
+        let bad = r#"{"command":"https://ha.example/mcp_server/sse","args":[]}"#;
+        let row = row_with(Some("https://app.vectorhawk.ai/gateway/home-assistant/mcp"), Some(bad));
+        let entry = mcp_row_to_backend_entry(&row, Some("jwt")).expect("entry");
+        assert!(matches!(entry.transport, BackendTransport::Http { .. }));
+    }
+
+    #[test]
+    fn no_gateway_url_falls_back_to_server_config() {
+        let cfg = r#"{"command":"npx","args":["@scope/server"]}"#;
+        let row = row_with(None, Some(cfg));
+        let entry = mcp_row_to_backend_entry(&row, None).expect("entry");
+        match entry.transport {
+            BackendTransport::Stdio { command, .. } => assert_eq!(command, "npx"),
+            other => panic!("expected Stdio transport, got {other:?}"),
+        }
     }
 }
