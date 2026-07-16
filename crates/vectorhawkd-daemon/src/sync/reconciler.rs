@@ -336,6 +336,7 @@ async fn dispatch_event(
             server_config,
             auth_type,
             gateway_server_id,
+            gateway_url,
         } => {
             spawn_install_mcp(
                 installation_id,
@@ -346,6 +347,7 @@ async fn dispatch_event(
                 server_config,
                 auth_type,
                 gateway_server_id,
+                gateway_url,
                 state,
                 registry_url,
                 skill_locks,
@@ -493,6 +495,7 @@ async fn dispatch_event(
                             server_config,
                             auth_type,
                             gateway_server_id,
+                            gateway_url,
                         } => {
                             spawn_install_mcp(
                                 installation_id,
@@ -503,6 +506,7 @@ async fn dispatch_event(
                                 server_config,
                                 auth_type,
                                 gateway_server_id,
+                                gateway_url,
                                 state,
                                 registry_url,
                                 skill_locks,
@@ -628,6 +632,7 @@ fn spawn_install_mcp(
     server_config: Option<serde_json::Value>,
     auth_type: String,
     gateway_server_id: Option<String>,
+    gateway_url: Option<String>,
     state: &Arc<AppState>,
     registry_url: &str,
     skill_locks: &SkillLockMap,
@@ -656,6 +661,7 @@ fn spawn_install_mcp(
             server_config,
             auth_type,
             gateway_server_id,
+            gateway_url,
             &st,
             &reg_url,
             &stats_clone,
@@ -990,6 +996,7 @@ async fn handle_install_mcp(
     server_config: Option<serde_json::Value>,
     auth_type: String,
     gateway_server_id: Option<String>,
+    gateway_url: Option<String>,
     state: &Arc<AppState>,
     registry_url: &str,
     stats: &Arc<Mutex<ReconcilerStats>>,
@@ -1012,6 +1019,7 @@ async fn handle_install_mcp(
         server_config: server_config_str,
         auth_type: auth_type.clone(),
         gateway_server_id: gateway_server_id.clone(),
+        gateway_url: gateway_url.clone(),
     };
 
     let state_clone = Arc::clone(state);
@@ -1063,8 +1071,15 @@ async fn handle_install_mcp(
                     .and_then(|v| serde_json::to_string(v).ok()),
                 auth_type: auth_type.clone(),
                 gateway_server_id: gateway_server_id.clone(),
+                gateway_url: gateway_url.clone(),
             };
-            match crate::mcp_row_to_backend_entry(&row) {
+            // Gateway-brokered backends connect to the proxy with the daemon's
+            // own portal JWT; load it once here so the aggregator can inject it.
+            let gw_token = vectorhawkd_core::auth::load_tokens(state, registry_url)
+                .ok()
+                .flatten()
+                .map(|t| t.access_token);
+            match crate::mcp_row_to_backend_entry(&row, gw_token.as_deref()) {
                 Some(entry) => {
                     let sid = entry.server_id.clone();
                     backend_registry.register_backend(entry.clone());
@@ -1258,6 +1273,7 @@ fn write_managed_mcp_json(state: &AppState) -> Result<()> {
             "server_config": server_config,
             "auth_type": row.auth_type,
             "gateway_server_id": row.gateway_server_id,
+            "gateway_url": row.gateway_url,
         }));
     }
 
@@ -2569,6 +2585,7 @@ pub(crate) fn build_derived_mcp_events_blocking(
                         server_config: record.server_config.clone(),
                         auth_type: record.auth_type.clone(),
                         gateway_server_id: record.gateway_server_id.clone(),
+                        gateway_url: record.gateway_url.clone(),
                     });
                 }
                 // Already installed: no event needed.
@@ -2839,6 +2856,7 @@ pub(crate) async fn handle_install_mcp_for_test(
     server_config: Option<serde_json::Value>,
     auth_type: String,
     gateway_server_id: Option<String>,
+    gateway_url: Option<String>,
     state: &Arc<AppState>,
     registry_url: &str,
     stats: &Arc<std::sync::Mutex<ReconcilerStats>>,
@@ -2854,6 +2872,7 @@ pub(crate) async fn handle_install_mcp_for_test(
         server_config,
         auth_type,
         gateway_server_id,
+        gateway_url,
         state,
         registry_url,
         stats,

@@ -13,3 +13,4 @@ Cargo.lock.bak
 state.db
 state.db-*
 agent.sock
+/target-linux

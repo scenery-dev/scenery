@@ -576,6 +576,10 @@ pub enum SyncEvent {
         server_config: Option<serde_json::Value>,
         auth_type: String,
         gateway_server_id: Option<String>,
+        /// Full gateway proxy URL for a credential-brokered server. When set,
+        /// the daemon connects here (with its own portal JWT) instead of the
+        /// raw backend — the upstream URL and its credential stay server-side.
+        gateway_url: Option<String>,
     },
     /// Deactivate (remove) a managed MCP server.
     DeactivateMcp {
@@ -635,6 +639,10 @@ pub struct McpInstallationRecord {
     pub server_config: Option<serde_json::Value>,
     pub auth_type: String,
     pub gateway_server_id: Option<String>,
+    /// Gateway proxy URL for credential-brokered servers. `#[serde(default)]`
+    /// so snapshots from older backends parse with `None`.
+    #[serde(default)]
+    pub gateway_url: Option<String>,
     /// `"desired"` | `"installing"` | `"installed"` | `"deactivated"` | `"removed"`
     pub state: String,
 }
@@ -683,6 +691,8 @@ pub struct WireInstallMcp {
     pub server_config: Option<serde_json::Value>,
     pub auth_type: String,
     pub gateway_server_id: Option<String>,
+    #[serde(default)]
+    pub gateway_url: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -767,6 +777,7 @@ fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
                 server_config: wire.server_config,
                 auth_type: wire.auth_type,
                 gateway_server_id: wire.gateway_server_id,
+                gateway_url: wire.gateway_url,
             })
         }
         "deactivate_mcp" => {
