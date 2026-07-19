@@ -63,15 +63,36 @@ esac
 # ---------------------------------------------------------------------------
 
 if command -v curl >/dev/null 2>&1; then
-    download_url() { curl -fsSL --retry 3 --retry-delay 2 -o "$2" "$1"; }
-    fetch_stdout() { curl -fsSL --retry 3 --retry-delay 2 "$1"; }
+    # --proto '=https' --tlsv1.2: refuse any non-HTTPS URL (including on
+    # redirects) and floor the TLS version, so a hijacked redirect can't
+    # downgrade the transport.
+    download_url() { curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 2 -o "$2" "$1"; }
+    fetch_stdout() { curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 2 "$1"; }
 elif command -v wget >/dev/null 2>&1; then
-    download_url() { wget -q --tries=3 --waitretry=2 -O "$2" "$1"; }
-    fetch_stdout() { wget -q --tries=3 --waitretry=2 -O - "$1"; }
+    download_url() { wget --https-only -q --tries=3 --waitretry=2 -O "$2" "$1"; }
+    fetch_stdout() { wget --https-only -q --tries=3 --waitretry=2 -O - "$1"; }
 else
     log_error "Neither curl nor wget found. Install one and retry."
     exit 1
 fi
+
+# ---------------------------------------------------------------------------
+# Checksum
+# ---------------------------------------------------------------------------
+
+# Print the lowercase hex SHA-256 of a file, or return non-zero if no SHA-256
+# tool is available. Tries sha256sum, then shasum, then openssl.
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{print $1}'
+    elif command -v openssl >/dev/null 2>&1; then
+        openssl dgst -sha256 "$1" | awk '{print $NF}'
+    else
+        return 1
+    fi
+}
 
 # ---------------------------------------------------------------------------
 # Resolve version
@@ -143,6 +164,35 @@ trap 'rm -rf "${TMPDIR}"' EXIT INT TERM
 
 log "Downloading vectorhawk ${VERSION} for ${TRIPLE}..."
 download_url "${TARBALL_URL}" "${TMPDIR}/${TARBALL}"
+
+# ---------------------------------------------------------------------------
+# Verify integrity against the published SHA-256 BEFORE extracting or running
+# anything from the tarball. A mismatch (corruption or tampering) aborts.
+# ---------------------------------------------------------------------------
+
+log_verbose "Verifying checksum..."
+download_url "${TARBALL_URL}.sha256" "${TMPDIR}/${TARBALL}.sha256"
+
+_EXPECTED="$(awk '{print $1}' "${TMPDIR}/${TARBALL}.sha256" | tr '[:upper:]' '[:lower:]')"
+if [ -z "${_EXPECTED}" ]; then
+    log_error "Empty or missing checksum for ${TARBALL} — refusing to install."
+    exit 1
+fi
+
+_ACTUAL="$(sha256_of "${TMPDIR}/${TARBALL}" | tr '[:upper:]' '[:lower:]')" || {
+    log_error "No SHA-256 tool (sha256sum, shasum, or openssl) found — cannot verify the download."
+    log_error "Install one and retry, or use Homebrew: brew install vectorhawk/tap/vectorhawk"
+    exit 1
+}
+
+if [ "${_ACTUAL}" != "${_EXPECTED}" ]; then
+    log_error "Checksum mismatch for ${TARBALL} — refusing to install."
+    log_error "  expected: ${_EXPECTED}"
+    log_error "  actual:   ${_ACTUAL}"
+    log_error "This means a corrupted download or a tampered artifact. Aborting."
+    exit 1
+fi
+log_verbose "Checksum verified: ${_ACTUAL}"
 
 log_verbose "Extracting..."
 tar -xzf "${TMPDIR}/${TARBALL}" -C "${TMPDIR}"
