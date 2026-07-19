@@ -690,6 +690,7 @@ impl RegistryClient {
         &self,
         source_tar_gz_bytes: Vec<u8>,
         publish_from_discovery_id: Option<&str>,
+        duplicate_resolution: Option<&str>,
     ) -> Result<CompilePublishResponse> {
         let token = self.get_auth_token().ok_or_else(|| {
             anyhow::anyhow!("not authenticated; run `vectorhawk auth login` first")
@@ -716,6 +717,9 @@ impl RegistryClient {
         if let Some(discovery_id) = publish_from_discovery_id {
             form = form.text("publish_from_discovery_id", discovery_id.to_string());
         }
+        if let Some(resolution) = duplicate_resolution {
+            form = form.text("duplicate_resolution", resolution.to_string());
+        }
 
         let resp = self
             .http
@@ -726,6 +730,13 @@ impl RegistryClient {
             .with_context(|| format!("failed to reach registry at {url}"))?;
 
         let status = resp.status();
+
+        if status == reqwest::StatusCode::CONFLICT {
+            // Duplicate detected and no resolution supplied — surface the
+            // report so the CLI can print it and prompt for --on-duplicate.
+            let body = resp.text().unwrap_or_default();
+            anyhow::bail!("DUPLICATE_CONFLICT: {body}");
+        }
 
         if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
             let body = resp.text().unwrap_or_default();
@@ -1989,7 +2000,7 @@ mod tests {
             enc.finish().unwrap();
             buf
         };
-        let result = client.compile_and_publish(gz_bytes, Some("disc-unit-001"));
+        let result = client.compile_and_publish(gz_bytes, Some("disc-unit-001"), None);
         assert!(
             result.is_ok(),
             "compile_and_publish should succeed; got: {:#?}",
@@ -2039,7 +2050,7 @@ mod tests {
             enc.finish().unwrap();
             buf
         };
-        let result = client.compile_and_publish(gz_bytes, None);
+        let result = client.compile_and_publish(gz_bytes, None, None);
         assert!(result.is_ok(), "compile_and_publish(None) should succeed");
         mock.assert();
     }

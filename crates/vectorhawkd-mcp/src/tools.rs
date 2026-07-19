@@ -259,8 +259,9 @@ fn build_tool_list_inner(
         name: "vectorhawk_import".to_string(),
         description: "Import an external skill or MCP server into your organization's governed \
             catalog. Pass a GitHub URL, npm package name (e.g. '@modelcontextprotocol/server-slack'), \
-            or marketplace URL. Use action='preview' first to see what will be imported, then \
-            action='submit' to request approval."
+            or marketplace URL. Use action='preview' first to see what will be imported (this also \
+            reports any duplicate already in the catalog), then action='submit' to request approval. \
+            If a duplicate is detected on submit, re-run with duplicate_resolution set."
             .to_string(),
         input_schema: serde_json::json!({
             "type": "object",
@@ -273,6 +274,15 @@ fn build_tool_list_inner(
                     "type": "string",
                     "enum": ["preview", "submit"],
                     "description": "preview: see what will be imported without committing. submit: submit for approval (or auto-approve if policy allows)."
+                },
+                "duplicate_resolution": {
+                    "type": "string",
+                    "enum": ["use_existing", "new_version", "fork", "force"],
+                    "description": "How to resolve a detected duplicate on submit: use_existing (adopt the existing catalog skill), new_version (add a version to it), fork (publish under a new name — set fork_name), or force (import anyway)."
+                },
+                "fork_name": {
+                    "type": "string",
+                    "description": "New skill name when duplicate_resolution='fork'."
                 }
             },
             "required": ["input", "action"]
@@ -1266,9 +1276,25 @@ fn handle_import(
         Err(e) => return e,
     };
 
+    let duplicate_resolution = arguments
+        .get("duplicate_resolution")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let fork_name = arguments
+        .get("fork_name")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+
     match action {
         ImportAction::Preview => handle_import_preview(url, input, &access_token, state),
-        ImportAction::Submit => handle_import_submit(url, input, &access_token, state),
+        ImportAction::Submit => handle_import_submit(
+            url,
+            input,
+            &access_token,
+            duplicate_resolution,
+            fork_name,
+            state,
+        ),
     }
 }
 
@@ -1318,12 +1344,17 @@ fn handle_import_submit(
     url: &str,
     input: &str,
     access_token: &str,
+    duplicate_resolution: Option<&str>,
+    fork_name: Option<&str>,
     state: &AppState,
 ) -> ToolCallResult {
-    match mcp_governance::import_submit(url, input, access_token) {
+    match mcp_governance::import_submit(url, input, access_token, duplicate_resolution, fork_name) {
         Ok(result) => ToolCallResult::success(format_import_result(&result)),
         Err(e) => {
             let err_str = e.to_string();
+            if err_str.contains("DUPLICATE_CONFLICT") {
+                return format_duplicate_conflict(&err_str);
+            }
             if err_str.contains("401") || err_str.contains("Unauthorized") {
                 let refresh_token = match auth::load_tokens(state, url) {
                     Ok(Some(t)) => t.refresh_token,
@@ -1333,15 +1364,53 @@ fn handle_import_submit(
                     Ok(t) => t,
                     Err(e) => return e,
                 };
-                match mcp_governance::import_submit(url, input, &new_token) {
+                match mcp_governance::import_submit(
+                    url,
+                    input,
+                    &new_token,
+                    duplicate_resolution,
+                    fork_name,
+                ) {
                     Ok(result) => ToolCallResult::success(format_import_result(&result)),
-                    Err(e) => ToolCallResult::error_result(format!("Import submit failed: {e}")),
+                    Err(e) => {
+                        let err_str = e.to_string();
+                        if err_str.contains("DUPLICATE_CONFLICT") {
+                            return format_duplicate_conflict(&err_str);
+                        }
+                        ToolCallResult::error_result(format!("Import submit failed: {e}"))
+                    }
                 }
             } else {
                 ToolCallResult::error_result(format!("Import submit failed: {e}"))
             }
         }
     }
+}
+
+/// Turn a 409 duplicate-conflict error into a user-facing prompt listing the
+/// matched skill, overlapping tools, and the resolutions the user can pass.
+fn format_duplicate_conflict(err_str: &str) -> ToolCallResult {
+    // err_str is "DUPLICATE_CONFLICT: {json body}" — extract and parse the body.
+    let body = err_str
+        .split_once("DUPLICATE_CONFLICT: ")
+        .map(|(_, b)| b)
+        .unwrap_or("");
+    let parsed: serde_json::Value = serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+    let dup = parsed
+        .get("detail")
+        .and_then(|d| d.get("duplicate_match"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+
+    let mut text = String::from("Duplicate detected — this import was blocked.");
+    if !dup.is_null() {
+        text.push_str(&format_duplicate_match(&dup));
+    } else {
+        text.push_str(
+            "\n  Re-run with duplicate_resolution=\"use_existing|new_version|fork|force\".",
+        );
+    }
+    ToolCallResult::error_result(text)
 }
 
 // ── vectorhawk_scan handler ───────────────────────────────────────────────────
@@ -1432,9 +1501,13 @@ fn format_import_preview(preview: &serde_json::Value) -> String {
                 .get("description")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            format!(
+            let mut text = format!(
                 "Skill Import Preview\n  Name: {name}\n  ID: {skill_id}\n  Version: {version}\n  Publisher: {publisher}\n  Description: {desc}"
-            )
+            );
+            if let Some(dup) = preview.get("duplicate_match").filter(|v| !v.is_null()) {
+                text.push_str(&format_duplicate_match(dup));
+            }
+            text
         }
         "mcp_server" => {
             let pkg = preview
@@ -1474,6 +1547,44 @@ fn format_import_preview(preview: &serde_json::Value) -> String {
         }
         _ => format!("Unknown import type: {import_type}"),
     }
+}
+
+/// Render a similarity-based duplicate report for the skill import preview.
+///
+/// The backend returns this when an incoming skill matches an existing one in
+/// the org. It calls out the score, the matched skill, and — critically — the
+/// specific overlapping tools, plus the resolution the user should pick.
+fn format_duplicate_match(dup: &serde_json::Value) -> String {
+    let band = dup.get("band").and_then(|v| v.as_str()).unwrap_or("?");
+    let score = dup.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let matched_id = dup
+        .get("matched_skill")
+        .and_then(|m| m.get("skill_id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    let action = dup
+        .get("recommended_action")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+
+    let mut text = format!(
+        "\n\n  ⚠ Possible duplicate ({band}, {score:.0}% match)\n    Matches existing skill: {matched_id}\n    Recommended: {action}"
+    );
+
+    if let Some(tools) = dup.get("matched_tools").and_then(|v| v.as_array()) {
+        let names: Vec<&str> = tools.iter().filter_map(|t| t.as_str()).collect();
+        if !names.is_empty() {
+            text.push_str(&format!("\n    Overlapping tools: {}", names.join(", ")));
+        }
+    }
+    if let Some(msg) = dup.get("message").and_then(|v| v.as_str()) {
+        text.push_str(&format!("\n    {msg}"));
+    }
+    text.push_str(
+        "\n    Resolve with vectorhawk_import(confirm=true, duplicate_resolution=\
+         \"use_existing|new_version|fork|force\").",
+    );
+    text
 }
 
 fn format_import_result(result: &serde_json::Value) -> String {

@@ -308,9 +308,27 @@ pub fn import_preview(base_url: &str, input: &str, auth_token: &str) -> Result<s
 }
 
 /// Submit an external import for approval.
-pub fn import_submit(base_url: &str, input: &str, auth_token: &str) -> Result<serde_json::Value> {
+///
+/// `duplicate_resolution` (and `fork_name` when forking) tell the backend how
+/// to handle a detected duplicate: `use_existing` | `new_version` | `fork` |
+/// `force`. When omitted and a high/exact duplicate is found, the backend
+/// returns HTTP 409 with the similarity report; the caller can then re-submit
+/// with a chosen resolution.
+pub fn import_submit(
+    base_url: &str,
+    input: &str,
+    auth_token: &str,
+    duplicate_resolution: Option<&str>,
+    fork_name: Option<&str>,
+) -> Result<serde_json::Value> {
     let url = format!("{}/portal/import/submit", base_url.trim_end_matches('/'));
-    let body = serde_json::json!({ "url": input });
+    let mut body = serde_json::json!({ "url": input });
+    if let Some(res) = duplicate_resolution {
+        body["duplicate_resolution"] = serde_json::Value::String(res.to_string());
+    }
+    if let Some(name) = fork_name {
+        body["fork_name"] = serde_json::Value::String(name.to_string());
+    }
 
     let client = make_http_client()?;
     let resp = client
@@ -320,6 +338,12 @@ pub fn import_submit(base_url: &str, input: &str, auth_token: &str) -> Result<se
         .send()
         .with_context(|| format!("failed to reach registry at {url}"))?;
 
+    if resp.status() == reqwest::StatusCode::CONFLICT {
+        // Duplicate detected and no resolution supplied — surface the report
+        // so the caller can prompt the user for a choice.
+        let body = resp.text().unwrap_or_default();
+        anyhow::bail!("DUPLICATE_CONFLICT: {body}");
+    }
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().unwrap_or_default();
