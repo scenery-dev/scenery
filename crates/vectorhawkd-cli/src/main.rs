@@ -227,6 +227,15 @@ pub enum SkillCommand {
         /// Compile and validate without creating a registry entry.
         #[arg(long, default_value_t = false)]
         dry_run: bool,
+        /// How to resolve a detected duplicate (same content under a different
+        /// name in your org): use-existing, new-version, fork, or force.
+        /// Without this, publish is blocked with a similarity report so you
+        /// can choose.
+        #[arg(long, value_name = "ACTION")]
+        on_duplicate: Option<String>,
+        /// New skill name to use when --on-duplicate=fork.
+        #[arg(long)]
+        fork_name: Option<String>,
     },
 
     /// Convert a legacy skill bundle to SKILL.md format.
@@ -623,7 +632,18 @@ async fn run(cli: Cli) -> Result<()> {
             path,
             registry_url,
             dry_run,
-        }) => cmd_skill_publish(path, &registry_url, dry_run).await,
+            on_duplicate,
+            fork_name,
+        }) => {
+            cmd_skill_publish(
+                path,
+                &registry_url,
+                dry_run,
+                on_duplicate.as_deref(),
+                fork_name.as_deref(),
+            )
+            .await
+        }
         Command::Skill(SkillCommand::Convert { path, output_dir }) => {
             cmd_skill_convert(path, output_dir.as_deref()).await
         }
@@ -2458,6 +2478,27 @@ fn inject_publisher_field(skill_md: &str, slug: &str) -> String {
     lines.join("\n") + if skill_md.ends_with('\n') { "\n" } else { "" }
 }
 
+/// Replace the top-level `name:` frontmatter field (used for --on-duplicate=fork).
+///
+/// The registry derives a skill's identity slug from `name`, so renaming it
+/// client-side is what makes a fork a genuinely new skill rather than a new
+/// version of the matched one.
+fn set_name_field(skill_md: &str, new_name: &str) -> String {
+    let trailing_nl = if skill_md.ends_with('\n') { "\n" } else { "" };
+    skill_md
+        .lines()
+        .map(|line| {
+            if line.strip_prefix("name:").is_some() {
+                format!("name: {new_name}")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + trailing_nl
+}
+
 /// Try to look up the logged-in user's publisher slug from auth state.
 ///
 /// Returns `None` silently on any failure (no tokens, network error, etc.).
@@ -3121,6 +3162,8 @@ async fn cmd_skill_publish(
     path: camino::Utf8PathBuf,
     registry_url: &str,
     dry_run: bool,
+    on_duplicate: Option<&str>,
+    fork_name: Option<&str>,
 ) -> Result<()> {
     use flate2::{write::GzEncoder, Compression};
     use std::fs;
@@ -3138,6 +3181,24 @@ async fn cmd_skill_publish(
         );
     }
 
+    // Normalize the --on-duplicate value (accept dashes) to the wire form.
+    let duplicate_resolution: Option<String> = match on_duplicate {
+        None => None,
+        Some(raw) => {
+            let norm = raw.trim().replace('-', "_");
+            if !["use_existing", "new_version", "fork", "force"].contains(&norm.as_str()) {
+                anyhow::bail!(
+                    "invalid --on-duplicate '{raw}' — expected one of: \
+                     use-existing, new-version, fork, force"
+                );
+            }
+            if norm == "fork" && fork_name.map(|n| n.trim().is_empty()).unwrap_or(true) {
+                anyhow::bail!("--on-duplicate=fork requires --fork-name");
+            }
+            Some(norm)
+        }
+    };
+
     let state = AppState::bootstrap().context("failed to bootstrap state")?;
     let tokens = load_tokens(&state, registry_url)
         .context("failed to load auth tokens")?
@@ -3152,7 +3213,7 @@ async fn cmd_skill_publish(
     let skill_md_text = fs::read_to_string(&skill_md_path)
         .with_context(|| format!("failed to read {skill_md_path}"))?;
 
-    let (skill_md_to_pack, injected_publisher) = if needs_publisher(&skill_md_text) {
+    let (mut skill_md_to_pack, injected_publisher) = if needs_publisher(&skill_md_text) {
         let client = AuthClient::new(registry_url);
         let user = client
             .me(&tokens.access_token)
@@ -3166,6 +3227,15 @@ async fn cmd_skill_publish(
 
     if let Some(ref slug) = injected_publisher {
         println!("Publisher not set — using '{slug}' from your logged-in account.");
+    }
+
+    // Forking renames the skill client-side so it becomes a new registry entry
+    // rather than a new version of the matched one.
+    if duplicate_resolution.as_deref() == Some("fork") {
+        if let Some(name) = fork_name {
+            skill_md_to_pack = set_name_field(&skill_md_to_pack, name.trim());
+            println!("Forking — publishing under new name '{}'.", name.trim());
+        }
     }
 
     // Pack the skill directory into an in-memory tar.gz.
@@ -3207,12 +3277,29 @@ async fn cmd_skill_publish(
     }
 
     let registry = RegistryClient::new(registry_url).with_auth(tokens.access_token);
-    // CLI publish is not discovery-driven; pass None so the backend does not
-    // attempt to back-fill frontmatter from a catalog stub.
-    let resp = tokio::task::spawn_blocking(move || registry.compile_and_publish(gz_buf, None))
-        .await
-        .context("publish task panicked")?
-        .context("publish failed")?;
+    // CLI publish is not discovery-driven; pass None for discovery so the
+    // backend does not attempt to back-fill frontmatter from a catalog stub.
+    let dup_res = duplicate_resolution.clone();
+    let publish_result = tokio::task::spawn_blocking(move || {
+        registry.compile_and_publish(gz_buf, None, dup_res.as_deref())
+    })
+    .await
+    .context("publish task panicked")?;
+
+    let resp = match publish_result {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("DUPLICATE_CONFLICT") {
+                print_duplicate_conflict(&msg);
+                anyhow::bail!(
+                    "publish blocked: duplicate detected — re-run with \
+                     --on-duplicate <use-existing|new-version|fork|force>"
+                );
+            }
+            return Err(e.context("publish failed"));
+        }
+    };
 
     println!(
         "Published '{}' v{}",
@@ -3232,6 +3319,37 @@ async fn cmd_skill_publish(
     }
 
     Ok(())
+}
+
+/// Parse a `DUPLICATE_CONFLICT: {json}` error and print the similarity report.
+fn print_duplicate_conflict(err_msg: &str) {
+    let body = err_msg
+        .split_once("DUPLICATE_CONFLICT: ")
+        .map(|(_, b)| b)
+        .unwrap_or("");
+    let parsed: serde_json::Value = serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+    let dup = parsed.get("detail").and_then(|d| d.get("duplicate_match"));
+
+    println!("\n⚠ Duplicate detected — publish was blocked.");
+    if let Some(dup) = dup {
+        let band = dup.get("band").and_then(|v| v.as_str()).unwrap_or("?");
+        let score = dup.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let matched = dup
+            .get("matched_skill")
+            .and_then(|m| m.get("skill_id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        println!("  Match: {band} ({score:.0}%) with existing skill '{matched}'");
+        if let Some(tools) = dup.get("matched_tools").and_then(|v| v.as_array()) {
+            let names: Vec<&str> = tools.iter().filter_map(|t| t.as_str()).collect();
+            if !names.is_empty() {
+                println!("  Overlapping tools: {}", names.join(", "));
+            }
+        }
+        if let Some(m) = dup.get("message").and_then(|v| v.as_str()) {
+            println!("  {m}");
+        }
+    }
 }
 
 // ── skill convert ─────────────────────────────────────────────────────────────

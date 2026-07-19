@@ -88,7 +88,9 @@ pub async fn handle_publish_requested(
     // (version, publisher) from the catalog Skill stub created during adopt.
     let discovery_id_opt = Some(discovery_id.clone());
     let resp = tokio::task::spawn_blocking(move || {
-        registry.compile_and_publish(gz_buf, discovery_id_opt.as_deref())
+        // Intentional publish of an already-adopted discovery — never block
+        // this automated path on the cross-name duplicate gate.
+        registry.compile_and_publish(gz_buf, discovery_id_opt.as_deref(), Some("force"))
     })
     .await
     .context("publish: upload task panicked")?
