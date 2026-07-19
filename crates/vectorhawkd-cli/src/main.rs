@@ -36,6 +36,7 @@ use clap::{Parser, Subcommand};
 
 mod commands_migrate;
 mod install;
+mod uninstall;
 
 // ── CLI structure ─────────────────────────────────────────────────────────────
 
@@ -87,6 +88,31 @@ pub enum Command {
     /// Managed-paths backup and rollback.
     #[command(subcommand)]
     Migrate(commands_migrate::MigrateCommand),
+
+    /// Remove VectorHawk and restore the host to its pre-install state.
+    ///
+    /// Unwinds every external change in reverse — stops the daemon, strips the
+    /// vectorhawk entries from all AI client configs, removes brokered MCP
+    /// servers completely (they can't run without the runner), restores anything
+    /// VectorHawk took over, and writes a restore report listing what was
+    /// removed, what was kept, and what to re-add on your own configuration.
+    Uninstall {
+        /// Skip the confirmation prompt.
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Also delete the VectorHawk data directory and keychain token.
+        #[arg(long)]
+        purge: bool,
+        /// Show the plan and report without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Directory to write the restore report into (default: home).
+        #[arg(long)]
+        report_dir: Option<std::path::PathBuf>,
+        /// Registry URL for the backend device-deprovision call.
+        #[arg(long, env = "VECTORHAWK_REGISTRY_URL")]
+        registry_url: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -677,6 +703,23 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Sync(SyncCommand::Status) => cmd_sync_status().await,
 
         Command::Migrate(args) => commands_migrate::run(args).await,
+        Command::Uninstall {
+            yes,
+            purge,
+            dry_run,
+            report_dir,
+            registry_url,
+        } => {
+            uninstall::run(uninstall::UninstallOpts {
+                yes,
+                purge,
+                dry_run,
+                report_dir,
+                registry_url: registry_url
+                    .unwrap_or_else(|| "https://app.vectorhawk.ai".to_string()),
+            })
+            .await
+        }
     }
 }
 
