@@ -19,10 +19,11 @@ fn make_state(root: &TempDir) -> AppState {
     AppState::bootstrap_in(root_dir).expect("state bootstrap should succeed")
 }
 
-/// Point `HOME` at `fake_home` and create `~/.claude/skills/<slug>/SKILL.md`
-/// so `managed_skill_present(slug)` returns `true`.
+/// Point `HOME` at `fake_home` and create `~/.agents/skills/<slug>/SKILL.md`
+/// (the canonical managed-skill root) so `managed_skill_present(slug)`
+/// returns `true`.
 fn seed_managed_copy(fake_home: &Path, slug: &str) {
-    let skill_dir = fake_home.join(".claude").join("skills").join(slug);
+    let skill_dir = fake_home.join(".agents").join("skills").join(slug);
     fs::create_dir_all(&skill_dir).unwrap();
     fs::write(skill_dir.join("SKILL.md"), b"---\nname: x\n---\n").unwrap();
 }
@@ -84,7 +85,7 @@ fn perform_if_pending_defers_when_managed_copy_absent() {
         .record_pending_adopt_takeover("hello-world", &source_dir.to_string_lossy())
         .unwrap();
 
-    // Intentionally do NOT seed ~/.claude/skills/hello-world/SKILL.md.
+    // Intentionally do NOT seed ~/.agents/skills/hello-world/SKILL.md.
     let result = perform_if_pending(&state, "hello-world");
     assert!(result.is_ok(), "deferring is not an error");
 
