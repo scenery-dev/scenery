@@ -16,18 +16,27 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Resolve the platform-appropriate data directory and bootstrap.
+    /// Resolve the platform-appropriate data directory (`<data_dir>/VectorHawk`)
+    /// without bootstrapping SQLite or creating any subdirectories.
     ///
     /// Uses `dirs::data_dir()` which returns:
     /// - macOS: `~/Library/Application Support`
     /// - Linux: `$XDG_DATA_HOME` or `~/.local/share`
     /// - Windows: `%APPDATA%` (deferred — not supported in M0)
-    pub fn bootstrap() -> Result<Self> {
+    ///
+    /// Exposed standalone (not just via `bootstrap()`) for call sites that
+    /// need `root_dir` — e.g. the restore journal — without paying for a
+    /// full SQLite bootstrap.
+    pub fn resolve_root_dir() -> Result<Utf8PathBuf> {
         let base = dirs::data_dir()
             .context("failed to resolve platform data directory (HOME not set?)")?;
-        let root_dir = Utf8PathBuf::from_path_buf(base.join("VectorHawk"))
-            .map_err(|p| anyhow::anyhow!("non-UTF-8 data dir path: {}", p.display()))?;
-        Self::bootstrap_in(root_dir)
+        Utf8PathBuf::from_path_buf(base.join("VectorHawk"))
+            .map_err(|p| anyhow::anyhow!("non-UTF-8 data dir path: {}", p.display()))
+    }
+
+    /// Resolve the platform-appropriate data directory and bootstrap.
+    pub fn bootstrap() -> Result<Self> {
+        Self::bootstrap_in(Self::resolve_root_dir()?)
     }
 
     /// Bootstrap state in a specific directory. Useful for tests and

@@ -167,6 +167,114 @@ async fn migrate_item_marks_adopted_skill_as_managed() {
     );
 }
 
+// ── Restore journal (ONE ledger) ────────────────────────────────────────────
+
+/// F1 takeovers must also land in the unified restore journal, source=native,
+/// pointing at the SAME backup the legacy `.vectorhawk-backup/` manifest uses
+/// — not a second copy.
+#[tokio::test]
+async fn migrate_item_appends_native_restore_journal_entry_for_skill() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (state, _guard) = temp_state();
+    let item = skill_item("journal-skill", tmp.path());
+    let backup_root = tmp.path().join("backup");
+
+    let client = reqwest::Client::new();
+    let migrated = migrate_item(&item, &backup_root, &state, "http://unused", &client)
+        .await
+        .unwrap();
+    assert!(migrated);
+
+    let journal = vectorhawkd_core::restore_journal::RestoreJournal::for_state(&state);
+    let entries = journal.read_all().unwrap();
+    assert_eq!(
+        entries.len(),
+        1,
+        "one restore-journal entry per migrated item"
+    );
+    let entry = &entries[0];
+    assert_eq!(
+        entry.op,
+        vectorhawkd_core::restore_journal::JournalOp::FileReplace
+    );
+    assert_eq!(
+        entry.source,
+        vectorhawkd_core::restore_journal::JournalSource::Native
+    );
+    assert_eq!(entry.slug.as_deref(), Some("journal-skill"));
+    assert_eq!(entry.target_path, item.source_path.to_string_lossy());
+
+    let backup_path = entry
+        .backup_path
+        .as_ref()
+        .expect("native takeover must carry a backup_path");
+    assert_eq!(
+        backup_path,
+        &backup_root
+            .join("skills")
+            .join("journal-skill")
+            .to_string_lossy()
+            .to_string(),
+        "restore journal must point at the SAME .vectorhawk-backup/ location, not a new copy"
+    );
+    assert!(
+        std::path::Path::new(backup_path).join("SKILL.md").exists(),
+        "the backup this entry points at must actually exist on disk"
+    );
+}
+
+/// Same as above, for an `Mcp` item: op=config_edit, target_path is the real
+/// `~/.claude.json` path (not the scanner's virtual `path:slug` key), and
+/// detail carries `server_key`/`mcp_key` so a later precise removal is
+/// possible without re-deriving it from `slug` alone.
+#[tokio::test]
+async fn migrate_item_appends_native_restore_journal_entry_for_mcp() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (state, _guard) = temp_state();
+    let claude_json = tmp.path().join(".claude.json");
+    fs::write(&claude_json, r#"{"mcpServers":{"my-mcp":{}}}"#).unwrap();
+
+    let item = MigrationItem {
+        kind: ItemKind::Mcp,
+        slug: "my-mcp".to_string(),
+        source_path: std::path::PathBuf::from(format!("{}:my-mcp", claude_json.display())),
+        files: vec![claude_json.clone()],
+        canonical_hash: "aabb".to_string(),
+        payload: serde_json::json!({"mcp_config": {}}),
+    };
+    let backup_root = tmp.path().join("backup");
+
+    let client = reqwest::Client::new();
+    let migrated = migrate_item(&item, &backup_root, &state, "http://unused", &client)
+        .await
+        .unwrap();
+    assert!(migrated);
+
+    let journal = vectorhawkd_core::restore_journal::RestoreJournal::for_state(&state);
+    let entries = journal.read_all().unwrap();
+    assert_eq!(entries.len(), 1);
+    let entry = &entries[0];
+    assert_eq!(
+        entry.op,
+        vectorhawkd_core::restore_journal::JournalOp::ConfigEdit
+    );
+    assert_eq!(
+        entry.source,
+        vectorhawkd_core::restore_journal::JournalSource::Native
+    );
+    assert_eq!(
+        entry.target_path,
+        claude_json.to_string_lossy(),
+        "target_path must be the real claude.json path, not the virtual path:slug key"
+    );
+    assert_eq!(entry.detail["server_key"], "my-mcp");
+    assert_eq!(entry.detail["mcp_key"], "mcpServers");
+    assert_eq!(
+        entry.backup_path.as_deref(),
+        Some(backup_root.join("claude.json").to_string_lossy().as_ref())
+    );
+}
+
 // ── Audit event ───────────────────────────────────────────────────────────────
 
 #[test]

@@ -20,7 +20,11 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
 use tracing::{debug, warn};
-use vectorhawkd_core::{auth::load_all_tokens, state::AppState};
+use vectorhawkd_core::{
+    auth::load_all_tokens,
+    restore_journal::{JournalEntry, JournalOp, JournalSource, RestoreJournal},
+    state::AppState,
+};
 use vectorhawkd_mcp::ownership;
 
 // ── Backup manifest ───────────────────────────────────────────────────────────
@@ -243,6 +247,46 @@ pub async fn migrate_item(
         .and_then(|n| n.to_str())
         .unwrap_or("unknown")
         .to_string();
+
+    // ── 5.5 Restore journal (source=native) ───────────────────────────────────
+    // ONE ledger: F1 takeovers get a restore-journal entry too, alongside the
+    // legacy `.vectorhawk-backup/<ts>/manifest.json` this function has always
+    // written (kept as-is for `migrate rollback` backwards compat). Reuses
+    // the SAME `backup_path` computed above — no second copy is made.
+    //
+    // Skill/Plugin: the native dir gets a `.vectorhawk-managed.json` sidecar
+    // written into it in place, so this is a `file_replace` of that dir.
+    // Mcp: no live rewrite happens yet (see the NOTE above) but the entry is
+    // still recorded now — same `config_edit` vocabulary as `write_mcp_entry`
+    // — so the ledger already has an entry once the live rewrite lands.
+    let (journal_op, journal_target) = match item.kind {
+        ItemKind::Skill | ItemKind::Plugin => (JournalOp::FileReplace, path_key.clone()),
+        ItemKind::Mcp => (
+            JournalOp::ConfigEdit,
+            item.files
+                .first()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| path_key.clone()),
+        ),
+    };
+    let mut journal_detail = serde_json::json!({
+        "canonical_hash": item.canonical_hash,
+        "installation_id": maybe_installation_id,
+    });
+    if item.kind == ItemKind::Mcp {
+        journal_detail["server_key"] = serde_json::Value::String(item.slug.clone());
+        journal_detail["mcp_key"] = serde_json::Value::String("mcpServers".to_string());
+    }
+    let journal_entry = JournalEntry::new(journal_op, JournalSource::Native, journal_target)
+        .with_slug(item.slug.clone())
+        .with_client("Claude Code")
+        .with_backup_path(backup_path.clone())
+        .with_detail(journal_detail);
+    if let Err(e) = RestoreJournal::for_state(state).append(journal_entry) {
+        // Non-fatal: the legacy manifest.json backup is already on disk and
+        // remains restorable via `migrate rollback` even if this fails.
+        warn!(slug = %item.slug, error = %e, "managed_paths: failed to append restore-journal entry (non-fatal)");
+    }
 
     let manifest_item = ManifestItem {
         kind: item.kind.to_string(),

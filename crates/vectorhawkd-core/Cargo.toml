@@ -38,6 +38,12 @@ getrandom.workspace = true
 hex = "0.4"
 urlencoding = "2"
 
+# Restore journal: exclusive file lock on restore-journal.json so the daemon
+# and CLI can both append concurrently without corrupting it. Same crate
+# already used by vectorhawkd-daemon's F2 pusher for the analogous
+# ~/.claude.json read-lock-modify-write cycle.
+fs2 = "0.4"
+
 # Secure-by-default token storage:
 #   - macOS: Keychain unconditionally
 #   - Windows: Credential Manager unconditionally

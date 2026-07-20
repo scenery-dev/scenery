@@ -199,7 +199,7 @@ fn managed_mcp_json_contains_all_installed_servers() {
             server_config: None,
             auth_type: "none".to_string(),
             gateway_server_id: None,
-        gateway_url: None,
+            gateway_url: None,
         };
         state.upsert_mcp_install(&row).unwrap();
     }

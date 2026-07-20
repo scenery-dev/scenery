@@ -24,6 +24,7 @@ pub mod managed;
 pub mod model;
 pub mod policy;
 pub mod registry;
+pub mod restore_journal;
 pub mod state;
 
 // M1 modules — ported from skillrunner-core

@@ -13,6 +13,13 @@ use rusqlite::Connection;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+/// Serializes every test in this file that mutates process-global state
+/// (`$HOME`, `VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER`) — `push_skill` /
+/// `push_mcp` / `push_plugin` resolve their destination via `$HOME`, so two
+/// such tests running on different threads at once corrupt each other's
+/// view. Paying down the TODO left on `push_adopted_discovery`'s tests.
+static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Build a minimal `ManagedPathsPusher` backed by a temp dir.
 fn make_pusher() -> (ManagedPathsPusher, TempDir) {
     let tmp = tempfile::tempdir().unwrap();
@@ -368,6 +375,7 @@ fn hex_sha256_known_value() {
 /// the next reconcile can resurrect F2's view.
 #[test]
 fn push_skill_replaces_legacy_symlink_with_real_dir() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let (pusher, _tmp) = make_pusher();
 
     let fake_home = tempfile::tempdir().unwrap();
@@ -424,6 +432,7 @@ fn push_skill_replaces_legacy_symlink_with_real_dir() {
 /// paths alone.
 #[test]
 fn reclaim_active_skills_converts_legacy_symlinks_only() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let fake_home = tempfile::tempdir().unwrap();
     let prev_home = std::env::var_os("HOME");
     std::env::set_var("HOME", fake_home.path());
@@ -524,8 +533,14 @@ fn reclaim_active_skills_converts_legacy_symlinks_only() {
 // TODO: gate all HOME-swapping tests behind a process-wide serial Mutex,
 // then re-add positive coverage here.
 
+// `#[tokio::test]` defaults to a current-thread runtime and this test has no
+// other concurrent task, so holding a std Mutex across the single `.await`
+// below cannot block a worker pool or deadlock — safe, unlike the general
+// case clippy's lint guards against.
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn push_adopted_discovery_noop_for_non_skill_kind() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let fake_home = tempfile::tempdir().unwrap();
     let prev_home = std::env::var_os("HOME");
     std::env::set_var("HOME", fake_home.path());
@@ -549,6 +564,7 @@ async fn push_adopted_discovery_noop_for_non_skill_kind() {
 
 #[test]
 fn push_skill_is_noop_when_reconciler_disabled() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     // Set the env var to disable reconciler.
     std::env::set_var("VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER", "1");
 
@@ -567,6 +583,7 @@ fn push_skill_is_noop_when_reconciler_disabled() {
 /// ~/.claude/skills dir is absent, and leave already-present dirs alone.
 #[test]
 fn push_missing_active_skills_repushes_only_absent() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let fake_home = tempfile::tempdir().unwrap();
     let prev_home = std::env::var_os("HOME");
     std::env::set_var("HOME", fake_home.path());
@@ -654,5 +671,170 @@ fn push_missing_active_skills_repushes_only_absent() {
     assert!(
         beta_untouched,
         "beta already present — must not be overwritten"
+    );
+}
+
+// ── Restore journal (F2 pushes) ─────────────────────────────────────────────
+//
+// push_skill/push_mcp/push_plugin all write into $HOME-derived paths, so
+// these tests follow the existing HOME-swap convention used above (no
+// process-wide mutex — matches the accepted, documented risk noted on
+// push_adopted_discovery's tests).
+
+use vectorhawkd_core::restore_journal::{JournalOp, JournalSource, RestoreJournal};
+
+#[test]
+fn push_skill_appends_managed_artifact_push_entry() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let (pusher, tmp) = make_pusher();
+
+    let fake_home = tempfile::tempdir().unwrap();
+    fs::create_dir_all(fake_home.path().join(".claude").join("skills")).unwrap();
+    let prev_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", fake_home.path());
+
+    let result = pusher.push_skill(
+        "journal-skill",
+        Some("inst-journal-1"),
+        b"---\nname: journal-skill\n---\nbody\n",
+        &[],
+    );
+
+    if let Some(v) = prev_home {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+    result.expect("push_skill should succeed");
+
+    let journal =
+        RestoreJournal::new(camino::Utf8PathBuf::from_path_buf(tmp.path().to_owned()).unwrap());
+    let entries = journal.read_all().unwrap();
+    assert_eq!(
+        entries.len(),
+        1,
+        "push_skill should append exactly one entry"
+    );
+    let entry = &entries[0];
+    assert_eq!(entry.op, JournalOp::ArtifactPush);
+    assert_eq!(entry.source, JournalSource::Managed);
+    assert_eq!(entry.slug.as_deref(), Some("journal-skill"));
+    assert_eq!(entry.client.as_deref(), Some("Claude Code"));
+    assert!(
+        entry.backup_path.is_none(),
+        "managed pushes are pure removals on uninstall — no backup"
+    );
+    assert!(entry.target_path.ends_with("journal-skill"));
+}
+
+#[test]
+fn push_mcp_appends_brokered_entry_when_flagged() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let (pusher, tmp) = make_pusher();
+
+    let fake_home = tempfile::tempdir().unwrap();
+    fs::create_dir_all(fake_home.path()).unwrap();
+    let prev_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", fake_home.path());
+
+    let result = pusher.push_mcp("slack-mcp", Some("inst-mcp-1"), true);
+
+    if let Some(v) = prev_home {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+    result.expect("push_mcp should succeed");
+
+    let journal =
+        RestoreJournal::new(camino::Utf8PathBuf::from_path_buf(tmp.path().to_owned()).unwrap());
+    let entries = journal.read_all().unwrap();
+    assert_eq!(entries.len(), 1);
+    let entry = &entries[0];
+    assert_eq!(entry.op, JournalOp::ArtifactPush);
+    assert_eq!(entry.source, JournalSource::Brokered);
+    assert_eq!(entry.slug.as_deref(), Some("slack-mcp"));
+    assert!(entry.target_path.ends_with(".claude.json"));
+    assert_eq!(entry.detail["server_key"], "slack-mcp");
+    assert_eq!(entry.detail["mcp_key"], "mcpServers");
+}
+
+#[test]
+fn push_mcp_appends_managed_entry_when_not_brokered() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let (pusher, tmp) = make_pusher();
+
+    let fake_home = tempfile::tempdir().unwrap();
+    fs::create_dir_all(fake_home.path()).unwrap();
+    let prev_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", fake_home.path());
+
+    let result = pusher.push_mcp("local-tool", None, false);
+
+    if let Some(v) = prev_home {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+    result.expect("push_mcp should succeed");
+
+    let journal =
+        RestoreJournal::new(camino::Utf8PathBuf::from_path_buf(tmp.path().to_owned()).unwrap());
+    let entries = journal.read_all().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].source, JournalSource::Managed);
+}
+
+#[test]
+fn push_plugin_appends_managed_artifact_push_entry() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let (pusher, tmp) = make_pusher();
+
+    let fake_home = tempfile::tempdir().unwrap();
+    fs::create_dir_all(fake_home.path().join(".claude").join("plugins")).unwrap();
+    let prev_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", fake_home.path());
+
+    let result = pusher.push_plugin(
+        "journal-plugin",
+        Some("inst-plugin-1"),
+        &serde_json::json!({"name": "journal-plugin"}),
+    );
+
+    if let Some(v) = prev_home {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+    result.expect("push_plugin should succeed");
+
+    let journal =
+        RestoreJournal::new(camino::Utf8PathBuf::from_path_buf(tmp.path().to_owned()).unwrap());
+    let entries = journal.read_all().unwrap();
+    assert_eq!(entries.len(), 1);
+    let entry = &entries[0];
+    assert_eq!(entry.op, JournalOp::ArtifactPush);
+    assert_eq!(entry.source, JournalSource::Managed);
+    assert_eq!(entry.slug.as_deref(), Some("journal-plugin"));
+    assert!(entry.target_path.ends_with("journal-plugin"));
+}
+
+#[test]
+fn push_skill_writes_no_journal_entry_when_reconciler_disabled() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::set_var("VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER", "1");
+
+    let (pusher, tmp) = make_pusher();
+    let result = pusher.push_skill("gated-journal-skill", None, b"---\nname: x\n---\n", &[]);
+
+    std::env::remove_var("VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER");
+    result.expect("must return Ok when gate is active");
+
+    let journal =
+        RestoreJournal::new(camino::Utf8PathBuf::from_path_buf(tmp.path().to_owned()).unwrap());
+    let entries = journal.read_all().unwrap();
+    assert!(
+        entries.is_empty(),
+        "no journal entry should be written when the reconciler is disabled"
     );
 }

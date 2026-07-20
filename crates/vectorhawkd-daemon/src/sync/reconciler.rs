@@ -1048,7 +1048,11 @@ async fn handle_install_mcp(
             // the per-server entry is additional.
             let slug = crate::mcp_server_slug(&mcp_server_name);
             if let Some(p) = pusher {
-                if let Err(e) = p.push_mcp(&slug, Some(&installation_id.to_string())) {
+                // gateway_url present -> credential-brokered via the gateway proxy;
+                // absent -> directly-configured from server_config. Both are
+                // VectorHawk-only artifacts for restore-journal purposes.
+                let brokered = gateway_url.is_some();
+                if let Err(e) = p.push_mcp(&slug, Some(&installation_id.to_string()), brokered) {
                     warn!(
                         mcp_server_id = %mcp_server_id,
                         slug = %slug,

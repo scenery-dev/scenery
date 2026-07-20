@@ -42,6 +42,7 @@ use std::{
     sync::Arc,
 };
 use tracing::{debug, info};
+use vectorhawkd_core::restore_journal::{JournalEntry, JournalOp, JournalSource, RestoreJournal};
 use vectorhawkd_core::state::AppState;
 use vectorhawkd_mcp::ownership;
 
@@ -56,9 +57,10 @@ fn reconciler_disabled() -> bool {
 
 /// Pushes VectorHawk-managed items into Claude Code's native directories.
 ///
-/// Cheaply cloneable — the only field is an `Arc<AppState>`.
+/// Cheaply cloneable — the only fields are two paths.
 pub struct ManagedPathsPusher {
     db_path: camino::Utf8PathBuf,
+    root_dir: camino::Utf8PathBuf,
 }
 
 impl ManagedPathsPusher {
@@ -66,6 +68,26 @@ impl ManagedPathsPusher {
     pub fn new(state: &AppState) -> Self {
         Self {
             db_path: state.db_path.clone(),
+            root_dir: state.root_dir.clone(),
+        }
+    }
+
+    /// Restore-journal handle rooted at this pusher's data dir.
+    ///
+    /// F2 pushes always append with `backup_path = None`: the pushed
+    /// artifact only ever worked because VectorHawk put it there
+    /// (`source = managed` / `brokered`), so uninstall removes it outright
+    /// rather than restoring from a backup — see `JournalSource`.
+    fn journal(&self) -> RestoreJournal {
+        RestoreJournal::new(self.root_dir.clone())
+    }
+
+    /// Append a restore-journal entry for a completed push, logging (not
+    /// propagating) any failure — the push itself already succeeded and
+    /// must not be rolled back just because the ledger write failed.
+    fn journal_push(&self, entry: JournalEntry) {
+        if let Err(e) = self.journal().append(entry) {
+            tracing::warn!(error = %e, "pusher: failed to append restore-journal entry (non-fatal)");
         }
     }
 
@@ -158,6 +180,16 @@ impl ManagedPathsPusher {
         self.upsert_db_marker(&path_key, "skill", slug, installation_id, &sha256, &now_ts)
             .context("pusher: failed to upsert managed_path_markers for skill")?;
 
+        // Restore journal: this directory only exists because VectorHawk put
+        // it there (source=managed) — uninstall removes it outright, no
+        // backup needed.
+        self.journal_push(
+            JournalEntry::new(JournalOp::ArtifactPush, JournalSource::Managed, path_key)
+                .with_slug(slug)
+                .with_client("Claude Code")
+                .with_detail(serde_json::json!({"installation_id": installation_id})),
+        );
+
         info!(slug, dest = %skill_dir.display(), "pusher: skill pushed to ~/.claude/skills/");
         Ok(())
     }
@@ -217,7 +249,19 @@ impl ManagedPathsPusher {
     ///
     /// Other entries in `mcpServers` (e.g. Anthropic's built-ins) are
     /// preserved.
-    pub fn push_mcp(&self, slug: &str, installation_id: Option<&str>) -> Result<()> {
+    ///
+    /// `brokered` classifies the restore-journal entry: `true` for
+    /// credential-brokered servers routed through the gateway (has a
+    /// `gateway_url`), `false` for directly-configured (`server_config`)
+    /// servers. Either way the entry is `source=brokered`/`managed` — this
+    /// pushed key only ever worked through VectorHawk, so uninstall removes
+    /// it outright rather than restoring it.
+    pub fn push_mcp(
+        &self,
+        slug: &str,
+        installation_id: Option<&str>,
+        brokered: bool,
+    ) -> Result<()> {
         if reconciler_disabled() {
             return Ok(());
         }
@@ -251,6 +295,26 @@ impl ManagedPathsPusher {
         let now_ts = chrono::Utc::now().to_rfc3339();
         self.upsert_db_marker(&path_key, "mcp", slug, installation_id, &sha256, &now_ts)
             .context("pusher: failed to upsert managed_path_markers for mcp")?;
+
+        let source = if brokered {
+            JournalSource::Brokered
+        } else {
+            JournalSource::Managed
+        };
+        self.journal_push(
+            JournalEntry::new(
+                JournalOp::ArtifactPush,
+                source,
+                claude_json.to_string_lossy().to_string(),
+            )
+            .with_slug(slug)
+            .with_client("Claude Code")
+            .with_detail(serde_json::json!({
+                "server_key": slug,
+                "mcp_key": "mcpServers",
+                "installation_id": installation_id,
+            })),
+        );
 
         info!(slug, "pusher: MCP entry written to ~/.claude.json");
         Ok(())
@@ -336,6 +400,13 @@ impl ManagedPathsPusher {
         let path_key = marker_dir.to_string_lossy().to_string();
         self.upsert_db_marker(&path_key, "plugin", slug, installation_id, &sha256, &now_ts)
             .context("pusher: failed to upsert managed_path_markers for plugin")?;
+
+        self.journal_push(
+            JournalEntry::new(JournalOp::ArtifactPush, JournalSource::Managed, path_key)
+                .with_slug(slug)
+                .with_client("Claude Code")
+                .with_detail(serde_json::json!({"installation_id": installation_id})),
+        );
 
         info!(slug, dest = %dest.display(), "pusher: plugin manifest pushed to ~/.claude/plugins/");
         Ok(())
