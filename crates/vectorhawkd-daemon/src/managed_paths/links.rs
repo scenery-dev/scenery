@@ -48,8 +48,11 @@ pub enum LinkMode {
 /// `LinkMode::Copy` fallback (identified by the `.vectorhawk-managed.json`
 /// marker the pusher writes into the canonical directory, which `copy_tree`
 /// necessarily carries along) is also replaced, so repeated calls stay
-/// idempotent even on platforms where symlinks are unavailable. Refuses to
-/// touch a real directory that is not ours — that is user content.
+/// idempotent even on platforms where symlinks are unavailable. Such a
+/// directory is moved into `~/.claude/.vectorhawk-backup/<ts>/links/` before
+/// removal, so the replacement is always recoverable — see
+/// [`backup_and_remove`]. Refuses to touch a real directory that is not
+/// ours — that is user content.
 pub fn link_dir(canonical: &Path, link_path: &Path) -> Result<LinkMode> {
     if !canonical.is_dir() {
         bail!(
@@ -76,15 +79,20 @@ pub fn link_dir(canonical: &Path, link_path: &Path) -> Result<LinkMode> {
                 link_path.display()
             );
         }
-        // A real directory we materialised ourselves via a prior
-        // `LinkMode::Copy` fallback. Remove it and re-materialise below so
+        // A real directory we materialised ourselves — either a prior
+        // `LinkMode::Copy` fallback, or (pre-pivot) a real managed skill dir
+        // that lived at the Claude path before `~/.agents/skills` became
+        // canonical. Back it up, then remove it and re-materialise below so
         // the call stays idempotent and heals into a symlink if possible.
-        fs::remove_dir_all(link_path).with_context(|| {
-            format!(
-                "links: failed to remove stale copy: {}",
-                link_path.display()
-            )
-        })?;
+        //
+        // The backup is what makes this recoverable: the marker proves
+        // VectorHawk *wrote* the directory, but not that its current content
+        // is still reproducible — a restored backup or a hand-customised
+        // skill dir carries the marker too. Every other destructive path in
+        // this codebase has a ledger behind it (the migrator backs up before
+        // each takeover, `push_skill` journals its own push); this one now
+        // does as well.
+        backup_and_remove(link_path)?;
     }
 
     if let Some(parent) = link_path.parent() {
@@ -149,6 +157,81 @@ fn symlink_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
 #[cfg(windows)]
 fn symlink_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
     std::os::windows::fs::symlink_dir(src, dst)
+}
+
+/// Move `dir` into a timestamped run directory under
+/// `~/.claude/.vectorhawk-backup/<ts>/links/<name>`, then ensure `dir` is gone.
+///
+/// Uses the same backup root and `%Y-%m-%dT%H%M%SZ` run-directory convention as
+/// the F1 migrator (`managed_paths::migrate_existing`), so recovered content
+/// sits alongside every other VectorHawk backup rather than in a new location
+/// of its own. No `manifest.json` is written, so `rollback::list_backups`
+/// deliberately skips these runs — `migrate rollback` restores *takeovers* of
+/// user content, and re-materialising a link's stale copy over the canonical
+/// directory is not that. The copy is here to be recoverable by hand.
+///
+/// Prefers a rename (cheap, atomic within a filesystem) and falls back to a
+/// recursive copy when the backup root is on a different device. If neither
+/// succeeds the error propagates and the caller must NOT delete: an
+/// unrecoverable removal is worse than a failed relink, which leaves Claude
+/// Code pointed at the pre-existing directory.
+fn backup_and_remove(dir: &Path) -> Result<()> {
+    let name = dir
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("links: path has no final component: {}", dir.display()))?;
+
+    let home = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("links: HOME directory not resolvable for backup"))?;
+    let ts = chrono::Utc::now().format("%Y-%m-%dT%H%M%SZ").to_string();
+    let backup_root = home
+        .join(".claude")
+        .join(".vectorhawk-backup")
+        .join(&ts)
+        .join("links");
+
+    fs::create_dir_all(&backup_root).with_context(|| {
+        format!(
+            "links: failed to create backup dir: {}",
+            backup_root.display()
+        )
+    })?;
+
+    let dest = backup_root.join(name);
+
+    match fs::rename(dir, &dest) {
+        Ok(()) => {
+            tracing::info!(
+                from = %dir.display(),
+                to = %dest.display(),
+                "links: backed up pre-existing managed dir before relinking"
+            );
+            return Ok(());
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "links: rename into backup failed, falling back to copy"
+            );
+        }
+    }
+
+    copy_tree(dir, &dest).with_context(|| {
+        format!(
+            "links: refusing to remove {} — could not back it up to {}",
+            dir.display(),
+            dest.display()
+        )
+    })?;
+    tracing::info!(
+        from = %dir.display(),
+        to = %dest.display(),
+        "links: backed up pre-existing managed dir before relinking"
+    );
+
+    fs::remove_dir_all(dir)
+        .with_context(|| format!("links: failed to remove stale copy: {}", dir.display()))?;
+
+    Ok(())
 }
 
 /// Recursive directory copy used only by the Windows fallback.
