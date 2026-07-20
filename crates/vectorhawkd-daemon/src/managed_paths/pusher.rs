@@ -159,6 +159,21 @@ impl ManagedPathsPusher {
                 slug,
                 "pusher: replaced a VectorHawk-managed symlink with a real managed dir"
             );
+        } else if skill_dir.is_dir() && !ownership::is_vectorhawk_managed(&skill_dir) {
+            // The more common shape of the same collision: `npx skills`,
+            // Cursor and Codex all create real directories at the canonical
+            // path, and `discoveries.rs` deliberately reports them without
+            // adopting them, so they legitimately sit here unmanaged forever.
+            // Annexing one here would overwrite its SKILL.md, stamp it with
+            // our marker, and prime it for a later remove_skill to
+            // `remove_dir_all` content VectorHawk never wrote — refuse rather
+            // than clobber, exactly as the symlink branch above does.
+            anyhow::bail!(
+                "pusher: refusing to replace the directory at {} — not VectorHawk-managed. \
+                 Slug '{slug}' collides with user content in the shared \
+                 ~/.agents/skills root.",
+                skill_dir.display()
+            );
         }
 
         fs::create_dir_all(&skill_dir).with_context(|| {
@@ -283,6 +298,19 @@ impl ManagedPathsPusher {
         if skill_dir.exists() {
             // Defense-in-depth: never delete Anthropic-native content.
             ownership::ensure_not_native(&skill_dir)?;
+            // Same ownership rule as push_skill's guard and `links::unlink_dir`:
+            // a real directory here is removed only when it carries the
+            // `.vectorhawk-managed.json` marker. Without this, a slug
+            // collision that push_skill refused to annex (or any other
+            // unmanaged directory a caller mistakenly targets) would still be
+            // destroyed here. Refuse rather than delete; the caller already
+            // treats `remove_skill` failures as non-fatal (warn-and-continue).
+            if !skill_dir.is_symlink() && !ownership::is_vectorhawk_managed(&skill_dir) {
+                anyhow::bail!(
+                    "pusher: refusing to remove the directory at {} — not VectorHawk-managed.",
+                    skill_dir.display()
+                );
+            }
             fs::remove_dir_all(&skill_dir).with_context(|| {
                 format!(
                     "pusher: failed to remove skill dir: {}",
