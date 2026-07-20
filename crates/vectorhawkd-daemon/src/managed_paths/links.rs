@@ -188,10 +188,14 @@ const COMPARE_CHUNK: usize = 64 * 1024;
 /// never be mistaken for "they match", because a false match suppresses the
 /// relink.
 ///
-/// `pub(crate)` so `drift::check_link_integrity` can reuse the same bounded
-/// comparison to recognise a healthy `LinkMode::Copy` steady state, rather
-/// than duplicating this walk.
-pub(crate) fn dirs_identical(a: &Path, b: &Path) -> bool {
+/// Used by `link_dir` alone to decide whether an existing real directory at
+/// the link path already matches canonical closely enough to leave in place
+/// (the `LinkMode::Copy` steady state). Drift's hot-path check
+/// (`drift::check_link_integrity`) deliberately does *not* call this — a
+/// full recursive compare on every clean skill every scan cycle is too
+/// costly; it hashes just `SKILL.md` instead, matching the granularity
+/// `current_hash_for` already uses everywhere else in drift detection.
+fn dirs_identical(a: &Path, b: &Path) -> bool {
     dirs_identical_inner(a, b).unwrap_or(false)
 }
 
