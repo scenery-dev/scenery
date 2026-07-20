@@ -416,13 +416,29 @@ fn migrates_managed_skill_from_claude_to_agents_and_relinks() {
     );
 }
 
-#[test]
-fn migration_is_idempotent() {
-    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-    let fake_home = tempfile::tempdir().unwrap();
-    let prev_home = std::env::var_os("HOME");
-    std::env::set_var("HOME", fake_home.path());
+// ── Helpers for the ~/.claude/skills → ~/.agents/skills tests ────────────────
 
+/// Restore `$HOME` after a test that mutated it.
+struct HomeGuard(Option<std::ffi::OsString>);
+
+impl HomeGuard {
+    fn set(path: &std::path::Path) -> Self {
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", path);
+        HomeGuard(prev)
+    }
+}
+
+impl Drop for HomeGuard {
+    fn drop(&mut self) {
+        match self.0.take() {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+}
+
+fn markers_conn() -> rusqlite::Connection {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     conn.execute_batch(
         "CREATE TABLE managed_path_markers (
@@ -431,18 +447,407 @@ fn migration_is_idempotent() {
             migrated_at TEXT NOT NULL, PRIMARY KEY (path))",
     )
     .unwrap();
+    conn
+}
 
-    let first = super::migrate_skills_to_agents_dir(&conn);
-    let second = super::migrate_skills_to_agents_dir(&conn);
+/// Create a VectorHawk-managed skill directory at `dir`.
+fn write_managed_skill(dir: &std::path::Path, slug: &str, body: &str) {
+    fs::create_dir_all(dir).unwrap();
+    fs::write(
+        dir.join("SKILL.md"),
+        format!("---\nname: {slug}\n---\n{body}"),
+    )
+    .unwrap();
+    fs::write(
+        dir.join(".vectorhawk-managed.json"),
+        br#"{"marker_version":1,"installation_id":null,"source_sha256":"abc","migrated_at":"2026-01-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+}
 
-    if let Some(v) = prev_home {
-        std::env::set_var("HOME", v);
-    } else {
-        std::env::remove_var("HOME");
+fn insert_marker(conn: &rusqlite::Connection, path: &std::path::Path, slug: &str, sha: &str) {
+    conn.execute(
+        "INSERT INTO managed_path_markers VALUES (?1,'skill',?2,NULL,?3,'2026-01-01T00:00:00Z')",
+        rusqlite::params![path.to_string_lossy().to_string(), slug, sha],
+    )
+    .unwrap();
+}
+
+fn marker_paths(conn: &rusqlite::Connection, slug: &str) -> Vec<String> {
+    let mut stmt = conn
+        .prepare("SELECT path FROM managed_path_markers WHERE slug = ?1 ORDER BY path")
+        .unwrap();
+    let rows = stmt
+        .query_map([slug], |r| r.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    rows
+}
+
+/// Snapshot a directory tree as (relative path, kind, content) triples.
+fn snapshot(root: &std::path::Path) -> Vec<(String, String)> {
+    fn walk(root: &std::path::Path, rel: &std::path::Path, out: &mut Vec<(String, String)>) {
+        let Ok(entries) = fs::read_dir(root.join(rel)) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let key = rel.join(entry.file_name());
+            let path = entry.path();
+            let meta = fs::symlink_metadata(&path).unwrap();
+            if meta.is_symlink() {
+                out.push((
+                    key.to_string_lossy().to_string(),
+                    format!("link:{}", fs::read_link(&path).unwrap().display()),
+                ));
+            } else if meta.is_dir() {
+                out.push((key.to_string_lossy().to_string(), "dir".into()));
+                walk(root, &key, out);
+            } else {
+                out.push((
+                    key.to_string_lossy().to_string(),
+                    format!("file:{}", fs::read_to_string(&path).unwrap_or_default()),
+                ));
+            }
+        }
+    }
+    let mut out = vec![];
+    walk(root, std::path::Path::new(""), &mut out);
+    out.sort();
+    out
+}
+
+#[test]
+fn migration_is_idempotent_with_a_real_managed_skill() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let fake_home = tempfile::tempdir().unwrap();
+    let _home = HomeGuard::set(fake_home.path());
+
+    let old = fake_home.path().join(".claude/skills/demo");
+    write_managed_skill(&old, "demo", "body");
+    let conn = markers_conn();
+    insert_marker(&conn, &old, "demo", "abc");
+
+    let first = super::migrate_skills_to_agents_dir(&conn).unwrap();
+    let after_first = snapshot(fake_home.path());
+    let rows_after_first = marker_paths(&conn, "demo");
+
+    let second = super::migrate_skills_to_agents_dir(&conn).unwrap();
+    let after_second = snapshot(fake_home.path());
+
+    let canonical = fake_home.path().join(".agents/skills/demo");
+
+    // First run migrates exactly one skill.
+    assert_eq!(first, 1);
+    assert!(canonical.join("SKILL.md").exists());
+    assert!(old.is_symlink());
+    assert_eq!(
+        rows_after_first,
+        vec![canonical.to_string_lossy().to_string()]
+    );
+
+    // Second run is a genuine no-op.
+    assert_eq!(second, 0, "second run must not re-migrate");
+    assert_eq!(
+        after_first, after_second,
+        "second run must leave disk state byte-identical (no new backup dir)"
+    );
+    assert!(
+        !fake_home.path().join(".claude/.vectorhawk-backup").exists(),
+        "an already-migrated skill must never be backed up again"
+    );
+    assert_eq!(
+        marker_paths(&conn, "demo"),
+        vec![canonical.to_string_lossy().to_string()],
+        "second run must not duplicate the marker row"
+    );
+}
+
+#[test]
+fn migration_is_idempotent_on_empty_home() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let fake_home = tempfile::tempdir().unwrap();
+    let _home = HomeGuard::set(fake_home.path());
+
+    let conn = markers_conn();
+    assert_eq!(super::migrate_skills_to_agents_dir(&conn).unwrap(), 0);
+    assert_eq!(super::migrate_skills_to_agents_dir(&conn).unwrap(), 0);
+}
+
+#[test]
+fn migrates_several_skills_and_leaves_user_skills_alone() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let fake_home = tempfile::tempdir().unwrap();
+    let _home = HomeGuard::set(fake_home.path());
+
+    let skills = fake_home.path().join(".claude/skills");
+    let conn = markers_conn();
+
+    for slug in ["alpha", "beta", "gamma"] {
+        let dir = skills.join(slug);
+        write_managed_skill(&dir, slug, slug);
+        insert_marker(&conn, &dir, slug, "abc");
     }
 
-    assert_eq!(first.unwrap(), 0);
-    assert_eq!(second.unwrap(), 0);
+    // Two unmanaged, user-authored skills — must be completely untouched.
+    let mine = skills.join("mine");
+    fs::create_dir_all(mine.join("nested")).unwrap();
+    fs::write(mine.join("SKILL.md"), "user content").unwrap();
+    fs::write(mine.join("nested/notes.md"), "notes").unwrap();
+    let theirs = skills.join("theirs");
+    fs::create_dir_all(&theirs).unwrap();
+    fs::write(theirs.join("SKILL.md"), "other user content").unwrap();
+
+    let mine_before = snapshot(&mine);
+
+    let migrated = super::migrate_skills_to_agents_dir(&conn).unwrap();
+
+    assert_eq!(migrated, 3);
+    for slug in ["alpha", "beta", "gamma"] {
+        let canonical = fake_home.path().join(".agents/skills").join(slug);
+        assert!(canonical.join("SKILL.md").exists(), "{slug} not moved");
+        assert!(!canonical.is_symlink());
+        assert!(skills.join(slug).is_symlink(), "{slug} not relinked");
+        assert_eq!(
+            marker_paths(&conn, slug),
+            vec![canonical.to_string_lossy().to_string()],
+            "{slug} marker not re-keyed"
+        );
+    }
+
+    // User content: not moved, not linked, not backed up, no row.
+    assert!(!mine.is_symlink());
+    assert!(!theirs.is_symlink());
+    assert_eq!(snapshot(&mine), mine_before);
+    assert_eq!(
+        fs::read_to_string(theirs.join("SKILL.md")).unwrap(),
+        "other user content"
+    );
+    assert!(!fake_home.path().join(".agents/skills/mine").exists());
+    assert!(!fake_home.path().join(".agents/skills/theirs").exists());
+    assert!(marker_paths(&conn, "mine").is_empty());
+    assert!(marker_paths(&conn, "theirs").is_empty());
+    assert!(!fake_home.path().join(".claude/.vectorhawk-backup").exists());
+}
+
+/// FINDING 1 (Critical) regression: a crash between `fs::rename` and the
+/// SQLite `UPDATE` leaves canonical + symlink on disk but the row still keyed
+/// on the old Claude path. Before the fix, the migration loop skipped the
+/// symlink entry and the row stayed stale forever.
+#[test]
+fn repairs_marker_stranded_by_a_crash_between_rename_and_update() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let fake_home = tempfile::tempdir().unwrap();
+    let _home = HomeGuard::set(fake_home.path());
+
+    // Post-crash disk state: content at canonical, symlink at the Claude path.
+    let canonical = fake_home.path().join(".agents/skills/demo");
+    write_managed_skill(&canonical, "demo", "body");
+    let old = fake_home.path().join(".claude/skills/demo");
+    fs::create_dir_all(old.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&canonical, &old).unwrap();
+
+    // …but the row is still keyed on the old path.
+    let conn = markers_conn();
+    insert_marker(&conn, &old, "demo", "abc");
+
+    let migrated = super::migrate_skills_to_agents_dir(&conn).unwrap();
+
+    // Nothing to move, but the row must be repaired.
+    assert_eq!(migrated, 0);
+    assert_eq!(
+        marker_paths(&conn, "demo"),
+        vec![canonical.to_string_lossy().to_string()],
+        "stale row was not repaired — it would report false drift forever"
+    );
+    assert!(old.is_symlink(), "the link must be left alone");
+    assert!(canonical.join("SKILL.md").exists());
+}
+
+/// FINDING 2: once `push_skill` has inserted a canonical row alongside the
+/// stale one, `PRIMARY KEY (path)` lets both coexist and the orphan reports
+/// false drift. The repair must collapse them to exactly one row — the
+/// canonical one, which carries the fresher hash.
+#[test]
+fn repair_drops_orphan_row_when_canonical_row_already_exists() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let fake_home = tempfile::tempdir().unwrap();
+    let _home = HomeGuard::set(fake_home.path());
+
+    let canonical = fake_home.path().join(".agents/skills/demo");
+    write_managed_skill(&canonical, "demo", "post-push body");
+    let old = fake_home.path().join(".claude/skills/demo");
+    fs::create_dir_all(old.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&canonical, &old).unwrap();
+
+    let conn = markers_conn();
+    insert_marker(&conn, &old, "demo", "stale-pre-push-sha");
+    insert_marker(&conn, &canonical, "demo", "fresh-post-push-sha");
+
+    super::migrate_skills_to_agents_dir(&conn).unwrap();
+
+    assert_eq!(
+        marker_paths(&conn, "demo"),
+        vec![canonical.to_string_lossy().to_string()],
+        "duplicate rows must collapse to one"
+    );
+    let sha: String = conn
+        .query_row(
+            "SELECT source_sha256 FROM managed_path_markers WHERE slug='demo'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(sha, "fresh-post-push-sha", "the fresher row must survive");
+}
+
+/// FINDING 1, second interleaving: the symlink itself was deleted, so there is
+/// no directory entry left to walk. A filesystem-driven repair would miss
+/// this; the DB-driven pass must still fix the row.
+#[test]
+fn repairs_marker_when_the_claude_symlink_is_gone() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let fake_home = tempfile::tempdir().unwrap();
+    let _home = HomeGuard::set(fake_home.path());
+
+    let canonical = fake_home.path().join(".agents/skills/demo");
+    write_managed_skill(&canonical, "demo", "body");
+    let old = fake_home.path().join(".claude/skills/demo");
+    fs::create_dir_all(old.parent().unwrap()).unwrap();
+
+    let conn = markers_conn();
+    insert_marker(&conn, &old, "demo", "abc");
+
+    super::migrate_skills_to_agents_dir(&conn).unwrap();
+
+    assert_eq!(
+        marker_paths(&conn, "demo"),
+        vec![canonical.to_string_lossy().to_string()]
+    );
+}
+
+/// FINDING 3: one unmigratable entry must not abort the whole run. A *file*
+/// at the canonical path makes `link_dir` bail for that slug only.
+#[test]
+fn one_bad_entry_does_not_block_the_other_skills() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let fake_home = tempfile::tempdir().unwrap();
+    let _home = HomeGuard::set(fake_home.path());
+
+    let skills = fake_home.path().join(".claude/skills");
+    let canonical_root = fake_home.path().join(".agents/skills");
+    fs::create_dir_all(&canonical_root).unwrap();
+
+    let conn = markers_conn();
+    for slug in ["aaa-bad", "bbb-good", "ccc-good"] {
+        let dir = skills.join(slug);
+        write_managed_skill(&dir, slug, slug);
+        insert_marker(&conn, &dir, slug, "abc");
+    }
+    // Canonical path for the first (alphabetically first, so it is hit first)
+    // is a regular FILE — the move is skipped and `link_dir` bails.
+    fs::write(canonical_root.join("aaa-bad"), "not a directory").unwrap();
+
+    let migrated = super::migrate_skills_to_agents_dir(&conn).unwrap();
+
+    assert_eq!(migrated, 2, "the two healthy skills must still migrate");
+    for slug in ["bbb-good", "ccc-good"] {
+        assert!(skills.join(slug).is_symlink(), "{slug} not migrated");
+        assert_eq!(
+            marker_paths(&conn, slug),
+            vec![canonical_root.join(slug).to_string_lossy().to_string()]
+        );
+    }
+    // The bad one is untouched and still keyed on its original path — no data
+    // lost, and it will be retried next start.
+    assert!(skills.join("aaa-bad").is_dir());
+    assert!(!skills.join("aaa-bad").is_symlink());
+    assert_eq!(
+        fs::read_to_string(canonical_root.join("aaa-bad")).unwrap(),
+        "not a directory"
+    );
+    assert_eq!(
+        marker_paths(&conn, "aaa-bad"),
+        vec![skills.join("aaa-bad").to_string_lossy().to_string()]
+    );
+}
+
+/// FINDING 5 (reasoned by eye on Unix): when the Claude-side directory is a
+/// real, byte-identical copy of canonical, the migration must not tear it down
+/// and rebuild it. On Unix symlinks *are* available, so the correct behaviour
+/// is to heal it into a symlink exactly once and then never touch it again —
+/// no second backup on the next run. On Windows-without-Developer-Mode the
+/// symlink probe fails, the copy is recognised as settled state, and not even
+/// the first backup happens.
+#[test]
+fn identical_copy_converges_and_stops_creating_backups() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let fake_home = tempfile::tempdir().unwrap();
+    let _home = HomeGuard::set(fake_home.path());
+
+    let canonical = fake_home.path().join(".agents/skills/demo");
+    let old = fake_home.path().join(".claude/skills/demo");
+    write_managed_skill(&canonical, "demo", "same body");
+    write_managed_skill(&old, "demo", "same body");
+
+    let conn = markers_conn();
+    insert_marker(&conn, &old, "demo", "abc");
+
+    // Run 1: heals to a symlink (Unix), backing the copy up once.
+    assert_eq!(super::migrate_skills_to_agents_dir(&conn).unwrap(), 0);
+    assert!(old.is_symlink());
+    assert_eq!(
+        marker_paths(&conn, "demo"),
+        vec![canonical.to_string_lossy().to_string()]
+    );
+
+    let backup_root = fake_home.path().join(".claude/.vectorhawk-backup");
+    let backups_after_first = snapshot(&backup_root);
+
+    // Runs 2 and 3: settled — no further backups, ever.
+    super::migrate_skills_to_agents_dir(&conn).unwrap();
+    super::migrate_skills_to_agents_dir(&conn).unwrap();
+
+    assert_eq!(
+        snapshot(&backup_root),
+        backups_after_first,
+        "repeat runs must not create a new timestamped backup"
+    );
+    assert!(canonical.join("SKILL.md").exists());
+}
+
+/// The genuinely-stale legacy case must still be replaced: Claude-side content
+/// differs from canonical, so it is backed up and replaced by a link.
+#[test]
+fn stale_legacy_content_is_backed_up_and_replaced() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let fake_home = tempfile::tempdir().unwrap();
+    let _home = HomeGuard::set(fake_home.path());
+
+    let canonical = fake_home.path().join(".agents/skills/demo");
+    let old = fake_home.path().join(".claude/skills/demo");
+    write_managed_skill(&canonical, "demo", "NEW canonical body");
+    write_managed_skill(&old, "demo", "OLD stale body");
+
+    let conn = markers_conn();
+    insert_marker(&conn, &old, "demo", "abc");
+
+    super::migrate_skills_to_agents_dir(&conn).unwrap();
+
+    assert!(old.is_symlink(), "stale content must be replaced by a link");
+    assert!(fs::read_to_string(old.join("SKILL.md"))
+        .unwrap()
+        .contains("NEW canonical body"));
+    assert_eq!(
+        marker_paths(&conn, "demo"),
+        vec![canonical.to_string_lossy().to_string()]
+    );
+    // The displaced content is recoverable under the links backup root.
+    let backups = snapshot(&fake_home.path().join(".claude/.vectorhawk-backup"));
+    assert!(
+        backups.iter().any(|(_, v)| v.contains("OLD stale body")),
+        "stale content must be preserved in a backup: {backups:?}"
+    );
 }
 
 #[test]

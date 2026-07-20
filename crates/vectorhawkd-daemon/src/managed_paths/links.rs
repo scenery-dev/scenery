@@ -149,6 +149,32 @@ pub fn link_is_intact(canonical: &Path, link_path: &Path) -> Result<bool> {
     Ok(resolved == target)
 }
 
+/// Whether a directory symlink can actually be created inside `dir`.
+///
+/// Windows without Developer Mode (and some network/FAT mounts) refuse
+/// `symlink_dir`, which is why [`link_dir`] has a copy fallback at all.
+/// Callers that must distinguish "materialised as a copy because symlinks are
+/// unavailable" from "materialised as a copy for some other reason" need to
+/// know this *before* they tear anything down, so the check is an explicit
+/// probe: create a throwaway link, observe, remove it.
+///
+/// Best-effort — any failure to even set up the probe reports `false`, which
+/// is the conservative answer (callers then treat the copy as deliberate).
+pub fn symlinks_supported(dir: &Path) -> bool {
+    if fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    let probe = dir.join(format!(".vectorhawk-symlink-probe-{}", std::process::id()));
+    let _ = fs::remove_file(&probe);
+    match symlink_dir(dir, &probe) {
+        Ok(()) => {
+            let _ = fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 #[cfg(unix)]
 fn symlink_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
     std::os::unix::fs::symlink(src, dst)
