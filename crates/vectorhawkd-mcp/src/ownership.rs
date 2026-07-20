@@ -93,6 +93,19 @@ pub fn claude_plugins_dir() -> Option<PathBuf> {
     claude_dir().map(|c| c.join("plugins"))
 }
 
+/// Resolve `~/.agents/` — the cross-agent config root shared by Cursor,
+/// Codex, and Gemini CLI.
+pub fn agents_dir() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".agents"))
+}
+
+/// Resolve `~/.agents/skills/` — the canonical location for VectorHawk-managed
+/// skills. Cursor, Codex, and Gemini CLI all scan this natively; Claude Code
+/// does not, and receives a symlink under `~/.claude/skills/` instead.
+pub fn agents_skills_dir() -> Option<PathBuf> {
+    agents_dir().map(|a| a.join("skills"))
+}
+
 /// Resolve `~/.claude/plugins/known_marketplaces.json`.
 pub fn known_marketplaces_path() -> Option<PathBuf> {
     claude_plugins_dir().map(|p| p.join("known_marketplaces.json"))
