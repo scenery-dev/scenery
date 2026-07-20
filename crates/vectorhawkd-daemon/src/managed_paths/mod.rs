@@ -14,6 +14,15 @@
 //! |                       | plumbing dirs (marketplaces/cache/data)   |
 //! | `~/.claude.json`      | `mcpServers` object (excluding `vectorhawk`) |
 //!
+//! F1 still *scans* `~/.claude/skills/` — that is where a Claude Code user's
+//! own skills live — but it is no longer where managed skills land. Since the
+//! pivot, adopted skills are written to the canonical `~/.agents/skills/<slug>/`
+//! and surfaced to Claude Code via a symlink at `~/.claude/skills/<slug>`, so
+//! this scan sees a mix of real user directories (adoptable) and VectorHawk's
+//! own links (skipped). `migrator::migrate_skills_to_agents_dir` normalises
+//! the pre-pivot layout before this runs; unmanaged skill *discovery* in the
+//! canonical root is `discoveries.rs`'s job, not F1's.
+//!
 //! # Idempotency
 //!
 //! Every item is keyed by its absolute path in the `managed_path_markers`
@@ -60,7 +69,7 @@ pub use marker::ManagedPathMarker;
 pub use plugin_marketplace::{
     install_plugin_bundle, uninstall_plugin_bundle, BundledSkill, PluginBundle,
 };
-pub use pusher::{push_missing_active_skills, reclaim_active_skills, ManagedPathsPusher};
+pub use pusher::{push_missing_active_skills, ManagedPathsPusher};
 pub use rollback::{list_backups, rollback, BackupSummary, RollbackReport};
 pub use scanner::MigrationItem;
 

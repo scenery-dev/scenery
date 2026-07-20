@@ -347,9 +347,10 @@ async fn dispatch_event(
     // the disk + HTTP round-trip.
     // T2 follow-up (v1.0.54): user adopted a discovery in the portal. The
     // install row is already created server-side; the daemon now needs to
-    // copy `source_path` into `~/.claude/skills/<slug>/` and write the F2
-    // marker so Claude Code can actually see the skill. Spawned as its own
-    // task so SSE dispatch isn't blocked on disk I/O.
+    // copy `source_path` into the canonical `~/.agents/skills/<slug>/`, write
+    // the F2 marker, and link it at `~/.claude/skills/<slug>` so every client
+    // — Claude Code included — can see the skill. Spawned as its own task so
+    // SSE dispatch isn't blocked on disk I/O.
     //
     // Adopt auto-upload + takeover: alongside that immediate local-copy push
     // (which gives the user an instant, usable copy regardless of how long

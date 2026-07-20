@@ -137,17 +137,36 @@ pub fn link_dir(canonical: &Path, link_path: &Path) -> Result<LinkMode> {
 
 /// Remove `link_path`, whether it is a symlink or a copied directory.
 /// Idempotent — absent is success. Never touches the canonical directory.
+///
+/// This is the exact inverse of [`link_dir`] and applies the **same ownership
+/// rule**: a real directory here is removed only when it carries the
+/// `.vectorhawk-managed.json` marker. The two disagreeing is a data-loss bug —
+/// `link_dir` refuses to replace an unmarked real directory because it is user
+/// content, and drift can legitimately report that same directory as
+/// `link_replaced`, after which a policy-driven `remove_skill` calls straight
+/// into here. Refusing (with an error the caller logs) leaves the user's
+/// directory intact; the canonical copy is still removed by `remove_skill`.
+///
+/// A marked directory is a `LinkMode::Copy` materialisation of ours, but the
+/// marker proves only that VectorHawk *wrote* it — not that its current
+/// content is still reproducible (a restored backup or hand-edited copy
+/// carries the marker too). So it goes through [`backup_and_remove`] like
+/// every other destructive step on this path, not `remove_dir_all`.
+///
+/// A symlink is unlinked outright: removing a link destroys no data.
 pub fn unlink_dir(link_path: &Path) -> Result<()> {
     if link_path.is_symlink() {
         fs::remove_file(link_path)
             .with_context(|| format!("links: failed to remove link: {}", link_path.display()))?;
     } else if link_path.is_dir() {
-        fs::remove_dir_all(link_path).with_context(|| {
-            format!(
-                "links: failed to remove copied dir: {}",
+        if !ownership::is_vectorhawk_managed(link_path) {
+            bail!(
+                "links: refusing to remove a real directory at {} — \
+                 not VectorHawk-managed",
                 link_path.display()
-            )
-        })?;
+            );
+        }
+        backup_and_remove(link_path)?;
     }
     Ok(())
 }
@@ -326,7 +345,11 @@ fn symlink_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
 /// directory is not that. The copy is here to be recoverable by hand.
 ///
 /// Prefers a rename (cheap, atomic within a filesystem) and falls back to a
-/// recursive copy when the backup root is on a different device. If neither
+/// recursive copy on **any** rename error — not only `EXDEV`. Crossing a
+/// device is the expected reason (`$HOME` on a different volume than the skill
+/// root), but the fallback is deliberately not conditioned on the errno: a
+/// permission or busy-file failure must reach the copy path too, because the
+/// alternative is refusing to back up and therefore refusing to remove. If neither
 /// succeeds the error propagates and the caller must NOT delete: an
 /// unrecoverable removal is worse than a failed relink, which leaves Claude
 /// Code pointed at the pre-existing directory.

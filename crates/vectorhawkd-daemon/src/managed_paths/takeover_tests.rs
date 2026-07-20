@@ -28,6 +28,28 @@ fn seed_managed_copy(fake_home: &Path, slug: &str) {
     fs::write(skill_dir.join("SKILL.md"), b"---\nname: x\n---\n").unwrap();
 }
 
+/// A discovery `source_path` that is genuinely **not** VectorHawk's own write
+/// location: an extra scan root supplied via `VECTORHAWK_EXTRA_SKILL_ROOTS`
+/// (see [`crate::managed_paths::discoveries::extra_roots`]).
+///
+/// This is the only shape of discovery whose takeover legitimately removes
+/// anything. Since the pivot, the other scan root — `~/.agents/skills` — is
+/// also `push_skill`'s destination, so a discovery found *there* has
+/// `source_path == destination` and takeover must no-op; that case is pinned
+/// separately by
+/// `perform_if_pending_noops_when_source_is_the_canonical_destination`.
+///
+/// These tests used to seed `<fake_home>/agents-skills/<slug>`, an invented
+/// path that matched no production root at all — which is exactly why the
+/// same-path bug went unnoticed.
+fn extra_root_source(fake_home: &Path, slug: &str) -> std::path::PathBuf {
+    fake_home
+        .join(".config")
+        .join("other-agent")
+        .join("skills")
+        .join(slug)
+}
+
 struct HomeGuard {
     prev: Option<std::ffi::OsString>,
     _lock: std::sync::MutexGuard<'static, ()>,
@@ -77,7 +99,7 @@ fn perform_if_pending_defers_when_managed_copy_absent() {
     let _home = HomeGuard::set(fake_home.path());
 
     // Original discovered source_path — still exists, untouched.
-    let source_dir = fake_home.path().join("agents-skills").join("hello-world");
+    let source_dir = extra_root_source(fake_home.path(), "hello-world");
     fs::create_dir_all(&source_dir).unwrap();
     fs::write(source_dir.join("SKILL.md"), b"original content").unwrap();
 
@@ -109,7 +131,7 @@ fn perform_if_pending_removes_source_dir_once_managed_copy_present() {
     let fake_home = tempfile::tempdir().unwrap();
     let _home = HomeGuard::set(fake_home.path());
 
-    let source_dir = fake_home.path().join("agents-skills").join("hello-world");
+    let source_dir = extra_root_source(fake_home.path(), "hello-world");
     fs::create_dir_all(&source_dir).unwrap();
     fs::write(source_dir.join("SKILL.md"), b"original content").unwrap();
 
@@ -133,6 +155,81 @@ fn perform_if_pending_removes_source_dir_once_managed_copy_present() {
     );
 }
 
+/// **Regression (adopt-discovery self-destruct).** Since the pivot,
+/// `~/.agents/skills` is both the discoveries scan root
+/// (`discoveries::extra_roots`) and `push_skill`'s destination
+/// (`pusher::resolve_skills_dir`). Adopting a discovery found there records a
+/// `source_path` that is *the very directory the managed copy gets written
+/// to*, so the "managed copy is present — remove the original" rule would
+/// delete the skill it just installed: the skill vanishes from every client,
+/// the Claude link dangles, and drift retires the marker on the next cycle.
+///
+/// Takeover is meaningless when source **is** destination. It must no-op and
+/// retire the pending record.
+///
+/// This test uses the real production path deliberately — the previous
+/// fixtures all used an invented `<fake_home>/agents-skills/<slug>`, which is
+/// why nothing caught this.
+#[test]
+fn perform_if_pending_noops_when_source_is_the_canonical_destination() {
+    let root = tempfile::tempdir().unwrap();
+    let state = make_state(&root);
+    let fake_home = tempfile::tempdir().unwrap();
+    let _home = HomeGuard::set(fake_home.path());
+
+    // The discovery was found at ~/.agents/skills/hello-world — which is also
+    // where push_skill writes. Simulate the post-push state: the managed copy
+    // now occupies that exact path, marker and all.
+    let canonical = fake_home
+        .path()
+        .join(".agents")
+        .join("skills")
+        .join("hello-world");
+    fs::create_dir_all(&canonical).unwrap();
+    fs::write(
+        canonical.join("SKILL.md"),
+        b"---\nname: hello-world\n---\nfreshly pushed managed content\n",
+    )
+    .unwrap();
+    fs::write(canonical.join(".vectorhawk-managed.json"), b"{}").unwrap();
+
+    // The SSE handler recorded this path back when it was still the user's
+    // own discovered copy.
+    state
+        .record_pending_adopt_takeover("hello-world", &canonical.to_string_lossy())
+        .unwrap();
+
+    let result = perform_if_pending(&state, "hello-world");
+    assert!(result.is_ok(), "identity no-op is not an error: {result:?}");
+
+    assert!(
+        canonical.join("SKILL.md").exists(),
+        "BUG: takeover deleted the freshly-pushed managed skill at {}",
+        canonical.display()
+    );
+    assert_eq!(
+        fs::read(canonical.join("SKILL.md")).unwrap(),
+        b"---\nname: hello-world\n---\nfreshly pushed managed content\n",
+        "the managed copy must be byte-for-byte untouched"
+    );
+    assert!(
+        canonical.join(".vectorhawk-managed.json").exists(),
+        "the marker must survive so drift keeps recognising the skill as ours"
+    );
+    assert_eq!(
+        state.pending_adopt_takeover_source("hello-world").unwrap(),
+        None,
+        "the record must be retired, not left to fire again on every install"
+    );
+
+    // Nothing was deleted, so nothing should have been journalled either.
+    let journal = RestoreJournal::for_state(&state);
+    assert!(
+        journal.read_all().unwrap().is_empty(),
+        "an identity no-op must not write a delete entry to the restore journal"
+    );
+}
+
 /// A pre-VectorHawk installer left a *symlink* at the discovered
 /// `source_path` (e.g. pointing into a shared marketplace checkout). Takeover
 /// must unlink the symlink itself, never follow it and delete the target.
@@ -150,7 +247,7 @@ fn perform_if_pending_unlinks_symlink_source_without_deleting_target() {
     fs::create_dir_all(&real_target).unwrap();
     fs::write(real_target.join("SKILL.md"), b"shared content").unwrap();
 
-    let source_symlink = fake_home.path().join("agents-skills").join("hello-world");
+    let source_symlink = extra_root_source(fake_home.path(), "hello-world");
     fs::create_dir_all(source_symlink.parent().unwrap()).unwrap();
     std::os::unix::fs::symlink(&real_target, &source_symlink).unwrap();
     assert!(source_symlink.is_symlink(), "test precondition");
@@ -185,7 +282,7 @@ fn perform_if_pending_is_idempotent_when_source_already_removed() {
     let _home = HomeGuard::set(fake_home.path());
 
     // Record a pending takeover whose source_path does not (or no longer) exist.
-    let source_dir = fake_home.path().join("agents-skills").join("hello-world");
+    let source_dir = extra_root_source(fake_home.path(), "hello-world");
     state
         .record_pending_adopt_takeover("hello-world", &source_dir.to_string_lossy())
         .unwrap();
@@ -217,7 +314,7 @@ fn perform_if_pending_noop_under_killswitch() {
     let fake_home = tempfile::tempdir().unwrap();
     let _home = HomeGuard::set(fake_home.path());
 
-    let source_dir = fake_home.path().join("agents-skills").join("hello-world");
+    let source_dir = extra_root_source(fake_home.path(), "hello-world");
     fs::create_dir_all(&source_dir).unwrap();
     state
         .record_pending_adopt_takeover("hello-world", &source_dir.to_string_lossy())
@@ -253,7 +350,7 @@ fn perform_if_pending_backs_up_directory_before_removing_it() {
     let fake_home = tempfile::tempdir().unwrap();
     let _home = HomeGuard::set(fake_home.path());
 
-    let source_dir = fake_home.path().join("agents-skills").join("hello-world");
+    let source_dir = extra_root_source(fake_home.path(), "hello-world");
     fs::create_dir_all(source_dir.join("prompts")).unwrap();
     fs::write(source_dir.join("SKILL.md"), b"original SKILL.md content").unwrap();
     fs::write(source_dir.join("prompts").join("p.txt"), b"a prompt").unwrap();
@@ -320,7 +417,7 @@ fn perform_if_pending_aborts_and_preserves_original_when_backup_fails() {
     let fake_home = tempfile::tempdir().unwrap();
     let _home = HomeGuard::set(fake_home.path());
 
-    let source_dir = fake_home.path().join("agents-skills").join("hello-world");
+    let source_dir = extra_root_source(fake_home.path(), "hello-world");
     fs::create_dir_all(&source_dir).unwrap();
     fs::write(source_dir.join("SKILL.md"), b"irreplaceable original").unwrap();
 
@@ -383,7 +480,7 @@ fn perform_if_pending_backs_up_symlink_source_before_unlinking() {
     fs::create_dir_all(&real_target).unwrap();
     fs::write(real_target.join("SKILL.md"), b"shared content").unwrap();
 
-    let source_symlink = fake_home.path().join("agents-skills").join("hello-world");
+    let source_symlink = extra_root_source(fake_home.path(), "hello-world");
     fs::create_dir_all(source_symlink.parent().unwrap()).unwrap();
     std::os::unix::fs::symlink(&real_target, &source_symlink).unwrap();
 
@@ -429,7 +526,7 @@ fn perform_if_pending_removes_dangling_symlink_without_backup() {
     let _home = HomeGuard::set(fake_home.path());
 
     let missing_target = fake_home.path().join("gone").join("hello-world");
-    let source_symlink = fake_home.path().join("agents-skills").join("hello-world");
+    let source_symlink = extra_root_source(fake_home.path(), "hello-world");
     fs::create_dir_all(source_symlink.parent().unwrap()).unwrap();
     std::os::unix::fs::symlink(&missing_target, &source_symlink).unwrap();
     assert!(source_symlink.is_symlink() && fs::metadata(&source_symlink).is_err());
@@ -453,10 +550,7 @@ fn perform_if_pending_backs_up_single_file_source_before_removing_it() {
     let fake_home = tempfile::tempdir().unwrap();
     let _home = HomeGuard::set(fake_home.path());
 
-    let source_file = fake_home
-        .path()
-        .join("agents-skills")
-        .join("hello-world.md");
+    let source_file = extra_root_source(fake_home.path(), "hello-world.md");
     fs::create_dir_all(source_file.parent().unwrap()).unwrap();
     fs::write(&source_file, b"a lone SKILL.md, no directory wrapper").unwrap();
 

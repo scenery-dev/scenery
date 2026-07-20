@@ -14,10 +14,13 @@ use vectorhawkd_manifest::SkillPackage;
 // resurrect itself after F2-driven cleanup — see the v1.0.50→1.0.51 fix.
 //
 // The legacy `register_in_claude_skills` / `unregister_from_claude_skills`
-// helpers were removed.  Any pre-existing symlinks under `~/.claude/skills/`
-// are reclaimed by the daemon at startup via
-// `managed_paths::pusher::reclaim_active_skills` so the F2 marker exists and
-// the path becomes a real directory the user can edit + that F3 can audit.
+// helpers were removed.  Since the `~/.agents/skills` pivot the canonical
+// managed-skill directory lives there, and `~/.claude/skills/<slug>` holds
+// only a symlink to it.  Any pre-existing symlink or stale directory at the
+// Claude path is healed by the daemon at startup via
+// `managed_paths::pusher::push_missing_active_skills`, whose `push_skill`
+// call re-writes the canonical dir (with its `.vectorhawk-managed.json`
+// marker) and re-points the Claude link at it.
 
 /// Controls how a skill source directory is placed into the versioned install layout.
 #[derive(Clone, Copy, Debug)]
