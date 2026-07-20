@@ -469,6 +469,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+    use crate::managed_paths::ENV_MUTEX;
     use std::fs;
     use vectorhawkd_core::state::AppState;
 
@@ -570,10 +571,11 @@ mod tests {
 
     #[test]
     fn respects_disable_env_var() {
-        // Use a unique env-var manipulation per test. `std::env::set_var` is not
-        // thread-safe in concurrent test suites, but this test also does not rely
-        // on any shared global state besides the env, so it is acceptable here.
-        // The env var is unset immediately after the assertion.
+        // This mutates the process-global VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER
+        // env var, which other tests (e.g. adopt_publish's) read indirectly via
+        // `reconciler_disabled()` — take the shared cross-file mutex so this
+        // window can't be observed mid-test by an unrelated thread.
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::set_var(ENV_DISABLE, "1");
         }
@@ -624,6 +626,7 @@ mod tests {
 
     #[test]
     fn parse_interval_secs_unset_returns_default() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::remove_var(ENV_INTERVAL);
         }
@@ -632,6 +635,7 @@ mod tests {
 
     #[test]
     fn parse_interval_secs_valid_value() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::set_var(ENV_INTERVAL, "60");
         }
@@ -644,6 +648,7 @@ mod tests {
 
     #[test]
     fn parse_interval_secs_zero_returns_default() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::set_var(ENV_INTERVAL, "0");
         }
@@ -656,6 +661,7 @@ mod tests {
 
     #[test]
     fn parse_interval_secs_garbage_returns_default() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::set_var(ENV_INTERVAL, "garbage");
         }
@@ -669,6 +675,7 @@ mod tests {
     #[test]
     fn parse_interval_secs_negative_returns_default() {
         // "-1" does not parse as u64, so it falls through to the Err branch.
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::set_var(ENV_INTERVAL, "-1");
         }

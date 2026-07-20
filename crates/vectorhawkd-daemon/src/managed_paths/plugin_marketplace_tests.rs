@@ -3,6 +3,7 @@
 #![allow(clippy::unwrap_used)]
 
 use super::*;
+use crate::managed_paths::ENV_MUTEX;
 
 fn bundle() -> PluginBundle {
     PluginBundle {
@@ -22,6 +23,7 @@ fn bundle() -> PluginBundle {
 
 #[test]
 fn install_plugin_bundle_writes_full_state() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let fake_home = tempfile::tempdir().unwrap();
     let prev = std::env::var_os("HOME");
     std::env::set_var("HOME", fake_home.path());
@@ -84,6 +86,7 @@ fn install_plugin_bundle_writes_full_state() {
 
 #[test]
 fn install_plugin_bundle_writes_imported_file_tree_verbatim() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let fake_home = tempfile::tempdir().unwrap();
     let prev = std::env::var_os("HOME");
     std::env::set_var("HOME", fake_home.path());
@@ -150,6 +153,7 @@ fn install_plugin_bundle_writes_imported_file_tree_verbatim() {
 
 #[test]
 fn install_then_uninstall_is_clean_and_preserves_other_marketplaces() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let fake_home = tempfile::tempdir().unwrap();
     let prev = std::env::var_os("HOME");
     std::env::set_var("HOME", fake_home.path());

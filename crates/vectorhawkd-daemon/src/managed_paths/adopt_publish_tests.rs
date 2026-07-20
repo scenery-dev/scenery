@@ -11,6 +11,7 @@ use tempfile::TempDir;
 use vectorhawkd_core::state::AppState;
 
 use super::*;
+use crate::managed_paths::ENV_MUTEX;
 
 /// Bootstrap a real `AppState` (full schema) backed by a temp directory.
 fn make_state(root: &TempDir) -> Arc<AppState> {
@@ -84,8 +85,19 @@ async fn handle_discovery_adopted_noop_when_source_already_removed() {
 /// so a crash (or, here, a missing-token failure) mid-flight still leaves
 /// enough state for the deferred-approval convergence path to finish the
 /// takeover later.
+///
+/// `#[tokio::test]` defaults to a current-thread runtime and this test has no
+/// other concurrent task, so holding a std Mutex across the single `.await`
+/// below cannot block a worker pool or deadlock — safe, unlike the general
+/// case clippy's lint guards against.
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn handle_discovery_adopted_records_pending_takeover_before_failing_without_token() {
+    // This test never sets the env vars itself, but `handle_discovery_adopted`
+    // reads `VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER` — take the shared
+    // guard so a concurrent test toggling that var can't flip the killswitch
+    // mid-run and turn this into a spurious early `Ok(())`.
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let root = tempfile::tempdir().unwrap();
     let state = make_state(&root);
 
@@ -129,8 +141,13 @@ async fn handle_discovery_adopted_records_pending_takeover_before_failing_withou
 
 /// The killswitch disables the whole handler, including the pending-takeover
 /// record write.
+///
+/// See the `await_holding_lock` note above — single `.await` on a
+/// current-thread runtime, no other concurrent task, so this is safe.
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn handle_discovery_adopted_noop_under_killswitch() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let root = tempfile::tempdir().unwrap();
     let state = make_state(&root);
 

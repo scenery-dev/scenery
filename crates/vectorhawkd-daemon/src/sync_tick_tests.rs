@@ -22,10 +22,8 @@ use vectorhawkd_core::{
 };
 use vectorhawkd_mcp::tools::UpdateCheckCache;
 
+use crate::managed_paths::ENV_MUTEX;
 use crate::run_sync_tick;
-
-/// Serialize all tests that mutate the `HOME` env var to prevent races.
-static HOME_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn temp_root(label: &str) -> Utf8PathBuf {
     let nanos = SystemTime::now()
@@ -304,9 +302,9 @@ fn gap06_unmanaged_server_buffered_as_audit_event() {
     .unwrap();
 
     // Redirect HOME so detect_ai_clients() finds the fake config.
-    // Hold HOME_MUTEX for the entire test body to prevent races with the other
-    // HOME-mutating test when cargo runs tests in parallel.
-    let _home_guard = HOME_MUTEX.lock().unwrap();
+    // Hold the shared ENV_MUTEX for the entire test body to prevent races with
+    // other HOME-mutating tests across the crate when cargo runs tests in parallel.
+    let _home_guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let original_home = std::env::var("HOME").ok();
     std::env::set_var("HOME", fake_home.as_str());
 
@@ -395,7 +393,7 @@ fn gap06_no_events_when_all_servers_managed() {
     )
     .unwrap();
 
-    let _home_guard = HOME_MUTEX.lock().unwrap();
+    let _home_guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let original_home = std::env::var("HOME").ok();
     std::env::set_var("HOME", fake_home.as_str());
 
