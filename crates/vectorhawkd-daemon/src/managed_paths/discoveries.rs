@@ -192,12 +192,12 @@ pub async fn run_once(state: Arc<AppState>, registry_url: String) -> Result<usiz
 
 // ── Root resolution ───────────────────────────────────────────────────────────
 
-/// Build the list of extra roots to scan.
+/// Build the list of extra roots to scan for *unmanaged* skills.
 ///
-/// Always includes `~/.agents/skills/` (if it exists).
-/// Also includes any paths from `VECTORHAWK_EXTRA_SKILL_ROOTS` (comma-separated
-/// absolute paths).  The canonical F1 path (`~/.claude/skills/`) is
-/// deliberately excluded — F1 owns that.
+/// Always includes `~/.agents/skills/` (if it exists) — note this is now also
+/// VectorHawk's own canonical write location, so the scan filters out
+/// directories carrying a `.vectorhawk-managed.json` marker.
+/// Also includes any paths from `VECTORHAWK_EXTRA_SKILL_ROOTS`.
 pub fn extra_roots() -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = Vec::new();
 
@@ -285,6 +285,16 @@ fn scan_root(root: &Path) -> Result<Vec<DiscoveryItem>> {
         };
 
         if !meta.is_dir() {
+            continue;
+        }
+
+        // Post-pivot, `~/.agents/skills/` is also VectorHawk's own write
+        // location. `collect_discoveries` filters managed slugs via SQLite,
+        // but that lags the filesystem — `remove_skill` drops the DB marker
+        // before the directory, so a scan in that window would report our own
+        // half-removed skill as foreign. The on-disk marker is the backstop.
+        if vectorhawkd_mcp::ownership::is_vectorhawk_managed(&path) {
+            debug!(path = %path.display(), "discoveries: VectorHawk-managed — skipping");
             continue;
         }
 
@@ -722,5 +732,33 @@ mod tests {
         assert!(!should_skip_debounced_kick(true, Duration::from_secs(11)));
         assert!(!should_skip_debounced_kick(true, Duration::from_secs(60)));
         assert!(!should_skip_debounced_kick(true, Duration::from_secs(3600)));
+    }
+
+    // ── 8. scan_root skips VectorHawk-managed dirs but keeps foreign ones ─────
+
+    #[test]
+    fn scan_skips_vectorhawk_managed_dirs_in_agents_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("skills");
+
+        // Ours — must not be reported as a discovery.
+        let managed = root.join("managed-skill");
+        std::fs::create_dir_all(&managed).unwrap();
+        std::fs::write(managed.join("SKILL.md"), b"---\nname: managed-skill\n---\n").unwrap();
+        std::fs::write(
+            managed.join(".vectorhawk-managed.json"),
+            br#"{"marker_version":1,"installation_id":null,"source_sha256":"abc","migrated_at":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+
+        // Theirs — installed by `npx skills`, must be reported.
+        let foreign = root.join("foreign-skill");
+        std::fs::create_dir_all(&foreign).unwrap();
+        std::fs::write(foreign.join("SKILL.md"), b"---\nname: foreign-skill\n---\n").unwrap();
+
+        let found = super::scan_root(&root).unwrap();
+        let slugs: Vec<&str> = found.iter().map(|d| d.slug.as_str()).collect();
+
+        assert_eq!(slugs, vec!["foreign-skill"]);
     }
 }
