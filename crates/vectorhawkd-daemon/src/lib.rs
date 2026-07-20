@@ -60,15 +60,16 @@ mod oauth_listener;
 mod oauth_state;
 mod socket_dispatch;
 pub mod sync;
+use sync::SyncEvent;
 
 use anyhow::{Context, Result};
 use std::{os::unix::fs::PermissionsExt, sync::Arc};
 use tokio::{
     net::UnixListener,
     signal::unix::{signal, SignalKind},
-    sync::{broadcast, Notify},
+    sync::{broadcast, mpsc, Notify},
 };
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use vectorhawkd_core::{
     audit::{AuditBuffer, SqliteAuditBuffer},
     auth::{load_all_tokens, load_tokens, record_refresh_failure, save_tokens, AuthClient},
@@ -196,51 +197,12 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     let update_check_cache: UpdateCheckCache =
         Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
-    // Spawn the registry sync loop (300 s interval).
-    // All synchronous I/O happens inside spawn_blocking so the current-thread
-    // Tokio executor is never blocked by HTTP or SQLite calls.
-    let sync_registry = Arc::clone(&registry);
-    let sync_audit = Arc::clone(&audit_buffer);
-    let sync_db_path = state.db_path.clone();
-    let sync_root_dir = state.root_dir.clone();
-    let sync_list_changed_tx = list_changed_tx.clone();
-    let sync_update_cache = Arc::clone(&update_check_cache);
-    tokio::spawn(async move {
-        let mut interval =
-            tokio::time::interval(std::time::Duration::from_secs(SYNC_INTERVAL_SECS));
-        // Skip the immediate first tick — let the accept loop start first.
-        interval.tick().await;
-
-        loop {
-            interval.tick().await;
-
-            let reg = Arc::clone(&sync_registry);
-            let aud = Arc::clone(&sync_audit);
-            let db = sync_db_path.clone();
-            let root = sync_root_dir.clone();
-            let cache = Arc::clone(&sync_update_cache);
-
-            let result =
-                tokio::task::spawn_blocking(move || run_sync_tick(&reg, &aud, &db, &root, &cache))
-                    .await;
-
-            match result {
-                Ok(Ok(changed)) => {
-                    if changed {
-                        // Sync updated the tool set — notify all connected shims.
-                        // Ignore errors: no receivers means no connected shims.
-                        let _ = sync_list_changed_tx.send(());
-                    }
-                }
-                Ok(Err(e)) => {
-                    warn!(error = %e, "registry sync tick failed; will retry on next interval");
-                }
-                Err(join_err) => {
-                    warn!(error = %join_err, "registry sync task panicked; will retry");
-                }
-            }
-        }
-    });
+    // NOTE: the registry sync loop (SYNC_INTERVAL_SECS tick, `run_sync_tick`)
+    // is spawned further down, *after* `sync_controller` exists — its periodic
+    // snapshot-reconcile step needs `sync_controller.event_sender()` to reach
+    // the reconciler's channel, and that sender doesn't exist until the SSE
+    // sync subsystem has (possibly) started. See "RUN2: Device registration"
+    // below for where it's spawned.
 
     // Spawn the token refresh loop (60 s interval).
     // Checks every stored access token and refreshes any that are within 5 min
@@ -591,6 +553,65 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
         );
     }
 
+    // Spawn the registry sync loop (300 s interval).
+    // All synchronous I/O happens inside spawn_blocking so the current-thread
+    // Tokio executor is never blocked by HTTP or SQLite calls.
+    //
+    // Spawned here — after `sync_controller` exists — rather than earlier in
+    // this function because its periodic snapshot-reconcile step needs
+    // `sync_controller.event_sender()`: the reconciler's event channel is only
+    // created once the SSE sync subsystem has (possibly) started above.
+    let sync_registry = Arc::clone(&registry);
+    let sync_audit = Arc::clone(&audit_buffer);
+    let sync_db_path = state.db_path.clone();
+    let sync_root_dir = state.root_dir.clone();
+    let sync_list_changed_tx = list_changed_tx.clone();
+    let sync_update_cache = Arc::clone(&update_check_cache);
+    let sync_controller_for_tick = Arc::clone(&sync_controller);
+    tokio::spawn(async move {
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_secs(SYNC_INTERVAL_SECS));
+        // Skip the immediate first tick — let the accept loop start first.
+        interval.tick().await;
+
+        loop {
+            interval.tick().await;
+
+            let reg = Arc::clone(&sync_registry);
+            let aud = Arc::clone(&sync_audit);
+            let db = sync_db_path.clone();
+            let root = sync_root_dir.clone();
+            let cache = Arc::clone(&sync_update_cache);
+            // `event_sender` locks a tokio Mutex, so it must be awaited here
+            // in the async task — before handing off to spawn_blocking below.
+            // Returns `None` until the SSE sync subsystem has started (device
+            // not yet paired); the snapshot-reconcile step inside
+            // `run_sync_tick` skips cleanly in that case.
+            let snapshot_tx = sync_controller_for_tick.event_sender().await;
+
+            let result = tokio::task::spawn_blocking(move || {
+                run_sync_tick(&reg, &aud, &db, &root, &cache, snapshot_tx.as_ref())
+            })
+            .await;
+
+            match result {
+                Ok(Ok(changed)) => {
+                    if changed {
+                        // Sync updated the tool set — notify all connected shims.
+                        // Ignore errors: no receivers means no connected shims.
+                        let _ = sync_list_changed_tx.send(());
+                    }
+                }
+                Ok(Err(e)) => {
+                    warn!(error = %e, "registry sync tick failed; will retry on next interval");
+                }
+                Err(join_err) => {
+                    warn!(error = %join_err, "registry sync task panicked; will retry");
+                }
+            }
+        }
+    });
+
     let mut backend = RealBackend::with_full_context(
         Arc::clone(&vh_registry),
         Arc::clone(&audit_buffer) as Arc<dyn AuditBuffer>,
@@ -877,10 +898,13 @@ pub struct SyncController {
     list_changed_tx: broadcast::Sender<()>,
     backend_registry: Arc<BackendRegistry>,
     pusher: Option<Arc<managed_paths::ManagedPathsPusher>>,
-    /// Current reconciler handle, or `None` if sync has not started yet.
-    /// Holding it keeps the (detached) sync tasks' status queryable; the mutex
-    /// also serializes concurrent `ensure_started` callers.
-    handle: tokio::sync::Mutex<Option<sync::ReconcilerHandle>>,
+    /// Current reconciler handle + its event-channel sender, or `None` if
+    /// sync has not started yet. Holding the handle keeps the (detached) sync
+    /// tasks' status queryable; the mutex also serializes concurrent
+    /// `ensure_started` callers. The sender lets `run_sync_tick`'s periodic
+    /// snapshot-reconcile step feed a polled snapshot into the same
+    /// reconciler that consumes live SSE events (see `event_sender`).
+    handle: tokio::sync::Mutex<Option<(sync::ReconcilerHandle, mpsc::Sender<SyncEvent>)>>,
 }
 
 impl SyncController {
@@ -924,6 +948,13 @@ impl SyncController {
         *guard = started;
         active
     }
+
+    /// Return a clone of the reconciler's event-channel sender, if the sync
+    /// subsystem has started. `None` before the device is paired (no auth
+    /// token yet) — callers should skip whatever they wanted to feed in.
+    pub(crate) async fn event_sender(&self) -> Option<mpsc::Sender<SyncEvent>> {
+        self.handle.lock().await.as_ref().map(|(_, tx)| tx.clone())
+    }
 }
 
 /// Register this device with the backend and start the SSE sync subsystem.
@@ -936,7 +967,7 @@ async fn try_start_sync(
     list_changed_tx: broadcast::Sender<()>,
     backend_registry: Arc<BackendRegistry>,
     pusher: Option<Arc<managed_paths::ManagedPathsPusher>>,
-) -> Option<sync::ReconcilerHandle> {
+) -> Option<(sync::ReconcilerHandle, mpsc::Sender<SyncEvent>)> {
     // Load the access token from SQLite.
     let token = match load_all_tokens(&state) {
         Ok(rows) => rows
@@ -978,7 +1009,7 @@ async fn try_start_sync(
     };
 
     match sync::run(sync_config, state, list_changed_tx, backend_registry) {
-        Ok(handle) => Some(handle),
+        Ok((handle, event_tx)) => Some((handle, event_tx)),
         Err(e) => {
             warn!(error = %e, "sync: failed to start sync subsystem");
             None
@@ -1082,26 +1113,35 @@ async fn register_device(registry_url: &str, token: &str, state: Arc<AppState>) 
 /// Called from `spawn_blocking` — issues synchronous SQLite and HTTP I/O.
 ///
 /// Steps:
-/// 1. Flush pending audit events to the registry.
-/// 2. Refresh the approved-server list.
-/// 3. Check skill lifecycle status + run version updates for all installed skills,
+/// 1. Desired-state snapshot reconcile: poll `GET /api/sync/snapshot` and feed
+///    it to the reconciler — a safety net for an SSE delta dropped while the
+///    connection stays healthy (the SSE stream otherwise only re-converges on
+///    reconnect). Skipped when the SSE sync subsystem hasn't started yet.
+/// 2. Flush pending audit events to the registry.
+/// 3. Refresh the approved-server list.
+/// 4. Check skill lifecycle status + run version updates for all installed skills,
 ///    populating `update_check_cache` with skills that have a newer version available.
-/// 4. Flush unsynced skill ratings to the registry.
-/// 5. Flush execution stats to the registry.
-/// 6. Scan AI client configs for unmanaged MCP servers; buffer audit events.
+/// 5. Flush unsynced skill ratings to the registry.
+/// 6. Flush execution stats to the registry.
+/// 7. Scan AI client configs for unmanaged MCP servers; buffer audit events.
 ///
 /// Each step failure logs at WARN and continues; only a total inability to
 /// open the database returns `Err`.
 ///
 /// Returns `true` if the sync detected changes to the approved-server list or
 /// skill set that might alter the tool list visible to connected shims.  The
-/// caller broadcasts `list_changed` when this returns `true`.
+/// caller broadcasts `list_changed` when this returns `true`. The snapshot
+/// reconcile step (1) never contributes to this return value directly — any
+/// resulting install/deactivate/purge work is handled asynchronously by the
+/// reconciler, which fires its own `list_changed` notification once the work
+/// completes.
 pub fn run_sync_tick(
     registry: &RegistryClient,
     audit: &SqliteAuditBuffer,
     db_path: &camino::Utf8PathBuf,
     root_dir: &camino::Utf8PathBuf,
     update_cache: &UpdateCheckCache,
+    snapshot_tx: Option<&mpsc::Sender<SyncEvent>>,
 ) -> Result<bool> {
     use vectorhawkd_core::policy::MockPolicyClient;
 
@@ -1150,14 +1190,44 @@ pub fn run_sync_tick(
         }
     }
 
-    // ── 1. Audit flush ────────────────────────────────────────────────────────
+    // ── 1. Desired-state snapshot reconcile ──────────────────────────────────
+    // Safety net for a live SSE delta dropped while the connection stays
+    // healthy (256-slot broadcast queue full, half-open socket, unknown-event
+    // swallow, etc.) — the SSE client otherwise only re-converges by fetching
+    // a fresh snapshot on *reconnect*, which may not happen for a long time.
+    //
+    // `snapshot_tx` is `None` until the SSE sync subsystem has started (device
+    // not yet paired) — nothing to reconcile against, so skip cleanly.
+    // Fetch + parse failures are logged and never fail the tick: this is a
+    // best-effort top-up, and the SSE stream remains the primary path.
+    if let Some(tx) = snapshot_tx {
+        match registry.fetch_sync_snapshot() {
+            Ok(body) => {
+                match sync::sse_client::snapshot_event_from_json(&body) {
+                    Ok(event) => match tx.try_send(event) {
+                        Ok(()) => debug!("sync: snapshot reconcile tick delivered to reconciler"),
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            warn!("sync: reconciler channel full — snapshot reconcile skipped this tick");
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            warn!("sync: reconciler channel closed — snapshot reconcile skipped");
+                        }
+                    },
+                    Err(e) => warn!(error = %e, "sync: failed to parse snapshot reconcile payload"),
+                }
+            }
+            Err(e) => warn!(error = %e, "sync: snapshot reconcile fetch failed"),
+        }
+    }
+
+    // ── 2. Audit flush ────────────────────────────────────────────────────────
     match audit.flush(&state_view) {
         Ok(n) if n > 0 => info!(count = n, "sync: audit flush uploaded events"),
         Ok(_) => {}
         Err(e) => warn!(error = %e, "sync: audit flush failed"),
     }
 
-    // ── 2. Approved-server list refresh ──────────────────────────────────────
+    // ── 3. Approved-server list refresh ──────────────────────────────────────
     // Any successful server-list refresh may have added or removed backends,
     // so treat a successful non-empty response as a potential tool-set change.
     match registry.fetch_approved_servers() {
@@ -1175,7 +1245,7 @@ pub fn run_sync_tick(
         }
     }
 
-    // ── 3. Skill lifecycle + version updates + update-check cache population ──
+    // ── 4. Skill lifecycle + version updates + update-check cache population ──
     let skill_ids = match state_view.list_installed_skill_ids() {
         Ok(ids) => ids,
         Err(e) => {
@@ -1309,7 +1379,7 @@ fn flush_ratings_and_scan(
     };
     use vectorhawkd_mcp::setup::detect_unmanaged_servers;
 
-    // ── 4. Ratings flush ──────────────────────────────────────────────────────
+    // ── 5. Ratings flush ──────────────────────────────────────────────────────
     match rusqlite::Connection::open(&state.db_path) {
         Ok(conn) => {
             match get_unsynced_ratings(&conn) {
@@ -1331,7 +1401,7 @@ fn flush_ratings_and_scan(
                 Err(e) => warn!(error = %e, "sync: failed to read unsynced ratings"),
             }
 
-            // ── 5. Execution stats flush ──────────────────────────────────────
+            // ── 6. Execution stats flush ──────────────────────────────────────
             match get_execution_stats(&conn) {
                 Ok(stats) if !stats.is_empty() => match registry.upload_execution_stats(&stats) {
                     Ok(()) => info!(count = stats.len(), "sync: execution stats flushed"),
@@ -1346,7 +1416,7 @@ fn flush_ratings_and_scan(
         }
     }
 
-    // ── 6. Unmanaged MCP server scan ──────────────────────────────────────────
+    // ── 7. Unmanaged MCP server scan ──────────────────────────────────────────
     // Scan AI client config files for non-vectorhawk MCP servers and buffer an
     // audit event for each one. IT admins can use this stream to detect shadow
     // MCP installations that bypass governance.
@@ -1768,8 +1838,8 @@ mod slug_tests {
 #[cfg(test)]
 mod backend_entry_tests {
     use super::{gateway_token_handle, mcp_row_to_backend_entry};
-    use vectorhawkd_mcp::aggregator::{resolve_live_token, BackendTransport};
     use vectorhawkd_core::state::McpInstallRow;
+    use vectorhawkd_mcp::aggregator::{resolve_live_token, BackendTransport};
 
     fn row_with(gateway_url: Option<&str>, server_config: Option<&str>) -> McpInstallRow {
         McpInstallRow {
@@ -1790,13 +1860,23 @@ mod backend_entry_tests {
         // Prime the shared live token handle; the gateway backend must resolve
         // the CURRENT value (not a captured one) so rotation is picked up.
         *gateway_token_handle().write().unwrap() = Some("jwt-abc".to_string());
-        let row = row_with(Some("https://app.vectorhawk.ai/gateway/home-assistant/mcp"), None);
+        let row = row_with(
+            Some("https://app.vectorhawk.ai/gateway/home-assistant/mcp"),
+            None,
+        );
         let entry = mcp_row_to_backend_entry(&row).expect("entry");
         assert_eq!(entry.server_id, "home-assistant");
         match &entry.transport {
-            BackendTransport::Http { url, auth_token, token_handle } => {
+            BackendTransport::Http {
+                url,
+                auth_token,
+                token_handle,
+            } => {
                 assert_eq!(url, "https://app.vectorhawk.ai/gateway/home-assistant/mcp");
-                assert!(token_handle.is_some(), "gateway backend must carry the live handle");
+                assert!(
+                    token_handle.is_some(),
+                    "gateway backend must carry the live handle"
+                );
                 assert_eq!(
                     resolve_live_token(token_handle, auth_token).as_deref(),
                     Some("jwt-abc")
@@ -1817,7 +1897,10 @@ mod backend_entry_tests {
         // The ha-claude bug: a remote URL stored as a stdio `command`. With a
         // gateway_url present the daemon must NOT spawn the URL as a subprocess.
         let bad = r#"{"command":"https://ha.example/mcp_server/sse","args":[]}"#;
-        let row = row_with(Some("https://app.vectorhawk.ai/gateway/home-assistant/mcp"), Some(bad));
+        let row = row_with(
+            Some("https://app.vectorhawk.ai/gateway/home-assistant/mcp"),
+            Some(bad),
+        );
         let entry = mcp_row_to_backend_entry(&row).expect("entry");
         assert!(matches!(entry.transport, BackendTransport::Http { .. }));
     }

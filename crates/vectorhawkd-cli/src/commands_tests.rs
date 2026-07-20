@@ -71,10 +71,12 @@ fn skill_install_local_path_parses() {
             skill_ref,
             link,
             registry_url,
+            all_devices,
         }) => {
             assert_eq!(skill_ref, "./my-skill");
             assert!(!link);
             assert!(registry_url.is_none());
+            assert!(!all_devices);
         }
         other => panic!("expected Skill(Install), got {other:?}"),
     }
@@ -89,10 +91,12 @@ fn skill_install_registry_id_parses() {
             skill_ref,
             link,
             registry_url,
+            all_devices,
         }) => {
             assert_eq!(skill_ref, "contract-compare");
             assert!(!link);
             assert!(registry_url.is_none());
+            assert!(!all_devices);
         }
         other => panic!("expected Skill(Install), got {other:?}"),
     }
@@ -131,6 +135,26 @@ fn skill_install_link_flag_parses() {
             skill_ref: _, link, ..
         }) => {
             assert!(link);
+        }
+        other => panic!("expected Skill(Install), got {other:?}"),
+    }
+}
+
+#[test]
+fn skill_install_all_devices_flag_parses() {
+    use super::{Command, SkillCommand};
+    unsafe { std::env::remove_var("VECTORHAWK_REGISTRY_URL") };
+    // Default: device-scoped (all_devices = false).
+    match parse(&["skill", "install", "contract-compare"]).command {
+        Command::Skill(SkillCommand::Install { all_devices, .. }) => {
+            assert!(!all_devices);
+        }
+        other => panic!("expected Skill(Install), got {other:?}"),
+    }
+    // --all-devices opts back into the fan-out-to-every-device behaviour.
+    match parse(&["skill", "install", "contract-compare", "--all-devices"]).command {
+        Command::Skill(SkillCommand::Install { all_devices, .. }) => {
+            assert!(all_devices);
         }
         other => panic!("expected Skill(Install), got {other:?}"),
     }

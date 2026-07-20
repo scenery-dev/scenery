@@ -59,6 +59,7 @@ fn mcp_sync_succeeds_when_registry_unreachable() {
         &state.db_path,
         &state.root_dir,
         &update_cache,
+        None,
     );
     assert!(
         result.is_ok(),
@@ -116,6 +117,7 @@ fn mcp_sync_calls_registry_endpoints_when_reachable() {
         &state.db_path,
         &state.root_dir,
         &update_cache,
+        None,
     );
     assert!(result.is_ok(), "run_sync_tick must succeed: {result:?}");
 

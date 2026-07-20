@@ -729,16 +729,26 @@ struct WireState {
     kind: Option<String>,
 }
 
+/// Parse a snapshot payload (`{"installations": [...], "mcp_installations":
+/// [...]}`) into a [`SyncEvent::Snapshot`].
+///
+/// Shared by the SSE `snapshot` event handler below and by the daemon's
+/// periodic snapshot-reconcile tick (`run_sync_tick` in `vectorhawkd-daemon`'s
+/// `lib.rs`), which calls `GET /api/sync/snapshot` as a safety net against a
+/// dropped SSE delta. Both paths must produce identical `SyncEvent`s so they
+/// converge through the exact same reconciler diff logic.
+pub fn snapshot_event_from_json(data: &str) -> Result<SyncEvent> {
+    let wire: WireSnapshot = serde_json::from_str(data)
+        .with_context(|| format!("failed to parse snapshot payload: {data}"))?;
+    Ok(SyncEvent::Snapshot {
+        installations: wire.installations,
+        mcp_installations: wire.mcp_installations,
+    })
+}
+
 fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
     match event_type {
-        "snapshot" => {
-            let wire: WireSnapshot = serde_json::from_str(data)
-                .with_context(|| format!("failed to parse snapshot event: {data}"))?;
-            Ok(SyncEvent::Snapshot {
-                installations: wire.installations,
-                mcp_installations: wire.mcp_installations,
-            })
-        }
+        "snapshot" => snapshot_event_from_json(data),
         "install" => {
             let wire: WireInstall = serde_json::from_str(data)
                 .with_context(|| format!("failed to parse install event: {data}"))?;

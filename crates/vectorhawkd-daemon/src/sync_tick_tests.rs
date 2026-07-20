@@ -111,6 +111,7 @@ fn gap04_update_cache_populated_when_newer_version_available() {
         &state.db_path,
         &state.root_dir,
         &cache,
+        None,
     )
     .unwrap();
 
@@ -161,6 +162,7 @@ fn gap04_update_cache_empty_when_no_installed_skills() {
         &state.db_path,
         &state.root_dir,
         &cache,
+        None,
     )
     .unwrap();
 
@@ -213,6 +215,7 @@ fn gap05_unsynced_rating_flushed_on_tick() {
         &state.db_path,
         &state.root_dir,
         &cache,
+        None,
     )
     .unwrap();
 
@@ -262,6 +265,7 @@ fn gap05_no_upload_when_no_ratings() {
         &state.db_path,
         &state.root_dir,
         &cache,
+        None,
     )
     .unwrap();
 
@@ -326,6 +330,7 @@ fn gap06_unmanaged_server_buffered_as_audit_event() {
         &state.db_path,
         &state.root_dir,
         &cache,
+        None,
     )
     .unwrap();
 
@@ -414,6 +419,7 @@ fn gap06_no_events_when_all_servers_managed() {
         &state.db_path,
         &state.root_dir,
         &cache,
+        None,
     )
     .unwrap();
 
