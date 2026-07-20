@@ -720,6 +720,94 @@ fn push_skill_replaces_a_managed_symlink_in_the_shared_root() {
     assert_eq!(md.as_deref(), Some(b"fresh managed content".as_ref()));
 }
 
+/// **Regression (shared-root real-directory clobber).**
+///
+/// The symlink case above (`push_skill_refuses_to_clobber_an_unmanaged_symlink_in_the_shared_root`)
+/// is the rarer shape. The common one is a **real directory**: `npx skills`,
+/// Cursor and Codex all create real directories at the canonical path, and
+/// `discoveries.rs` deliberately reports them without adopting them, so they
+/// legitimately sit there unmanaged forever. `push_skill` must refuse a slug
+/// collision against one of these exactly as it refuses one against a foreign
+/// symlink — not silently annex it, overwrite its `SKILL.md`, stamp it with
+/// VectorHawk's marker, and leave it primed for a later `remove_skill` to
+/// `remove_dir_all` content VectorHawk never wrote.
+#[test]
+fn push_skill_refuses_to_clobber_an_unmanaged_real_dir_in_the_shared_root() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let (pusher, _tmp) = make_pusher();
+
+    let fake_home = tempfile::tempdir().unwrap();
+
+    // A real, unmanaged directory at the canonical path — e.g. left by `npx
+    // skills`, Cursor, or Codex, and never carrying VectorHawk's marker.
+    let agents_skills = fake_home.path().join(".agents").join("skills");
+    fs::create_dir_all(&agents_skills).unwrap();
+    let collision = agents_skills.join("hello-world");
+    fs::create_dir_all(&collision).unwrap();
+    fs::write(collision.join("SKILL.md"), b"the user's own SKILL.md").unwrap();
+    fs::write(collision.join("notes.md"), b"the user's own notes").unwrap();
+    assert!(
+        collision.is_dir() && !collision.is_symlink(),
+        "test precondition: a real, unmanaged directory"
+    );
+
+    let prev_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", fake_home.path());
+
+    let push_result = pusher.push_skill("hello-world", Some("inst-1"), b"managed content", &[]);
+
+    let skill_md_after_push = fs::read(collision.join("SKILL.md")).ok();
+    let notes_md_after_push = fs::read(collision.join("notes.md")).ok();
+    let marker_written = collision.join(".vectorhawk-managed.json").exists();
+
+    // A subsequent remove_skill (as the reconciler would call on deactivate)
+    // must not destroy the directory either.
+    let remove_result = pusher.remove_skill("hello-world");
+    let dir_survives_remove = collision.is_dir();
+    let skill_md_after_remove = fs::read(collision.join("SKILL.md")).ok();
+    let notes_md_after_remove = fs::read(collision.join("notes.md")).ok();
+
+    if let Some(v) = prev_home {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+
+    assert!(
+        push_result.is_err(),
+        "push_skill must refuse rather than annex a foreign real directory"
+    );
+    assert_eq!(
+        skill_md_after_push.as_deref(),
+        Some(b"the user's own SKILL.md".as_ref()),
+        "BUG: push_skill overwrote the user's SKILL.md"
+    );
+    assert_eq!(
+        notes_md_after_push.as_deref(),
+        Some(b"the user's own notes".as_ref()),
+        "the user's second file must be untouched"
+    );
+    assert!(
+        !marker_written,
+        "BUG: push_skill stamped the user's directory as VectorHawk-managed"
+    );
+    assert!(
+        dir_survives_remove,
+        "BUG: remove_skill deleted the user's unmanaged directory"
+    );
+    assert_eq!(
+        skill_md_after_remove.as_deref(),
+        Some(b"the user's own SKILL.md".as_ref()),
+        "the user's SKILL.md must survive a subsequent remove_skill call"
+    );
+    assert_eq!(
+        notes_md_after_remove.as_deref(),
+        Some(b"the user's own notes".as_ref()),
+        "the user's notes.md must survive a subsequent remove_skill call"
+    );
+    let _ = remove_result; // may legitimately be Err (refused) or Ok (idempotent no-op)
+}
+
 // NOTE: `reclaim_active_skills_converts_legacy_symlinks_only` was removed with
 // the `reclaim_active_skills` function it named (see the retirement note in
 // pusher.rs). Its fixture planted an *unmarked* symlink at
