@@ -11,7 +11,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
 };
-use tracing::warn;
+use tracing::{debug, warn};
 use vectorhawkd_mcp::ownership::{self, is_excluded_plugin_dir, is_vectorhawk_mcp_key};
 
 /// One discovered item ready for migration.
@@ -80,6 +80,7 @@ pub fn scan_skills_dir(skills_dir: &Path) -> Result<Vec<MigrationItem>> {
         // its own pushed skills as freshly-found native items on every start.
         // The marker is read through the link, i.e. from the canonical dir.
         if ownership::is_vectorhawk_managed(&path) {
+            debug!(path = %path.display(), "managed_paths/scanner: skipping already-managed skill entry");
             continue;
         }
 

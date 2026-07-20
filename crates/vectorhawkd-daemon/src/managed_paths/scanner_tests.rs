@@ -83,6 +83,61 @@ fn scan_skills_files_in_root_skipped() {
     assert!(items.is_empty());
 }
 
+/// Pins the fix for the self-adoption bug: since the pivot to
+/// `~/.agents/skills`, VectorHawk writes real skill content into a canonical
+/// dir and leaves a *directory symlink* at `~/.claude/skills/<slug>`. The
+/// fixture reproduces that exact production shape — the canonical dir holds
+/// both `SKILL.md` and the `.vectorhawk-managed.json` marker, and
+/// `skills_dir` holds only a symlink pointing at it — so this also proves the
+/// marker is resolved *through* the link (`fs::metadata`/`Path::join` follow
+/// symlinks), not just checked against the link path itself.
+///
+/// An unmanaged sibling skill in the same `skills_dir` is asserted present so
+/// this test cannot pass against a scanner that returns nothing at all.
+#[test]
+fn scan_skills_skips_vectorhawk_managed_symlink_but_keeps_sibling() {
+    let tmp = tempfile::tempdir().unwrap();
+    let skills = tmp.path().join("skills");
+    fs::create_dir_all(&skills).unwrap();
+
+    // Canonical dir (simulates ~/.agents/skills/<slug>): real content + marker.
+    let canonical_root = tmp.path().join("agents-skills");
+    let canonical_dir = write_skill_dir(
+        &canonical_root,
+        "managed-skill",
+        "---\nname: managed-skill\n---",
+    );
+    fs::write(
+        canonical_dir.join(vectorhawkd_mcp::ownership::MANAGED_MARKER_FILENAME),
+        r#"{"marker_version":1,"installation_id":null,"source_sha256":"abc","migrated_at":"2026-01-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+
+    // Directory symlink at ~/.claude/skills/<slug> — the exact production shape.
+    let link_path = skills.join("managed-skill");
+    std::os::unix::fs::symlink(&canonical_dir, &link_path).unwrap();
+
+    // Unmanaged sibling skill, a real dir directly under skills_dir.
+    write_skill_dir(&skills, "native-skill", "---\nname: native-skill\n---");
+
+    let items = scan_skills_dir(&skills).unwrap();
+    let slugs: Vec<&str> = items.iter().map(|i| i.slug.as_str()).collect();
+
+    assert_eq!(
+        items.len(),
+        1,
+        "only the unmanaged sibling should be returned: {slugs:?}"
+    );
+    assert!(
+        slugs.contains(&"native-skill"),
+        "unmanaged sibling must still be discovered: {slugs:?}"
+    );
+    assert!(
+        !slugs.contains(&"managed-skill"),
+        "VectorHawk-managed symlink must be skipped: {slugs:?}"
+    );
+}
+
 // ── Plugins ───────────────────────────────────────────────────────────────────
 
 #[test]
