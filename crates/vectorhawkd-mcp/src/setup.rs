@@ -205,6 +205,13 @@ fn detect_ai_clients_in(
 ///
 /// Reads the existing JSON (if any), merges the entry under `mcp_key`, and
 /// writes back. Creates the file (and parent directories) if they do not exist.
+///
+/// Before the very first edit to a given `config_path`, the pre-edit file is
+/// backed up and a `restore-journal` entry (`op=config_edit`, `source=native`)
+/// is appended, so `vectorhawk uninstall` can restore the client's config to
+/// exactly what it was before VectorHawk touched it. Journal/backup failures
+/// are logged and never block the actual config write — see
+/// [`record_config_edit_journal`].
 pub fn write_mcp_entry(config: &ClientConfig) -> Result<()> {
     let existing: serde_json::Value = if config.config_path.exists() {
         let text = fs::read_to_string(&config.config_path)?;
@@ -228,9 +235,103 @@ pub fn write_mcp_entry(config: &ClientConfig) -> Result<()> {
     if let Some(parent) = config.config_path.parent() {
         fs::create_dir_all(parent)?;
     }
+
+    // Journal + backup BEFORE overwriting the file, so the backup captures
+    // the file exactly as it stood before this edit (or before any
+    // VectorHawk edit at all, on repeat calls — see doc comment below).
+    #[cfg(feature = "daemon")]
+    record_config_edit_journal(config);
+
     let output = serde_json::to_string_pretty(&serde_json::Value::Object(obj))?;
     fs::write(&config.config_path, output)?;
     Ok(())
+}
+
+/// Record the restore-journal entry for a `write_mcp_entry` call.
+///
+/// Backs up `config.config_path` (if it exists) only the *first* time this
+/// path is journaled — determined by scanning existing entries for a prior
+/// `config_edit` against the same `target_path` and reusing its
+/// `backup_path` — so a second `mcp setup` run never clobbers the pristine
+/// pre-VectorHawk backup with an already-modified copy. If the file did not
+/// exist before this edit, `backup_path` is left `None`: uninstall should
+/// delete `target_path` rather than restore it in that case.
+///
+/// Best-effort: any failure (can't resolve the data dir, lock contention,
+/// I/O error) is logged at WARN and swallowed. Losing a restore-journal
+/// entry must never block the AI client from getting configured.
+#[cfg(feature = "daemon")]
+fn record_config_edit_journal(config: &ClientConfig) {
+    use vectorhawkd_core::state::AppState;
+
+    let root_dir = match AppState::resolve_root_dir() {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(error = %e, "mcp setup: could not resolve data dir — skipping restore-journal entry");
+            return;
+        }
+    };
+    record_config_edit_journal_in(config, root_dir);
+}
+
+/// Core logic for [`record_config_edit_journal`], parameterised on `root_dir`
+/// so tests can point it at a temp directory instead of the real platform
+/// data dir.
+#[cfg(feature = "daemon")]
+fn record_config_edit_journal_in(config: &ClientConfig, root_dir: camino::Utf8PathBuf) {
+    use vectorhawkd_core::restore_journal::{
+        new_backup_ts, JournalEntry, JournalOp, JournalSource, RestoreJournal,
+    };
+
+    let journal = RestoreJournal::new(root_dir);
+    let target_path = config.config_path.to_string_lossy().to_string();
+
+    let prior_backup_path = journal.read_all().ok().and_then(|entries| {
+        entries.into_iter().rev().find_map(|e| {
+            if e.op == JournalOp::ConfigEdit && e.target_path == target_path {
+                e.backup_path
+            } else {
+                None
+            }
+        })
+    });
+
+    let backup_path = match prior_backup_path {
+        Some(p) => Some(p),
+        None if config.config_path.exists() => {
+            let Some(utf8_source) = camino::Utf8Path::from_path(config.config_path.as_path())
+            else {
+                tracing::warn!(
+                    path = %config.config_path.display(),
+                    "mcp setup: config path is not valid UTF-8 — skipping restore-journal backup"
+                );
+                return;
+            };
+            match journal.backup_path_for(&new_backup_ts(), utf8_source) {
+                Ok(p) => Some(p.to_string()),
+                Err(e) => {
+                    tracing::warn!(error = %e, "mcp setup: failed to back up client config for restore journal");
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+
+    let mut entry = JournalEntry::new(JournalOp::ConfigEdit, JournalSource::Native, target_path)
+        .with_slug(MCP_SERVER_NAME)
+        .with_client(config.name.clone())
+        .with_detail(serde_json::json!({
+            "server_key": MCP_SERVER_NAME,
+            "mcp_key": config.mcp_key,
+        }));
+    if let Some(bp) = backup_path {
+        entry = entry.with_backup_path(bp);
+    }
+
+    if let Err(e) = journal.append(entry) {
+        tracing::warn!(error = %e, "mcp setup: failed to append restore-journal entry (non-fatal)");
+    }
 }
 
 /// Remove the VectorHawk MCP entry from a client config file.
@@ -677,6 +778,31 @@ mod tests {
         std::env::temp_dir().join(format!("vh-setup-test-{label}-{nanos}"))
     }
 
+    /// Serializes tests that call the public `write_mcp_entry` (which, with
+    /// the `daemon` feature on, resolves the real platform data dir via
+    /// `$HOME` to record a restore-journal entry). Redirecting `HOME` to a
+    /// throwaway temp dir keeps that side effect out of the developer's real
+    /// `~/Library/Application Support/VectorHawk`; the mutex prevents
+    /// parallel tests from racing on the process-global env var.
+    static HOME_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Run `f` with `HOME` pointed at `fake_home`, restoring the original
+    /// value afterward even if `f` panics.
+    fn with_fake_home<T>(fake_home: &std::path::Path, f: impl FnOnce() -> T) -> T {
+        let _guard = HOME_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let original = std::env::var_os("HOME");
+        std::env::set_var("HOME", fake_home);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        match original {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match result {
+            Ok(v) => v,
+            Err(e) => std::panic::resume_unwind(e),
+        }
+    }
+
     /// The command `build_mcp_entry` writes: the absolute path to the current
     /// executable, or the `MCP_COMMAND` fallback when it can't be resolved.
     /// (Absolute path so AI clients spawning a non-login shell still find it.)
@@ -758,7 +884,9 @@ mod tests {
             already_configured: false,
         };
 
-        write_mcp_entry(&config).expect("write should succeed");
+        // write_mcp_entry's restore-journal side effect resolves the real
+        // data dir via $HOME unless redirected — keep it inside `tmp`.
+        with_fake_home(&tmp, || write_mcp_entry(&config)).expect("write should succeed");
 
         let json: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
@@ -796,7 +924,7 @@ mod tests {
             already_configured: false,
         };
 
-        write_mcp_entry(&config).expect("write should succeed");
+        with_fake_home(&tmp, || write_mcp_entry(&config)).expect("write should succeed");
 
         let json: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
@@ -806,6 +934,141 @@ mod tests {
             expected_command()
         );
         assert_eq!(json["mcpServers"]["other-tool"]["command"], "other");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // ── write_mcp_entry restore-journal integration ───────────────────────────
+    // Uses record_config_edit_journal_in directly (root_dir injected) so these
+    // tests never touch the real platform data dir.
+
+    #[cfg(feature = "daemon")]
+    fn journal_for(
+        root_dir: &camino::Utf8Path,
+    ) -> vectorhawkd_core::restore_journal::RestoreJournal {
+        vectorhawkd_core::restore_journal::RestoreJournal::new(root_dir.to_owned())
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn record_config_edit_journal_backs_up_pre_existing_file_and_appends_entry() {
+        let tmp = temp_root("journal-existing");
+        let config_path = tmp.join("claude.json");
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(
+            &config_path,
+            r#"{"mcpServers":{"other":{"command":"other"}}}"#,
+        )
+        .unwrap();
+
+        let root_dir = camino::Utf8PathBuf::from_path_buf(tmp.join("vh-root")).unwrap();
+
+        let config = ClientConfig {
+            name: "Claude Code".to_string(),
+            config_path: config_path.clone(),
+            mcp_key: "mcpServers".to_string(),
+            already_configured: false,
+        };
+
+        record_config_edit_journal_in(&config, root_dir.clone());
+
+        let journal = journal_for(&root_dir);
+        let entries = journal.read_all().unwrap();
+        assert_eq!(entries.len(), 1, "one config_edit entry should be appended");
+
+        let entry = &entries[0];
+        assert_eq!(
+            entry.op,
+            vectorhawkd_core::restore_journal::JournalOp::ConfigEdit
+        );
+        assert_eq!(
+            entry.source,
+            vectorhawkd_core::restore_journal::JournalSource::Native
+        );
+        assert_eq!(entry.target_path, config_path.to_string_lossy());
+        assert_eq!(entry.slug.as_deref(), Some(MCP_SERVER_NAME));
+        assert_eq!(entry.client.as_deref(), Some("Claude Code"));
+        assert_eq!(entry.detail["server_key"], MCP_SERVER_NAME);
+        assert_eq!(entry.detail["mcp_key"], "mcpServers");
+
+        let backup_path = entry
+            .backup_path
+            .as_ref()
+            .expect("pre-existing file must be backed up");
+        assert_eq!(
+            fs::read_to_string(backup_path).unwrap(),
+            r#"{"mcpServers":{"other":{"command":"other"}}}"#,
+            "backup must capture the pre-edit content"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn record_config_edit_journal_omits_backup_when_file_did_not_exist() {
+        let tmp = temp_root("journal-new-file");
+        let config_path = tmp.join("cursor").join("mcp.json");
+        fs::create_dir_all(&tmp).unwrap();
+        // config_path deliberately does not exist yet.
+
+        let root_dir = camino::Utf8PathBuf::from_path_buf(tmp.join("vh-root")).unwrap();
+        let config = ClientConfig {
+            name: "Cursor".to_string(),
+            config_path: config_path.clone(),
+            mcp_key: "mcpServers".to_string(),
+            already_configured: false,
+        };
+
+        record_config_edit_journal_in(&config, root_dir.clone());
+
+        let entries = journal_for(&root_dir).read_all().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(
+            entries[0].backup_path.is_none(),
+            "no backup_path when the file did not exist before — uninstall should delete instead"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn record_config_edit_journal_second_call_reuses_original_backup() {
+        let tmp = temp_root("journal-reuse");
+        let config_path = tmp.join("claude.json");
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(&config_path, "original content").unwrap();
+
+        let root_dir = camino::Utf8PathBuf::from_path_buf(tmp.join("vh-root")).unwrap();
+        let config = ClientConfig {
+            name: "Claude Code".to_string(),
+            config_path: config_path.clone(),
+            mcp_key: "mcpServers".to_string(),
+            already_configured: false,
+        };
+
+        // First edit: backs up "original content".
+        record_config_edit_journal_in(&config, root_dir.clone());
+        // Simulate the actual write happening (file now VectorHawk-modified).
+        fs::write(&config_path, "vectorhawk-modified content").unwrap();
+        // Second edit (e.g. a later `mcp setup` re-run): must NOT re-back-up
+        // the now-modified content over the pristine original.
+        record_config_edit_journal_in(&config, root_dir.clone());
+
+        let entries = journal_for(&root_dir).read_all().unwrap();
+        assert_eq!(entries.len(), 2, "each call appends its own entry");
+        let backup_1 = entries[0].backup_path.clone().unwrap();
+        let backup_2 = entries[1].backup_path.clone().unwrap();
+        assert_eq!(
+            backup_1, backup_2,
+            "second call must reuse the first backup path"
+        );
+        assert_eq!(
+            fs::read_to_string(&backup_1).unwrap(),
+            "original content",
+            "backup must still hold the pristine pre-VectorHawk content"
+        );
 
         let _ = fs::remove_dir_all(&tmp);
     }
@@ -1036,7 +1299,7 @@ mod tests {
             already_configured: false,
         };
 
-        write_mcp_entry(&config).unwrap();
+        with_fake_home(&tmp, || write_mcp_entry(&config)).unwrap();
 
         let json: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
@@ -1062,7 +1325,7 @@ mod tests {
             already_configured: false,
         };
 
-        write_mcp_entry(&config).unwrap();
+        with_fake_home(&tmp, || write_mcp_entry(&config)).unwrap();
 
         let json: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
@@ -1245,7 +1508,7 @@ mod tests {
             already_configured: false,
         };
 
-        write_mcp_entry(&config).unwrap();
+        with_fake_home(&tmp, || write_mcp_entry(&config)).unwrap();
         assert!(is_vectorhawk_configured(&config_path, "mcpServers"));
 
         let removed = remove_mcp_entry(&config).unwrap();

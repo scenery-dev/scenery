@@ -21,12 +21,27 @@
 //! installs (see `sync::reconciler::push_skill_to_claude` and the
 //! phantom-artifact branch in `sync::reconciler::do_install`).
 //!
+//! # Data-loss guard (backup before delete)
+//!
+//! The user's `source_path` is the only copy of whatever they authored —
+//! adopting it must never be able to destroy it. Before
+//! [`remove_source_path`] deletes anything it copies the original byte-for-
+//! byte into the restore journal's backup area
+//! (`<root_dir>/restore-backups/<ts>/adopted/<slug>/...`) via
+//! [`vectorhawkd_core::restore_journal::RestoreJournal`] and records a
+//! `source = adopted` journal entry pointing `backup_path` at that copy.
+//! **The delete only happens if the backup + journal append both succeed.**
+//! If either fails, the takeover aborts with an error, the original is left
+//! completely untouched, and the pending-takeover record stays set so a
+//! later call (retried adopt, next install) can try again.
+//!
 //! # Idempotency
 //!
 //! [`perform_if_pending`] is a no-op unless [`vectorhawkd_core::state::AppState::pending_adopt_takeover_source`]
 //! has a row for the slug, so calling it speculatively on every completed
 //! install is safe and cheap. Removal of `source_path` itself tolerates the
-//! path already being gone (SSE redelivery, retried adopt).
+//! path already being gone (SSE redelivery, retried adopt) — no backup is
+//! attempted in that case since there is nothing left to lose.
 //!
 //! # Killswitch
 //!
@@ -36,7 +51,10 @@
 use anyhow::{Context, Result};
 use std::{fs, path::Path};
 use tracing::{debug, info};
-use vectorhawkd_core::state::AppState;
+use vectorhawkd_core::{
+    restore_journal::{new_backup_ts, JournalEntry, JournalOp, JournalSource, RestoreJournal},
+    state::AppState,
+};
 
 use super::pusher::managed_skill_present;
 
@@ -80,7 +98,7 @@ pub fn perform_if_pending(state: &AppState, slug: &str) -> Result<()> {
         return Ok(());
     }
 
-    remove_source_path(Path::new(&source_path)).with_context(|| {
+    remove_source_path(state, slug, Path::new(&source_path)).with_context(|| {
         format!("takeover: failed to remove original source_path: {source_path}")
     })?;
 
@@ -96,27 +114,131 @@ pub fn perform_if_pending(state: &AppState, slug: &str) -> Result<()> {
     Ok(())
 }
 
-/// Remove `path`, which may be a real directory or (per the shared contract)
-/// a symlink a pre-VectorHawk installer created at the discovered location.
+/// Remove `path`, which may be a real directory, a regular file, or (per the
+/// shared contract) a symlink a pre-VectorHawk installer created at the
+/// discovered location.
 ///
 /// A symlink is unlinked directly rather than followed, so this never
 /// recurses into — or deletes — whatever the symlink points at. Absence is
 /// treated as success (idempotent: already-removed dir, retried takeover).
-fn remove_source_path(path: &Path) -> Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() => {
-            fs::remove_file(path).context("failed to remove symlink")?;
-        }
-        Ok(meta) if meta.is_dir() => {
-            fs::remove_dir_all(path).context("failed to remove directory")?;
-        }
-        Ok(_) => {
-            fs::remove_file(path).context("failed to remove file")?;
-        }
+///
+/// **Never deletes without backing up first.** Unless `path` is already
+/// absent or is a dangling symlink (nothing behind it to lose), the original
+/// is copied byte-for-byte into the restore journal's backup area and a
+/// journal entry is appended *before* anything is removed. If that backup
+/// step fails for any reason, this returns `Err` and `path` is left
+/// completely untouched — the caller's pending-takeover record is not
+/// cleared, so a later retry can try again.
+fn remove_source_path(state: &AppState, slug: &str, path: &Path) -> Result<()> {
+    let link_meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             debug!(path = %path.display(), "takeover: source_path already absent (idempotent)");
+            return Ok(());
         }
         Err(e) => return Err(e).context("failed to stat source_path"),
+    };
+
+    if link_meta.file_type().is_symlink() && fs::metadata(path).is_err() {
+        // Dangling symlink: whatever it once pointed at is already gone, so
+        // there is no data behind it to lose. Unlink directly — no backup
+        // needed or possible.
+        fs::remove_file(path).context("failed to remove dangling symlink")?;
+        debug!(
+            path = %path.display(),
+            "takeover: removed dangling symlink source_path (nothing to back up)"
+        );
+        return Ok(());
+    }
+
+    back_up_before_delete(state, slug, path).with_context(|| {
+        format!(
+            "refusing to delete un-backed-up source_path: {}",
+            path.display()
+        )
+    })?;
+
+    if link_meta.file_type().is_symlink() {
+        fs::remove_file(path).context("failed to remove symlink")?;
+    } else if link_meta.is_dir() {
+        fs::remove_dir_all(path).context("failed to remove directory")?;
+    } else {
+        fs::remove_file(path).context("failed to remove file")?;
+    }
+    Ok(())
+}
+
+/// Copy `path` byte-for-byte into
+/// `<root_dir>/restore-backups/<ts>/adopted/<slug>/` and append a
+/// `source = adopted` restore-journal entry pointing at that copy — all
+/// *before* the caller deletes anything.
+///
+/// Returns `Err` (and leaves no partial journal entry) if either the copy or
+/// the journal append fails, so the caller can treat backup failure as a
+/// hard stop rather than proceeding to delete un-backed-up data.
+fn back_up_before_delete(state: &AppState, slug: &str, path: &Path) -> Result<()> {
+    let journal = RestoreJournal::for_state(state);
+    let ts = new_backup_ts();
+    let dest = journal.backup_dir_for(&ts).join("adopted").join(slug);
+
+    if path.is_dir() {
+        copy_tree_recursive(path, dest.as_std_path())
+            .with_context(|| format!("failed to back up directory {} -> {dest}", path.display()))?;
+    } else {
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent.as_std_path())
+                .with_context(|| format!("failed to create backup dir {parent}"))?;
+        }
+        fs::copy(path, dest.as_std_path())
+            .with_context(|| format!("failed to back up file {} -> {dest}", path.display()))?;
+    }
+
+    journal
+        .append(
+            JournalEntry::new(
+                JournalOp::FileDelete,
+                JournalSource::Adopted,
+                path.to_string_lossy().to_string(),
+            )
+            .with_slug(slug)
+            .with_backup_path(dest.to_string())
+            .with_detail(serde_json::json!({"reason": "adopt_takeover"})),
+        )
+        .context("failed to append restore-journal entry for adopt takeover backup")?;
+
+    Ok(())
+}
+
+/// Recursively copy a directory tree, creating destination directories as
+/// needed. Mirrors the equivalent private helper in
+/// `vectorhawkd_core::restore_journal` / `managed_paths::migrator` — kept
+/// local rather than shared since none of those are exported across the
+/// crate boundary.
+fn copy_tree_recursive(src: &Path, dest: &Path) -> Result<()> {
+    fs::create_dir_all(dest)
+        .with_context(|| format!("failed to create backup dest: {}", dest.display()))?;
+
+    for entry in fs::read_dir(src)
+        .with_context(|| format!("failed to read dir for backup: {}", src.display()))?
+    {
+        let entry = entry.context("failed to read dir entry during backup")?;
+        let entry_path = entry.path();
+        let dest_path = dest.join(entry.file_name());
+        let meta = entry
+            .metadata()
+            .with_context(|| format!("failed to stat: {}", entry_path.display()))?;
+
+        if meta.is_dir() {
+            copy_tree_recursive(&entry_path, &dest_path)?;
+        } else {
+            fs::copy(&entry_path, &dest_path).with_context(|| {
+                format!(
+                    "failed to copy {} to {}",
+                    entry_path.display(),
+                    dest_path.display()
+                )
+            })?;
+        }
     }
     Ok(())
 }
