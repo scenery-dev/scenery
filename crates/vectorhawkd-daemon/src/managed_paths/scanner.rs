@@ -70,6 +70,19 @@ pub fn scan_skills_dir(skills_dir: &Path) -> Result<Vec<MigrationItem>> {
             continue;
         }
 
+        // Already ours — nothing to adopt. Same content-based ownership test
+        // `scan_plugin_marketplaces` applies to plugins.
+        //
+        // This matters most since the pivot to `~/.agents/skills`: VectorHawk
+        // now writes real skill content there and leaves a *symlink* at
+        // `~/.claude/skills/<slug>` for Claude Code. `fs::metadata` above
+        // follows that link, so without this check the daemon would rediscover
+        // its own pushed skills as freshly-found native items on every start.
+        // The marker is read through the link, i.e. from the canonical dir.
+        if ownership::is_vectorhawk_managed(&path) {
+            continue;
+        }
+
         let slug = match path.file_name().and_then(|n| n.to_str()) {
             Some(s) => s.to_string(),
             None => {

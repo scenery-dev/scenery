@@ -420,30 +420,56 @@ fn remove_managed_artifacts(_plan: &Plan, report: &mut RestoreReport) {
         return;
     };
 
+    // Order matters. `~/.claude/skills/<slug>` is now a *symlink* into the
+    // canonical `~/.agents/skills/<slug>`, and the marker is only readable
+    // through that link while its target still exists. Sweeping the link root
+    // first drops the aliases; sweeping the canonical root second removes the
+    // real content and produces the report entry. Reversed, every link would
+    // dangle, read as unmarked, and be left behind.
     remove_marked_dirs(
         &home.join(".claude").join("skills"),
         RemovedKind::ManagedSkill,
         "~/.claude/skills",
+        &["~/.claude/skills"],
+        report,
+    );
+    remove_marked_dirs(
+        &home.join(".agents").join("skills"),
+        RemovedKind::ManagedSkill,
+        "~/.agents/skills",
+        // The alias at the Claude path was removed by the sweep above, so a
+        // skill that lived at both is reported once, naming both locations.
+        &["~/.agents/skills", "~/.claude/skills"],
         report,
     );
     remove_marked_dirs(
         &home.join(".claude").join("plugins"),
         RemovedKind::ManagedPlugin,
         "~/.claude/plugins",
+        &["~/.claude/plugins"],
         report,
     );
 }
 
-/// Remove every top-level directory under `base` that carries a
+/// Remove every top-level entry under `base` that carries a
 /// `.vectorhawk-managed.json` marker (F2 pushed it there). Directories
 /// without the marker are the user's own and are left completely alone —
 /// they're reported as KEPT via `detect_unmanaged_servers` for MCP, but for
 /// skills/plugins there's no separate detector today, so they're simply
 /// untouched and unlisted.
+///
+/// Symlinked entries are unlinked but **not** reported: since the pivot to
+/// `~/.agents/skills`, a marked symlink is only ever an alias VectorHawk
+/// created for a client that cannot read the canonical root, and the real
+/// content it points at is reported by that root's own sweep. Reporting both
+/// would double-count one skill; `stripped_from` on the canonical entry names
+/// every location instead. Note the marker is read *through* the link, so an
+/// alias is identified by the ownership of its target, never by its own path.
 fn remove_marked_dirs(
     base: &Path,
     kind: RemovedKind,
     location: &'static str,
+    stripped_from: &[&str],
     report: &mut RestoreReport,
 ) {
     use vectorhawkd_daemon::managed_paths::marker::read_file_marker;
@@ -454,7 +480,12 @@ fn remove_marked_dirs(
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.is_dir() {
+        // `is_symlink` uses `symlink_metadata`, so it is true for a link even
+        // when the link target is a directory — unlike `is_dir()` below,
+        // which follows. That distinction is the whole point here:
+        // `remove_dir_all` on a symlink would not remove the real content.
+        let is_link = path.is_symlink();
+        if !is_link && !path.is_dir() {
             continue;
         }
         let name = path
@@ -463,6 +494,15 @@ fn remove_marked_dirs(
             .unwrap_or_default();
 
         match read_file_marker(&path) {
+            Ok(Some(_marker)) if is_link => {
+                // Drop the alias only. The canonical sweep removes the content
+                // and files the report entry.
+                if let Err(e) = std::fs::remove_file(&path) {
+                    report.warnings.push(format!(
+                        "failed to remove managed {location} link '{name}': {e:#}"
+                    ));
+                }
+            }
             Ok(Some(_marker)) => {
                 if let Err(e) = std::fs::remove_dir_all(&path) {
                     report.warnings.push(format!(
@@ -477,7 +517,7 @@ fn remove_marked_dirs(
                         "Pushed by your organization's VectorHawk policy — nothing to re-add; \
                          ask IT if you still need it."
                             .into(),
-                    stripped_from: vec![location.into()],
+                    stripped_from: stripped_from.iter().map(|s| (*s).to_string()).collect(),
                 });
             }
             Ok(None) => {
@@ -1149,6 +1189,77 @@ mod tests {
                 .removed
                 .iter()
                 .any(|r| r.name == "marked-skill" && matches!(r.kind, RemovedKind::ManagedSkill)));
+        });
+        let _ = fs::remove_dir_all(&fake_home);
+    }
+
+    /// Post-pivot layout: the real content lives at `~/.agents/skills/<slug>`
+    /// and `~/.claude/skills/<slug>` is only a symlink into it. Both must go,
+    /// and the skill must be reported exactly once — sweeping only the Claude
+    /// path would remove the link, leave the real skill on disk, and still
+    /// tell the user it had been removed.
+    #[test]
+    fn remove_managed_artifacts_removes_canonical_skill_and_its_claude_link() {
+        let fake_home = temp_dir("managed-sweep-canonical");
+        with_fake_home(&fake_home, || {
+            let canonical_root = fake_home.join(".agents").join("skills");
+            let link_root = fake_home.join(".claude").join("skills");
+            fs::create_dir_all(&canonical_root).unwrap();
+            fs::create_dir_all(&link_root).unwrap();
+
+            let canonical = canonical_root.join("pushed-skill");
+            fs::create_dir_all(&canonical).unwrap();
+            fs::write(canonical.join("SKILL.md"), b"managed body").unwrap();
+            vectorhawkd_daemon::managed_paths::marker::write_file_marker(
+                &canonical,
+                Some("inst-1"),
+                "deadbeef",
+                "2026-07-19T00:00:00Z",
+            )
+            .unwrap();
+
+            let link = link_root.join("pushed-skill");
+            std::os::unix::fs::symlink(&canonical, &link).unwrap();
+
+            // A user's own skill in the canonical root must survive.
+            let user_own = canonical_root.join("user-skill");
+            fs::create_dir_all(&user_own).unwrap();
+            fs::write(user_own.join("SKILL.md"), b"the user's own skill").unwrap();
+
+            let plan = Plan {
+                brokered: vec![],
+                clients: vec![],
+            };
+            let mut report = RestoreReport::default();
+            remove_managed_artifacts(&plan, &mut report);
+
+            assert!(
+                !canonical.exists(),
+                "the real skill content must be removed from ~/.agents/skills"
+            );
+            assert!(
+                !link.exists() && !link.is_symlink(),
+                "the Claude link must be removed too"
+            );
+            assert!(user_own.exists(), "the user's own skill must survive");
+
+            let hits: Vec<_> = report
+                .removed
+                .iter()
+                .filter(|r| r.name == "pushed-skill")
+                .collect();
+            assert_eq!(
+                hits.len(),
+                1,
+                "one skill must be reported exactly once, not once per location"
+            );
+            assert!(
+                hits[0]
+                    .stripped_from
+                    .iter()
+                    .any(|s| s == "~/.agents/skills"),
+                "the report must name the canonical location it was removed from"
+            );
         });
         let _ = fs::remove_dir_all(&fake_home);
     }

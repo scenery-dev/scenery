@@ -155,6 +155,33 @@ pub async fn migrate_item(
         return Ok(false);
     }
 
+    // ── 0.5 Never re-adopt VectorHawk's own managed content ───────────────────
+    // Defense-in-depth alongside the scanner's own check, exactly as for
+    // Anthropic-native content above.
+    //
+    // The path-equality idempotency check in step 1 is NOT sufficient here.
+    // Since the pivot to `~/.agents/skills`, the `managed_path_markers` row for
+    // a pushed skill is keyed on the canonical `.agents` path, while the
+    // scanner walks `~/.claude/skills` and would hand us the *symlink* path —
+    // a different key, so `is_already_marked` returns false and the item would
+    // sail through. Everything downstream then compounds: the org's own skill
+    // is POSTed to the backend as a newly discovered native item (a duplicate,
+    // governance-visible installation), a second marker row is inserted at the
+    // link path, and `write_file_marker` writes *through the symlink* into the
+    // canonical directory — which is precisely the write-through-a-link
+    // failure mode the `links` module exists to prevent.
+    //
+    // Ownership is content-based (the `.vectorhawk-managed.json` marker), not
+    // link-based, so a user's own symlinked skill still gets adopted normally.
+    if ownership::is_vectorhawk_managed(&item.source_path) {
+        debug!(
+            slug = %item.slug,
+            path = %path_key,
+            "managed_paths: refusing to adopt VectorHawk-managed item (already ours)"
+        );
+        return Ok(false);
+    }
+
     // ── 1. Idempotency check ──────────────────────────────────────────────────
     {
         let conn = Connection::open(&state.db_path).context("migrator: failed to open state DB")?;

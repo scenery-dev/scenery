@@ -500,6 +500,87 @@ fn push_skill_replaces_legacy_symlink_with_real_dir() {
     );
 }
 
+/// The pre-pivot upgrade case: before `~/.agents/skills` became canonical,
+/// `push_skill` wrote a **real, marked directory** straight into
+/// `~/.claude/skills/<slug>`. On the first post-pivot push for that slug the
+/// real directory must be replaced by a symlink into the canonical root,
+/// with the content living exactly once, at the canonical path.
+///
+/// This is the integration-level counterpart to `links_tests`' isolated
+/// `link_dir_replaces_its_own_prior_copy_materialisation`: it drives the same
+/// replacement through `push_skill`, which is where the ordering between
+/// "write canonical" and "replace the Claude path" actually matters.
+#[test]
+fn push_skill_replaces_real_marked_dir_at_claude_path_with_link() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let (pusher, _tmp) = make_pusher();
+
+    let fake_home = tempfile::tempdir().unwrap();
+
+    // A pre-pivot managed skill: real directory at the Claude path, carrying
+    // the `.vectorhawk-managed.json` marker push_skill used to write there.
+    let claude_skill_dir = fake_home
+        .path()
+        .join(".claude")
+        .join("skills")
+        .join("legacy-real");
+    fs::create_dir_all(&claude_skill_dir).unwrap();
+    fs::write(claude_skill_dir.join("SKILL.md"), b"pre-pivot content").unwrap();
+    fs::write(
+        claude_skill_dir.join(".vectorhawk-managed.json"),
+        format!(
+            r#"{{"marker_version":{MARKER_FILE_VERSION},"installation_id":null,"source_sha256":"old","migrated_at":"2026-01-01T00:00:00Z"}}"#
+        ),
+    )
+    .unwrap();
+    assert!(
+        !claude_skill_dir.is_symlink() && claude_skill_dir.is_dir(),
+        "test precondition: a real directory, not a link"
+    );
+
+    let prev_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", fake_home.path());
+
+    let new_content = b"---\nname: legacy-real\n---\npost-pivot content\n";
+    let result = pusher.push_skill("legacy-real", Some("inst-9"), new_content, &[]);
+
+    let canonical = fake_home.path().join(".agents/skills/legacy-real");
+    let was_ok = result.is_ok();
+    let claude_is_symlink = claude_skill_dir.is_symlink();
+    let canonical_is_real_dir = canonical.is_dir() && !canonical.is_symlink();
+    let canonical_md = fs::read(canonical.join("SKILL.md")).ok();
+    let resolves_to_canonical = fs::canonicalize(&claude_skill_dir)
+        .ok()
+        .zip(fs::canonicalize(&canonical).ok())
+        .map(|(a, b)| a == b)
+        .unwrap_or(false);
+
+    if let Some(v) = prev_home {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+
+    assert!(was_ok, "push_skill must succeed over a real marked dir");
+    assert!(
+        claude_is_symlink,
+        "the old real directory must be gone, replaced by a symlink"
+    );
+    assert!(
+        resolves_to_canonical,
+        "the Claude path must resolve to the canonical ~/.agents/skills dir"
+    );
+    assert!(
+        canonical_is_real_dir,
+        "the canonical path must hold the real directory"
+    );
+    assert_eq!(
+        canonical_md.as_deref(),
+        Some(new_content.as_ref()),
+        "the canonical dir must hold the freshly pushed content"
+    );
+}
+
 // ── reclaim_active_skills (v1.0.51 startup pass) ──────────────────────────────
 
 /// reclaim_active_skills must materialize legacy installer symlinks for every
