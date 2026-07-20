@@ -130,6 +130,131 @@ fn link_dir_replaces_its_own_prior_copy_materialisation() {
     drop(tmp);
 }
 
+/// The `.vectorhawk-managed.json` sidecar the pusher writes into every
+/// canonical skill dir, which `copy_tree` necessarily carries into a copy.
+const MARKER: &[u8] = br#"{"marker_version":1,"installation_id":null,"source_sha256":"abc","migrated_at":"2026-01-01T00:00:00Z"}"#;
+
+#[test]
+fn link_dir_does_not_churn_backups_when_the_copy_already_matches_canonical() {
+    // The unbounded-backup bug: on a copy-mode host (Windows without Developer
+    // Mode) `link_dir` tore down its own byte-identical copy into a fresh
+    // timestamped backup on *every* call — and `push_skill` calls it every
+    // push, `migrate_skills_to_agents_dir` every daemon start. The identity
+    // check makes an already-correct copy a no-op, so nothing accumulates.
+    //
+    // This is testable without Windows because the identity path is taken
+    // before any symlink is attempted.
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let (_tmp, canonical, link_path) = fixture();
+    fs::write(canonical.join(".vectorhawk-managed.json"), MARKER).unwrap();
+
+    // Materialise `link_path` as a byte-identical copy of canonical — exactly
+    // what the copy fallback leaves behind.
+    fs::create_dir_all(&link_path).unwrap();
+    fs::write(link_path.join("SKILL.md"), b"---\nname: demo\n---\n").unwrap();
+    fs::write(link_path.join(".vectorhawk-managed.json"), MARKER).unwrap();
+
+    let fake_home = tempfile::tempdir().unwrap();
+    let prev_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", fake_home.path());
+
+    let modes: Vec<_> = (0..5)
+        .map(|_| link_dir(&canonical, &link_path).unwrap())
+        .collect();
+
+    if let Some(v) = prev_home {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+
+    assert!(
+        modes.iter().all(|m| *m == LinkMode::Copy),
+        "an identical copy must be reported as a settled Copy, not re-materialised: {modes:?}"
+    );
+    assert!(
+        !fake_home
+            .path()
+            .join(".claude")
+            .join(".vectorhawk-backup")
+            .exists(),
+        "an identical copy must never be backed up — this is the unbounded churn bug"
+    );
+    assert!(!link_path.is_symlink(), "the copy must be left in place");
+    assert_eq!(
+        fs::read(link_path.join("SKILL.md")).unwrap(),
+        b"---\nname: demo\n---\n"
+    );
+}
+
+#[test]
+fn link_dir_still_replaces_a_copy_that_has_diverged() {
+    // The identity check must not suppress healing: once the copy differs from
+    // canonical (any push updates canonical), the full backup-and-relink path
+    // runs, so a stale copy can never persist past the next content change.
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let (_tmp, canonical, link_path) = fixture();
+    fs::write(canonical.join(".vectorhawk-managed.json"), MARKER).unwrap();
+    fs::create_dir_all(&link_path).unwrap();
+    fs::write(link_path.join("SKILL.md"), b"---\nname: demo\n---\nOLD").unwrap();
+    fs::write(link_path.join(".vectorhawk-managed.json"), MARKER).unwrap();
+
+    let fake_home = tempfile::tempdir().unwrap();
+    let prev_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", fake_home.path());
+
+    let result = link_dir(&canonical, &link_path);
+
+    if let Some(v) = prev_home {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+
+    assert_eq!(result.unwrap(), LinkMode::Symlink);
+    assert!(link_is_intact(&canonical, &link_path).unwrap());
+    let backed_up = find_link_backup(fake_home.path(), "demo")
+        .expect("a diverged copy must still be backed up before removal");
+    assert_eq!(
+        fs::read(backed_up.join("SKILL.md")).unwrap(),
+        b"---\nname: demo\n---\nOLD"
+    );
+}
+
+#[test]
+fn link_dir_treats_a_copy_with_an_extra_file_as_diverged() {
+    // Same-name/same-content is not enough: a superset must not read as
+    // identical, or content the copy alone carries would be silently kept.
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let (_tmp, canonical, link_path) = fixture();
+    fs::write(canonical.join(".vectorhawk-managed.json"), MARKER).unwrap();
+    fs::create_dir_all(&link_path).unwrap();
+    fs::write(link_path.join("SKILL.md"), b"---\nname: demo\n---\n").unwrap();
+    fs::write(link_path.join(".vectorhawk-managed.json"), MARKER).unwrap();
+    fs::write(link_path.join("extra.txt"), b"only in the copy").unwrap();
+
+    let fake_home = tempfile::tempdir().unwrap();
+    let prev_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", fake_home.path());
+
+    let result = link_dir(&canonical, &link_path);
+
+    if let Some(v) = prev_home {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+
+    assert_eq!(result.unwrap(), LinkMode::Symlink);
+    let backed_up =
+        find_link_backup(fake_home.path(), "demo").expect("a diverged copy must be backed up");
+    assert_eq!(
+        fs::read(backed_up.join("extra.txt")).unwrap(),
+        b"only in the copy",
+        "the extra file must be recoverable, not dropped"
+    );
+}
+
 /// Locate `~/.claude/.vectorhawk-backup/<ts>/links/<name>` without hardcoding
 /// the run timestamp.
 fn find_link_backup(home: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
