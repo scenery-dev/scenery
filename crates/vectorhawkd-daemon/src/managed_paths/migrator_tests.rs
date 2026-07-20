@@ -167,6 +167,48 @@ async fn migrate_item_marks_adopted_skill_as_managed() {
     );
 }
 
+/// Pins the fix for the self-adoption bug (step "0.5" in `migrate_item`):
+/// a `MigrationItem` whose `source_path` already carries
+/// `.vectorhawk-managed.json` must never be adopted — no backup POST, no DB
+/// marker row, and `migrate_item` must return `Ok(false)` rather than
+/// `Ok(true)`. Without this check the idempotency check in step 1 is not
+/// sufficient, because since the `.agents` pivot the DB marker is keyed on
+/// the canonical path while the scanner can hand back a different (symlink)
+/// `source_path` for the same content.
+#[tokio::test]
+async fn migrate_item_does_not_adopt_vectorhawk_managed_source() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (state, _guard) = temp_state();
+    let item = skill_item("already-managed", tmp.path());
+    fs::write(
+        item.source_path
+            .join(vectorhawkd_mcp::ownership::MANAGED_MARKER_FILENAME),
+        r#"{"marker_version":1,"installation_id":null,"source_sha256":"abc","migrated_at":"2026-01-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+    let backup_root = tmp.path().join("backup");
+
+    let client = reqwest::Client::new();
+    let result = migrate_item(&item, &backup_root, &state, "http://unused", &client)
+        .await
+        .unwrap();
+
+    assert!(
+        !result,
+        "an already-managed source_path must never be (re)adopted"
+    );
+
+    let conn = rusqlite::Connection::open(&state.db_path).unwrap();
+    assert!(
+        !crate::managed_paths::marker::is_already_marked(
+            &conn,
+            &item.source_path.to_string_lossy(),
+        )
+        .unwrap(),
+        "no managed_path_markers row should be inserted for already-managed content"
+    );
+}
+
 // ── Restore journal (ONE ledger) ────────────────────────────────────────────
 
 /// F1 takeovers must also land in the unified restore journal, source=native,
