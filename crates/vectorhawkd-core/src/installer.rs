@@ -188,7 +188,16 @@ pub fn uninstall_skill(state: &AppState, skill_id: &str) -> Result<Option<String
     Ok(Some(active_version))
 }
 
-/// Deactivate an installed skill (set status = 'deactivated', remove active symlink).
+/// Deactivate an installed skill because the registry reports it unpublished
+/// (set status = 'deactivated', remove active symlink).
+///
+/// Deliberately leaves the `deactivated` integer column untouched: this
+/// lifecycle path is meant to auto-reverse itself via [`reactivate_skill`]
+/// when the skill is republished. Do not confuse this with the reconciler's
+/// per-device kill switch (`deactivate_skill_blocking` in
+/// `vectorhawkd-daemon/src/sync/reconciler.rs`), which sets `deactivated = 1`
+/// precisely so that a later republish-reactivate cycle here does *not* apply
+/// to it.
 ///
 /// Returns `true` if the skill was active and has been deactivated,
 /// `false` if the skill was not found or was already deactivated.
@@ -233,24 +242,42 @@ pub fn deactivate_skill(state: &AppState, skill_id: &str) -> Result<bool> {
 /// Reactivate a deactivated skill (restore active symlink, set status = 'active').
 ///
 /// Returns `true` if the skill was deactivated and has been reactivated,
-/// `false` if the skill was not found or was not deactivated.
+/// `false` if the skill was not found, was not deactivated, or is currently
+/// held deactivated by a per-device kill switch (see below).
+///
+/// `deactivated` (the integer column, distinct from `current_status`) is the
+/// authoritative flag for a per-device kill switch set by the reconciler's
+/// SSE-driven Deactivate handler (`deactivate_skill_blocking` in
+/// `vectorhawkd-daemon/src/sync/reconciler.rs`), which writes it together
+/// with `current_status = 'deactivated'` in one statement. This function must
+/// never clear that kill switch — a skill being republished in the registry
+/// is not consent to resurrect an installation an admin explicitly killed on
+/// this device. The *only* legitimate caller of this reactivation path is the
+/// registry unpublish/republish auto-cycle (`check_skill_updates` in
+/// `updater.rs`), whose deactivation (`deactivate_skill`, below) intentionally
+/// never touches `deactivated`, leaving it `0`.
 pub fn reactivate_skill(state: &AppState, skill_id: &str) -> Result<bool> {
     let conn = Connection::open(&state.db_path)?;
 
-    let row: Option<(String, String, String)> = conn
+    let row: Option<(String, String, String, i64)> = conn
         .query_row(
-            "SELECT install_root, active_version, current_status FROM installed_skills WHERE skill_id = ?1",
+            "SELECT install_root, active_version, current_status, deactivated \
+             FROM installed_skills WHERE skill_id = ?1",
             [skill_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?;
 
-    let (install_root, active_version, current_status) = match row {
+    let (install_root, active_version, current_status, deactivated) = match row {
         Some(r) => r,
         None => return Ok(false),
     };
 
     if current_status != "deactivated" {
+        return Ok(false);
+    }
+
+    if deactivated != 0 {
         return Ok(false);
     }
 
@@ -280,8 +307,15 @@ pub fn reactivate_skill(state: &AppState, skill_id: &str) -> Result<bool> {
     #[cfg(target_family = "unix")]
     std::os::unix::fs::symlink(&version_dir, &active_path)?;
 
+    // Reset `deactivated`/`deactivated_at` alongside `current_status` even
+    // though `deactivated` is already 0 here (checked above) — this keeps the
+    // write self-contained and matches the sibling write in
+    // `sync/reconciler.rs::flip_active_symlink`, so the two fields can never
+    // be observed to disagree by another reader.
     conn.execute(
-        "UPDATE installed_skills SET current_status = 'active' WHERE skill_id = ?1",
+        "UPDATE installed_skills \
+         SET current_status = 'active', deactivated = 0, deactivated_at = NULL \
+         WHERE skill_id = ?1",
         [skill_id],
     )?;
 

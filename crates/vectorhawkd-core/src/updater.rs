@@ -331,12 +331,26 @@ pub fn check_skill_updates(
                         "published" => {
                             published.insert(skill_id.clone());
                             if local_status == "deactivated" {
+                                // `reactivate_skill` itself refuses when a
+                                // per-device kill switch (`deactivated = 1`)
+                                // is set — that refusal is silent (`Ok(false)`)
+                                // by design elsewhere in this match, but it's
+                                // worth a debug trace here since it's the one
+                                // case where "republished" does NOT mean
+                                // "reactivate" and is easy to miss during
+                                // incident debugging.
                                 match reactivate_skill(state, skill_id) {
                                     Ok(true) => {
                                         info!(skill_id, "sync: skill republished, reactivated");
                                         changes += 1;
                                     }
-                                    Ok(false) => {}
+                                    Ok(false) => {
+                                        tracing::debug!(
+                                            skill_id,
+                                            "sync: skill republished but not reactivated \
+                                             (already active, or held by a per-device kill switch)"
+                                        );
+                                    }
                                     Err(e) => {
                                         tracing::warn!(skill_id, error = %e, "sync: failed to reactivate republished skill");
                                     }
@@ -1035,6 +1049,96 @@ mod tests {
 
         status_mock.assert();
         detail_mock.assert();
+        let _ = fs::remove_dir_all(&state_root);
+        let _ = fs::remove_dir_all(&skill_root);
+    }
+
+    /// Regression test for the kill-switch-resurrection bug: a per-device
+    /// deactivation (the reconciler's SSE-driven `Deactivate` handler, which
+    /// sets `deactivated = 1` *and* `current_status = 'deactivated'` together)
+    /// must survive a subsequent lifecycle/version-update pass even when the
+    /// registry still reports the skill as "published" overall. Reproduced on
+    /// a real device (runner 1.0.82): the reconciler's deactivate and the
+    /// updater's lifecycle pass raced 79ms apart, and the lifecycle pass won,
+    /// leaving `deactivated = 1` but `current_status = 'active'` with a live
+    /// `active` symlink — the kill switch silently undone.
+    ///
+    /// Unlike `test_sync_reactivates_republished_skill` above (which exercises
+    /// the *legitimate* auto-reactivation cycle: registry-unpublish sets only
+    /// `current_status`, leaving `deactivated = 0`, so republishing should
+    /// reactivate), this test sets `deactivated = 1` to simulate an explicit
+    /// per-device kill switch, which must be authoritative over registry
+    /// publish status.
+    #[test]
+    fn check_skill_updates_does_not_reactivate_device_deactivated_skill() {
+        use mockito::Server;
+
+        let state_root = temp_root("csu-device-killed");
+        let skill_root = temp_root("csu-device-killed-skill");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+
+        write_skill_bundle(&skill_root, "0.1.0");
+        let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
+        install_unpacked_skill(&state, &pkg, InstallMode::Copy).unwrap();
+
+        // Simulate the reconciler's `deactivate_skill_blocking` (per-device
+        // kill switch): remove the active symlink and set `deactivated = 1`
+        // alongside `current_status = 'deactivated'` in one write.
+        let active_path = state.root_dir.join("skills/test-skill/active");
+        fs::remove_file(&active_path)
+            .or_else(|_| fs::remove_dir_all(&active_path))
+            .unwrap();
+        let conn = rusqlite::Connection::open(&state.db_path).unwrap();
+        conn.execute(
+            "UPDATE installed_skills \
+             SET deactivated = 1, deactivated_at = ?1, current_status = 'deactivated' \
+             WHERE skill_id = 'test-skill'",
+            rusqlite::params![chrono::Utc::now().to_rfc3339()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut server = Server::new();
+
+        // Registry still reports the skill as published overall.
+        let status_mock = server
+            .mock("POST", "/skills/status")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"statuses":{"test-skill":{"status":"published","latest_version":"0.1.0"}},"unknown":[]}"#,
+            )
+            .create();
+
+        let registry = RegistryClient::new(server.url());
+        let policy_client = crate::policy::MockPolicyClient::new();
+
+        let count = check_skill_updates(&state, &registry, &policy_client).unwrap();
+        assert_eq!(
+            count, 0,
+            "a per-device kill switch must not be undone by the registry lifecycle pass"
+        );
+
+        let conn = rusqlite::Connection::open(&state.db_path).unwrap();
+        let (status, deactivated): (String, i64) = conn
+            .query_row(
+                "SELECT current_status, deactivated FROM installed_skills WHERE skill_id = 'test-skill'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            status, "deactivated",
+            "current_status must not flip back to active"
+        );
+        assert_eq!(deactivated, 1, "deactivated flag must remain set");
+
+        assert!(
+            !active_path.exists(),
+            "active symlink must not be recreated for a device-deactivated skill"
+        );
+
+        status_mock.assert();
         let _ = fs::remove_dir_all(&state_root);
         let _ = fs::remove_dir_all(&skill_root);
     }
