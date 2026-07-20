@@ -187,7 +187,11 @@ const COMPARE_CHUNK: usize = 64 * 1024;
 /// points at. Any read error yields `false`: "cannot prove they match" must
 /// never be mistaken for "they match", because a false match suppresses the
 /// relink.
-fn dirs_identical(a: &Path, b: &Path) -> bool {
+///
+/// `pub(crate)` so `drift::check_link_integrity` can reuse the same bounded
+/// comparison to recognise a healthy `LinkMode::Copy` steady state, rather
+/// than duplicating this walk.
+pub(crate) fn dirs_identical(a: &Path, b: &Path) -> bool {
     dirs_identical_inner(a, b).unwrap_or(false)
 }
 

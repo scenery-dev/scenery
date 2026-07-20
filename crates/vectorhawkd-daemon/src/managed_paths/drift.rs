@@ -182,7 +182,48 @@ impl DriftScanner {
 
         for outcome in outcomes {
             match outcome.status {
-                DriftStatus::Clean => {}
+                DriftStatus::Clean => {
+                    // Content is intact, but Claude Code's link may have been
+                    // replaced by a real directory — a distinct tamper signal
+                    // from content drift, and invisible to hashing because the
+                    // canonical file never changed.
+                    if outcome.kind == "skill" {
+                        match check_link_integrity(&outcome.slug) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                stats.drifted += 1;
+                                let action = match mode {
+                                    PolicyMode::AuditOnly
+                                    | PolicyMode::Warn
+                                    | PolicyMode::Quarantine => "reported",
+                                    PolicyMode::ApproveRequired => "awaiting_approval",
+                                };
+                                warn!(
+                                    slug = %outcome.slug,
+                                    "drift: Claude Code skill link replaced by a real directory"
+                                );
+                                to_report.push(DriftReportItem {
+                                    slug: outcome.slug,
+                                    kind: outcome.kind,
+                                    current_hash: String::new(),
+                                    expected_hash: outcome.expected_hash,
+                                    action: action.to_string(),
+                                    detail: Some(serde_json::json!({
+                                        "path": outcome.path,
+                                        "reason": "link_replaced"
+                                    })),
+                                });
+                            }
+                            Err(e) => {
+                                warn!(
+                                    slug = %outcome.slug,
+                                    error = %e,
+                                    "drift: link integrity check failed"
+                                );
+                            }
+                        }
+                    }
+                }
                 DriftStatus::Drifted => {
                     stats.drifted += 1;
                     let current_hash = outcome.current_hash.clone().unwrap_or_default();
@@ -543,6 +584,61 @@ fn remove_path_for(marker: &ManagedPathMarker) -> Result<()> {
         }
         _ => Ok(()),
     }
+}
+
+// ── Link integrity ────────────────────────────────────────────────────────────
+
+/// Verify Claude Code's link for `slug` still points at the canonical dir.
+///
+/// Content hashing alone cannot see a *link* being replaced — the canonical
+/// file at `~/.agents/skills/<slug>` never changes, so a `Clean` classify()
+/// result says nothing about what Claude Code is actually reading from
+/// `~/.claude/skills/<slug>`. This is the complementary check.
+///
+/// Three states at the Claude path are all "intact":
+/// 1. A symlink resolving to canonical.
+/// 2. Absent — a surfacing failure the pusher heals on the next reconcile,
+///    not tampering.
+/// 3. A **real directory** that is VectorHawk-managed (carries the
+///    `.vectorhawk-managed.json` marker) and byte-identical to canonical —
+///    the legitimate `LinkMode::Copy` steady state on hosts where a symlink
+///    could not be created (Windows without Developer Mode). `link_dir`
+///    deliberately leaves this alone rather than converting it on every run
+///    (see `links::link_dir`), so drift must recognise it as healthy too, or
+///    every cycle would report false `link_replaced` drift on a perfectly
+///    good install.
+///
+/// Only a real directory that is *not* ours, or one that is ours but has
+/// diverged from canonical, returns `false` — that is the actual tamper
+/// signal: something outside VectorHawk is serving content to Claude Code
+/// under a managed slug.
+pub fn check_link_integrity(slug: &str) -> Result<bool> {
+    let (Some(canonical_root), Some(link_root)) = (
+        super::paths::agents_skills_dir(),
+        super::paths::claude_skills_link_dir(),
+    ) else {
+        return Ok(true);
+    };
+
+    let canonical = canonical_root.join(slug);
+    let link = link_root.join(slug);
+
+    if link.is_symlink() {
+        return super::links::link_is_intact(&canonical, &link);
+    }
+
+    if !link.exists() {
+        return Ok(true);
+    }
+
+    // A real directory sits where Claude Code expects a link. Reuse the
+    // bounded identity comparison `link_dir` itself uses so a healthy copy
+    // (state 3 above) isn't mistaken for tampering.
+    if ownership::is_vectorhawk_managed(&link) && super::links::dirs_identical(&canonical, &link) {
+        return Ok(true);
+    }
+
+    Ok(false)
 }
 
 // ── Quarantine ────────────────────────────────────────────────────────────────
