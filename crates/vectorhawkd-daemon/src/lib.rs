@@ -1760,14 +1760,14 @@ pub fn mcp_row_to_backend_entry(
             env,
             process: Arc::new(std::sync::Mutex::new(None)),
         }
-    } else if let Some(url) = config.get("url").and_then(|v| v.as_str()) {
+    } else {
+        // Neither a stdio command nor an http url — nothing we can connect to.
+        let url = config.get("url").and_then(|v| v.as_str())?;
         BackendTransport::Http {
             url: url.to_string(),
             auth_token: None,
             token_handle: None,
         }
-    } else {
-        return None;
     };
 
     Some(BackendEntry {
