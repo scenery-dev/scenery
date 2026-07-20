@@ -49,7 +49,7 @@ use vectorhawkd_mcp::ownership;
 // ── Env-var gate ──────────────────────────────────────────────────────────────
 
 /// Return `true` when the filesystem reconciler is disabled.
-fn reconciler_disabled() -> bool {
+pub(crate) fn reconciler_disabled() -> bool {
     std::env::var_os("VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER").is_some()
 }
 
