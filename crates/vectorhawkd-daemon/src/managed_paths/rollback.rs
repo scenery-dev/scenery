@@ -194,7 +194,7 @@ pub async fn rollback(
         let original_path = PathBuf::from(&item.original_path);
         let backup_path = PathBuf::from(&item.backup_path);
 
-        if let Err(e) = restore_item(&backup_path, &original_path, &item.kind) {
+        if let Err(e) = restore_item(&backup_path, &original_path, &item.kind, &item.slug, home) {
             report.errors.push(RollbackError {
                 slug: item.slug.clone(),
                 message: format!("file restore failed: {e:#}"),
@@ -203,21 +203,31 @@ pub async fn rollback(
         }
 
         // ── 2. Delete SQLite marker ───────────────────────────────────────────
-        let marker_path = item.f2_marker_path.clone();
+        // By (kind, slug), not by the manifest's f2_marker_path — see
+        // `delete_db_marker`.
         let db_path = state.db_path.clone();
+        let kind = item.kind.clone();
+        let slug = item.slug.clone();
         let marker_result =
-            tokio::task::spawn_blocking(move || delete_db_marker(&db_path, &marker_path))
+            tokio::task::spawn_blocking(move || delete_db_marker(&db_path, &kind, &slug))
                 .await
                 .context("rollback: marker delete task panicked")?;
 
-        if let Err(e) = marker_result {
-            // Non-fatal: the files are already restored; marker cleanup failure
-            // is annoying but not catastrophic.
-            warn!(slug = %item.slug, error = %e, "rollback: marker delete failed (non-fatal)");
-            report.errors.push(RollbackError {
-                slug: item.slug.clone(),
-                message: format!("SQLite marker delete failed: {e:#}"),
-            });
+        match marker_result {
+            Ok(0) => debug!(
+                slug = %item.slug,
+                "rollback: no managed_path_markers row to delete (already clean)"
+            ),
+            Ok(n) => debug!(slug = %item.slug, rows = n, "rollback: marker row(s) deleted"),
+            Err(e) => {
+                // Non-fatal: the files are already restored; marker cleanup
+                // failure is annoying but not catastrophic.
+                warn!(slug = %item.slug, error = %e, "rollback: marker delete failed (non-fatal)");
+                report.errors.push(RollbackError {
+                    slug: item.slug.clone(),
+                    message: format!("SQLite marker delete failed: {e:#}"),
+                });
+            }
         }
 
         // ── 3. DELETE catalog entry (non-fatal) ───────────────────────────────
@@ -406,7 +416,28 @@ pub async fn rollback(
 /// Removes the F2-managed directory/file at `original_path` before restoring,
 /// then tries `rename` first (same filesystem).  On cross-filesystem rename
 /// failure falls back to recursive copy then delete.
-fn restore_item(backup_path: &Path, original_path: &Path, kind: &str) -> Result<()> {
+///
+/// # Pivot awareness
+///
+/// F1 adopts skills in place at `~/.claude/skills/<slug>`, so that is what the
+/// manifest records. `migrate_skills_to_agents_dir` then moves the adopted
+/// directory to `~/.agents/skills/<slug>` and leaves a symlink at the old
+/// path. `original_path.is_dir()` follows that symlink and returns true, so
+/// removing it naively unlinks only the link and the adopted copy survives —
+/// still live for every client that scans the canonical root. When
+/// `original_path` is a symlink into `<home>/.agents/skills/<slug>`, both are
+/// removed.
+///
+/// `home` is threaded through from [`rollback`] rather than read from
+/// `dirs::home_dir()` so the canonical root always matches the backup tree
+/// being restored.
+fn restore_item(
+    backup_path: &Path,
+    original_path: &Path,
+    kind: &str,
+    slug: &str,
+    home: &Path,
+) -> Result<()> {
     if !backup_path.exists() {
         anyhow::bail!(
             "restore_item: backup does not exist: {}",
@@ -414,8 +445,48 @@ fn restore_item(backup_path: &Path, original_path: &Path, kind: &str) -> Result<
         );
     }
 
-    // Remove whatever F2 has put at original_path.
-    if original_path.exists() {
+    // Remove whatever F2 has put at original_path. Check `is_symlink` FIRST:
+    // `exists`/`is_dir` both follow links and would misclassify the
+    // post-migration layout.
+    if original_path.is_symlink() {
+        // Only follow the link when it lands exactly where the pivot puts
+        // managed skills. Anything else is a link we do not own, and deleting
+        // whatever it happens to point at would be unbounded.
+        let canonical = home.join(".agents").join("skills").join(slug);
+        let points_at_canonical = fs::canonicalize(original_path)
+            .ok()
+            .zip(fs::canonicalize(&canonical).ok())
+            .map(|(a, b)| a == b)
+            .unwrap_or(false);
+
+        if points_at_canonical {
+            fs::remove_dir_all(&canonical).with_context(|| {
+                format!(
+                    "restore_item: failed to remove migrated adoption: {}",
+                    canonical.display()
+                )
+            })?;
+            debug!(
+                slug,
+                canonical = %canonical.display(),
+                "restore_item: removed the migrated copy behind the Claude-path symlink"
+            );
+        } else {
+            warn!(
+                slug,
+                link = %original_path.display(),
+                "restore_item: symlink at original_path does not resolve to the canonical \
+                 skills root — unlinking it only"
+            );
+        }
+
+        fs::remove_file(original_path).with_context(|| {
+            format!(
+                "restore_item: failed to remove symlink: {}",
+                original_path.display()
+            )
+        })?;
+    } else if original_path.exists() {
         if original_path.is_dir() {
             fs::remove_dir_all(original_path).with_context(|| {
                 format!(
@@ -520,18 +591,29 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Delete the `managed_path_markers` row keyed by `path`.
+/// Delete the `managed_path_markers` row for `(kind, slug)`.
+///
+/// Keyed on `(kind, slug)` rather than on the manifest's `f2_marker_path`
+/// because that path goes stale: `migrate_skills_to_agents_dir` re-keys skill
+/// rows from `~/.claude/skills/<slug>` to `~/.agents/skills/<slug>` after F1
+/// wrote the manifest, so a `WHERE path = <claude path>` delete matches
+/// nothing and drift keeps governing the orphaned row. `(kind, slug)` is
+/// stable across the pivot and across any future relocation.
+///
+/// Returns the number of rows deleted, so the caller can tell a real cleanup
+/// from a silent no-match.
 ///
 /// Called inside `spawn_blocking` — synchronous SQLite I/O.
-fn delete_db_marker(db_path: &camino::Utf8PathBuf, path: &str) -> Result<()> {
+fn delete_db_marker(db_path: &camino::Utf8PathBuf, kind: &str, slug: &str) -> Result<usize> {
     let conn =
         Connection::open(db_path).context("rollback: failed to open state DB for marker delete")?;
-    conn.execute(
-        "DELETE FROM managed_path_markers WHERE path = ?1",
-        rusqlite::params![path],
-    )
-    .context("rollback: failed to delete managed_path_markers row")?;
-    Ok(())
+    let deleted = conn
+        .execute(
+            "DELETE FROM managed_path_markers WHERE kind = ?1 AND slug = ?2",
+            rusqlite::params![kind, slug],
+        )
+        .context("rollback: failed to delete managed_path_markers row")?;
+    Ok(deleted)
 }
 
 /// Load the access token for `registry_url` from SQLite.
@@ -717,6 +799,131 @@ mod tests {
             original_skill.join("SKILL.md").exists(),
             "SKILL.md should be restored"
         );
+    }
+
+    /// **Regression (rollback is not pivot-aware).**
+    ///
+    /// F1 adopts a user skill in place at `~/.claude/skills/<slug>` and writes
+    /// a manifest whose `original_path` and `f2_marker_path` both point there.
+    /// The next daemon start's `migrate_skills_to_agents_dir` then MOVES that
+    /// directory to `~/.agents/skills/<slug>`, leaves a symlink behind, and
+    /// re-keys the SQLite row to the canonical path.
+    ///
+    /// Rollback — the user-facing undo for adoption — must cope with that:
+    ///
+    /// * `original_path.is_dir()` follows the symlink and reports true, so a
+    ///   naive `remove_dir_all` removes only the link. The adopted copy at
+    ///   `~/.agents/skills/<slug>` survives, marker intact, still surfaced to
+    ///   Cursor / Codex / Gemini.
+    /// * `DELETE ... WHERE path = <claude path>` matches nothing, because the
+    ///   row was re-keyed. The marker row survives and drift keeps governing
+    ///   the orphan.
+    ///
+    /// …and the report says "restored" through both.
+    #[tokio::test]
+    async fn rollback_undoes_an_adoption_that_was_migrated_to_the_agents_dir() {
+        let home = make_home();
+        let ts = "2025-07-19T000000Z";
+        let run_dir = home
+            .path()
+            .join(".claude")
+            .join(".vectorhawk-backup")
+            .join(ts);
+        let slug = "adopted-skill";
+
+        // The user's pre-adoption content, as F1 backed it up.
+        let backup_dir = run_dir.join("skills").join(slug);
+        fs::create_dir_all(&backup_dir).unwrap();
+        fs::write(backup_dir.join("SKILL.md"), b"the user's original").unwrap();
+
+        // Post-Task-5 on-disk state: a symlink at the Claude path pointing at
+        // the real, marked, adopted directory in the canonical root.
+        let claude_path = home.path().join(".claude").join("skills").join(slug);
+        let canonical = home.path().join(".agents").join("skills").join(slug);
+        fs::create_dir_all(&canonical).unwrap();
+        fs::write(canonical.join("SKILL.md"), b"the F2-managed adoption").unwrap();
+        fs::write(canonical.join(".vectorhawk-managed.json"), b"{}").unwrap();
+        fs::create_dir_all(claude_path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&canonical, &claude_path).unwrap();
+        assert!(claude_path.is_symlink() && claude_path.is_dir());
+
+        // The manifest still records the pre-migration Claude path.
+        let item = ManifestItem {
+            kind: "skill".to_string(),
+            slug: slug.to_string(),
+            original_path: claude_path.to_string_lossy().to_string(),
+            backup_path: backup_dir.to_string_lossy().to_string(),
+            f2_marker_path: claude_path.to_string_lossy().to_string(),
+            catalog_skill_id: None,
+            installation_id: None,
+        };
+        append_manifest_item(&run_dir, ts, item).unwrap();
+
+        let db_dir = home.path().join(".vectorhawk");
+        fs::create_dir_all(&db_dir).unwrap();
+        let db_path = camino::Utf8PathBuf::from(db_dir.join("state.db").to_string_lossy().as_ref());
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS auth_tokens (id INTEGER PRIMARY KEY, registry_url TEXT, access_token TEXT, refresh_token TEXT, expires_at INTEGER);
+             CREATE TABLE IF NOT EXISTS sync_state (key TEXT PRIMARY KEY, value TEXT);
+             CREATE TABLE IF NOT EXISTS managed_path_markers (path TEXT PRIMARY KEY, kind TEXT, slug TEXT, installation_id TEXT, source_sha256 TEXT, migrated_at TEXT);",
+        )
+        .unwrap();
+        // The row as `migrate_skills_to_agents_dir` re-keyed it: canonical path.
+        conn.execute(
+            "INSERT INTO managed_path_markers (path, kind, slug, installation_id, source_sha256, migrated_at) \
+             VALUES (?1, 'skill', ?2, NULL, 'abc', '2025-07-01T00:00:00Z')",
+            rusqlite::params![canonical.to_string_lossy(), slug],
+        )
+        .unwrap();
+        drop(conn);
+
+        let root_dir = camino::Utf8PathBuf::from(db_dir.to_string_lossy().as_ref());
+        let state = AppState { root_dir, db_path };
+
+        let report = rollback(&state, "https://app.vectorhawk.ai", home.path(), ts, None)
+            .await
+            .unwrap();
+
+        // The adopted copy must be gone from the canonical root — otherwise it
+        // stays live for every non-Claude client that scans ~/.agents/skills.
+        assert!(
+            !canonical.exists(),
+            "BUG: the adopted copy survived rollback at {}",
+            canonical.display()
+        );
+
+        // The user's original must be back at the Claude path, as a real
+        // directory — not a symlink to something we failed to delete.
+        assert!(!claude_path.is_symlink(), "the stale symlink must be gone");
+        assert_eq!(
+            fs::read(claude_path.join("SKILL.md")).unwrap(),
+            b"the user's original",
+            "the user's pre-adoption content must be restored"
+        );
+
+        // The marker row was re-keyed to canonical, so deleting by the
+        // manifest's stale Claude path would leave it behind for drift.
+        let conn = rusqlite::Connection::open(&state.db_path).unwrap();
+        let remaining: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM managed_path_markers WHERE slug = ?1",
+                rusqlite::params![slug],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            remaining, 0,
+            "BUG: the re-keyed marker row survived rollback — drift will keep governing the orphan"
+        );
+
+        let fatal: Vec<_> = report
+            .errors
+            .iter()
+            .filter(|e| !e.message.contains("no auth token"))
+            .collect();
+        assert!(fatal.is_empty(), "unexpected fatal errors: {fatal:?}");
+        assert_eq!(report.restored, vec![slug], "report must say restored");
     }
 
     #[tokio::test]

@@ -311,27 +311,18 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     let vh_registry = Arc::new(build_stub_registry());
     load_managed_mcp_into_registry(&state, &vh_registry, list_changed_tx.clone());
 
-    // ── Legacy install reclaim (pre-v1.0.51) ──────────────────────────────────
+    // ── Active-skill self-heal ────────────────────────────────────────────────
     //
-    // Before v1.0.51 the core installer also wrote a symlink at
-    // `~/.claude/skills/<slug>` pointing at the runner-managed `active` dir.
-    // v1.0.51 makes the F2 pusher the SOLE writer of that path. On startup
-    // we materialize any surviving legacy symlinks as real F2-managed dirs
-    // (with markers) so the path has a single owner going forward.
+    // The pre-v1.0.51 `reclaim_active_skills` pass that used to run here was
+    // retired with the ~/.agents/skills pivot: the legacy installer symlink it
+    // looked for could only ever exist at the old canonical path, and
+    // `push_missing_active_skills` already covers the surviving job.
     if std::env::var("VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER").is_err() {
         let one_shot_pusher = managed_paths::ManagedPathsPusher::new(&state);
-        match managed_paths::reclaim_active_skills(&state, &one_shot_pusher) {
-            Ok(n) if n > 0 => info!(
-                reclaimed = n,
-                "reclaim: converted legacy installer symlinks to F2-managed dirs"
-            ),
-            Ok(_) => {}
-            Err(e) => warn!(error = %e, "reclaim: legacy symlink reclaim failed (non-fatal)"),
-        }
 
-        // Self-heal: re-push any active installed skill whose ~/.claude/skills
-        // dir is missing (e.g. removed by the v1.0.67 cleanup pass). Installed
-        // skills must always show in Claude Code's skills list.
+        // Self-heal: re-push any active installed skill whose canonical
+        // ~/.agents/skills dir is missing (e.g. removed by the v1.0.67 cleanup
+        // pass). Installed skills must always show in every client's list.
         match managed_paths::push_missing_active_skills(&state, &one_shot_pusher) {
             Ok(n) if n > 0 => info!(
                 healed = n,

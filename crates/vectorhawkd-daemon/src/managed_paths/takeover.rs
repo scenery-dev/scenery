@@ -43,6 +43,15 @@
 //! path already being gone (SSE redelivery, retried adopt) — no backup is
 //! attempted in that case since there is nothing left to lose.
 //!
+//! # Source == destination
+//!
+//! Since the `~/.agents/skills` pivot, VectorHawk's canonical write location
+//! is *also* one of the discoveries scan roots. A discovery found there has a
+//! `source_path` equal to `push_skill`'s destination, and removing it would
+//! destroy the managed copy instead of the thing it replaced. [`perform_if_pending`]
+//! detects that case up front and no-ops, retiring the pending record — see
+//! [`source_is_canonical_dest`].
+//!
 //! # Killswitch
 //!
 //! Honors `VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER` like the rest of the F2
@@ -90,6 +99,30 @@ pub fn perform_if_pending(state: &AppState, slug: &str) -> Result<()> {
         None => return Ok(()),
     };
 
+    // Identity guard — MUST precede the presence check, which is trivially
+    // true when source and destination are the same path.
+    //
+    // Since the pivot, `~/.agents/skills` is both the discoveries scan root
+    // (`discoveries::extra_roots`) and `push_skill`'s destination
+    // (`pusher::resolve_skills_dir`). For a discovery found there,
+    // `source_path` IS the directory the managed copy gets written to, so
+    // "the managed copy landed, remove the original" would delete the skill
+    // that was just installed. Takeover has nothing to take over when source
+    // is destination — retire the record so it cannot fire again on the next
+    // install, and stop.
+    if source_is_canonical_dest(slug, Path::new(&source_path)) {
+        state
+            .clear_pending_adopt_takeover(slug)
+            .context("takeover: failed to clear no-op pending-takeover record")?;
+        info!(
+            slug,
+            source = %source_path,
+            "adopt takeover: source_path is the canonical managed destination — \
+             nothing to remove (adoption completed in place)"
+        );
+        return Ok(());
+    }
+
     if !managed_skill_present(slug).context("takeover: failed to check managed copy presence")? {
         debug!(
             slug,
@@ -112,6 +145,33 @@ pub fn perform_if_pending(state: &AppState, slug: &str) -> Result<()> {
         "adopt takeover: managed copy confirmed present — original discovered path removed"
     );
     Ok(())
+}
+
+/// True iff `source_path` denotes the same location as
+/// `agents_skills_dir()/<slug>` — i.e. removing it would delete the managed
+/// copy rather than the thing it replaced.
+///
+/// Compared literally first, so a *symlink* sitting at the canonical path is
+/// recognised without being followed (`canonicalize` would resolve it to its
+/// target and miss the identity). The canonicalized comparison then covers
+/// the equivalent-but-differently-spelled cases: `/var` vs `/private/var` on
+/// macOS, a symlinked `$HOME`, `..` segments.
+///
+/// Fails **closed**: if the canonical root cannot be resolved, or neither
+/// path can be canonicalized, this returns `false` and the normal
+/// presence-gated path runs — which is the pre-existing behaviour, still
+/// guarded by its own backup-before-delete.
+fn source_is_canonical_dest(slug: &str, source_path: &Path) -> bool {
+    let Some(dest) = super::paths::agents_skills_dir().map(|d| d.join(slug)) else {
+        return false;
+    };
+    if source_path == dest {
+        return true;
+    }
+    match (fs::canonicalize(source_path), fs::canonicalize(&dest)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// Remove `path`, which may be a real directory, a regular file, or (per the

@@ -58,10 +58,14 @@ fn reconciler_disabled() -> bool {
 ///
 /// Runs alongside (not instead of) the existing immediate local-copy push
 /// (`pusher::push_adopted_discovery`) — that call still gives the user an
-/// instant, usable copy under `~/.claude/skills/<slug>/` regardless of how
-/// long the scan/approval gate takes. This function's job is solely to route
-/// the bytes through that gate and, once a real artifact exists, complete the
-/// takeover.
+/// instant, usable copy at the canonical `~/.agents/skills/<slug>/` (linked at
+/// `~/.claude/skills/<slug>` for Claude Code) regardless of how long the
+/// scan/approval gate takes. This function's job is solely to route the bytes
+/// through that gate and, once a real artifact exists, complete the takeover.
+///
+/// Note that when the discovery was itself found in `~/.agents/skills`, the
+/// "copy" is a rewrite in place and there is nothing left to take over — see
+/// `takeover::source_is_canonical_dest`.
 pub async fn handle_discovery_adopted(
     state: Arc<AppState>,
     registry_url: String,

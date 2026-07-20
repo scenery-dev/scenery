@@ -166,9 +166,10 @@ impl AppState {
     }
 
     /// Return `(skill_id, install_root, active_version)` for every active
-    /// install. Used by the F2 reclaim pass on startup to materialise
-    /// `~/.claude/skills/<slug>/` as a real directory for any skill that
-    /// pre-dates the installer's removal from that path.
+    /// install. Used by the F2 self-heal pass on startup
+    /// (`managed_paths::pusher::push_missing_active_skills`) to re-push any
+    /// active skill whose canonical `~/.agents/skills/<slug>/` directory has
+    /// gone missing, which also re-points its `~/.claude/skills/<slug>` link.
     pub fn list_active_installed_skills(&self) -> Result<Vec<(String, String, String)>> {
         let conn = Connection::open(&self.db_path).context("failed to open state DB")?;
         let mut stmt = conn

@@ -338,3 +338,96 @@ fn unlink_dir_is_idempotent_when_absent() {
     unlink_dir(&link_path).unwrap();
     unlink_dir(&link_path).unwrap();
 }
+
+/// **Regression (unlink_dir / link_dir ownership disagreement).**
+///
+/// `link_dir` refuses to replace a real, unmarked directory at the link path
+/// — that is user content. `unlink_dir` is its inverse and must agree: drift
+/// can legitimately classify a user directory at `~/.claude/skills/<slug>` as
+/// `link_replaced`, and a policy-driven `remove_skill` then calls
+/// `unlink_dir` on it. Deleting it there would destroy user-authored content
+/// that `link_dir` had just finished protecting one function over.
+#[test]
+fn unlink_dir_refuses_to_delete_an_unmanaged_real_dir() {
+    let (_tmp, canonical, link_path) = fixture();
+
+    // A user's own skill directory sitting where the Claude link would go —
+    // no `.vectorhawk-managed.json`, so not ours.
+    fs::create_dir_all(&link_path).unwrap();
+    fs::write(link_path.join("SKILL.md"), b"user-authored, never ours").unwrap();
+
+    // `link_dir` already refuses this exact directory — the two must agree.
+    assert!(
+        link_dir(&canonical, &link_path).is_err(),
+        "precondition: link_dir refuses an unmarked real dir here"
+    );
+
+    let result = unlink_dir(&link_path);
+
+    assert!(
+        result.is_err(),
+        "unlink_dir must refuse an unmanaged real directory, not delete it"
+    );
+    assert!(
+        link_path.join("SKILL.md").exists(),
+        "BUG: unlink_dir deleted user-authored content at {}",
+        link_path.display()
+    );
+    assert_eq!(
+        fs::read(link_path.join("SKILL.md")).unwrap(),
+        b"user-authored, never ours",
+        "user content must be byte-for-byte untouched"
+    );
+}
+
+/// The `LinkMode::Copy` steady state: a real directory at the link path that
+/// VectorHawk *did* materialise (it carries the marker). `unlink_dir` may
+/// remove it — but, like every other destructive step on this branch, only
+/// after backing it up, since a marker proves we wrote it, not that its
+/// current content is still reproducible.
+#[test]
+fn unlink_dir_backs_up_a_managed_real_dir_before_removing_it() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let (tmp, _canonical, link_path) = fixture();
+
+    let fake_home = tmp.path().join("home");
+    fs::create_dir_all(&fake_home).unwrap();
+    let prev_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", &fake_home);
+
+    fs::create_dir_all(&link_path).unwrap();
+    fs::write(link_path.join("SKILL.md"), b"a copy-mode materialisation").unwrap();
+    fs::write(link_path.join(".vectorhawk-managed.json"), b"{}").unwrap();
+
+    let result = unlink_dir(&link_path);
+
+    let backup_root = fake_home.join(".claude").join(".vectorhawk-backup");
+    let recovered: Vec<_> = fs::read_dir(&backup_root)
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.path().join("links").join("demo").join("SKILL.md"))
+                .filter(|p| p.exists())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if let Some(v) = prev_home {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+
+    result.unwrap();
+    assert!(!link_path.exists(), "the managed copy must be removed");
+    assert_eq!(
+        recovered.len(),
+        1,
+        "exactly one recoverable backup must have been written under {}",
+        backup_root.display()
+    );
+    assert_eq!(
+        fs::read(&recovered[0]).unwrap(),
+        b"a copy-mode materialisation",
+        "the backup must hold the removed content verbatim"
+    );
+}

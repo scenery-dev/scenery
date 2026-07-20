@@ -103,14 +103,51 @@ fn push_skill_writes_files_and_marker() {
     assert_eq!(m.source_sha256, h1);
 }
 
+/// `remove_skill` must be safe to call on a slug that was never installed,
+/// and safe to call twice on one that was.
+///
+/// This test previously called `delete_db_marker` and never `remove_skill` at
+/// all — so the `unlink_dir` step `remove_skill` gained on this branch (the
+/// one carrying the ownership guard) had no coverage from the only test named
+/// for it. It now drives the real function end to end, under a fake `$HOME`,
+/// and asserts on the filesystem it actually touches.
 #[test]
 fn remove_skill_is_idempotent() {
-    let (pusher, tmp) = make_pusher();
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let (pusher, _tmp) = make_pusher();
 
-    // Call remove on a non-existent slug — must return Ok.
-    // Use a fake path key that doesn't exist in the DB.
-    let absent_key = format!("{}/skills/nonexistent", tmp.path().display());
-    pusher.delete_db_marker(&absent_key).unwrap();
+    let fake_home = tempfile::tempdir().unwrap();
+    let prev_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", fake_home.path());
+
+    let canonical = fake_home.path().join(".agents/skills/demo");
+    let link = fake_home.path().join(".claude/skills/demo");
+
+    // 1. Never installed — must be a clean no-op, not an error.
+    let never_installed = pusher.remove_skill("nonexistent");
+
+    // 2. Install, then remove twice.
+    let pushed = pusher.push_skill("demo", None, b"---\nname: demo\n---\n", &[]);
+    let existed_before = canonical.join("SKILL.md").exists() && link.is_symlink();
+    let first = pusher.remove_skill("demo");
+    let gone_after_first = !canonical.exists() && !link.exists() && !link.is_symlink();
+    let second = pusher.remove_skill("demo");
+
+    if let Some(v) = prev_home {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+
+    never_installed.expect("removing a slug that was never installed must be Ok");
+    pushed.expect("push_skill setup must succeed");
+    assert!(existed_before, "test precondition: the push landed");
+    first.expect("first remove_skill must succeed");
+    assert!(
+        gone_after_first,
+        "remove_skill must drop both the canonical dir and the Claude link"
+    );
+    second.expect("a second remove_skill must be a clean no-op");
 }
 
 // ── MCP push / remove ─────────────────────────────────────────────────────────
@@ -581,94 +618,43 @@ fn push_skill_replaces_real_marked_dir_at_claude_path_with_link() {
     );
 }
 
-// ── reclaim_active_skills (v1.0.51 startup pass) ──────────────────────────────
-
-/// reclaim_active_skills must materialize legacy installer symlinks for every
-/// active row in `installed_skills`, set an F2 marker, and leave non-symlink
-/// paths alone.
+/// **Regression (shared-root symlink clobber).**
 ///
-/// Post-pivot note: `reclaim_active_skills` checks `resolve_skills_dir()`,
-/// which now resolves to the canonical `~/.agents/skills/` root rather than
-/// the old `~/.claude/skills/`. A genuine pre-v1.0.51 legacy symlink could
-/// never actually appear at `~/.agents/skills/<slug>` (that path did not
-/// exist before this pivot), so in practice this pass is now dormant — see
-/// its doc comment. This test still exercises the exact code path
-/// (push_skill's own top-of-function symlink-replacement guard, applied to
-/// whatever `resolve_skills_dir()` yields) by placing the symlink at that
-/// canonical location directly, which is what the unchanged implementation
-/// actually inspects.
+/// `~/.agents/skills` is not VectorHawk's private root. `npx skills`, Cursor
+/// and Codex users all populate it — `discoveries.rs` scans it *because* it is
+/// user-populated — and symlinking a skill in from a checkout elsewhere is a
+/// normal thing for a user to do there. VectorHawk never puts a symlink at
+/// the canonical path itself (it writes a real directory), so a symlink whose
+/// target carries no marker is someone else's.
+///
+/// Pushing a managed skill whose slug collides with such a link must refuse,
+/// not silently unlink it.
 #[test]
-fn reclaim_active_skills_converts_legacy_symlinks_only() {
+fn push_skill_refuses_to_clobber_an_unmanaged_symlink_in_the_shared_root() {
     let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let (pusher, _tmp) = make_pusher();
+
     let fake_home = tempfile::tempdir().unwrap();
+
+    // The user's own skill, checked out elsewhere and linked into the shared
+    // cross-agent root by hand (or by `npx skills`).
+    let user_checkout = fake_home.path().join("dev").join("my-skill");
+    fs::create_dir_all(&user_checkout).unwrap();
+    fs::write(user_checkout.join("SKILL.md"), b"the user's own work").unwrap();
+
+    let agents_skills = fake_home.path().join(".agents").join("skills");
+    fs::create_dir_all(&agents_skills).unwrap();
+    let collision = agents_skills.join("hello-world");
+    std::os::unix::fs::symlink(&user_checkout, &collision).unwrap();
+    assert!(collision.is_symlink(), "test precondition");
+
     let prev_home = std::env::var_os("HOME");
     std::env::set_var("HOME", fake_home.path());
 
-    // Build state with an `installed_skills` table containing two active
-    // skills (one with a legacy symlink, one without) and one deactivated.
-    let tmp = tempfile::tempdir().unwrap();
-    let db_path = camino::Utf8PathBuf::from_path_buf(tmp.path().join("state.db")).unwrap();
-    let conn = Connection::open(&db_path).unwrap();
-    conn.execute_batch(
-        "CREATE TABLE managed_path_markers (
-            path TEXT PRIMARY KEY, kind TEXT NOT NULL, slug TEXT NOT NULL,
-            installation_id TEXT, source_sha256 TEXT NOT NULL, migrated_at TEXT NOT NULL
-        );
-        CREATE TABLE installed_skills (
-            skill_id TEXT PRIMARY KEY, active_version TEXT NOT NULL,
-            install_root TEXT NOT NULL, channel TEXT, current_status TEXT
-        );",
-    )
-    .unwrap();
+    let result = pusher.push_skill("hello-world", Some("inst-1"), b"managed content", &[]);
 
-    // Active skill #1 — legacy symlink present.
-    let install_root_1 = fake_home
-        .path()
-        .join("app-support")
-        .join("skills")
-        .join("alpha");
-    fs::create_dir_all(install_root_1.join("active")).unwrap();
-    fs::write(
-        install_root_1.join("active").join("SKILL.md"),
-        b"alpha body",
-    )
-    .unwrap();
-    let skills_dir = fake_home.path().join(".agents").join("skills");
-    fs::create_dir_all(&skills_dir).unwrap();
-    std::os::unix::fs::symlink(install_root_1.join("active"), skills_dir.join("alpha")).unwrap();
-
-    // Active skill #2 — no symlink. Reclaim must skip it cleanly.
-    let install_root_2 = fake_home
-        .path()
-        .join("app-support")
-        .join("skills")
-        .join("beta");
-    fs::create_dir_all(install_root_2.join("active")).unwrap();
-    fs::write(install_root_2.join("active").join("SKILL.md"), b"beta body").unwrap();
-
-    // Deactivated skill — must be ignored entirely.
-    conn.execute(
-        "INSERT INTO installed_skills(skill_id, active_version, install_root, channel, current_status) VALUES
-            ('alpha','1.0.0',?1,'stable','active'),
-            ('beta','1.0.0',?2,'stable','active'),
-            ('gamma','1.0.0','/tmp/whatever','stable','deactivated')",
-        rusqlite::params![install_root_1.to_string_lossy(), install_root_2.to_string_lossy()],
-    )
-    .unwrap();
-    drop(conn);
-
-    let state = vectorhawkd_core::state::AppState {
-        root_dir: camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap(),
-        db_path,
-    };
-    let pusher = ManagedPathsPusher::new(&state);
-
-    let reclaimed = reclaim_active_skills(&state, &pusher).unwrap();
-
-    let alpha_path = skills_dir.join("alpha");
-    let alpha_is_dir = alpha_path.is_dir() && !alpha_path.is_symlink();
-    let alpha_marker_exists = alpha_path.join(".vectorhawk-managed.json").exists();
-    let beta_exists = skills_dir.join("beta").exists();
+    let still_a_symlink = collision.is_symlink();
+    let target_md = fs::read(user_checkout.join("SKILL.md")).ok();
 
     if let Some(v) = prev_home {
         std::env::set_var("HOME", v);
@@ -676,17 +662,72 @@ fn reclaim_active_skills_converts_legacy_symlinks_only() {
         std::env::remove_var("HOME");
     }
 
-    assert_eq!(
-        reclaimed, 1,
-        "only the symlinked alpha must count as reclaimed"
-    );
-    assert!(alpha_is_dir, "alpha must now be a real directory");
-    assert!(alpha_marker_exists, "alpha must have an F2 marker");
     assert!(
-        !beta_exists,
-        "beta had no symlink — reclaim must not create one"
+        result.is_err(),
+        "push_skill must refuse rather than clobber a foreign symlink"
+    );
+    assert!(
+        still_a_symlink,
+        "BUG: push_skill silently unlinked the user's symlink at {}",
+        collision.display()
+    );
+    assert_eq!(
+        target_md.as_deref(),
+        Some(b"the user's own work".as_ref()),
+        "the user's checkout must be untouched"
     );
 }
+
+/// The counterpart: a symlink at the canonical path that resolves to
+/// VectorHawk-marked content *is* ours to replace, so the push proceeds and
+/// materialises a real managed directory.
+#[test]
+fn push_skill_replaces_a_managed_symlink_in_the_shared_root() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let (pusher, _tmp) = make_pusher();
+
+    let fake_home = tempfile::tempdir().unwrap();
+
+    let managed_target = fake_home.path().join("vh-managed").join("hello-world");
+    fs::create_dir_all(&managed_target).unwrap();
+    fs::write(managed_target.join("SKILL.md"), b"old managed content").unwrap();
+    fs::write(managed_target.join(".vectorhawk-managed.json"), b"{}").unwrap();
+
+    let agents_skills = fake_home.path().join(".agents").join("skills");
+    fs::create_dir_all(&agents_skills).unwrap();
+    let canonical = agents_skills.join("hello-world");
+    std::os::unix::fs::symlink(&managed_target, &canonical).unwrap();
+
+    let prev_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", fake_home.path());
+
+    let result = pusher.push_skill("hello-world", Some("inst-1"), b"fresh managed content", &[]);
+
+    let is_real_dir = canonical.is_dir() && !canonical.is_symlink();
+    let md = fs::read(canonical.join("SKILL.md")).ok();
+
+    if let Some(v) = prev_home {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+
+    result.unwrap();
+    assert!(
+        is_real_dir,
+        "our own symlink must become a real managed dir"
+    );
+    assert_eq!(md.as_deref(), Some(b"fresh managed content".as_ref()));
+}
+
+// NOTE: `reclaim_active_skills_converts_legacy_symlinks_only` was removed with
+// the `reclaim_active_skills` function it named (see the retirement note in
+// pusher.rs). Its fixture planted an *unmarked* symlink at
+// `~/.agents/skills/<slug>` — which, post-pivot, is user content in a shared
+// root that `push_skill` must now refuse to touch, not legacy state to
+// reclaim. The surviving behaviour is covered by
+// `push_missing_active_skills_repushes_only_absent` and by the two
+// shared-root ownership tests above.
 
 // ── push_adopted_discovery (v1.0.54) ──────────────────────────────────────────
 
