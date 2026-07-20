@@ -124,6 +124,11 @@ pub enum SkillCommand {
     ///
     /// SKILL_REF is treated as a local path if the path exists on disk;
     /// otherwise it is sent to the registry as an ID.
+    ///
+    /// Registry installs are device-scoped by default: the skill is installed
+    /// only on the device running this command, matching `skill uninstall`.
+    /// Pass `--all-devices` to fan the install out to every device registered
+    /// to your account (the old default).
     Install {
         /// Local bundle directory path or registry skill ID.
         skill_ref: String,
@@ -136,6 +141,11 @@ pub enum SkillCommand {
         /// Registry base URL (registry installs only).
         #[arg(long, env = "VECTORHAWK_REGISTRY_URL")]
         registry_url: Option<String>,
+
+        /// Install on every device registered to your account instead of
+        /// just this one (registry installs only).
+        #[arg(long, default_value_t = false)]
+        all_devices: bool,
     },
 
     /// Search the skill registry for available skills.
@@ -514,6 +524,10 @@ pub enum PluginCommand {
     /// Requests the install via the portal; the daemon then registers it as a
     /// self-contained Claude Code plugin (it appears in `/plugin list`, bundling
     /// its skills). Requires `vectorhawk auth login`.
+    ///
+    /// Device-scoped by default: installs only on the device running this
+    /// command. Pass `--all-devices` to fan the install out to every device
+    /// registered to your account (the old default).
     Install {
         /// Plugin slug to install (as shown in the catalog).
         slug: String,
@@ -528,6 +542,11 @@ pub enum PluginCommand {
             default_value = "https://app.vectorhawk.ai"
         )]
         registry_url: String,
+
+        /// Install on every device registered to your account instead of
+        /// just this one.
+        #[arg(long, default_value_t = false)]
+        all_devices: bool,
     },
 
     /// Uninstall (remove) a locally installed plugin.
@@ -596,7 +615,8 @@ async fn run(cli: Cli) -> Result<()> {
             skill_ref,
             link,
             registry_url,
-        }) => cmd_skill_install(&skill_ref, link, registry_url.as_deref()).await,
+            all_devices,
+        }) => cmd_skill_install(&skill_ref, link, registry_url.as_deref(), all_devices).await,
         Command::Skill(SkillCommand::Search {
             query,
             registry_url,
@@ -712,7 +732,8 @@ async fn run(cli: Cli) -> Result<()> {
             slug,
             version,
             registry_url,
-        }) => cmd_plugin_install(&slug, version.as_deref(), &registry_url).await,
+            all_devices,
+        }) => cmd_plugin_install(&slug, version.as_deref(), &registry_url, all_devices).await,
         Command::Plugin(PluginCommand::Uninstall { slug, registry_url }) => {
             cmd_plugin_uninstall(&slug, registry_url.as_deref()).await
         }
@@ -1479,7 +1500,12 @@ const REGISTRY_INSTALL_POLL_TIMEOUT_SECS: u64 = 120;
 /// SQLite poll interval while waiting for reconciler confirmation.
 const REGISTRY_INSTALL_POLL_INTERVAL_MS: u64 = 500;
 
-async fn cmd_skill_install(skill_ref: &str, link: bool, registry_url: Option<&str>) -> Result<()> {
+async fn cmd_skill_install(
+    skill_ref: &str,
+    link: bool,
+    registry_url: Option<&str>,
+    all_devices: bool,
+) -> Result<()> {
     use vectorhawkd_core::{
         audit::{write_audit_event_direct, AuditEvent},
         state::AppState,
@@ -1535,12 +1561,22 @@ async fn cmd_skill_install(skill_ref: &str, link: bool, registry_url: Option<&st
         // cli-registry direct, or desired-state's inner direct fallback).
         let url = registry_url.unwrap_or("https://app.vectorhawk.ai");
 
-        // Check if the daemon has an auth token.  If not, fall through to
-        // direct install so the CLI remains usable without the daemon.
-        let has_token = state.get_sync_state("device_id").ok().flatten().is_some();
+        // Check if the daemon has registered this device.  If not, fall through
+        // to direct install so the CLI remains usable without the daemon.
+        // Read this synchronously now — `state` wraps a non-Send rusqlite
+        // Connection, so it must not be touched after an `.await` or from
+        // inside a spawn_blocking closure.
+        let device_id = state.get_sync_state("device_id").ok().flatten();
 
-        if has_token {
-            install_via_desired_state(skill_ref, url, &state).await?;
+        if let Some(device_id) = device_id {
+            // Device-scoped by default; --all-devices omits device_id so the
+            // backend fans the install out to every registered device instead.
+            let scope = if all_devices {
+                None
+            } else {
+                Some(device_id.as_str())
+            };
+            install_via_desired_state(skill_ref, url, &state, scope).await?;
         } else {
             // No daemon registration → direct install path (pre-RUN2 behaviour).
             direct_registry_install(skill_ref, url, state.db_path.clone()).await?;
@@ -1551,10 +1587,15 @@ async fn cmd_skill_install(skill_ref: &str, link: bool, registry_url: Option<&st
 }
 
 /// Call `POST /api/installations` and poll SQLite for the reconciler to confirm.
+///
+/// `device_id`, when set, scopes the install to that one device; `None` omits
+/// the field so the backend fans the install out to every device registered
+/// to the account (the `--all-devices` escape hatch).
 async fn install_via_desired_state(
     skill_id: &str,
     registry_url: &str,
     state: &vectorhawkd_core::state::AppState,
+    device_id: Option<&str>,
 ) -> Result<()> {
     use rusqlite::Connection;
     use rusqlite::OptionalExtension;
@@ -1583,10 +1624,13 @@ async fn install_via_desired_state(
         }
     };
 
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
         "skill_id": skill_id,
         "source": "cli",
     });
+    if let Some(id) = device_id {
+        payload["device_id"] = serde_json::Value::String(id.to_string());
+    }
 
     eprint!("Requesting install of '{skill_id}' from backend");
 
@@ -4243,7 +4287,12 @@ async fn cmd_mcp_serve(server: Option<String>) -> Result<()> {
 
 // ── plugin install ─────────────────────────────────────────────────────────────
 
-async fn cmd_plugin_install(slug: &str, version: Option<&str>, registry_url: &str) -> Result<()> {
+async fn cmd_plugin_install(
+    slug: &str,
+    version: Option<&str>,
+    registry_url: &str,
+    all_devices: bool,
+) -> Result<()> {
     use vectorhawkd_core::{auth::load_tokens, state::AppState};
 
     let state = AppState::bootstrap().context("failed to bootstrap state")?;
@@ -4254,9 +4303,22 @@ async fn cmd_plugin_install(slug: &str, version: Option<&str>, registry_url: &st
             anyhow::anyhow!("Not logged in to {registry_url}. Run `vectorhawk auth login` first.")
         })?;
 
+    // Device-scoped by default, matching `skill install`; --all-devices omits
+    // device_id so the backend fans out to every registered device instead.
+    // Read synchronously — `state` wraps a non-Send rusqlite Connection and
+    // must not be touched after the `.await` below.
+    let device_id = if all_devices {
+        None
+    } else {
+        state.get_sync_state("device_id").ok().flatten()
+    };
+
     let mut body = serde_json::json!({ "plugin_slug": slug });
     if let Some(v) = version {
         body["version"] = serde_json::Value::String(v.to_string());
+    }
+    if let Some(id) = device_id {
+        body["device_id"] = serde_json::Value::String(id);
     }
 
     let resp = reqwest::Client::new()
@@ -4680,8 +4742,11 @@ async fn cmd_mcp_sync() -> Result<()> {
     let update_cache: UpdateCheckCache =
         Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
+    // No reconciler is running in this standalone invocation (there's no
+    // daemon, so no SSE sync subsystem/event channel to feed) — the periodic
+    // snapshot-reconcile step is a daemon-only safety net and is skipped here.
     tokio::task::spawn_blocking(move || {
-        run_sync_tick(&registry, &audit, &db_path, &root_dir, &update_cache)
+        run_sync_tick(&registry, &audit, &db_path, &root_dir, &update_cache, None)
     })
     .await
     .context("sync task panicked")?

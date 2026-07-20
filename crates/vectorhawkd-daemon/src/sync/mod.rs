@@ -43,15 +43,18 @@ pub struct SyncConfig {
 /// Spawn the SSE client and reconciler tasks.
 ///
 /// Returns a [`ReconcilerHandle`] that the daemon's sync loop can use to query
-/// reconciler status (for `doctor` output).  The two spawned tasks run
-/// independently until the process exits or the SSE connection is torn down
-/// via token invalidation.
+/// reconciler status (for `doctor` output), plus a clone of the event channel
+/// sender. The sender lets the periodic sync tick (`run_sync_tick`) feed a
+/// polled `GET /api/sync/snapshot` result into the *same* reconciler that
+/// consumes live SSE events — a safety net for a delta dropped while the SSE
+/// connection stays healthy. The two spawned tasks run independently until the
+/// process exits or the SSE connection is torn down via token invalidation.
 pub fn run(
     config: SyncConfig,
     state: Arc<AppState>,
     list_changed_tx: broadcast::Sender<()>,
     backend_registry: Arc<BackendRegistry>,
-) -> Result<ReconcilerHandle> {
+) -> Result<(ReconcilerHandle, mpsc::Sender<SyncEvent>)> {
     let (event_tx, event_rx) = mpsc::channel::<SyncEvent>(64);
 
     info!(
@@ -63,7 +66,8 @@ pub fn run(
     // Spawn SSE client — feeds events into the channel.
     let sse_config = config.clone();
     let sse_state = Arc::clone(&state);
-    tokio::spawn(sse_client::run(sse_config, sse_state, event_tx));
+    let sse_tx = event_tx.clone();
+    tokio::spawn(sse_client::run(sse_config, sse_state, sse_tx));
 
     // Spawn reconciler — consumes events and converges local state.
     let handle = reconciler::spawn(
@@ -74,5 +78,5 @@ pub fn run(
         config.pusher,
     );
 
-    Ok(handle)
+    Ok((handle, event_tx))
 }

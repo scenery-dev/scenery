@@ -497,6 +497,51 @@ impl RegistryClient {
         Ok(())
     }
 
+    /// Fetch the full desired-state snapshot: `{"installations": [...],
+    /// "mcp_installations": [...]}`, byte-identical to the SSE `snapshot`
+    /// event's payload.
+    ///
+    /// This is the periodic-tick safety net for a dropped SSE delta (see
+    /// `run_sync_tick` in `vectorhawkd-daemon`): the SSE stream only
+    /// re-converges on reconnect, so a single lost event while the
+    /// connection stays healthy would otherwise sit un-reconciled
+    /// indefinitely. Callers deserialize the returned JSON body into a
+    /// `SyncEvent::Snapshot` and feed it through the same reconciler diff
+    /// path the SSE snapshot event uses.
+    ///
+    /// Requires both a Bearer token ([`set_auth`](Self::set_auth)) and a
+    /// device ID ([`set_device_id`](Self::set_device_id)) to be set — the
+    /// backend 400s without `X-Device-ID` and 404s for a device the caller
+    /// doesn't own.
+    pub fn fetch_sync_snapshot(&self) -> Result<String> {
+        let url = format!("{}/api/sync/snapshot", self.base_url.trim_end_matches('/'));
+        debug!(url, "fetching desired-state snapshot (periodic reconcile)");
+
+        let token = self
+            .get_auth_token()
+            .context("no auth token set — cannot fetch sync snapshot")?;
+        let device_id = self
+            .get_device_id()
+            .context("no device_id set — cannot fetch sync snapshot")?;
+
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(token)
+            .header("X-Device-ID", device_id)
+            .send()
+            .with_context(|| format!("failed to reach registry at {url}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().unwrap_or_default();
+            anyhow::bail!("registry returned HTTP {status} for sync snapshot: {body}");
+        }
+
+        resp.text()
+            .context("failed to read sync snapshot response body")
+    }
+
     /// Health check — returns `Ok(true)` if the registry is reachable.
     pub fn health_check(&self) -> Result<bool> {
         let url = format!("{}/health", self.base_url.trim_end_matches('/'));
