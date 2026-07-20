@@ -287,6 +287,159 @@ fn policy_mode_parses_known_strings() {
     );
 }
 
+// ── Link integrity ────────────────────────────────────────────────────────────
+
+/// RAII guard restoring `$HOME` even if the test body panics.
+struct HomeGuard(Option<std::ffi::OsString>);
+
+impl HomeGuard {
+    fn set(path: &std::path::Path) -> Self {
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", path);
+        HomeGuard(prev)
+    }
+}
+
+impl Drop for HomeGuard {
+    fn drop(&mut self) {
+        match self.0.take() {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+}
+
+#[test]
+fn link_integrity_false_when_link_replaced_by_real_dir() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let fake_home = tempfile::tempdir().unwrap();
+    let _home_guard = HomeGuard::set(fake_home.path());
+
+    let canonical = fake_home.path().join(".agents/skills/demo");
+    fs::create_dir_all(&canonical).unwrap();
+    fs::write(canonical.join("SKILL.md"), b"managed").unwrap();
+    // User replaced the link with their own real directory — not
+    // VectorHawk-managed (no marker file), so it can never read as intact.
+    let link = fake_home.path().join(".claude/skills/demo");
+    fs::create_dir_all(&link).unwrap();
+    fs::write(link.join("SKILL.md"), b"tampered").unwrap();
+
+    let result = super::check_link_integrity("demo");
+
+    assert!(!result.unwrap());
+}
+
+#[test]
+fn link_integrity_true_when_link_intact() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let fake_home = tempfile::tempdir().unwrap();
+    let _home_guard = HomeGuard::set(fake_home.path());
+
+    let canonical = fake_home.path().join(".agents/skills/demo");
+    fs::create_dir_all(&canonical).unwrap();
+    fs::write(canonical.join("SKILL.md"), b"managed").unwrap();
+    let link = fake_home.path().join(".claude/skills/demo");
+    fs::create_dir_all(link.parent().unwrap()).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&canonical, &link).unwrap();
+
+    let result = super::check_link_integrity("demo");
+
+    assert!(result.unwrap());
+}
+
+#[test]
+fn link_integrity_true_when_link_absent() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let fake_home = tempfile::tempdir().unwrap();
+    let _home_guard = HomeGuard::set(fake_home.path());
+
+    let canonical = fake_home.path().join(".agents/skills/demo");
+    fs::create_dir_all(&canonical).unwrap();
+    fs::write(canonical.join("SKILL.md"), b"managed").unwrap();
+    // No `.claude/skills/demo` at all — a surfacing failure the pusher heals
+    // on the next reconcile, not tampering.
+
+    let result = super::check_link_integrity("demo");
+
+    assert!(result.unwrap());
+}
+
+/// State 3: a real directory at the Claude path that is VectorHawk-managed
+/// and byte-identical to canonical — the legitimate `LinkMode::Copy` steady
+/// state (e.g. Windows without Developer Mode). `links::link_is_intact`
+/// alone returns `false` here because it checks `is_symlink()` first; a
+/// naive port of the brief's implementation would report `link_replaced`
+/// drift every cycle on a perfectly healthy install. This must read as
+/// intact.
+#[test]
+fn link_integrity_true_when_healthy_managed_copy() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let fake_home = tempfile::tempdir().unwrap();
+    let _home_guard = HomeGuard::set(fake_home.path());
+
+    // The pusher writes the `.vectorhawk-managed.json` marker into the
+    // *canonical* directory, and `copy_tree` necessarily carries it along
+    // into the copy — so a real steady-state pair has the marker on both
+    // sides, not just the copy.
+    let canonical = fake_home.path().join(".agents/skills/demo");
+    fs::create_dir_all(&canonical).unwrap();
+    fs::write(canonical.join("SKILL.md"), b"managed").unwrap();
+    fs::write(
+        canonical.join(vectorhawkd_mcp::ownership::MANAGED_MARKER_FILENAME),
+        br#"{"marker_version":1,"installation_id":null,"source_sha256":"abc","migrated_at":"2026-01-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+
+    // A real directory (not a symlink) at the Claude path, carrying the
+    // VectorHawk marker and identical content — as `link_dir` leaves behind
+    // on a copy-mode host.
+    let link = fake_home.path().join(".claude/skills/demo");
+    fs::create_dir_all(&link).unwrap();
+    fs::write(link.join("SKILL.md"), b"managed").unwrap();
+    fs::write(
+        link.join(vectorhawkd_mcp::ownership::MANAGED_MARKER_FILENAME),
+        br#"{"marker_version":1,"installation_id":null,"source_sha256":"abc","migrated_at":"2026-01-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+
+    assert!(!link.is_symlink());
+    let result = super::check_link_integrity("demo");
+
+    assert!(result.unwrap());
+}
+
+/// Same real-directory-with-marker shape as the healthy-copy case, but the
+/// content has diverged from canonical — must NOT read as intact.
+#[test]
+fn link_integrity_false_when_managed_copy_diverged() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let fake_home = tempfile::tempdir().unwrap();
+    let _home_guard = HomeGuard::set(fake_home.path());
+
+    let canonical = fake_home.path().join(".agents/skills/demo");
+    fs::create_dir_all(&canonical).unwrap();
+    fs::write(canonical.join("SKILL.md"), b"managed").unwrap();
+    fs::write(
+        canonical.join(vectorhawkd_mcp::ownership::MANAGED_MARKER_FILENAME),
+        br#"{"marker_version":1,"installation_id":null,"source_sha256":"abc","migrated_at":"2026-01-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+
+    let link = fake_home.path().join(".claude/skills/demo");
+    fs::create_dir_all(&link).unwrap();
+    fs::write(link.join("SKILL.md"), b"diverged").unwrap();
+    fs::write(
+        link.join(vectorhawkd_mcp::ownership::MANAGED_MARKER_FILENAME),
+        br#"{"marker_version":1,"installation_id":null,"source_sha256":"abc","migrated_at":"2026-01-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+
+    let result = super::check_link_integrity("demo");
+
+    assert!(!result.unwrap());
+}
+
 #[test]
 fn list_markers_returns_all_rows() {
     let (_td, conn) = fresh_conn();
