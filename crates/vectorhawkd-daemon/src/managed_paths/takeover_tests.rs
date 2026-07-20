@@ -8,14 +8,8 @@ use std::fs;
 use tempfile::TempDir;
 
 use super::*;
+use crate::managed_paths::ENV_MUTEX;
 use vectorhawkd_core::state::AppState;
-
-/// Serializes tests in this file that mutate the process-wide `HOME` env var.
-/// Does not coordinate with other test files that also mutate `HOME` — this
-/// mirrors the pre-existing (documented) raciness in `pusher_tests.rs` and
-/// `publish.rs`'s own test module. Run with `--test-threads=1` if flakes
-/// appear from concurrent HOME mutation across files.
-static HOME_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Bootstrap a real `AppState` (full schema, including
 /// `adopt_pending_takeovers`) backed by a temp directory.
@@ -40,7 +34,7 @@ struct HomeGuard {
 
 impl HomeGuard {
     fn set(path: &Path) -> Self {
-        let lock = HOME_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var_os("HOME");
         std::env::set_var("HOME", path);
         Self { prev, _lock: lock }

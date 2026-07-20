@@ -6,6 +6,7 @@
 
 use super::*;
 use crate::managed_paths::marker::{insert_db_marker, ManagedPathMarker};
+use crate::managed_paths::ENV_MUTEX;
 use rusqlite::Connection;
 use std::fs;
 use tempfile::TempDir;
@@ -172,6 +173,7 @@ fn split_mcp_path_recovers_components() {
 
 #[test]
 fn quarantine_skill_moves_dir_aside() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     // Test in a fake $HOME so the real ~/.claude isn't touched.
     let td = TempDir::new().unwrap();
     let fake_home = td.path().join("home");
@@ -210,6 +212,7 @@ fn quarantine_skill_moves_dir_aside() {
 
 #[test]
 fn quarantine_mcp_writes_entry_snapshot_and_removes() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let td = TempDir::new().unwrap();
     let fake_home = td.path().join("home");
     fs::create_dir_all(fake_home.join(".claude")).unwrap();

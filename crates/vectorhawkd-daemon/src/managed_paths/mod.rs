@@ -39,6 +39,15 @@ pub mod rollback;
 pub mod scanner;
 pub mod takeover;
 
+/// Serializes every test that mutates process-global state (`$HOME`,
+/// `VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER`).
+///
+/// This MUST be a single shared static. A `static` is per-module, so a
+/// per-file `ENV_MUTEX` in each test file yields independent locks and no
+/// cross-file serialization — which is the bug this replaces.
+#[cfg(test)]
+pub(crate) static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 use anyhow::Result;
 use std::{path::PathBuf, sync::Arc};
 use tracing::{info, warn};

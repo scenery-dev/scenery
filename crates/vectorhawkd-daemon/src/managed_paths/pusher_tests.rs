@@ -9,16 +9,10 @@ use tempfile::TempDir;
 
 use super::*;
 use crate::managed_paths::marker::MARKER_FILE_VERSION;
+use crate::managed_paths::ENV_MUTEX;
 use rusqlite::Connection;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
-/// Serializes every test in this file that mutates process-global state
-/// (`$HOME`, `VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER`) — `push_skill` /
-/// `push_mcp` / `push_plugin` resolve their destination via `$HOME`, so two
-/// such tests running on different threads at once corrupt each other's
-/// view. Paying down the TODO left on `push_adopted_discovery`'s tests.
-static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Build a minimal `ManagedPathsPusher` backed by a temp dir.
 fn make_pusher() -> (ManagedPathsPusher, TempDir) {
