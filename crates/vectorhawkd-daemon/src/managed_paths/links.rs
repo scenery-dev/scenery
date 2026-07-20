@@ -29,6 +29,7 @@
 use anyhow::{bail, Context, Result};
 use std::fs;
 use std::path::Path;
+use vectorhawkd_mcp::ownership;
 
 /// How a link target was materialised.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,8 +44,12 @@ pub enum LinkMode {
 /// Point `link_path` at `canonical`.
 ///
 /// Idempotent: an existing correct link is left alone; an existing link
-/// pointing elsewhere is replaced. Refuses to touch a real directory that is
-/// not ours — that is user content.
+/// pointing elsewhere is replaced. A real directory left behind by a prior
+/// `LinkMode::Copy` fallback (identified by the `.vectorhawk-managed.json`
+/// marker the pusher writes into the canonical directory, which `copy_tree`
+/// necessarily carries along) is also replaced, so repeated calls stay
+/// idempotent even on platforms where symlinks are unavailable. Refuses to
+/// touch a real directory that is not ours — that is user content.
 pub fn link_dir(canonical: &Path, link_path: &Path) -> Result<LinkMode> {
     if !canonical.is_dir() {
         bail!(
@@ -64,11 +69,22 @@ pub fn link_dir(canonical: &Path, link_path: &Path) -> Result<LinkMode> {
             )
         })?;
     } else if link_path.exists() {
-        bail!(
-            "links: refusing to replace a real directory at {} — \
-             not VectorHawk-managed",
-            link_path.display()
-        );
+        if !ownership::is_vectorhawk_managed(link_path) {
+            bail!(
+                "links: refusing to replace a real directory at {} — \
+                 not VectorHawk-managed",
+                link_path.display()
+            );
+        }
+        // A real directory we materialised ourselves via a prior
+        // `LinkMode::Copy` fallback. Remove it and re-materialise below so
+        // the call stays idempotent and heals into a symlink if possible.
+        fs::remove_dir_all(link_path).with_context(|| {
+            format!(
+                "links: failed to remove stale copy: {}",
+                link_path.display()
+            )
+        })?;
     }
 
     if let Some(parent) = link_path.parent() {

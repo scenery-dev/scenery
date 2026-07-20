@@ -59,6 +59,10 @@ fn link_dir_replaces_a_stale_link_pointing_elsewhere() {
 
 #[test]
 fn link_dir_refuses_to_clobber_a_real_directory() {
+    // This also covers the "real directory without our marker" case for
+    // idempotency: it proves the reject path leaves user content byte-for-
+    // byte untouched, so a marker-less directory is never mistaken for our
+    // own prior Copy-mode materialisation.
     let (_tmp, canonical, link_path) = fixture();
     fs::create_dir_all(&link_path).unwrap();
     fs::write(link_path.join("SKILL.md"), b"user content").unwrap();
@@ -70,6 +74,33 @@ fn link_dir_refuses_to_clobber_a_real_directory() {
     assert_eq!(
         fs::read(link_path.join("SKILL.md")).unwrap(),
         b"user content"
+    );
+}
+
+#[test]
+fn link_dir_replaces_its_own_prior_copy_materialisation() {
+    // Simulates the Windows-without-Developer-Mode fallback: `link_path` is
+    // a real directory (not a symlink) carrying the
+    // `.vectorhawk-managed.json` marker that `copy_tree` would have copied
+    // in from the canonical directory. `link_dir` must recognise this as
+    // its own prior work and replace it rather than bailing out.
+    let (_tmp, canonical, link_path) = fixture();
+    fs::create_dir_all(&link_path).unwrap();
+    fs::write(link_path.join("SKILL.md"), b"stale copy").unwrap();
+    fs::write(
+        link_path.join(".vectorhawk-managed.json"),
+        br#"{"marker_version":1,"installation_id":null,"source_sha256":"abc","migrated_at":"2026-01-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+
+    let mode = link_dir(&canonical, &link_path).unwrap();
+
+    assert_eq!(mode, LinkMode::Symlink);
+    assert!(link_is_intact(&canonical, &link_path).unwrap());
+    // Content now reflects the canonical directory, not the stale copy.
+    assert_eq!(
+        fs::read(link_path.join("SKILL.md")).unwrap(),
+        b"---\nname: demo\n---\n"
     );
 }
 
