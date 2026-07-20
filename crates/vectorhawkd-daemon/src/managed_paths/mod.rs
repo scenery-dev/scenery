@@ -29,6 +29,7 @@
 pub mod adopt_publish;
 pub mod discoveries;
 pub mod drift;
+pub mod links;
 pub mod marker;
 pub mod migrator;
 pub mod paths;
@@ -270,3 +271,7 @@ impl ManagedPathsReconciler {
 #[cfg(test)]
 #[path = "mod_tests.rs"]
 mod mod_tests;
+
+#[cfg(test)]
+#[path = "links_tests.rs"]
+mod links_tests;
