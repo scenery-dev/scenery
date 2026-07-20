@@ -263,3 +263,12 @@ fn ensure_not_native_allows_ordinary_paths() {
     assert!(ensure_not_native(dir.path()).is_ok());
     assert!(ensure_not_native(&dir.path().join("skills").join("my-skill")).is_ok());
 }
+
+// ── ~/.agents path helpers ───────────────────────────────────────────────────────
+
+#[test]
+fn agents_skills_dir_is_home_dot_agents_skills() {
+    let dir = agents_skills_dir().expect("home dir should resolve");
+    assert!(dir.ends_with("skills"));
+    assert!(dir.parent().unwrap().ends_with(".agents"));
+}
