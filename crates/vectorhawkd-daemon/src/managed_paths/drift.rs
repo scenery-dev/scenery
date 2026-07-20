@@ -188,7 +188,7 @@ impl DriftScanner {
                     // from content drift, and invisible to hashing because the
                     // canonical file never changed.
                     if outcome.kind == "skill" {
-                        match check_link_integrity(&outcome.slug) {
+                        match check_link_integrity(&outcome.slug, &outcome.expected_hash) {
                             Ok(true) => {}
                             Ok(false) => {
                                 stats.drifted += 1;
@@ -595,24 +595,40 @@ fn remove_path_for(marker: &ManagedPathMarker) -> Result<()> {
 /// result says nothing about what Claude Code is actually reading from
 /// `~/.claude/skills/<slug>`. This is the complementary check.
 ///
+/// `expected_hash` is canonical's already-known `SKILL.md` hash — the caller
+/// only reaches this function from the `DriftStatus::Clean` arm of
+/// `run_cycle`, where `outcome.expected_hash` (computed by `current_hash_for`)
+/// is guaranteed to be canonical's current hash. Passing it in avoids
+/// rehashing canonical here.
+///
 /// Three states at the Claude path are all "intact":
 /// 1. A symlink resolving to canonical.
 /// 2. Absent — a surfacing failure the pusher heals on the next reconcile,
 ///    not tampering.
 /// 3. A **real directory** that is VectorHawk-managed (carries the
-///    `.vectorhawk-managed.json` marker) and byte-identical to canonical —
-///    the legitimate `LinkMode::Copy` steady state on hosts where a symlink
-///    could not be created (Windows without Developer Mode). `link_dir`
-///    deliberately leaves this alone rather than converting it on every run
-///    (see `links::link_dir`), so drift must recognise it as healthy too, or
-///    every cycle would report false `link_replaced` drift on a perfectly
-///    good install.
+///    `.vectorhawk-managed.json` marker) whose `SKILL.md` hash matches
+///    `expected_hash` — the legitimate `LinkMode::Copy` steady state on
+///    hosts where a symlink could not be created (Windows without Developer
+///    Mode). `link_dir` deliberately leaves this alone rather than
+///    converting it on every run (see `links::link_dir`), so drift must
+///    recognise it as healthy too, or every cycle would report false
+///    `link_replaced` drift on a perfectly good install.
 ///
-/// Only a real directory that is *not* ours, or one that is ours but has
-/// diverged from canonical, returns `false` — that is the actual tamper
-/// signal: something outside VectorHawk is serving content to Claude Code
-/// under a managed slug.
-pub fn check_link_integrity(slug: &str) -> Result<bool> {
+///    This runs on every clean skill every scan cycle (300s by default), so
+///    it deliberately hashes only `SKILL.md` rather than doing a full
+///    recursive tree compare (`links::dirs_identical`) — the latter is
+///    O(entire tree) on both sides and cannot early-exit when the trees are
+///    identical, which is the permanent steady state on a copy-mode host.
+///    This matches the granularity `current_hash_for` already uses
+///    everywhere else in drift detection: it too hashes only `SKILL.md`, so
+///    a copy that diverges *only* in some other file (e.g. a bundled
+///    reference doc) reads as intact here, same as it would for canonical.
+///
+/// Only a real directory that is *not* ours, or one that is ours but has a
+/// diverged `SKILL.md`, returns `false` — that is the actual tamper signal:
+/// something outside VectorHawk is serving content to Claude Code under a
+/// managed slug.
+pub fn check_link_integrity(slug: &str, expected_hash: &str) -> Result<bool> {
     let (Some(canonical_root), Some(link_root)) = (
         super::paths::agents_skills_dir(),
         super::paths::claude_skills_link_dir(),
@@ -631,11 +647,17 @@ pub fn check_link_integrity(slug: &str) -> Result<bool> {
         return Ok(true);
     }
 
-    // A real directory sits where Claude Code expects a link. Reuse the
-    // bounded identity comparison `link_dir` itself uses so a healthy copy
-    // (state 3 above) isn't mistaken for tampering.
-    if ownership::is_vectorhawk_managed(&link) && super::links::dirs_identical(&canonical, &link) {
-        return Ok(true);
+    // A real directory sits where Claude Code expects a link. Match
+    // `current_hash_for`'s single-file granularity: hash the copy's
+    // SKILL.md and compare against canonical's already-known hash, instead
+    // of a full recursive tree compare.
+    if ownership::is_vectorhawk_managed(&link) {
+        let skill_md = link.join("SKILL.md");
+        if let Ok(bytes) = fs::read(&skill_md) {
+            if hex_sha256(&bytes) == expected_hash {
+                return Ok(true);
+            }
+        }
     }
 
     Ok(false)

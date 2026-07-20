@@ -324,7 +324,7 @@ fn link_integrity_false_when_link_replaced_by_real_dir() {
     fs::create_dir_all(&link).unwrap();
     fs::write(link.join("SKILL.md"), b"tampered").unwrap();
 
-    let result = super::check_link_integrity("demo");
+    let result = super::check_link_integrity("demo", &hex_sha256(b"managed"));
 
     assert!(!result.unwrap());
 }
@@ -343,7 +343,7 @@ fn link_integrity_true_when_link_intact() {
     #[cfg(unix)]
     std::os::unix::fs::symlink(&canonical, &link).unwrap();
 
-    let result = super::check_link_integrity("demo");
+    let result = super::check_link_integrity("demo", &hex_sha256(b"managed"));
 
     assert!(result.unwrap());
 }
@@ -360,7 +360,7 @@ fn link_integrity_true_when_link_absent() {
     // No `.claude/skills/demo` at all — a surfacing failure the pusher heals
     // on the next reconcile, not tampering.
 
-    let result = super::check_link_integrity("demo");
+    let result = super::check_link_integrity("demo", &hex_sha256(b"managed"));
 
     assert!(result.unwrap());
 }
@@ -404,13 +404,13 @@ fn link_integrity_true_when_healthy_managed_copy() {
     .unwrap();
 
     assert!(!link.is_symlink());
-    let result = super::check_link_integrity("demo");
+    let result = super::check_link_integrity("demo", &hex_sha256(b"managed"));
 
     assert!(result.unwrap());
 }
 
-/// Same real-directory-with-marker shape as the healthy-copy case, but the
-/// content has diverged from canonical — must NOT read as intact.
+/// Same real-directory-with-marker shape as the healthy-copy case, but
+/// `SKILL.md` itself has diverged from canonical — must NOT read as intact.
 #[test]
 fn link_integrity_false_when_managed_copy_diverged() {
     let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
@@ -435,9 +435,52 @@ fn link_integrity_false_when_managed_copy_diverged() {
     )
     .unwrap();
 
-    let result = super::check_link_integrity("demo");
+    let result = super::check_link_integrity("demo", &hex_sha256(b"managed"));
 
     assert!(!result.unwrap());
+}
+
+/// Documents a deliberate blind spot introduced by matching
+/// `current_hash_for`'s single-file granularity: `check_link_integrity` only
+/// hashes `SKILL.md`, so a managed copy that diverges *solely* in some other
+/// bundled file (e.g. a reference doc or script) is NOT detected as drift —
+/// it reads as intact, same as canonical's own drift classification would.
+/// This is intentional for consistency with the rest of drift detection, not
+/// an oversight; this test exists so the limitation stays visible rather
+/// than being silently reintroduced or "fixed" without discussion.
+#[test]
+fn link_integrity_true_when_managed_copy_diverges_only_in_reference_file() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let fake_home = tempfile::tempdir().unwrap();
+    let _home_guard = HomeGuard::set(fake_home.path());
+
+    let canonical = fake_home.path().join(".agents/skills/demo");
+    fs::create_dir_all(&canonical).unwrap();
+    fs::write(canonical.join("SKILL.md"), b"managed").unwrap();
+    fs::write(canonical.join("reference.md"), b"original reference").unwrap();
+    fs::write(
+        canonical.join(vectorhawkd_mcp::ownership::MANAGED_MARKER_FILENAME),
+        br#"{"marker_version":1,"installation_id":null,"source_sha256":"abc","migrated_at":"2026-01-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+
+    let link = fake_home.path().join(".claude/skills/demo");
+    fs::create_dir_all(&link).unwrap();
+    // SKILL.md matches canonical byte-for-byte...
+    fs::write(link.join("SKILL.md"), b"managed").unwrap();
+    // ...but the bundled reference file has silently diverged.
+    fs::write(link.join("reference.md"), b"tampered reference").unwrap();
+    fs::write(
+        link.join(vectorhawkd_mcp::ownership::MANAGED_MARKER_FILENAME),
+        br#"{"marker_version":1,"installation_id":null,"source_sha256":"abc","migrated_at":"2026-01-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+
+    let result = super::check_link_integrity("demo", &hex_sha256(b"managed"));
+
+    // Blind spot, not a bug: SKILL.md-only hashing cannot see this, exactly
+    // like `current_hash_for` cannot see it for canonical either.
+    assert!(result.unwrap());
 }
 
 #[test]
