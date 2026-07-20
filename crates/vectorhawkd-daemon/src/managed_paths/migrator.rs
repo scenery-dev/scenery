@@ -19,7 +19,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use vectorhawkd_core::{
     auth::load_all_tokens,
     restore_journal::{JournalEntry, JournalOp, JournalSource, RestoreJournal},
@@ -537,6 +537,90 @@ fn buffer_audit_event(
     )
     .context("managed_paths: failed to insert audit event")?;
     Ok(())
+}
+
+// ── ~/.claude/skills → ~/.agents/skills one-shot migration ────────────────────
+
+/// One-shot migration: move VectorHawk-managed skills from
+/// `~/.claude/skills/<slug>/` to `~/.agents/skills/<slug>/` and leave a
+/// symlink behind for Claude Code.
+///
+/// Only directories carrying a `.vectorhawk-managed.json` marker are touched —
+/// user-authored skills in the same directory are left exactly as they are.
+/// Idempotent: already-migrated skills (the Claude path is a symlink) are
+/// skipped, so this is safe to run on every daemon start.
+pub fn migrate_skills_to_agents_dir(conn: &Connection) -> Result<usize> {
+    if super::pusher::reconciler_disabled() {
+        return Ok(0);
+    }
+
+    let Some(claude_skills) = super::paths::claude_skills_link_dir() else {
+        return Ok(0);
+    };
+    let Some(canonical_root) = super::paths::agents_skills_dir() else {
+        return Ok(0);
+    };
+    if !claude_skills.is_dir() {
+        return Ok(0);
+    }
+
+    let mut migrated = 0usize;
+
+    for entry in std::fs::read_dir(&claude_skills)
+        .with_context(|| format!("migrator: failed to read {}", claude_skills.display()))?
+    {
+        let entry = entry.context("migrator: failed to read dir entry")?;
+        let old_path = entry.path();
+
+        // Already migrated, or someone else's link — leave it.
+        if old_path.is_symlink() || !old_path.is_dir() {
+            continue;
+        }
+        // Not ours — user-authored skill.
+        if !vectorhawkd_mcp::ownership::is_vectorhawk_managed(&old_path) {
+            continue;
+        }
+
+        let Some(slug) = old_path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let new_path = canonical_root.join(slug);
+
+        if new_path.exists() {
+            warn!(
+                slug,
+                "migrator: canonical dir already exists — skipping move, relinking only"
+            );
+        } else {
+            std::fs::create_dir_all(&canonical_root).with_context(|| {
+                format!("migrator: failed to create {}", canonical_root.display())
+            })?;
+            std::fs::rename(&old_path, &new_path).with_context(|| {
+                format!(
+                    "migrator: failed to move {} -> {}",
+                    old_path.display(),
+                    new_path.display()
+                )
+            })?;
+        }
+
+        super::links::link_dir(&new_path, &old_path)
+            .with_context(|| format!("migrator: failed to link {}", old_path.display()))?;
+
+        conn.execute(
+            "UPDATE managed_path_markers SET path = ?1 WHERE path = ?2 AND kind = 'skill'",
+            rusqlite::params![
+                new_path.to_string_lossy().to_string(),
+                old_path.to_string_lossy().to_string()
+            ],
+        )
+        .context("migrator: failed to repoint managed_path_markers")?;
+
+        migrated += 1;
+        info!(slug, dest = %new_path.display(), "migrator: skill migrated to ~/.agents/skills/");
+    }
+
+    Ok(migrated)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

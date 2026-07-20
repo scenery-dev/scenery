@@ -355,6 +355,26 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
         }
     }
 
+    // ── Task 5: ~/.claude/skills → ~/.agents/skills one-shot migration ───────
+    //
+    // Every existing user has real managed skill directories at
+    // ~/.claude/skills/<slug>/ with SQLite rows keyed on those old paths (the
+    // pre-pivot layout). Run this before F1's migrate_existing() below so F1
+    // always scans an already-normalized ~/.claude/skills/ (real managed dirs
+    // converted to symlinks) rather than a transitional mix of the two
+    // layouts. Idempotent and gated by the same env var; failure is
+    // non-fatal — log and continue, never block daemon start.
+    if std::env::var("VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER").is_err() {
+        match rusqlite::Connection::open(&state.db_path) {
+            Ok(conn) => match managed_paths::migrator::migrate_skills_to_agents_dir(&conn) {
+                Ok(0) => {}
+                Ok(n) => info!(count = n, "migrated skills to ~/.agents/skills/"),
+                Err(e) => warn!(error = %e, "skill migration to ~/.agents/skills/ failed"),
+            },
+            Err(e) => warn!(error = %e, "skill migration: failed to open state DB (non-fatal)"),
+        }
+    }
+
     // ── F1: Managed-paths first-run migration ─────────────────────────────────
     //
     // Scans ~/.claude/skills/, ~/.claude/plugins/, and ~/.claude.json; migrates

@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used)]
 
 use super::*;
+use crate::managed_paths::ENV_MUTEX;
 use std::fs;
 use vectorhawkd_core::state::AppState;
 
@@ -346,6 +347,103 @@ fn buffer_audit_event_writes_row() {
 }
 
 // ── copy_dir_recursive ────────────────────────────────────────────────────────
+
+// ── ~/.claude/skills → ~/.agents/skills migration ───────────────────────────
+
+#[test]
+fn migrates_managed_skill_from_claude_to_agents_and_relinks() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let fake_home = tempfile::tempdir().unwrap();
+    let prev_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", fake_home.path());
+
+    // A pre-pivot managed skill: real dir under .claude/skills with a marker.
+    let old = fake_home.path().join(".claude/skills/demo");
+    std::fs::create_dir_all(&old).unwrap();
+    std::fs::write(old.join("SKILL.md"), b"---\nname: demo\n---\n").unwrap();
+    std::fs::write(old.join(".vectorhawk-managed.json"), br#"{"marker_version":1,"installation_id":null,"source_sha256":"abc","migrated_at":"2026-01-01T00:00:00Z"}"#).unwrap();
+
+    // An unmanaged, user-authored skill that must be left completely alone.
+    let user_skill = fake_home.path().join(".claude/skills/mine");
+    std::fs::create_dir_all(&user_skill).unwrap();
+    std::fs::write(user_skill.join("SKILL.md"), b"user content").unwrap();
+
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE managed_path_markers (
+            path TEXT NOT NULL, kind TEXT NOT NULL, slug TEXT NOT NULL,
+            installation_id TEXT, source_sha256 TEXT NOT NULL,
+            migrated_at TEXT NOT NULL, PRIMARY KEY (path))",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO managed_path_markers VALUES (?1,'skill','demo',NULL,'abc','2026-01-01T00:00:00Z')",
+        [old.to_string_lossy().to_string()],
+    )
+    .unwrap();
+
+    let result = super::migrate_skills_to_agents_dir(&conn);
+
+    let canonical = fake_home.path().join(".agents/skills/demo");
+    let new_key: String = conn
+        .query_row(
+            "SELECT path FROM managed_path_markers WHERE slug='demo'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+
+    if let Some(v) = prev_home {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+
+    assert_eq!(result.unwrap(), 1);
+    // Content moved to canonical.
+    assert!(canonical.join("SKILL.md").exists());
+    assert!(!canonical.is_symlink());
+    // Claude path is now a link.
+    assert!(old.is_symlink());
+    assert!(old.join("SKILL.md").exists());
+    // SQLite now keys on the canonical path.
+    assert_eq!(new_key, canonical.to_string_lossy().to_string());
+    // The user's own skill is untouched and still a real directory.
+    assert!(!user_skill.is_symlink());
+    assert_eq!(
+        std::fs::read(user_skill.join("SKILL.md")).unwrap(),
+        b"user content"
+    );
+}
+
+#[test]
+fn migration_is_idempotent() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let fake_home = tempfile::tempdir().unwrap();
+    let prev_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", fake_home.path());
+
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE managed_path_markers (
+            path TEXT NOT NULL, kind TEXT NOT NULL, slug TEXT NOT NULL,
+            installation_id TEXT, source_sha256 TEXT NOT NULL,
+            migrated_at TEXT NOT NULL, PRIMARY KEY (path))",
+    )
+    .unwrap();
+
+    let first = super::migrate_skills_to_agents_dir(&conn);
+    let second = super::migrate_skills_to_agents_dir(&conn);
+
+    if let Some(v) = prev_home {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+
+    assert_eq!(first.unwrap(), 0);
+    assert_eq!(second.unwrap(), 0);
+}
 
 #[test]
 fn copy_dir_recursive_copies_nested_files() {
