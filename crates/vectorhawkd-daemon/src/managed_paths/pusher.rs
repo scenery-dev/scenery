@@ -1,11 +1,11 @@
-//! F2 managed-paths pusher — writes VectorHawk-managed items into Claude Code's
+//! F2 managed-paths pusher — writes VectorHawk-managed items into clients'
 //! native directories on install and removes them on deactivate.
 //!
 //! # What it writes
 //!
 //! | Item   | Destination                                           |
 //! |--------|-------------------------------------------------------|
-//! | Skill  | `~/.claude/skills/<slug>/` + `.vectorhawk-managed.json` marker |
+//! | Skill  | `~/.agents/skills/<slug>/` + `.vectorhawk-managed.json` marker, linked at `~/.claude/skills/<slug>` for Claude Code |
 //! | MCP    | Entry in `~/.claude.json` `mcpServers` block           |
 //! | Plugin | `~/.claude/plugins/<slug>/.claude-plugin/plugin.json`  |
 //!
@@ -41,7 +41,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use vectorhawkd_core::restore_journal::{JournalEntry, JournalOp, JournalSource, RestoreJournal};
 use vectorhawkd_core::state::AppState;
 use vectorhawkd_mcp::ownership;
@@ -93,7 +93,9 @@ impl ManagedPathsPusher {
 
     // ── Skill ─────────────────────────────────────────────────────────────────
 
-    /// Write a skill into `~/.claude/skills/<slug>/`.
+    /// Write a skill into `~/.agents/skills/<slug>/` (the canonical, real
+    /// directory) and link it at `~/.claude/skills/<slug>` for Claude Code,
+    /// which does not read `~/.agents/skills` natively.
     ///
     /// `skill_md_bytes` is the raw SKILL.md content.
     /// `referenced_files` is a slice of `(relative_path, bytes)` pairs for any
@@ -186,15 +188,49 @@ impl ManagedPathsPusher {
         self.journal_push(
             JournalEntry::new(JournalOp::ArtifactPush, JournalSource::Managed, path_key)
                 .with_slug(slug)
-                .with_client("Claude Code")
+                .with_client("all")
                 .with_detail(serde_json::json!({"installation_id": installation_id})),
         );
 
-        info!(slug, dest = %skill_dir.display(), "pusher: skill pushed to ~/.claude/skills/");
+        // Surface the skill to Claude Code, which does not read
+        // `~/.agents/skills`. Cursor, Codex, and Gemini CLI scan the canonical
+        // path natively and need nothing here.
+        //
+        // Guard decision (see pusher_tests.rs / task-4-report.md for the full
+        // writeup): `link_dir` will replace a real directory at `link_path`
+        // when it alone carries a `.vectorhawk-managed.json` marker — an
+        // existence-only check, not a SQLite cross-check. We deliberately do
+        // NOT add an extra `managed_path_markers` lookup here: a marked
+        // directory is, by this codebase's own ownership invariant
+        // (`ownership::is_vectorhawk_managed`), never supposed to hold
+        // anything VectorHawk didn't put there itself, so its content is
+        // reproducible from the very `skill_md_bytes`/`referenced_files` this
+        // call just wrote to the canonical directory. A DB cross-check would
+        // also actively misfire on a legitimate, common case: if a prior
+        // `remove_skill` deleted the SQLite row but crashed before deleting
+        // the directory, the leftover marked directory would have NO
+        // matching row, and a cross-check would refuse to relink — leaving
+        // Claude Code pointed at stale content instead of finishing the
+        // cleanup. Pre-Task-5-migration, a legitimate `~/.claude/skills/<slug>`
+        // real directory from before this pivot carries the same marker
+        // invariant, so it is safe for this call to replace it with a link to
+        // the freshly-written canonical copy.
+        let link_path = resolve_claude_link_dir()?.join(slug);
+        match super::links::link_dir(&skill_dir, &link_path) {
+            Ok(mode) => debug!(slug, ?mode, "pusher: linked skill for Claude Code"),
+            Err(e) => warn!(
+                slug,
+                error = %e,
+                "pusher: failed to link skill for Claude Code — canonical copy is still live"
+            ),
+        }
+
+        info!(slug, dest = %skill_dir.display(), "pusher: skill pushed to ~/.agents/skills/");
         Ok(())
     }
 
-    /// Remove a skill from `~/.claude/skills/<slug>/`.
+    /// Remove a skill from `~/.agents/skills/<slug>/`, dropping its
+    /// `~/.claude/skills/<slug>` link.
     ///
     /// Deletes the marker from SQLite first to avoid a race where F3's drift
     /// detector sees a manageless directory mid-cleanup, then removes the
@@ -212,7 +248,15 @@ impl ManagedPathsPusher {
         self.delete_db_marker(&path_key)
             .context("pusher: failed to delete managed_path_markers for skill")?;
 
-        // Remove the directory.
+        // Drop Claude Code's link before removing the canonical directory, so
+        // a crash between the two leaves a dangling link rather than a live
+        // link to deleted content.
+        let link_path = resolve_claude_link_dir()?.join(slug);
+        if let Err(e) = super::links::unlink_dir(&link_path) {
+            warn!(slug, error = %e, "pusher: failed to unlink skill for Claude Code");
+        }
+
+        // Remove the canonical directory.
         if skill_dir.exists() {
             // Defense-in-depth: never delete Anthropic-native content.
             ownership::ensure_not_native(&skill_dir)?;
@@ -222,7 +266,7 @@ impl ManagedPathsPusher {
                     skill_dir.display()
                 )
             })?;
-            info!(slug, "pusher: skill removed from ~/.claude/skills/");
+            info!(slug, "pusher: skill removed from ~/.agents/skills/");
         } else {
             debug!(
                 slug,
@@ -503,13 +547,25 @@ impl ManagedPathsPusher {
 // ── Legacy reclaim ────────────────────────────────────────────────────────────
 
 /// One-shot startup pass: for every active skill in `installed_skills`, if
-/// `~/.claude/skills/<slug>` is still a legacy symlink left behind by the
-/// pre-v1.0.51 installer, materialize it as a real F2-managed directory.
+/// `resolve_skills_dir()/<slug>` (the canonical managed-skill root) is still a
+/// legacy symlink left behind by the pre-v1.0.51 installer, materialize it as
+/// a real F2-managed directory.
 ///
 /// Reads `<install_root>/active/SKILL.md` to source the canonical content
 /// (referenced files are not migrated — they'll be re-pushed on the next
 /// install of that skill). Sets the F2 marker so future drift scans treat
 /// the path as managed. Skills that are already F2-marked are skipped.
+///
+/// Note: since the pivot to `~/.agents/skills` as the canonical root, the
+/// pre-v1.0.51 legacy symlink this pass targets can only ever have existed at
+/// the old canonical location, `~/.claude/skills/<slug>` — never at
+/// `~/.agents/skills/<slug>`, which did not exist before this pivot. This
+/// pass is therefore effectively a no-op going forward; a legacy symlink at
+/// `~/.claude/skills/<slug>` (the Claude *link* path now) is instead healed
+/// the moment `push_skill` next runs for that slug, since its link step
+/// replaces whatever sits at the Claude path — see `push_missing_active_skills`
+/// below, which still finds and re-pushes any active skill missing from the
+/// canonical root and so subsumes this pass's job.
 ///
 /// Failures for one skill are logged at WARN and do not abort the pass.
 ///
@@ -572,18 +628,23 @@ pub fn reclaim_active_skills(state: &AppState, pusher: &ManagedPathsPusher) -> R
 // ── Active-skill self-heal ──────────────────────────────────────────────────────
 
 /// One-shot startup pass: for every active skill in `installed_skills`, if its
-/// `~/.claude/skills/<slug>` directory is **entirely absent**, re-push it from
-/// the installed copy so the skill reappears in Claude Code's skills list.
+/// canonical `~/.agents/skills/<slug>` directory is **entirely absent**,
+/// re-push it from the installed copy so the skill reappears for every client
+/// (and gets re-linked at `~/.claude/skills/<slug>` for Claude Code).
 ///
 /// This heals machines whose native skill dirs were removed out-of-band — e.g.
 /// the v1.0.67 cleanup pass that (incorrectly) deleted installed skills along
 /// with VectorHawk's own command-skills. Going forward it also self-heals any
-/// user-installed skill dir that gets deleted while the daemon is down.
+/// user-installed skill dir that gets deleted while the daemon is down, and —
+/// since the pivot to `~/.agents/skills` — any active skill that only has a
+/// stale/legacy path at the old Claude location: `push_skill`'s link step
+/// resolves that when this pass calls it, subsuming [`reclaim_active_skills`]'s
+/// now-effectively-dormant job (see its doc comment).
 ///
-/// Only acts on missing paths: existing real dirs are left to F2/drift, and
-/// legacy symlinks are handled by [`reclaim_active_skills`]. Reads SKILL.md plus
-/// sibling files from `<install_root>/active/`. Per-skill failures are logged at
-/// WARN and do not abort the pass. Returns the number of skills re-pushed.
+/// Only acts on missing paths: existing real dirs are left to F2/drift. Reads
+/// SKILL.md plus sibling files from `<install_root>/active/`. Per-skill
+/// failures are logged at WARN and do not abort the pass. Returns the number
+/// of skills re-pushed.
 pub fn push_missing_active_skills(state: &AppState, pusher: &ManagedPathsPusher) -> Result<usize> {
     if reconciler_disabled() {
         return Ok(0);
@@ -641,9 +702,10 @@ pub fn push_missing_active_skills(state: &AppState, pusher: &ManagedPathsPusher)
 // ── Adopt-discovery push ──────────────────────────────────────────────────────
 
 /// Push a skill from `source_path` (the discovery's on-disk location, e.g.
-/// `~/.agents/skills/<slug>`) into `~/.claude/skills/<slug>/` as a real
-/// F2-managed directory. Called from the SSE handler when the user adopts a
-/// discovery via the portal.
+/// `~/.agents/skills/<slug>`) into `~/.agents/skills/<slug>/` as a real
+/// F2-managed directory (linked at `~/.claude/skills/<slug>` for Claude
+/// Code). Called from the SSE handler when the user adopts a discovery via
+/// the portal.
 ///
 /// For `kind="skill"` we read `<source_path>/SKILL.md` plus any sibling files
 /// (prompts/, etc.) and hand them to `push_skill`. For other kinds we no-op
@@ -687,7 +749,7 @@ pub async fn push_adopted_discovery(
         info!(
             slug,
             source = %source_path,
-            "adopt: discovery pushed into ~/.claude/skills/"
+            "adopt: discovery pushed into ~/.agents/skills/"
         );
         Ok(())
     })
@@ -732,12 +794,19 @@ fn resolve_home() -> Result<PathBuf> {
     dirs::home_dir().ok_or_else(|| anyhow::anyhow!("pusher: HOME directory not resolvable"))
 }
 
+/// The canonical managed-skill root: `~/.agents/skills/`.
 fn resolve_skills_dir() -> Result<PathBuf> {
+    Ok(resolve_home()?.join(".agents").join("skills"))
+}
+
+/// Where Claude Code looks: `~/.claude/skills/`. VectorHawk places only
+/// symlinks here — never real content.
+fn resolve_claude_link_dir() -> Result<PathBuf> {
     Ok(resolve_home()?.join(".claude").join("skills"))
 }
 
 /// Return `true` if the F2-managed copy for `slug` is present on disk, i.e.
-/// `~/.claude/skills/<slug>/SKILL.md` exists.
+/// `~/.agents/skills/<slug>/SKILL.md` exists.
 ///
 /// Used by the adopt-publish takeover flow (`managed_paths::takeover`) to
 /// confirm the VectorHawk-managed replacement actually landed before removing

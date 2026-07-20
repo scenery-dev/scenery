@@ -361,12 +361,80 @@ fn hex_sha256_known_value() {
     );
 }
 
+// ── Canonical write + Claude Code link (agents/skills pivot) ──────────────────
+
+#[test]
+fn push_skill_writes_canonical_and_links_claude() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let (pusher, _tmp) = make_pusher();
+    let fake_home = tempfile::tempdir().unwrap();
+    let prev_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", fake_home.path());
+
+    let result = pusher.push_skill("demo", Some("inst-1"), b"---\nname: demo\n---\n", &[]);
+
+    let canonical = fake_home.path().join(".agents/skills/demo");
+    let link = fake_home.path().join(".claude/skills/demo");
+
+    if let Some(v) = prev_home {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+
+    result.unwrap();
+    // Canonical is a real directory holding the content and the marker.
+    assert!(canonical.is_dir());
+    assert!(!canonical.is_symlink());
+    assert!(canonical.join("SKILL.md").exists());
+    assert!(canonical.join(".vectorhawk-managed.json").exists());
+    // Claude Code's path is a link, and the content is reachable through it.
+    assert!(link.is_symlink());
+    assert!(link.join("SKILL.md").exists());
+}
+
+#[test]
+fn remove_skill_removes_canonical_and_link() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let (pusher, _tmp) = make_pusher();
+    let fake_home = tempfile::tempdir().unwrap();
+    let prev_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", fake_home.path());
+
+    pusher
+        .push_skill("demo", None, b"---\nname: demo\n---\n", &[])
+        .unwrap();
+    let result = pusher.remove_skill("demo");
+
+    let canonical = fake_home.path().join(".agents/skills/demo");
+    let link = fake_home.path().join(".claude/skills/demo");
+
+    if let Some(v) = prev_home {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+
+    result.unwrap();
+    assert!(!canonical.exists());
+    assert!(!link.exists());
+    assert!(!link.is_symlink());
+}
+
 // ── Legacy symlink replacement (v1.0.51) ──────────────────────────────────────
 
-/// When `~/.claude/skills/<slug>` is a legacy installer symlink, push_skill
-/// must remove it and create a real directory it owns — otherwise the file
-/// writes leak through the symlink into the legacy `versions/0.1.0` dir and
-/// the next reconcile can resurrect F2's view.
+/// When `~/.claude/skills/<slug>` (Claude Code's link path, post-pivot) is a
+/// legacy installer symlink, push_skill must replace it with a fresh symlink
+/// to the canonical `~/.agents/skills/<slug>` directory it just wrote — never
+/// leave the stale symlink in place, and never write through it into the
+/// legacy `versions/0.1.0` dir it points at.
+///
+/// Pre-pivot this same scenario was handled by push_skill's own top-of-
+/// function symlink check (it wrote directly to `~/.claude/skills/<slug>`).
+/// Post-pivot that check now guards the brand-new canonical path instead
+/// (which a legacy installer never touched), and this exact scenario —
+/// stale symlink at the Claude *link* path — is handled by `link_dir`'s own
+/// stale-link replacement inside push_skill's link step.
 #[test]
 fn push_skill_replaces_legacy_symlink_with_real_dir() {
     let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
@@ -377,11 +445,11 @@ fn push_skill_replaces_legacy_symlink_with_real_dir() {
     fs::create_dir_all(&target).unwrap();
     fs::write(target.join("SKILL.md"), b"legacy content").unwrap();
 
-    let skills_dir = fake_home.path().join(".claude").join("skills");
-    fs::create_dir_all(&skills_dir).unwrap();
-    let slug_path = skills_dir.join("hello-world");
-    std::os::unix::fs::symlink(&target, &slug_path).unwrap();
-    assert!(slug_path.is_symlink(), "test precondition: legacy symlink");
+    let claude_skills_dir = fake_home.path().join(".claude").join("skills");
+    fs::create_dir_all(&claude_skills_dir).unwrap();
+    let link_path = claude_skills_dir.join("hello-world");
+    std::os::unix::fs::symlink(&target, &link_path).unwrap();
+    assert!(link_path.is_symlink(), "test precondition: legacy symlink");
 
     let prev_home = std::env::var_os("HOME");
     std::env::set_var("HOME", fake_home.path());
@@ -393,10 +461,12 @@ fn push_skill_replaces_legacy_symlink_with_real_dir() {
         &[],
     );
 
+    let canonical_path = fake_home.path().join(".agents/skills/hello-world");
     let was_ok = result.is_ok();
-    let post_symlink = slug_path.is_symlink();
-    let post_dir_is_real = slug_path.is_dir() && !slug_path.is_symlink();
-    let f2_skill_md = std::fs::read(slug_path.join("SKILL.md")).ok();
+    let link_is_symlink = link_path.is_symlink();
+    let canonical_is_real_dir = canonical_path.is_dir() && !canonical_path.is_symlink();
+    let canonical_skill_md = std::fs::read(canonical_path.join("SKILL.md")).ok();
+    let link_skill_md = std::fs::read(link_path.join("SKILL.md")).ok();
     let legacy_target_md = std::fs::read(target.join("SKILL.md")).unwrap();
 
     if let Some(v) = prev_home {
@@ -406,12 +476,23 @@ fn push_skill_replaces_legacy_symlink_with_real_dir() {
     }
 
     assert!(was_ok, "push_skill must succeed even over a legacy symlink");
-    assert!(!post_symlink, "the symlink must be unlinked");
-    assert!(post_dir_is_real, "the path must become a real directory");
+    assert!(
+        link_is_symlink,
+        "the Claude link path must remain/become a symlink"
+    );
+    assert!(
+        canonical_is_real_dir,
+        "the canonical path must be a real directory"
+    );
     assert_eq!(
-        f2_skill_md.as_deref(),
+        canonical_skill_md.as_deref(),
         Some(b"---\nname: hello-world\n---\nfresh F2 content\n".as_ref()),
-        "F2's content must land at the real dir, not through the symlink"
+        "F2's content must land at the canonical dir"
+    );
+    assert_eq!(
+        link_skill_md.as_deref(),
+        Some(b"---\nname: hello-world\n---\nfresh F2 content\n".as_ref()),
+        "the Claude link must have been repointed to the canonical dir, not left on the legacy target"
     );
     assert_eq!(
         legacy_target_md, b"legacy content",
@@ -424,6 +505,17 @@ fn push_skill_replaces_legacy_symlink_with_real_dir() {
 /// reclaim_active_skills must materialize legacy installer symlinks for every
 /// active row in `installed_skills`, set an F2 marker, and leave non-symlink
 /// paths alone.
+///
+/// Post-pivot note: `reclaim_active_skills` checks `resolve_skills_dir()`,
+/// which now resolves to the canonical `~/.agents/skills/` root rather than
+/// the old `~/.claude/skills/`. A genuine pre-v1.0.51 legacy symlink could
+/// never actually appear at `~/.agents/skills/<slug>` (that path did not
+/// exist before this pivot), so in practice this pass is now dormant — see
+/// its doc comment. This test still exercises the exact code path
+/// (push_skill's own top-of-function symlink-replacement guard, applied to
+/// whatever `resolve_skills_dir()` yields) by placing the symlink at that
+/// canonical location directly, which is what the unchanged implementation
+/// actually inspects.
 #[test]
 fn reclaim_active_skills_converts_legacy_symlinks_only() {
     let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
@@ -460,7 +552,7 @@ fn reclaim_active_skills_converts_legacy_symlinks_only() {
         b"alpha body",
     )
     .unwrap();
-    let skills_dir = fake_home.path().join(".claude").join("skills");
+    let skills_dir = fake_home.path().join(".agents").join("skills");
     fs::create_dir_all(&skills_dir).unwrap();
     std::os::unix::fs::symlink(install_root_1.join("active"), skills_dir.join("alpha")).unwrap();
 
@@ -597,8 +689,9 @@ fn push_missing_active_skills_repushes_only_absent() {
     )
     .unwrap();
 
-    // Active skill "alpha" — installed copy exists, but its ~/.claude/skills dir
-    // is MISSING (the v1.0.67-wipe scenario). Must be re-pushed.
+    // Active skill "alpha" — installed copy exists, but its ~/.agents/skills dir
+    // is MISSING (the v1.0.67-wipe scenario, now against the canonical root).
+    // Must be re-pushed.
     let install_root_1 = fake_home
         .path()
         .join("app-support")
@@ -611,7 +704,8 @@ fn push_missing_active_skills_repushes_only_absent() {
     )
     .unwrap();
 
-    // Active skill "beta" — already present in ~/.claude/skills. Must be skipped.
+    // Active skill "beta" — already present in ~/.agents/skills (the
+    // canonical root). Must be skipped.
     let install_root_2 = fake_home
         .path()
         .join("app-support")
@@ -623,7 +717,7 @@ fn push_missing_active_skills_repushes_only_absent() {
         b"---\nname: beta\n---\nbody",
     )
     .unwrap();
-    let skills_dir = fake_home.path().join(".claude").join("skills");
+    let skills_dir = fake_home.path().join(".agents").join("skills");
     fs::create_dir_all(skills_dir.join("beta")).unwrap();
     fs::write(skills_dir.join("beta").join("SKILL.md"), b"preexisting").unwrap();
 
@@ -713,7 +807,11 @@ fn push_skill_appends_managed_artifact_push_entry() {
     assert_eq!(entry.op, JournalOp::ArtifactPush);
     assert_eq!(entry.source, JournalSource::Managed);
     assert_eq!(entry.slug.as_deref(), Some("journal-skill"));
-    assert_eq!(entry.client.as_deref(), Some("Claude Code"));
+    assert_eq!(
+        entry.client.as_deref(),
+        Some("all"),
+        "the canonical directory serves every client, not just Claude Code"
+    );
     assert!(
         entry.backup_path.is_none(),
         "managed pushes are pure removals on uninstall — no backup"
