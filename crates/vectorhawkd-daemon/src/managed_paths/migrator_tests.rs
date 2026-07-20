@@ -726,6 +726,72 @@ fn repairs_marker_when_the_claude_symlink_is_gone() {
     );
 }
 
+/// FINDING A: the repair pass must not re-key a row onto a same-slug canonical
+/// directory that is not ours.
+///
+/// A row for an F1-adopted *user* skill at `~/.claude/skills/notes`, whose
+/// directory the user then deleted, must be left alone so drift classifies it
+/// DELETED and drops the marker. Re-pointing it at an unrelated
+/// `~/.agents/skills/notes` produces a permanent false-drift row instead: the
+/// foreign content's sha will never match the row's.
+#[test]
+fn repair_does_not_repoint_onto_foreign_canonical_content() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let fake_home = tempfile::tempdir().unwrap();
+    let _home = HomeGuard::set(fake_home.path());
+
+    // An unrelated directory — no `.vectorhawk-managed.json` — happens to
+    // share the slug under the canonical root.
+    let canonical = fake_home.path().join(".agents/skills/notes");
+    fs::create_dir_all(&canonical).unwrap();
+    fs::write(canonical.join("SKILL.md"), b"someone else's notes skill").unwrap();
+
+    // The row's Claude-side directory is gone: the user deleted it.
+    let old = fake_home.path().join(".claude/skills/notes");
+    fs::create_dir_all(old.parent().unwrap()).unwrap();
+
+    let conn = markers_conn();
+    insert_marker(&conn, &old, "notes", "abc");
+
+    super::migrate_skills_to_agents_dir(&conn).unwrap();
+
+    assert_eq!(
+        marker_paths(&conn, "notes"),
+        vec![old.to_string_lossy().to_string()],
+        "row must NOT be repointed at foreign content — drift must still see it as DELETED"
+    );
+    assert_eq!(
+        fs::read(canonical.join("SKILL.md")).unwrap(),
+        b"someone else's notes skill",
+        "the foreign directory must be left completely untouched"
+    );
+}
+
+/// The same repair, when the canonical directory *is* ours, must still happen —
+/// this pins that the `is_vectorhawk_managed` guard did not disable the repair.
+#[test]
+fn repair_still_repoints_onto_our_own_canonical_content() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let fake_home = tempfile::tempdir().unwrap();
+    let _home = HomeGuard::set(fake_home.path());
+
+    let canonical = fake_home.path().join(".agents/skills/notes");
+    write_managed_skill(&canonical, "notes", "ours");
+    let old = fake_home.path().join(".claude/skills/notes");
+    fs::create_dir_all(old.parent().unwrap()).unwrap();
+
+    let conn = markers_conn();
+    insert_marker(&conn, &old, "notes", "abc");
+
+    super::migrate_skills_to_agents_dir(&conn).unwrap();
+
+    assert_eq!(
+        marker_paths(&conn, "notes"),
+        vec![canonical.to_string_lossy().to_string()],
+        "a marked canonical dir is ours — the row must still be repaired"
+    );
+}
+
 /// FINDING 3: one unmigratable entry must not abort the whole run. A *file*
 /// at the canonical path makes `link_dir` bail for that slug only.
 #[test]
@@ -772,13 +838,18 @@ fn one_bad_entry_does_not_block_the_other_skills() {
     );
 }
 
-/// FINDING 5 (reasoned by eye on Unix): when the Claude-side directory is a
-/// real, byte-identical copy of canonical, the migration must not tear it down
-/// and rebuild it. On Unix symlinks *are* available, so the correct behaviour
-/// is to heal it into a symlink exactly once and then never touch it again —
-/// no second backup on the next run. On Windows-without-Developer-Mode the
-/// symlink probe fails, the copy is recognised as settled state, and not even
-/// the first backup happens.
+/// FINDING 5: when the Claude-side directory is a real, byte-identical copy of
+/// canonical, the migration must not tear it down and rebuild it.
+///
+/// The identity check now lives in `link_dir` rather than here, so this holds
+/// on *every* platform and via *every* caller — and it holds more strictly than
+/// before: an identical copy is recognised as settled state and left alone, so
+/// not even the first backup happens. (The previous migrator-side version healed
+/// the copy into a symlink on Unix, costing one backup, and only suppressed the
+/// churn on a copy-mode host. Nothing is lost by leaving it: the copy's content
+/// is correct by definition, and the moment it diverges — which any push does,
+/// since a push rewrites canonical — `link_dir` backs it up and relinks, as
+/// `stale_legacy_content_is_backed_up_and_replaced` below pins.)
 #[test]
 fn identical_copy_converges_and_stops_creating_backups() {
     let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
@@ -793,27 +864,29 @@ fn identical_copy_converges_and_stops_creating_backups() {
     let conn = markers_conn();
     insert_marker(&conn, &old, "demo", "abc");
 
-    // Run 1: heals to a symlink (Unix), backing the copy up once.
-    assert_eq!(super::migrate_skills_to_agents_dir(&conn).unwrap(), 0);
-    assert!(old.is_symlink());
-    assert_eq!(
-        marker_paths(&conn, "demo"),
-        vec![canonical.to_string_lossy().to_string()]
-    );
-
     let backup_root = fake_home.path().join(".claude/.vectorhawk-backup");
-    let backups_after_first = snapshot(&backup_root);
 
-    // Runs 2 and 3: settled — no further backups, ever.
-    super::migrate_skills_to_agents_dir(&conn).unwrap();
-    super::migrate_skills_to_agents_dir(&conn).unwrap();
+    // Three runs, and no run creates a backup at all.
+    for run in 1..=3 {
+        assert_eq!(super::migrate_skills_to_agents_dir(&conn).unwrap(), 0);
+        assert!(
+            !backup_root.exists(),
+            "run {run} created a timestamped backup for an already-identical copy"
+        );
+        assert_eq!(
+            marker_paths(&conn, "demo"),
+            vec![canonical.to_string_lossy().to_string()],
+            "run {run}: the row must be keyed on canonical"
+        );
+    }
 
-    assert_eq!(
-        snapshot(&backup_root),
-        backups_after_first,
-        "repeat runs must not create a new timestamped backup"
-    );
+    // Content is intact on both sides and the copy was left as a real dir.
+    assert!(!old.is_symlink());
     assert!(canonical.join("SKILL.md").exists());
+    assert_eq!(
+        fs::read(old.join("SKILL.md")).unwrap(),
+        fs::read(canonical.join("SKILL.md")).unwrap()
+    );
 }
 
 /// The genuinely-stale legacy case must still be replaced: Claude-side content

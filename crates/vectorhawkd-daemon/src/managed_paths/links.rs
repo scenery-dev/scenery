@@ -43,15 +43,17 @@ pub enum LinkMode {
 
 /// Point `link_path` at `canonical`.
 ///
-/// Idempotent: an existing correct link is left alone; an existing link
-/// pointing elsewhere is replaced. A real directory left behind by a prior
-/// `LinkMode::Copy` fallback (identified by the `.vectorhawk-managed.json`
-/// marker the pusher writes into the canonical directory, which `copy_tree`
-/// necessarily carries along) is also replaced, so repeated calls stay
-/// idempotent even on platforms where symlinks are unavailable. Such a
-/// directory is moved into `~/.claude/.vectorhawk-backup/<ts>/links/` before
-/// removal, so the replacement is always recoverable — see
-/// [`backup_and_remove`]. Refuses to touch a real directory that is not
+/// Idempotent, and idempotent *without churn*: an existing correct link is left
+/// alone, and so is a real directory left behind by a prior `LinkMode::Copy`
+/// fallback whose content already matches `canonical` — that returns
+/// [`LinkMode::Copy`] having touched nothing. Only a link pointing elsewhere,
+/// or a copy that has actually diverged, is replaced; such a directory is moved
+/// into `~/.claude/.vectorhawk-backup/<ts>/links/` before removal, so the
+/// replacement is always recoverable — see [`backup_and_remove`].
+///
+/// Ownership of a real directory is decided by the `.vectorhawk-managed.json`
+/// marker the pusher writes into the canonical directory (which `copy_tree`
+/// necessarily carries along). Refuses to touch a real directory that is not
 /// ours — that is user content.
 pub fn link_dir(canonical: &Path, link_path: &Path) -> Result<LinkMode> {
     if !canonical.is_dir() {
@@ -82,8 +84,26 @@ pub fn link_dir(canonical: &Path, link_path: &Path) -> Result<LinkMode> {
         // A real directory we materialised ourselves — either a prior
         // `LinkMode::Copy` fallback, or (pre-pivot) a real managed skill dir
         // that lived at the Claude path before `~/.agents/skills` became
-        // canonical. Back it up, then remove it and re-materialise below so
-        // the call stays idempotent and heals into a symlink if possible.
+        // canonical.
+        //
+        // If it is already byte-identical to canonical there is nothing to
+        // do, and doing something is actively harmful: on a copy-mode host
+        // (Windows without Developer Mode) the symlink below always fails, so
+        // tearing the directory down and re-copying it would mint a fresh
+        // timestamped backup on *every* call — and this function is called on
+        // every `push_skill` and every daemon start. That is unbounded disk
+        // growth on a recurring trigger. Recognise the settled state and stop.
+        //
+        // This does not suppress healing where it matters: any divergence
+        // (including one introduced by the very next push, which rewrites
+        // canonical) falls through to the relink below, so a copy can never
+        // persist past a content change. What we skip is converting a copy
+        // whose content is already correct — which costs nothing.
+        if dirs_identical(canonical, link_path) {
+            return Ok(LinkMode::Copy);
+        }
+        // Diverged. Back it up, then remove it and re-materialise below so the
+        // call stays idempotent and heals into a symlink if possible.
         //
         // The backup is what makes this recoverable: the marker proves
         // VectorHawk *wrote* the directory, but not that its current content
@@ -149,30 +169,131 @@ pub fn link_is_intact(canonical: &Path, link_path: &Path) -> Result<bool> {
     Ok(resolved == target)
 }
 
-/// Whether a directory symlink can actually be created inside `dir`.
+// ── Content comparison ────────────────────────────────────────────────────────
+
+/// Chunk size for the streaming file comparison. Fixed, so comparing a tree
+/// costs O(1) memory regardless of how large the files in it are.
+const COMPARE_CHUNK: usize = 64 * 1024;
+
+/// True iff `a` and `b` are identical directory trees.
 ///
-/// Windows without Developer Mode (and some network/FAT mounts) refuse
-/// `symlink_dir`, which is why [`link_dir`] has a copy fallback at all.
-/// Callers that must distinguish "materialised as a copy because symlinks are
-/// unavailable" from "materialised as a copy for some other reason" need to
-/// know this *before* they tear anything down, so the check is an explicit
-/// probe: create a throwaway link, observe, remove it.
+/// Bounded by construction: entries are compared pairwise with an early return
+/// on the first difference, and file contents stream through a fixed-size
+/// buffer rather than being read into memory. A tree that differs in its first
+/// entry costs one `read_dir` pair.
 ///
-/// Best-effort — any failure to even set up the probe reports `false`, which
-/// is the conservative answer (callers then treat the copy as deliberate).
-pub fn symlinks_supported(dir: &Path) -> bool {
-    if fs::create_dir_all(dir).is_err() {
-        return false;
+/// Never follows links — `symlink_metadata` classifies, and a symlink is
+/// compared by its *target*, so a link is never confused with the file it
+/// points at. Any read error yields `false`: "cannot prove they match" must
+/// never be mistaken for "they match", because a false match suppresses the
+/// relink.
+fn dirs_identical(a: &Path, b: &Path) -> bool {
+    dirs_identical_inner(a, b).unwrap_or(false)
+}
+
+fn dirs_identical_inner(a: &Path, b: &Path) -> Result<bool> {
+    let mut names_a = read_dir_names(a)?;
+    let mut names_b = read_dir_names(b)?;
+    if names_a.len() != names_b.len() {
+        return Ok(false);
     }
-    let probe = dir.join(format!(".vectorhawk-symlink-probe-{}", std::process::id()));
-    let _ = fs::remove_file(&probe);
-    match symlink_dir(dir, &probe) {
-        Ok(()) => {
-            let _ = fs::remove_file(&probe);
-            true
+    names_a.sort();
+    names_b.sort();
+    if names_a != names_b {
+        return Ok(false);
+    }
+
+    for name in &names_a {
+        let pa = a.join(name);
+        let pb = b.join(name);
+        let ma = fs::symlink_metadata(&pa)
+            .with_context(|| format!("links: failed to stat {}", pa.display()))?;
+        let mb = fs::symlink_metadata(&pb)
+            .with_context(|| format!("links: failed to stat {}", pb.display()))?;
+
+        if ma.is_symlink() || mb.is_symlink() {
+            // Compare nested links by target; never traverse them.
+            if !(ma.is_symlink() && mb.is_symlink()) {
+                return Ok(false);
+            }
+            let ta = fs::read_link(&pa)
+                .with_context(|| format!("links: failed to read link {}", pa.display()))?;
+            let tb = fs::read_link(&pb)
+                .with_context(|| format!("links: failed to read link {}", pb.display()))?;
+            if ta != tb {
+                return Ok(false);
+            }
+        } else if ma.is_dir() || mb.is_dir() {
+            if !(ma.is_dir() && mb.is_dir()) {
+                return Ok(false);
+            }
+            if !dirs_identical_inner(&pa, &pb)? {
+                return Ok(false);
+            }
+        } else {
+            if ma.len() != mb.len() {
+                return Ok(false);
+            }
+            if !files_identical(&pa, &pb)? {
+                return Ok(false);
+            }
         }
-        Err(_) => false,
     }
+
+    Ok(true)
+}
+
+fn read_dir_names(dir: &Path) -> Result<Vec<std::ffi::OsString>> {
+    let mut names = Vec::new();
+    for entry in
+        fs::read_dir(dir).with_context(|| format!("links: failed to read {}", dir.display()))?
+    {
+        let entry = entry.context("links: failed to read dir entry")?;
+        names.push(entry.file_name());
+    }
+    Ok(names)
+}
+
+/// Stream two same-sized files through fixed buffers, returning on the first
+/// differing chunk. Never holds more than `2 * COMPARE_CHUNK` bytes.
+fn files_identical(a: &Path, b: &Path) -> Result<bool> {
+    let mut fa =
+        fs::File::open(a).with_context(|| format!("links: failed to open {}", a.display()))?;
+    let mut fb =
+        fs::File::open(b).with_context(|| format!("links: failed to open {}", b.display()))?;
+
+    let mut buf_a = vec![0u8; COMPARE_CHUNK];
+    let mut buf_b = vec![0u8; COMPARE_CHUNK];
+
+    loop {
+        let n = read_full(&mut fa, &mut buf_a)
+            .with_context(|| format!("links: failed to read {}", a.display()))?;
+        let m = read_full(&mut fb, &mut buf_b)
+            .with_context(|| format!("links: failed to read {}", b.display()))?;
+        if n != m {
+            return Ok(false);
+        }
+        if n == 0 {
+            return Ok(true);
+        }
+        if buf_a[..n] != buf_b[..n] {
+            return Ok(false);
+        }
+    }
+}
+
+/// Fill `buf` as far as EOF allows, so the two sides stay chunk-aligned even
+/// when a single `read` returns short.
+fn read_full(f: &mut fs::File, buf: &mut [u8]) -> std::io::Result<usize> {
+    use std::io::Read;
+    let mut filled = 0;
+    while filled < buf.len() {
+        match f.read(&mut buf[filled..])? {
+            0 => break,
+            n => filled += n,
+        }
+    }
+    Ok(filled)
 }
 
 #[cfg(unix)]

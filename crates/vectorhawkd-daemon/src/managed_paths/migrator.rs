@@ -19,7 +19,6 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
 };
@@ -594,8 +593,6 @@ pub fn migrate_skills_to_agents_dir(conn: &Connection) -> Result<usize> {
     }
 
     let mut migrated = 0usize;
-    // Probed lazily, at most once per run — see `migrate_one_legacy_skill`.
-    let mut symlinks_ok: Option<bool> = None;
 
     for entry in std::fs::read_dir(&claude_skills)
         .with_context(|| format!("migrator: failed to read {}", claude_skills.display()))?
@@ -616,7 +613,7 @@ pub fn migrate_skills_to_agents_dir(conn: &Connection) -> Result<usize> {
             continue;
         };
 
-        match migrate_one_legacy_skill(conn, &old_path, &canonical_root, &slug, &mut symlinks_ok) {
+        match migrate_one_legacy_skill(conn, &old_path, &canonical_root, &slug) {
             Ok(true) => {
                 migrated += 1;
                 info!(slug, "migrator: skill migrated to ~/.agents/skills/");
@@ -646,7 +643,6 @@ fn migrate_one_legacy_skill(
     old_path: &Path,
     canonical_root: &Path,
     slug: &str,
-    symlinks_ok: &mut Option<bool>,
 ) -> Result<bool> {
     // Already migrated, or someone else's link — leave it. Any stale DB row
     // for this path was already fixed by `repair_stale_skill_markers`.
@@ -677,38 +673,23 @@ fn migrate_one_legacy_skill(
     }
 
     // ── Canonical already exists ──────────────────────────────────────────────
-    // This is not legacy content awaiting a move. Two sub-cases, and they need
-    // opposite treatment:
+    // This is not legacy content awaiting a move — it is a Claude-side copy
+    // sitting alongside a canonical directory that already has the content.
+    // Hand it to `link_dir`, which owns the decision:
     //
-    //   a) The Claude-side directory is byte-identical to canonical AND
-    //      symlinks are unavailable on this platform (Windows without
-    //      Developer Mode). `link_dir` materialised it as a copy and would do
-    //      so again — tearing it down into a fresh timestamped backup and
-    //      rebuilding it on *every daemon start*, forever. That is unbounded
-    //      disk growth on a recurring trigger, so we recognise the settled
-    //      state, make sure the DB row is keyed correctly, and stop.
+    //   * already byte-identical to canonical — returns `LinkMode::Copy`
+    //     having touched nothing, so a copy-mode host does not mint a fresh
+    //     backup on every daemon start;
+    //   * diverged — backs the Claude-side content up to
+    //     `~/.claude/.vectorhawk-backup/<ts>/links/` (which `migrate rollback`
+    //     deliberately does not list — manual recovery only) and replaces it
+    //     with a link.
     //
-    //   b) Anything else — genuinely stale legacy content that differs from
-    //      canonical, or an identical copy on a platform where a symlink *can*
-    //      be created. Both should be replaced by a link (with the usual
-    //      backup), which converges after one run: on the next start the entry
-    //      is a symlink, or an identical copy that case (a) then leaves alone.
-    if dir_trees_match(old_path, &new_path) && !symlinks_available(canonical_root, symlinks_ok) {
-        debug!(
-            slug,
-            "migrator: canonical dir already materialised as a copy (symlinks unavailable) — \
-             re-keying marker only, no backup/relink"
-        );
-        rekey_skill_marker(conn, old_path, &new_path)?;
-        return Ok(false);
-    }
-
-    warn!(
+    // Either way the DB row must end up keyed on canonical.
+    debug!(
         slug,
         canonical = %new_path.display(),
-        "migrator: canonical dir already exists — replacing the Claude-side copy with a link; \
-         its previous content is moved to ~/.claude/.vectorhawk-backup/<ts>/links/, which \
-         `migrate rollback` deliberately does not list (manual recovery only)"
+        "migrator: canonical dir already exists — reconciling the Claude-side copy"
     );
     super::links::link_dir(&new_path, old_path)
         .with_context(|| format!("migrator: failed to link {}", old_path.display()))?;
@@ -751,13 +732,26 @@ fn rekey_skill_marker(conn: &Connection, old_path: &Path, new_path: &Path) -> Re
 }
 
 /// Re-point every `kind='skill'` marker row still keyed under
-/// `~/.claude/skills/<slug>` whose canonical counterpart exists on disk.
+/// `~/.claude/skills/<slug>` onto a canonical counterpart that exists on disk
+/// **and is VectorHawk-managed**.
 ///
-/// Only entries that are NOT a real directory are repaired — a symlink (the
-/// settled post-migration state) or nothing at all (the link was deleted).
-/// A real directory still sitting at the Claude path is deliberately left to
-/// the migration loop, which is the only place that knows whether that content
-/// is ours and whether it matches canonical.
+/// Two conditions must both hold, and neither is sufficient alone:
+///
+///   * The Claude-side entry is NOT a real directory — a symlink (the settled
+///     post-migration state) or nothing at all (the link was deleted). A real
+///     directory still sitting there is deliberately left to the migration
+///     loop, which is the only place that knows whether that content is ours.
+///   * The canonical directory carries a `.vectorhawk-managed.json` marker.
+///     Slug collision is not proof of identity: a row for an F1-adopted *user*
+///     skill whose directory the user deleted would otherwise be re-keyed onto
+///     an unrelated same-slug directory, whose sha can never match the row's —
+///     a permanent false-drift row. Left alone, drift correctly classifies the
+///     vanished path as DELETED and drops the marker.
+///
+/// This pass runs only at daemon start, so it repairs rows that exist *at that
+/// moment*; a row orphaned by a `push_skill` on an already-running daemon
+/// survives until the next start. That bounds the orphan by a restart rather
+/// than eliminating it.
 ///
 /// Returns the number of rows repaired.
 fn repair_stale_skill_markers(
@@ -793,6 +787,16 @@ fn repair_stale_skill_markers(
         if !new_path.is_dir() {
             continue;
         }
+        // Same slug is not the same skill. Only re-key onto content we own.
+        if !ownership::is_vectorhawk_managed(&new_path) {
+            debug!(
+                from = %key,
+                candidate = %new_path.display(),
+                "migrator: canonical dir with this slug is not VectorHawk-managed — \
+                 leaving the stale row for drift to retire"
+            );
+            continue;
+        }
 
         rekey_skill_marker(conn, &old_path, &new_path)?;
         repaired += 1;
@@ -804,70 +808,6 @@ fn repair_stale_skill_markers(
     }
 
     Ok(repaired)
-}
-
-/// Whether directory symlinks can be created under `root`, probed at most once
-/// per migration run and memoised in `cache`.
-fn symlinks_available(root: &Path, cache: &mut Option<bool>) -> bool {
-    if let Some(v) = *cache {
-        return v;
-    }
-    let v = super::links::symlinks_supported(root);
-    *cache = Some(v);
-    v
-}
-
-// ── Content comparison ────────────────────────────────────────────────────────
-
-/// One node in a directory tree snapshot.
-#[derive(Debug, PartialEq, Eq)]
-enum TreeNode {
-    Dir,
-    File(Vec<u8>),
-    Link(PathBuf),
-}
-
-/// True iff `a` and `b` are byte-identical directory trees.
-///
-/// Any read error yields `false` — "cannot prove they match" must never be
-/// mistaken for "they match", because a false match suppresses the relink.
-fn dir_trees_match(a: &Path, b: &Path) -> bool {
-    let mut ta = BTreeMap::new();
-    let mut tb = BTreeMap::new();
-    if collect_tree(a, Path::new(""), &mut ta).is_err() {
-        return false;
-    }
-    if collect_tree(b, Path::new(""), &mut tb).is_err() {
-        return false;
-    }
-    ta == tb
-}
-
-fn collect_tree(root: &Path, rel: &Path, out: &mut BTreeMap<PathBuf, TreeNode>) -> Result<()> {
-    let dir = root.join(rel);
-    for entry in
-        fs::read_dir(&dir).with_context(|| format!("migrator: failed to read {}", dir.display()))?
-    {
-        let entry = entry.context("migrator: failed to read dir entry")?;
-        let path = entry.path();
-        let key = rel.join(entry.file_name());
-        let meta = fs::symlink_metadata(&path)
-            .with_context(|| format!("migrator: failed to stat {}", path.display()))?;
-
-        if meta.is_symlink() {
-            let target = fs::read_link(&path)
-                .with_context(|| format!("migrator: failed to read link {}", path.display()))?;
-            out.insert(key, TreeNode::Link(target));
-        } else if meta.is_dir() {
-            out.insert(key.clone(), TreeNode::Dir);
-            collect_tree(root, &key, out)?;
-        } else {
-            let bytes = fs::read(&path)
-                .with_context(|| format!("migrator: failed to read {}", path.display()))?;
-            out.insert(key, TreeNode::File(bytes));
-        }
-    }
-    Ok(())
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
