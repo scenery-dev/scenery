@@ -798,40 +798,34 @@ impl Backend for RealBackend {
                 let policy_client = self.policy_client.clone();
 
                 let rating_state_clone = self.rating_state.clone();
-                let tool_result = tokio::task::spawn_blocking(move || {
-                    if let Some(pc) = policy_client {
-                        crate::tools::handle_tool_call(
-                            &tool_name,
-                            &tool_args,
-                            &state_arc,
-                            pc.as_ref(),
-                            model_client.as_deref(),
-                            &registry_url,
-                            &cache,
-                            Some(&*registry_arc),
-                            rating_state_clone.as_ref(),
-                        )
-                    } else {
-                        let mock_policy = vectorhawkd_core::policy::MockPolicyClient::new();
-                        crate::tools::handle_tool_call(
-                            &tool_name,
-                            &tool_args,
-                            &state_arc,
-                            &mock_policy,
-                            model_client.as_deref(),
-                            &registry_url,
-                            &cache,
-                            Some(&*registry_arc),
-                            rating_state_clone.as_ref(),
-                        )
-                    }
-                })
-                .await
-                .unwrap_or_else(|join_err| {
-                    crate::protocol::ToolCallResult::error_result(format!(
-                        "tool handler panicked: {join_err}"
-                    ))
-                });
+                let tool_result = if let Some(pc) = policy_client {
+                    crate::tools::handle_tool_call(
+                        &tool_name,
+                        &tool_args,
+                        &state_arc,
+                        pc.as_ref(),
+                        model_client.as_deref(),
+                        &registry_url,
+                        &cache,
+                        Some(&*registry_arc),
+                        rating_state_clone.as_ref(),
+                    )
+                    .await
+                } else {
+                    let mock_policy = vectorhawkd_core::policy::MockPolicyClient::new();
+                    crate::tools::handle_tool_call(
+                        &tool_name,
+                        &tool_args,
+                        &state_arc,
+                        &mock_policy,
+                        model_client.as_deref(),
+                        &registry_url,
+                        &cache,
+                        Some(&*registry_arc),
+                        rating_state_clone.as_ref(),
+                    )
+                    .await
+                };
 
                 let latency_ms = started.elapsed().as_millis() as u64;
                 let status = if tool_result.is_error == Some(true) {

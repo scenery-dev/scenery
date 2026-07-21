@@ -57,8 +57,8 @@ fn make_jwt_with_exp(exp: u64) -> String {
 
 /// A near-expiry access token (expires in 2 minutes) causes refresh_one_tick
 /// to call the refresh endpoint and overwrite the stored token.
-#[test]
-fn refresh_one_tick_rotates_near_expiry_token() {
+#[tokio::test]
+async fn refresh_one_tick_rotates_near_expiry_token() {
     let _guard = KeychainOff::enable();
     let root = temp_root("rotate");
     let state = AppState::bootstrap_in(root.clone()).expect("bootstrap");
@@ -71,7 +71,7 @@ fn refresh_one_tick_rotates_near_expiry_token() {
     // Access token that expires in 2 minutes (< 5 min threshold).
     let near_expiry_access = make_jwt_with_exp(now + 120);
 
-    let mut server = Server::new();
+    let mut server = Server::new_async().await;
     let registry_url = server.url();
 
     let _refresh_mock = server
@@ -81,13 +81,16 @@ fn refresh_one_tick_rotates_near_expiry_token() {
         .with_body(
             r#"{"access_token":"rotated_acc","refresh_token":"rotated_ref","token_type":"bearer"}"#,
         )
-        .create();
+        .create_async()
+        .await;
 
     // Save the near-expiry token.
     save_tokens(&state, &registry_url, &near_expiry_access, "old_refresh").expect("save_tokens");
 
     // Run one tick of the refresh loop.
-    refresh_one_tick(&state, &registry_url).expect("refresh_one_tick should not error");
+    refresh_one_tick(&state, &registry_url)
+        .await
+        .expect("refresh_one_tick should not error");
 
     // Verify the token was rotated in SQLite.
     let loaded = load_tokens(&state, &registry_url)
@@ -107,8 +110,8 @@ fn refresh_one_tick_rotates_near_expiry_token() {
 }
 
 /// A token that is NOT near expiry should not trigger a refresh call.
-#[test]
-fn refresh_one_tick_skips_healthy_token() {
+#[tokio::test]
+async fn refresh_one_tick_skips_healthy_token() {
     let _guard = KeychainOff::enable();
     let root = temp_root("skip");
     let state = AppState::bootstrap_in(root.clone()).expect("bootstrap");
@@ -121,18 +124,21 @@ fn refresh_one_tick_skips_healthy_token() {
     // Access token that expires in 10 minutes (> 5 min threshold).
     let healthy_access = make_jwt_with_exp(now + 600);
 
-    let mut server = Server::new();
+    let mut server = Server::new_async().await;
     let registry_url = server.url();
 
     // The refresh endpoint should NOT be called.
     let refresh_mock = server
         .mock("POST", "/portal/auth/refresh")
         .expect(0)
-        .create();
+        .create_async()
+        .await;
 
     save_tokens(&state, &registry_url, &healthy_access, "ref_token").expect("save_tokens");
 
-    refresh_one_tick(&state, &registry_url).expect("refresh_one_tick should not error");
+    refresh_one_tick(&state, &registry_url)
+        .await
+        .expect("refresh_one_tick should not error");
 
     // Token should be unchanged.
     let loaded = load_tokens(&state, &registry_url)
@@ -151,8 +157,8 @@ fn refresh_one_tick_skips_healthy_token() {
 
 /// A failed refresh call should log WARN and continue — refresh_one_tick
 /// should return Ok(()) even when the HTTP call fails.
-#[test]
-fn refresh_one_tick_continues_after_refresh_failure() {
+#[tokio::test]
+async fn refresh_one_tick_continues_after_refresh_failure() {
     let _guard = KeychainOff::enable();
     let root = temp_root("fail");
     let state = AppState::bootstrap_in(root.clone()).expect("bootstrap");
@@ -164,19 +170,20 @@ fn refresh_one_tick_continues_after_refresh_failure() {
 
     let near_expiry_access = make_jwt_with_exp(now + 120);
 
-    let mut server = Server::new();
+    let mut server = Server::new_async().await;
     let registry_url = server.url();
 
     let _fail_mock = server
         .mock("POST", "/portal/auth/refresh")
         .with_status(401)
         .with_body(r#"{"error":"invalid_refresh_token"}"#)
-        .create();
+        .create_async()
+        .await;
 
     save_tokens(&state, &registry_url, &near_expiry_access, "bad_refresh").expect("save_tokens");
 
     // Should not return Err even though the HTTP call failed.
-    let result = refresh_one_tick(&state, &registry_url);
+    let result = refresh_one_tick(&state, &registry_url).await;
     assert!(
         result.is_ok(),
         "refresh_one_tick must return Ok on HTTP failure: {result:?}"
@@ -195,8 +202,8 @@ fn refresh_one_tick_continues_after_refresh_failure() {
 /// A persistent 401 from /portal/auth/refresh must drive backoff: the next
 /// tick must NOT hit the endpoint again until next_refresh_attempt_at passes.
 /// This protects against the 1-hot-loop-per-60s bug seen in production logs.
-#[test]
-fn refresh_one_tick_backs_off_after_401() {
+#[tokio::test]
+async fn refresh_one_tick_backs_off_after_401() {
     let _guard = KeychainOff::enable();
     let root = temp_root("backoff");
     let state = AppState::bootstrap_in(root.clone()).expect("bootstrap");
@@ -208,7 +215,7 @@ fn refresh_one_tick_backs_off_after_401() {
 
     let near_expiry_access = make_jwt_with_exp(now + 120);
 
-    let mut server = Server::new();
+    let mut server = Server::new_async().await;
     let registry_url = server.url();
 
     // The 401 mock must be hit exactly ONCE across both ticks. If backoff is
@@ -218,12 +225,15 @@ fn refresh_one_tick_backs_off_after_401() {
         .with_status(401)
         .with_body(r#"{"error":"invalid_refresh_token"}"#)
         .expect(1)
-        .create();
+        .create_async()
+        .await;
 
     save_tokens(&state, &registry_url, &near_expiry_access, "dead_refresh").expect("save_tokens");
 
     // First tick: hits the endpoint, gets 401, records failure + 60s backoff.
-    refresh_one_tick(&state, &registry_url).expect("first tick");
+    refresh_one_tick(&state, &registry_url)
+        .await
+        .expect("first tick");
 
     let after_first = load_tokens(&state, &registry_url)
         .expect("load")
@@ -244,7 +254,9 @@ fn refresh_one_tick_backs_off_after_401() {
     // Second tick (immediately): backoff window is still active, must skip
     // the HTTP call entirely. The mockito `expect(1)` assertion below
     // verifies the endpoint was hit only once total.
-    refresh_one_tick(&state, &registry_url).expect("second tick");
+    refresh_one_tick(&state, &registry_url)
+        .await
+        .expect("second tick");
 
     fail_mock.assert();
 
@@ -253,8 +265,8 @@ fn refresh_one_tick_backs_off_after_401() {
 
 /// A successful refresh after a prior failure must reset the backoff
 /// counters so future refreshes resume the normal cadence.
-#[test]
-fn refresh_one_tick_resets_backoff_on_success() {
+#[tokio::test]
+async fn refresh_one_tick_resets_backoff_on_success() {
     let _guard = KeychainOff::enable();
     let root = temp_root("reset");
     let state = AppState::bootstrap_in(root.clone()).expect("bootstrap");
@@ -266,7 +278,7 @@ fn refresh_one_tick_resets_backoff_on_success() {
 
     let near_expiry_access = make_jwt_with_exp(now + 120);
 
-    let mut server = Server::new();
+    let mut server = Server::new_async().await;
     let registry_url = server.url();
 
     let _ok_mock = server
@@ -279,7 +291,8 @@ fn refresh_one_tick_resets_backoff_on_success() {
             })
             .to_string(),
         )
-        .create();
+        .create_async()
+        .await;
 
     save_tokens(&state, &registry_url, &near_expiry_access, "old_refresh").expect("save_tokens");
 
@@ -292,7 +305,7 @@ fn refresh_one_tick_resets_backoff_on_success() {
     )
     .expect("record");
 
-    refresh_one_tick(&state, &registry_url).expect("tick");
+    refresh_one_tick(&state, &registry_url).await.expect("tick");
 
     let after = load_tokens(&state, &registry_url)
         .expect("load")
@@ -306,13 +319,13 @@ fn refresh_one_tick_resets_backoff_on_success() {
 }
 
 /// With no tokens stored, refresh_one_tick is a no-op.
-#[test]
-fn refresh_one_tick_with_no_tokens_is_noop() {
+#[tokio::test]
+async fn refresh_one_tick_with_no_tokens_is_noop() {
     let _guard = KeychainOff::enable();
     let root = temp_root("empty");
     let state = AppState::bootstrap_in(root.clone()).expect("bootstrap");
 
-    let result = refresh_one_tick(&state, "https://registry.vectorhawk.ai");
+    let result = refresh_one_tick(&state, "https://registry.vectorhawk.ai").await;
     assert!(
         result.is_ok(),
         "refresh_one_tick with empty table should succeed"
@@ -323,8 +336,8 @@ fn refresh_one_tick_with_no_tokens_is_noop() {
 
 /// refresh_one_tick handles multiple token rows: rotates near-expiry ones,
 /// leaves healthy ones unchanged.
-#[test]
-fn refresh_one_tick_handles_multiple_rows() {
+#[tokio::test]
+async fn refresh_one_tick_handles_multiple_rows() {
     let _guard = KeychainOff::enable();
     let root = temp_root("multi");
     let state = AppState::bootstrap_in(root.clone()).expect("bootstrap");
@@ -337,7 +350,7 @@ fn refresh_one_tick_handles_multiple_rows() {
     let near_expiry = make_jwt_with_exp(now + 120);
     let healthy = make_jwt_with_exp(now + 600);
 
-    let mut server = Server::new();
+    let mut server = Server::new_async().await;
     let near_expiry_url = server.url();
 
     let _refresh_mock = server
@@ -347,7 +360,8 @@ fn refresh_one_tick_handles_multiple_rows() {
         .with_body(
             r#"{"access_token":"rotated","refresh_token":"rotated_ref","token_type":"bearer"}"#,
         )
-        .create();
+        .create_async()
+        .await;
 
     // Save near-expiry token for the mock server's registry.
     save_tokens(&state, &near_expiry_url, &near_expiry, "ref1").expect("save near_expiry");
@@ -357,7 +371,9 @@ fn refresh_one_tick_handles_multiple_rows() {
     let healthy_url = "http://127.0.0.1:1"; // unreachable — will error if called
     save_tokens(&state, healthy_url, &healthy, "ref2").expect("save healthy");
 
-    refresh_one_tick(&state, &near_expiry_url).expect("refresh_one_tick should succeed");
+    refresh_one_tick(&state, &near_expiry_url)
+        .await
+        .expect("refresh_one_tick should succeed");
 
     // Near-expiry token should be rotated.
     let rotated = load_tokens(&state, &near_expiry_url)

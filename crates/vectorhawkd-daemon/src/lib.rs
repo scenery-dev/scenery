@@ -244,8 +244,8 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
 
     // Spawn the token refresh loop (60 s interval).
     // Checks every stored access token and refreshes any that are within 5 min
-    // of expiry.  All sync I/O (SQLite + HTTP) happens inside spawn_blocking
-    // per the spawn_blocking discipline documented at the top of this file.
+    // of expiry. AuthClient is now async so we call refresh_one_tick directly
+    // without spawn_blocking.
     let refresh_db_path = state.db_path.clone();
     let refresh_root_dir = state.root_dir.clone();
     let refresh_registry_url = registry_url.clone();
@@ -262,23 +262,12 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
             let root = refresh_root_dir.clone();
             let reg_url = refresh_registry_url.clone();
 
-            let result = tokio::task::spawn_blocking(move || {
-                let state_view = AppState {
-                    root_dir: root,
-                    db_path: db,
-                };
-                refresh_one_tick(&state_view, &reg_url)
-            })
-            .await;
-
-            match result {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    warn!(error = %e, "token refresh tick failed; will retry on next interval");
-                }
-                Err(join_err) => {
-                    warn!(error = %join_err, "token refresh task panicked; will retry");
-                }
+            let state_view = AppState {
+                root_dir: root,
+                db_path: db,
+            };
+            if let Err(e) = refresh_one_tick(&state_view, &reg_url).await {
+                warn!(error = %e, "token refresh tick failed; will retry on next interval");
             }
         }
     });
@@ -669,7 +658,7 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
 
 /// One tick of the token refresh loop.
 ///
-/// Called from `spawn_blocking` — issues synchronous SQLite and HTTP I/O.
+/// An `async fn` that issues synchronous SQLite I/O and async HTTP calls.
 ///
 /// Steps:
 /// 1. Load all rows from `auth_tokens`.
@@ -680,7 +669,7 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
 ///
 /// This function is exposed as `pub` so tests can drive a single tick
 /// without running the full 60-second loop.
-pub fn refresh_one_tick(state: &AppState, registry_url: &str) -> Result<()> {
+pub async fn refresh_one_tick(state: &AppState, registry_url: &str) -> Result<()> {
     let rows = load_all_tokens(state).context("refresh_one_tick: failed to load auth_tokens")?;
 
     let now_unix = std::time::SystemTime::now()
@@ -717,7 +706,7 @@ pub fn refresh_one_tick(state: &AppState, registry_url: &str) -> Result<()> {
         );
 
         let client = AuthClient::new(&row.registry_url);
-        match client.refresh_detailed(&row.refresh_token) {
+        match client.refresh_detailed(&row.refresh_token).await {
             Ok(new_tokens) => {
                 // save_tokens clears the backoff counters on success.
                 match save_tokens(

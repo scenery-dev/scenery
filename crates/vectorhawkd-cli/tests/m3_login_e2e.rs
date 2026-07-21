@@ -285,8 +285,9 @@ fn m3_ac2_login_full_flow() {
 
     let state = AppState::bootstrap().expect("bootstrap");
     let client = AuthClient::new(&registry_url);
-    let tokens = client
-        .exchange_oauth_code(received_code, "dummy-verifier")
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let tokens = rt
+        .block_on(client.exchange_oauth_code(received_code, "dummy-verifier"))
         .expect("token exchange should succeed against mock");
     assert_eq!(tokens.access_token, "e2e_acc");
 
