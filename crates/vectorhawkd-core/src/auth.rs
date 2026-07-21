@@ -150,14 +150,14 @@ pub fn derive_code_challenge(code_verifier: &str) -> String {
 
 pub struct AuthClient {
     base_url: String,
-    http: reqwest::blocking::Client,
+    http: reqwest::Client,
 }
 
 impl AuthClient {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into(),
-            http: reqwest::blocking::Client::builder()
+            http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .expect("HTTP client should build"),
@@ -233,7 +233,11 @@ impl AuthClient {
     ///
     /// POSTs form-urlencoded to `/portal/auth/cli/token` with the code,
     /// code_verifier, grant_type, and client_id.
-    pub fn exchange_oauth_code(&self, code: &str, code_verifier: &str) -> Result<TokenResponse> {
+    pub async fn exchange_oauth_code(
+        &self,
+        code: &str,
+        code_verifier: &str,
+    ) -> Result<TokenResponse> {
         let url = format!(
             "{}/portal/auth/cli/token",
             self.base_url.trim_end_matches('/')
@@ -250,21 +254,23 @@ impl AuthClient {
                 ("client_id", "runner"),
             ])
             .send()
+            .await
             .with_context(|| format!("failed to reach registry at {url}"))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let body_text = resp.text().unwrap_or_default();
+            let body_text = resp.text().await.unwrap_or_default();
             anyhow::bail!("OAuth token exchange failed (HTTP {status}): {body_text}");
         }
 
         resp.json()
+            .await
             .context("failed to deserialize OAuth token response")
     }
 
     /// Refresh an access token using a refresh token.
-    pub fn refresh(&self, refresh_token: &str) -> Result<TokenResponse> {
-        match self.refresh_detailed(refresh_token) {
+    pub async fn refresh(&self, refresh_token: &str) -> Result<TokenResponse> {
+        match self.refresh_detailed(refresh_token).await {
             Ok(t) => Ok(t),
             Err(RefreshError::AuthFailed { status, body }) => {
                 anyhow::bail!("token refresh failed (HTTP {status}): {body}")
@@ -282,7 +288,7 @@ impl AuthClient {
     /// failures escalate the retry interval because the refresh token is
     /// almost certainly dead until the user re-authenticates; transport
     /// failures retry on the normal cadence.
-    pub fn refresh_detailed(
+    pub async fn refresh_detailed(
         &self,
         refresh_token: &str,
     ) -> std::result::Result<TokenResponse, RefreshError> {
@@ -299,13 +305,14 @@ impl AuthClient {
                 refresh_token: refresh_token.to_string(),
             })
             .send()
+            .await
             .map_err(|e| RefreshError::Transport {
                 source: anyhow::Error::new(e).context(format!("failed to reach registry at {url}")),
             })?;
 
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().unwrap_or_default();
+            let body = resp.text().await.unwrap_or_default();
             if status == reqwest::StatusCode::UNAUTHORIZED
                 || status == reqwest::StatusCode::FORBIDDEN
             {
@@ -320,7 +327,7 @@ impl AuthClient {
             });
         }
 
-        resp.json().map_err(|e| {
+        resp.json().await.map_err(|e| {
             RefreshError::Decode(
                 anyhow::Error::new(e).context("failed to deserialize refresh response"),
             )
@@ -328,7 +335,7 @@ impl AuthClient {
     }
 
     /// Fetch the currently authenticated user's info.
-    pub fn me(&self, access_token: &str) -> Result<UserInfo> {
+    pub async fn me(&self, access_token: &str) -> Result<UserInfo> {
         let url = format!("{}/portal/auth/me", self.base_url.trim_end_matches('/'));
 
         let resp = self
@@ -336,15 +343,16 @@ impl AuthClient {
             .get(&url)
             .bearer_auth(access_token)
             .send()
+            .await
             .with_context(|| format!("failed to reach registry at {url}"))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().unwrap_or_default();
+            let body = resp.text().await.unwrap_or_default();
             anyhow::bail!("auth check failed (HTTP {status}): {body}");
         }
 
-        resp.json().context("failed to deserialize user info")
+        resp.json().await.context("failed to deserialize user info")
     }
 
     /// Determine if the access token needs to be refreshed.
@@ -872,9 +880,9 @@ mod tests {
 
     // ── exchange_oauth_code tests ─────────────────────────────────────────────
 
-    #[test]
-    fn exchange_oauth_code_posts_form_to_cli_token_endpoint() {
-        let mut server = Server::new();
+    #[tokio::test]
+    async fn exchange_oauth_code_posts_form_to_cli_token_endpoint() {
+        let mut server = Server::new_async().await;
         let mock = server
             .mock("POST", "/portal/auth/cli/token")
             .match_header(
@@ -886,28 +894,31 @@ mod tests {
             .with_body(
                 r#"{"access_token":"new_acc","refresh_token":"new_ref","token_type":"bearer"}"#,
             )
-            .create();
+            .create_async()
+            .await;
 
         let client = AuthClient::new(server.url());
         let resp = client
             .exchange_oauth_code("test-code", "test-verifier")
+            .await
             .expect("exchange should succeed");
         assert_eq!(resp.access_token, "new_acc");
         assert_eq!(resp.refresh_token, "new_ref");
         mock.assert();
     }
 
-    #[test]
-    fn exchange_oauth_code_fails_on_non_200() {
-        let mut server = Server::new();
+    #[tokio::test]
+    async fn exchange_oauth_code_fails_on_non_200() {
+        let mut server = Server::new_async().await;
         let _mock = server
             .mock("POST", "/portal/auth/cli/token")
             .with_status(400)
             .with_body(r#"{"error":"invalid_grant"}"#)
-            .create();
+            .create_async()
+            .await;
 
         let client = AuthClient::new(server.url());
-        let result = client.exchange_oauth_code("bad-code", "verifier");
+        let result = client.exchange_oauth_code("bad-code", "verifier").await;
         assert!(result.is_err(), "non-200 response should return Err");
     }
 
@@ -1001,9 +1012,9 @@ mod tests {
 
     // ── Refresh + me tests ────────────────────────────────────────────────────
 
-    #[test]
-    fn refresh_returns_new_tokens() {
-        let mut server = Server::new();
+    #[tokio::test]
+    async fn refresh_returns_new_tokens() {
+        let mut server = Server::new_async().await;
         let mock = server
             .mock("POST", "/portal/auth/refresh")
             .with_status(200)
@@ -1011,26 +1022,31 @@ mod tests {
             .with_body(
                 r#"{"access_token":"new_acc","refresh_token":"new_ref","token_type":"bearer"}"#,
             )
-            .create();
+            .create_async()
+            .await;
 
         let client = AuthClient::new(server.url());
-        let resp = client.refresh("old_ref").expect("refresh should succeed");
+        let resp = client
+            .refresh("old_ref")
+            .await
+            .expect("refresh should succeed");
         assert_eq!(resp.access_token, "new_acc");
         mock.assert();
     }
 
-    #[test]
-    fn me_returns_user_info() {
-        let mut server = Server::new();
+    #[tokio::test]
+    async fn me_returns_user_info() {
+        let mut server = Server::new_async().await;
         let mock = server
             .mock("GET", "/portal/auth/me")
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"id":"u1","email":"test@example.com","display_name":"Test User"}"#)
-            .create();
+            .create_async()
+            .await;
 
         let client = AuthClient::new(server.url());
-        let info = client.me("tok123").expect("me should succeed");
+        let info = client.me("tok123").await.expect("me should succeed");
         assert_eq!(info.email, "test@example.com");
         mock.assert();
     }

@@ -2,7 +2,6 @@
 //! extended with `model_source` and `cost_usd` columns.
 
 use camino::Utf8PathBuf;
-use rusqlite::Connection;
 use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 use vectorhawkd_core::{
