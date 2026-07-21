@@ -766,35 +766,28 @@ fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
 /// Uses the existing token store (SQLite `auth_tokens`).  On success, saves the
 /// new tokens back and returns the new access token.
 async fn try_refresh_token(registry_url: &str, state: Arc<AppState>) -> Result<String> {
-    let reg_url = registry_url.to_string();
-    let state_clone = Arc::clone(&state);
+    let rows = load_all_tokens(&state).context("failed to load auth tokens for refresh")?;
 
-    tokio::task::spawn_blocking(move || {
-        let rows =
-            load_all_tokens(&state_clone).context("failed to load auth tokens for refresh")?;
+    let row = rows
+        .into_iter()
+        .find(|r| r.registry_url == registry_url)
+        .ok_or_else(|| anyhow::anyhow!("no stored token for {registry_url}"))?;
 
-        let row = rows
-            .into_iter()
-            .find(|r| r.registry_url == reg_url)
-            .ok_or_else(|| anyhow::anyhow!("no stored token for {reg_url}"))?;
+    let client = AuthClient::new(registry_url);
+    let new_tokens = client
+        .refresh(&row.refresh_token)
+        .await
+        .context("token refresh HTTP call failed")?;
 
-        let client = AuthClient::new(&reg_url);
-        let new_tokens = client
-            .refresh(&row.refresh_token)
-            .context("token refresh HTTP call failed")?;
+    save_tokens(
+        &state,
+        registry_url,
+        &new_tokens.access_token,
+        &new_tokens.refresh_token,
+    )
+    .context("failed to save refreshed tokens")?;
 
-        save_tokens(
-            &state_clone,
-            &reg_url,
-            &new_tokens.access_token,
-            &new_tokens.refresh_token,
-        )
-        .context("failed to save refreshed tokens")?;
-
-        Ok(new_tokens.access_token)
-    })
-    .await
-    .context("token refresh task panicked")?
+    Ok(new_tokens.access_token)
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────

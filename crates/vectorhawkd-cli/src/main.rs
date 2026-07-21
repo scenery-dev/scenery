@@ -2142,10 +2142,7 @@ async fn try_infer_publisher_id(registry_url: &str) -> Option<String> {
     let state = AppState::bootstrap().ok()?;
     let tokens = load_tokens(&state, registry_url).ok().flatten()?;
     let client = AuthClient::new(registry_url);
-    let user_info = tokio::task::spawn_blocking(move || client.me(&tokens.access_token))
-        .await
-        .ok()?
-        .ok()?;
+    let user_info = client.me(&tokens.access_token).await.ok()?;
     let slug = derive_publisher_slug(&user_info.display_name);
     if slug.is_empty() {
         None
@@ -2828,6 +2825,7 @@ async fn cmd_skill_publish(
         let client = AuthClient::new(registry_url);
         let user = client
             .me(&tokens.access_token)
+            .await
             .context("failed to look up your publisher ID — try 'vectorhawk auth login'")?;
         let slug = derive_publisher_slug(&user.display_name);
         let patched = inject_publisher_field(&skill_md_text, &slug);
@@ -3515,6 +3513,7 @@ async fn cmd_auth_login(registry_url: &str) -> Result<()> {
 
     let tokens = client
         .exchange_oauth_code(&code, &init.code_verifier)
+        .await
         .context("OAuth token exchange failed")?;
 
     // ── Step 7: save tokens and print identity ────────────────────────────────
@@ -3527,7 +3526,7 @@ async fn cmd_auth_login(registry_url: &str) -> Result<()> {
     )
     .context("failed to save auth tokens")?;
 
-    match client.me(&tokens.access_token) {
+    match client.me(&tokens.access_token).await {
         Ok(user) => {
             println!("Logged in as {} ({}).", user.display_name, user.email);
         }
@@ -3623,7 +3622,7 @@ async fn cmd_auth_status(registry_url: &str) -> Result<()> {
         }
         Some(stored) => {
             let client = AuthClient::new(registry_url);
-            match client.me(&stored.access_token) {
+            match client.me(&stored.access_token).await {
                 Ok(user) => {
                     let slug = derive_publisher_slug(&user.display_name);
                     println!("Logged in as {} ({}).", user.display_name, user.email);
@@ -3658,11 +3657,9 @@ async fn cmd_auth_token(token: &str, registry_url: &str) -> Result<()> {
 
     let state = AppState::bootstrap().context("failed to bootstrap application state")?;
 
-    let token_owned = token.to_string();
-    let reg_url = registry_url.to_string();
-    let user = tokio::task::spawn_blocking(move || AuthClient::new(&reg_url).me(&token_owned))
+    let user = AuthClient::new(registry_url)
+        .me(token)
         .await
-        .context("validation task panicked")?
         .context("token validation failed — check that the token is valid and not revoked")?;
 
     save_tokens(&state, registry_url, token, token)

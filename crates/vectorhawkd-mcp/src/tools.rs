@@ -664,11 +664,11 @@ fn extract_rating_reply(arguments: &serde_json::Value) -> Option<&'static str> {
 
 /// Execute a tool call and return the MCP result.
 #[allow(clippy::too_many_arguments)]
-pub fn handle_tool_call(
+pub async fn handle_tool_call(
     name: &str,
     arguments: &serde_json::Value,
     state: &AppState,
-    policy_client: &dyn PolicyClient,
+    policy_client: &(dyn PolicyClient + Send + Sync),
     model_client: Option<&dyn ModelClient>,
     registry_url: &Option<String>,
     update_check_cache: &UpdateCheckCache,
@@ -708,22 +708,22 @@ pub fn handle_tool_call(
         "vectorhawk_install" => handle_install(arguments, state, registry_url),
         "vectorhawk_info" => handle_info(arguments, state),
         "vectorhawk_validate" => handle_validate(arguments),
-        "vectorhawk_import" => handle_import(arguments, state, registry_url),
+        "vectorhawk_import" => handle_import(arguments, state, registry_url).await,
         "vectorhawk_scan" => handle_scan(arguments, state, registry_url),
         "vectorhawk_login" => handle_login(arguments, state, registry_url),
         "vectorhawk_logout" => handle_logout(state, registry_url),
         "vectorhawk_mcp_catalog" => handle_mcp_catalog(state, registry_url),
-        "vectorhawk_mcp_request" => handle_mcp_request(arguments, state, registry_url),
-        "vectorhawk_mcp_status" => handle_mcp_status(state, registry_url),
+        "vectorhawk_mcp_request" => handle_mcp_request(arguments, state, registry_url).await,
+        "vectorhawk_mcp_status" => handle_mcp_status(state, registry_url).await,
         "vectorhawk_mcp_install" => handle_mcp_install(arguments, state, registry_url, aggregator),
         "vectorhawk_mcp_uninstall" => handle_mcp_uninstall(arguments, registry_url, aggregator),
         "vectorhawk_uninstall" => handle_uninstall(arguments, state),
         "vectorhawk_update" => handle_update(arguments, state, registry_url),
         "vectorhawk_plugin_export" => handle_plugin_export(arguments),
         "vectorhawk_plugin_import" => handle_plugin_import(arguments),
-        "vectorhawk_author" => handle_author(arguments, state, registry_url.as_deref()),
+        "vectorhawk_author" => handle_author(arguments, state, registry_url.as_deref()).await,
         "vectorhawk_author_confirm" => {
-            handle_author_confirm(arguments, state, registry_url.as_deref())
+            handle_author_confirm(arguments, state, registry_url.as_deref()).await
         }
         _ => handle_skill_run(
             name,
@@ -798,7 +798,10 @@ fn handle_list(state: &AppState) -> ToolCallResult {
     }
 }
 
-fn handle_search(arguments: &serde_json::Value, registry_url: &Option<String>) -> ToolCallResult {
+async fn handle_search(
+    arguments: &serde_json::Value,
+    registry_url: &Option<String>,
+) -> ToolCallResult {
     let url = match registry_url {
         Some(u) => u,
         None => return ToolCallResult::error_result("No registry URL configured"),
@@ -815,8 +818,15 @@ fn handle_search(arguments: &serde_json::Value, registry_url: &Option<String>) -
         );
     }
 
-    match mcp_governance::search_skills(url, query) {
-        Ok(results) => {
+    let url_owned = url.to_string();
+    let query_owned = query.to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        mcp_governance::search_skills(&url_owned, &query_owned)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(results)) => {
             if results.is_empty() {
                 ToolCallResult::success(format!("No skills found matching '{query}'."))
             } else {
@@ -826,7 +836,8 @@ fn handle_search(arguments: &serde_json::Value, registry_url: &Option<String>) -
                 }
             }
         }
-        Err(e) => ToolCallResult::error_result(format!("Search failed: {e}")),
+        Ok(Err(e)) => ToolCallResult::error_result(format!("Search failed: {e}")),
+        Err(e) => ToolCallResult::error_result(format!("Search panicked: {e}")),
     }
 }
 
@@ -989,7 +1000,7 @@ fn ensure_auth(
     }
 }
 
-fn try_refresh_auth(
+async fn try_refresh_auth(
     state: &AppState,
     registry_url: &str,
     refresh_token: &str,
@@ -997,7 +1008,7 @@ fn try_refresh_auth(
     debug!("access token expired, attempting refresh");
 
     let auth_client = AuthClient::new(registry_url);
-    match auth_client.refresh(refresh_token) {
+    match auth_client.refresh(refresh_token).await {
         Ok(new_tokens) => {
             if let Err(e) = auth::save_tokens(
                 state,
@@ -1095,30 +1106,26 @@ pub fn handle_login_with_oauth(
                             }
                         };
 
-                        let result = tokio::task::spawn_blocking(move || {
-                            let client = AuthClient::new(&reg_url);
-                            let tokens = client.exchange_oauth_code(&code, &code_verifier)?;
+                        let client = AuthClient::new(&reg_url);
+                        let result: Result<(), anyhow::Error> = async {
+                            let tokens = client.exchange_oauth_code(&code, &code_verifier).await?;
                             auth::save_tokens(
                                 &task_state,
                                 &reg_url,
                                 &tokens.access_token,
                                 &tokens.refresh_token,
                             )?;
-                            Ok::<(), anyhow::Error>(())
-                        })
+                            Ok(())
+                        }
                         .await;
 
                         match result {
-                            Ok(Ok(())) => {
+                            Ok(()) => {
                                 tracing::info!("vectorhawk_login: PKCE complete, tokens saved")
                             }
-                            Ok(Err(e)) => tracing::warn!(
-                                error = %e,
-                                "vectorhawk_login: token exchange/save failed"
-                            ),
                             Err(e) => tracing::warn!(
                                 error = %e,
-                                "vectorhawk_login: background task panicked"
+                                "vectorhawk_login: token exchange/save failed"
                             ),
                         }
                     });
@@ -1225,7 +1232,7 @@ fn parse_import_action(arguments: &serde_json::Value) -> Result<ImportAction, To
     }
 }
 
-fn handle_import(
+async fn handle_import(
     arguments: &serde_json::Value,
     state: &AppState,
     registry_url: &Option<String>,
@@ -1255,21 +1262,37 @@ fn handle_import(
     };
 
     match action {
-        ImportAction::Preview => handle_import_preview(url, input, &access_token, state),
-        ImportAction::Submit => handle_import_submit(url, input, &access_token, state),
+        ImportAction::Preview => handle_import_preview(url, input, &access_token, state).await,
+        ImportAction::Submit => handle_import_submit(url, input, &access_token, state).await,
     }
 }
 
 /// Execute the preview step: call the registry and return a formatted preview.
 ///
 /// Retries once with a refreshed token on 401.
-fn handle_import_preview(
+///
+/// `mcp_governance::import_preview` uses `reqwest::blocking` and must run
+/// inside `spawn_blocking` to avoid panicking on a tokio async runtime.
+async fn handle_import_preview(
     url: &str,
     input: &str,
     access_token: &str,
     state: &AppState,
 ) -> ToolCallResult {
-    match mcp_governance::import_preview(url, input, access_token) {
+    let url_owned = url.to_string();
+    let input_owned = input.to_string();
+    let token_owned = access_token.to_string();
+    let first_result = tokio::task::spawn_blocking(move || {
+        mcp_governance::import_preview(&url_owned, &input_owned, &token_owned)
+    })
+    .await;
+
+    let first_result = match first_result {
+        Ok(r) => r,
+        Err(e) => return ToolCallResult::error_result(format!("Import preview panicked: {e}")),
+    };
+
+    match first_result {
         Ok(preview) => ToolCallResult::success(format!(
             "{}\n\nUse action='submit' to request approval.",
             format_import_preview(&preview)
@@ -1281,16 +1304,27 @@ fn handle_import_preview(
                     Ok(Some(t)) => t.refresh_token,
                     _ => return auth_elicitation_prompt(url),
                 };
-                let new_token = match try_refresh_auth(state, url, &refresh_token) {
+                let new_token = match try_refresh_auth(state, url, &refresh_token).await {
                     Ok(t) => t,
                     Err(e) => return e,
                 };
-                match mcp_governance::import_preview(url, input, &new_token) {
-                    Ok(preview) => ToolCallResult::success(format!(
+                let url_owned = url.to_string();
+                let input_owned = input.to_string();
+                let retry_result = tokio::task::spawn_blocking(move || {
+                    mcp_governance::import_preview(&url_owned, &input_owned, &new_token)
+                })
+                .await;
+                match retry_result {
+                    Ok(Ok(preview)) => ToolCallResult::success(format!(
                         "{}\n\nUse action='submit' to request approval.",
                         format_import_preview(&preview)
                     )),
-                    Err(e) => ToolCallResult::error_result(format!("Import preview failed: {e}")),
+                    Ok(Err(e)) => {
+                        ToolCallResult::error_result(format!("Import preview failed: {e}"))
+                    }
+                    Err(e) => {
+                        ToolCallResult::error_result(format!("Import preview panicked: {e}"))
+                    }
                 }
             } else {
                 ToolCallResult::error_result(format!("Import preview failed: {e}"))
@@ -1302,13 +1336,29 @@ fn handle_import_preview(
 /// Execute the submit step: call the registry and return a formatted result.
 ///
 /// Retries once with a refreshed token on 401.
-fn handle_import_submit(
+///
+/// `mcp_governance::import_submit` uses `reqwest::blocking` and must run
+/// inside `spawn_blocking` to avoid panicking on a tokio async runtime.
+async fn handle_import_submit(
     url: &str,
     input: &str,
     access_token: &str,
     state: &AppState,
 ) -> ToolCallResult {
-    match mcp_governance::import_submit(url, input, access_token) {
+    let url_owned = url.to_string();
+    let input_owned = input.to_string();
+    let token_owned = access_token.to_string();
+    let first_result = tokio::task::spawn_blocking(move || {
+        mcp_governance::import_submit(&url_owned, &input_owned, &token_owned)
+    })
+    .await;
+
+    let first_result = match first_result {
+        Ok(r) => r,
+        Err(e) => return ToolCallResult::error_result(format!("Import submit panicked: {e}")),
+    };
+
+    match first_result {
         Ok(result) => ToolCallResult::success(format_import_result(&result)),
         Err(e) => {
             let err_str = e.to_string();
@@ -1317,13 +1367,24 @@ fn handle_import_submit(
                     Ok(Some(t)) => t.refresh_token,
                     _ => return auth_elicitation_prompt(url),
                 };
-                let new_token = match try_refresh_auth(state, url, &refresh_token) {
+                let new_token = match try_refresh_auth(state, url, &refresh_token).await {
                     Ok(t) => t,
                     Err(e) => return e,
                 };
-                match mcp_governance::import_submit(url, input, &new_token) {
-                    Ok(result) => ToolCallResult::success(format_import_result(&result)),
-                    Err(e) => ToolCallResult::error_result(format!("Import submit failed: {e}")),
+                let url_owned = url.to_string();
+                let input_owned = input.to_string();
+                let retry_result = tokio::task::spawn_blocking(move || {
+                    mcp_governance::import_submit(&url_owned, &input_owned, &new_token)
+                })
+                .await;
+                match retry_result {
+                    Ok(Ok(result)) => ToolCallResult::success(format_import_result(&result)),
+                    Ok(Err(e)) => {
+                        ToolCallResult::error_result(format!("Import submit failed: {e}"))
+                    }
+                    Err(e) => {
+                        ToolCallResult::error_result(format!("Import submit panicked: {e}"))
+                    }
                 }
             } else {
                 ToolCallResult::error_result(format!("Import submit failed: {e}"))
@@ -1576,7 +1637,7 @@ fn handle_mcp_catalog(state: &AppState, registry_url: &Option<String>) -> ToolCa
     }
 }
 
-fn handle_mcp_request(
+async fn handle_mcp_request(
     arguments: &serde_json::Value,
     state: &AppState,
     registry_url: &Option<String>,
@@ -1608,7 +1669,7 @@ fn handle_mcp_request(
                         Ok(Some(t)) => t.refresh_token,
                         _ => return auth_elicitation_prompt(url),
                     };
-                    let new_token = match try_refresh_auth(state, url, &refresh_token) {
+                    let new_token = match try_refresh_auth(state, url, &refresh_token).await {
                         Ok(t) => t,
                         Err(e) => return e,
                     };
@@ -1651,7 +1712,7 @@ fn handle_mcp_request(
     }
 }
 
-fn handle_mcp_status(state: &AppState, registry_url: &Option<String>) -> ToolCallResult {
+async fn handle_mcp_status(state: &AppState, registry_url: &Option<String>) -> ToolCallResult {
     let url = match registry_url {
         Some(u) => u,
         None => return ToolCallResult::error_result("No registry URL configured"),
@@ -1671,7 +1732,7 @@ fn handle_mcp_status(state: &AppState, registry_url: &Option<String>) -> ToolCal
                     Ok(Some(t)) => t.refresh_token,
                     _ => return auth_elicitation_prompt(url),
                 };
-                let new_token = match try_refresh_auth(state, url, &refresh_token) {
+                let new_token = match try_refresh_auth(state, url, &refresh_token).await {
                     Ok(t) => t,
                     Err(e) => return e,
                 };
@@ -1913,7 +1974,7 @@ fn handle_skill_run(
     skill_id: &str,
     arguments: &serde_json::Value,
     state: &AppState,
-    policy_client: &dyn PolicyClient,
+    policy_client: &(dyn PolicyClient + Send + Sync),
     model_client: Option<&dyn ModelClient>,
     update_check_cache: &UpdateCheckCache,
     rating_state: Option<&RatingState>,
@@ -2319,13 +2380,13 @@ fn derive_publisher_slug(display_name: &str) -> String {
 /// Try to look up the logged-in user's publisher slug from auth state.
 ///
 /// Returns `None` silently on any failure.
-fn try_infer_publisher_id(state: &AppState, registry_url: Option<&str>) -> Option<String> {
+async fn try_infer_publisher_id(state: &AppState, registry_url: Option<&str>) -> Option<String> {
     use vectorhawkd_core::auth::{load_tokens, AuthClient};
 
     let url = registry_url.unwrap_or("https://app.vectorhawk.ai");
     let tokens = load_tokens(state, url).ok().flatten()?;
     let client = AuthClient::new(url);
-    let user_info = client.me(&tokens.access_token).ok()?;
+    let user_info = client.me(&tokens.access_token).await.ok()?;
     let slug = derive_publisher_slug(&user_info.display_name);
     if slug.is_empty() {
         None
@@ -2343,7 +2404,7 @@ fn format_duration_ms(ms: u32) -> String {
     }
 }
 
-fn handle_author(
+async fn handle_author(
     arguments: &serde_json::Value,
     state: &AppState,
     registry_url: Option<&str>,
@@ -2377,6 +2438,7 @@ fn handle_author(
 
     let skill_id = normalize_skill_id(name);
     let publisher_id = try_infer_publisher_id(state, registry_url)
+        .await
         .unwrap_or_else(|| "YOUR_PUBLISHER_ID".to_string());
 
     match mode {
@@ -2542,7 +2604,7 @@ fn handle_author(
     }
 }
 
-fn handle_author_confirm(
+async fn handle_author_confirm(
     arguments: &serde_json::Value,
     state: &AppState,
     registry_url: Option<&str>,
@@ -2631,12 +2693,16 @@ fn handle_author_confirm(
     let normalized_id = normalize_skill_id(skill_id);
 
     // Publisher ID: use explicit arg if provided, otherwise infer from auth.
-    let publisher_id = arguments
+    let publisher_id = match arguments
         .get("publisher_id")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
-        .or_else(|| try_infer_publisher_id(state, registry_url))
-        .unwrap_or_else(|| "YOUR_PUBLISHER_ID".to_string());
+    {
+        Some(id) => id,
+        None => try_infer_publisher_id(state, registry_url)
+            .await
+            .unwrap_or_else(|| "YOUR_PUBLISHER_ID".to_string()),
+    };
 
     match scaffold_skill_md(SkillMdParams {
         skill_id: &normalized_id,
@@ -2699,6 +2765,10 @@ mod tests {
     }
 
     fn fake_login(state: &AppState, url: &str) {
+        // Disable keychain for test tokens so the call goes through SQLite
+        // and does not block the tokio runtime (macOS keyring blocks on
+        // current-thread runtimes).
+        std::env::set_var("VECTORHAWK_DISABLE_KEYCHAIN", "1");
         vectorhawkd_core::auth::save_tokens(state, url, "fake-access", "fake-refresh").unwrap();
     }
 
@@ -3088,15 +3158,16 @@ mod tests {
         let _ = fs::remove_dir_all(&state_root);
     }
 
-    #[test]
-    fn handle_mcp_request_requires_server_name() {
+    #[tokio::test]
+    async fn handle_mcp_request_requires_server_name() {
         let state_root = temp_root("mcp-request-no-name");
         let state = AppState::bootstrap_in(state_root.clone()).unwrap();
         let result = handle_mcp_request(
             &serde_json::json!({}),
             &state,
             &Some("http://localhost:8000".to_string()),
-        );
+        )
+        .await;
         assert_eq!(result.is_error, Some(true));
         assert!(result.content[0].text.contains("server_name"));
         let _ = fs::remove_dir_all(&state_root);
@@ -3159,22 +3230,23 @@ mod tests {
 
     // ── handle_import integration tests ───────────────────────────────────────
 
-    #[test]
-    fn handle_import_requires_input() {
+    #[tokio::test]
+    async fn handle_import_requires_input() {
         let state_root = temp_root("import-no-input");
         let state = AppState::bootstrap_in(state_root.clone()).unwrap();
         let result = handle_import(
             &serde_json::json!({"action": "preview"}),
             &state,
             &Some("http://localhost:8000".to_string()),
-        );
+        )
+        .await;
         assert_eq!(result.is_error, Some(true));
         assert!(result.content[0].text.contains("input"));
         let _ = fs::remove_dir_all(&state_root);
     }
 
-    #[test]
-    fn handle_import_requires_action() {
+    #[tokio::test]
+    async fn handle_import_requires_action() {
         let state_root = temp_root("import-no-action");
         let state = AppState::bootstrap_in(state_root.clone()).unwrap();
         fake_login(&state, "http://localhost:8000");
@@ -3182,28 +3254,30 @@ mod tests {
             &serde_json::json!({"input": "some-package"}),
             &state,
             &Some("http://localhost:8000".to_string()),
-        );
+        )
+        .await;
         assert_eq!(result.is_error, Some(true));
         assert!(result.content[0].text.contains("action"));
         let _ = fs::remove_dir_all(&state_root);
     }
 
-    #[test]
-    fn handle_import_no_registry() {
+    #[tokio::test]
+    async fn handle_import_no_registry() {
         let state_root = temp_root("import-no-reg");
         let state = AppState::bootstrap_in(state_root.clone()).unwrap();
         let result = handle_import(
             &serde_json::json!({"input": "some-package", "action": "preview"}),
             &state,
             &None,
-        );
+        )
+        .await;
         assert_eq!(result.is_error, Some(true));
         assert!(result.content[0].text.contains("registry"));
         let _ = fs::remove_dir_all(&state_root);
     }
 
-    #[test]
-    fn handle_import_preview_requires_auth() {
+    #[tokio::test]
+    async fn handle_import_preview_requires_auth() {
         let state_root = temp_root("import-preview-no-auth");
         let state = AppState::bootstrap_in(state_root.clone()).unwrap();
         // No fake_login — user is not authenticated
@@ -3211,7 +3285,8 @@ mod tests {
             &serde_json::json!({"input": "@modelcontextprotocol/server-slack", "action": "preview"}),
             &state,
             &Some("http://localhost:8000".to_string()),
-        );
+        )
+        .await;
         assert_eq!(result.is_error, Some(true));
         assert!(
             result.content[0].text.contains("login") || result.content[0].text.contains("auth"),
@@ -3221,8 +3296,8 @@ mod tests {
         let _ = fs::remove_dir_all(&state_root);
     }
 
-    #[test]
-    fn handle_import_submit_requires_auth() {
+    #[tokio::test]
+    async fn handle_import_submit_requires_auth() {
         let state_root = temp_root("import-submit-no-auth");
         let state = AppState::bootstrap_in(state_root.clone()).unwrap();
         // No fake_login — user is not authenticated
@@ -3230,7 +3305,8 @@ mod tests {
             &serde_json::json!({"input": "@modelcontextprotocol/server-slack", "action": "submit"}),
             &state,
             &Some("http://localhost:8000".to_string()),
-        );
+        )
+        .await;
         assert_eq!(result.is_error, Some(true));
         assert!(
             result.content[0].text.contains("login") || result.content[0].text.contains("auth"),
@@ -3240,14 +3316,14 @@ mod tests {
         let _ = fs::remove_dir_all(&state_root);
     }
 
-    #[test]
-    fn handle_import_preview_skill_formats_output() {
+    #[tokio::test]
+    async fn handle_import_preview_skill_formats_output() {
         use mockito::Server;
 
         let state_root = temp_root("import-preview-skill-ok");
         let state = AppState::bootstrap_in(state_root.clone()).unwrap();
 
-        let mut server = Server::new();
+        let mut server = Server::new_async().await;
         let url = server.url();
         fake_login(&state, &url);
 
@@ -3275,7 +3351,8 @@ mod tests {
             }),
             &state,
             &Some(url),
-        );
+        )
+        .await;
 
         assert_eq!(
             result.is_error, None,
@@ -3294,14 +3371,14 @@ mod tests {
         let _ = fs::remove_dir_all(&state_root);
     }
 
-    #[test]
-    fn handle_import_preview_mcp_server_formats_output() {
+    #[tokio::test]
+    async fn handle_import_preview_mcp_server_formats_output() {
         use mockito::Server;
 
         let state_root = temp_root("import-preview-mcp-ok");
         let state = AppState::bootstrap_in(state_root.clone()).unwrap();
 
-        let mut server = Server::new();
+        let mut server = Server::new_async().await;
         let url = server.url();
         fake_login(&state, &url);
 
@@ -3330,7 +3407,8 @@ mod tests {
             }),
             &state,
             &Some(url),
-        );
+        )
+        .await;
 
         assert_eq!(
             result.is_error, None,
@@ -3351,14 +3429,14 @@ mod tests {
         let _ = fs::remove_dir_all(&state_root);
     }
 
-    #[test]
-    fn handle_import_submit_mcp_server_approved() {
+    #[tokio::test]
+    async fn handle_import_submit_mcp_server_approved() {
         use mockito::Server;
 
         let state_root = temp_root("import-submit-mcp-approved");
         let state = AppState::bootstrap_in(state_root.clone()).unwrap();
 
-        let mut server = Server::new();
+        let mut server = Server::new_async().await;
         let url = server.url();
         fake_login(&state, &url);
 
@@ -3385,7 +3463,8 @@ mod tests {
             }),
             &state,
             &Some(url),
-        );
+        )
+        .await;
 
         assert_eq!(
             result.is_error, None,
@@ -3403,14 +3482,14 @@ mod tests {
         let _ = fs::remove_dir_all(&state_root);
     }
 
-    #[test]
-    fn handle_import_submit_mcp_server_pending() {
+    #[tokio::test]
+    async fn handle_import_submit_mcp_server_pending() {
         use mockito::Server;
 
         let state_root = temp_root("import-submit-mcp-pending");
         let state = AppState::bootstrap_in(state_root.clone()).unwrap();
 
-        let mut server = Server::new();
+        let mut server = Server::new_async().await;
         let url = server.url();
         fake_login(&state, &url);
 
@@ -3437,7 +3516,8 @@ mod tests {
             }),
             &state,
             &Some(url),
-        );
+        )
+        .await;
 
         assert_eq!(
             result.is_error, None,
@@ -3454,14 +3534,14 @@ mod tests {
         let _ = fs::remove_dir_all(&state_root);
     }
 
-    #[test]
-    fn handle_import_submit_skill_ok() {
+    #[tokio::test]
+    async fn handle_import_submit_skill_ok() {
         use mockito::Server;
 
         let state_root = temp_root("import-submit-skill-ok");
         let state = AppState::bootstrap_in(state_root.clone()).unwrap();
 
-        let mut server = Server::new();
+        let mut server = Server::new_async().await;
         let url = server.url();
         fake_login(&state, &url);
 
@@ -3488,7 +3568,8 @@ mod tests {
             }),
             &state,
             &Some(url),
-        );
+        )
+        .await;
 
         assert_eq!(
             result.is_error, None,
@@ -3692,8 +3773,8 @@ mod tests {
         let _ = fs::remove_dir_all(&state_root);
     }
 
-    #[test]
-    fn rating_reply_captured_and_state_cleared() {
+    #[tokio::test]
+    async fn rating_reply_captured_and_state_cleared() {
         use rusqlite::Connection;
         use vectorhawkd_core::ratings::get_unsynced_ratings;
 
@@ -3718,7 +3799,8 @@ mod tests {
             &empty_cache(),
             None,
             Some(&rs),
-        );
+        )
+        .await;
 
         assert!(result.is_error.is_none() || result.is_error == Some(false));
         assert!(result.content[0].text.contains("thumbs up"));
