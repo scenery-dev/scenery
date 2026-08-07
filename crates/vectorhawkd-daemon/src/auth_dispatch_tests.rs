@@ -8,7 +8,10 @@ use vectorhawkd_mcp::protocol::INTERNAL_ERROR;
 
 use crate::oauth_state::OAuthState;
 
-use super::{handle_get_oauth_listener_port, handle_reload, handle_wait_for_callback};
+use super::{
+    handle_get_oauth_listener_port, handle_get_portal_session, handle_reload,
+    handle_wait_for_callback, NOT_AUTHENTICATED,
+};
 
 fn id() -> Option<serde_json::Value> {
     Some(serde_json::json!(1))
@@ -213,4 +216,117 @@ async fn wait_for_callback_default_timeout_is_accepted() {
     let resp = handle.await.unwrap();
     assert!(resp.error.is_none());
     assert_eq!(resp.result.unwrap()["code"], "code-default");
+}
+
+// ── auth/get_portal_session ──────────────────────────────────────────────────
+
+/// Force the SQLite fallback so these tests don't pollute the real macOS
+/// keychain. Holds a global mutex so concurrent tests can't race each
+/// other's env-var set/clear (cargo test runs in parallel by default).
+/// Mirrors the identical helper in `refresh_loop_tests.rs` / `vectorhawkd-core`'s
+/// own `auth.rs` test suite — kept local rather than shared since it's a tiny,
+/// test-only utility and none of those modules expose it publicly.
+struct KeychainOff {
+    _g: std::sync::MutexGuard<'static, ()>,
+}
+static KEYCHAIN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+impl KeychainOff {
+    fn enable() -> Self {
+        let _g = KEYCHAIN_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("VECTORHAWK_DISABLE_KEYCHAIN", "1");
+        KeychainOff { _g }
+    }
+}
+impl Drop for KeychainOff {
+    fn drop(&mut self) {
+        std::env::remove_var("VECTORHAWK_DISABLE_KEYCHAIN");
+    }
+}
+
+/// Bootstrap a fresh, isolated `AppState` (real SQLite schema, no rows).
+/// Returns the `TempDir` guard alongside it — the caller must keep it alive
+/// for as long as the `AppState` is used, same as the pattern already used by
+/// `reload_returns_inactive_without_token_and_is_idempotent` above.
+fn bootstrap_state() -> (vectorhawkd_core::state::AppState, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+    let state = vectorhawkd_core::state::AppState::bootstrap_in(root).unwrap();
+    (state, tmp)
+}
+
+#[tokio::test]
+async fn get_portal_session_returns_not_authenticated_when_no_tokens_stored() {
+    let (state, _tmp) = bootstrap_state(); // fresh bootstrapped AppState, no auth_tokens rows
+
+    let resp = handle_get_portal_session(id(), &state, "https://example.invalid").await;
+
+    assert!(
+        resp.error.is_some(),
+        "expected an error when no tokens are stored"
+    );
+    assert_eq!(resp.error.as_ref().unwrap().code, NOT_AUTHENTICATED);
+    assert_eq!(resp.error.as_ref().unwrap().message, "not authenticated");
+}
+
+#[tokio::test]
+async fn get_portal_session_returns_full_session_on_success() {
+    let _guard = KeychainOff::enable();
+    let (state, _tmp) = bootstrap_state();
+
+    let mut server = mockito::Server::new_async().await;
+    let registry_url = server.url();
+
+    let mock = server
+        .mock("GET", "/portal/auth/me")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"id":"u1","email":"portal@example.com","display_name":"Portal User"}"#)
+        .create_async()
+        .await;
+
+    vectorhawkd_core::auth::save_tokens(&state, &registry_url, "acc-tok", "ref-tok")
+        .expect("save_tokens");
+
+    let resp = handle_get_portal_session(id(), &state, &registry_url).await;
+
+    assert!(resp.error.is_none(), "should not error: {:?}", resp.error);
+    let result = resp.result.unwrap();
+    assert_eq!(result["access_token"], "acc-tok");
+    assert_eq!(result["refresh_token"], "ref-tok");
+    assert_eq!(result["auth_scope"], "portal");
+    assert_eq!(result["user"]["id"], "u1");
+    assert_eq!(result["user"]["email"], "portal@example.com");
+    assert_eq!(result["user"]["display_name"], "Portal User");
+    mock.assert_async().await;
+}
+
+#[tokio::test]
+async fn get_portal_session_returns_internal_error_when_me_fails() {
+    let _guard = KeychainOff::enable();
+    let (state, _tmp) = bootstrap_state();
+
+    let mut server = mockito::Server::new_async().await;
+    let registry_url = server.url();
+
+    let mock = server
+        .mock("GET", "/portal/auth/me")
+        .with_status(401)
+        .with_body("unauthorized")
+        .create_async()
+        .await;
+
+    vectorhawkd_core::auth::save_tokens(&state, &registry_url, "acc-tok", "ref-tok")
+        .expect("save_tokens");
+
+    let resp = handle_get_portal_session(id(), &state, &registry_url).await;
+
+    assert!(resp.result.is_none());
+    let err = resp.error.unwrap();
+    assert_eq!(err.code, INTERNAL_ERROR);
+    assert!(
+        err.message.contains("failed to fetch user info"),
+        "error message should mention the failed user-info fetch; got: {}",
+        err.message
+    );
+    mock.assert_async().await;
 }

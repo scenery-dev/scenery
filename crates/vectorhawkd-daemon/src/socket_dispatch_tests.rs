@@ -259,21 +259,3 @@ async fn dispatch_initialize_fires_kick() {
         .await
         .expect("discoveries_kick was not notified within 100 ms after initialize");
 }
-
-#[tokio::test]
-async fn get_portal_session_returns_not_authenticated_when_no_tokens_stored() {
-    let ctx = make_ctx(); // fresh bootstrapped AppState, no auth_tokens rows
-
-    let resp = dispatch(
-        &ctx,
-        make_request("auth/get_portal_session", serde_json::json!(null)),
-    )
-    .await;
-
-    assert!(
-        resp.error.is_some(),
-        "expected an error when no tokens are stored"
-    );
-    assert_eq!(resp.error.as_ref().unwrap().code, -32001);
-    assert_eq!(resp.error.as_ref().unwrap().message, "not authenticated");
-}
