@@ -11,6 +11,7 @@
 //! | `auth/get_oauth_listener_port` | `{}` | `{"port": <u16>}` |
 //! | `auth/wait_for_callback` | `{"state": str, "timeout_secs": u64}` | `{"code": str}` |
 //! | `auth/reload` | `{}` | `{"sync_active": bool}` |
+//! | `auth/get_portal_session` | `{}` | `{"access_token": str, "refresh_token": str, "auth_scope": "portal", "user": {"id": str, "email": str, "display_name": str}}` |
 //!
 //! # Timeout semantics
 //!
@@ -22,6 +23,7 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 use tracing::debug;
+use vectorhawkd_core::state::AppState;
 use vectorhawkd_mcp::protocol::{JsonRpcError, JsonRpcResponse, INTERNAL_ERROR, INVALID_PARAMS};
 
 use crate::oauth_state::OAuthState;
@@ -33,6 +35,14 @@ const TIMEOUT_SECS_MIN: u64 = 1;
 const TIMEOUT_SECS_MAX: u64 = 600;
 /// Default `timeout_secs` when the field is absent.
 const TIMEOUT_SECS_DEFAULT: u64 = 300;
+
+/// `auth/get_portal_session` error code for "daemon is reachable but has no
+/// stored auth session." Deliberately distinct from `DAEMON_UNREACHABLE`
+/// (`-32001`, defined in `vectorhawkd-shim/src/lib.rs`), which the shim uses
+/// when it cannot reach the daemon *process* at all — an unrelated failure
+/// mode. Reusing `-32001` here would let a client conflate "no daemon" with
+/// "daemon is up but you're logged out."
+const NOT_AUTHENTICATED: i64 = -32002;
 
 /// Params for `auth/wait_for_callback`.
 #[derive(Debug, Deserialize)]
@@ -150,6 +160,99 @@ pub async fn handle_reload(
     let active = sync_controller.ensure_started().await;
     debug!(sync_active = active, "auth/reload processed");
     JsonRpcResponse::success(id, serde_json::json!({ "sync_active": active }))
+}
+
+/// Handle `auth/get_portal_session`.
+///
+/// Reuses `vectorhawkd_core::auth::load_tokens` (Keychain-vs-SQLite lookup
+/// already handled there) and `AuthClient::me()` to hand the desktop app the
+/// daemon's already-authenticated session — access token, refresh token, and
+/// user info — so it can open a portal WebView pre-authenticated without
+/// reaching into the daemon's storage directly.
+///
+/// `"auth_scope": "portal"` is correct (not a placeholder): the backend mints
+/// CLI-flow tokens with `scope="portal"` (see `portal_auth.py`'s `cli_token`
+/// handler), identical to `portal_login`. The frontend's `AuthContext` only
+/// accepts `"admin" | "portal"` for `auth_scope`; CLI-issued tokens are
+/// already portal-scoped, so no backend changes are needed here.
+pub async fn handle_get_portal_session(
+    id: Option<serde_json::Value>,
+    state: &AppState,
+    registry_url: &str,
+) -> JsonRpcResponse {
+    let state = state.clone();
+    let registry_url = registry_url.to_string();
+
+    let stored = tokio::task::spawn_blocking(move || {
+        vectorhawkd_core::auth::load_tokens(&state, &registry_url)
+    })
+    .await;
+
+    let stored = match stored {
+        Ok(Ok(Some(tokens))) => tokens,
+        Ok(Ok(None)) => {
+            return JsonRpcResponse::error(id, NOT_AUTHENTICATED, "not authenticated".to_string());
+        }
+        Ok(Err(e)) => {
+            return JsonRpcResponse::error(
+                id,
+                INTERNAL_ERROR,
+                format!("failed to load tokens: {e}"),
+            );
+        }
+        Err(e) => {
+            return JsonRpcResponse::error(
+                id,
+                INTERNAL_ERROR,
+                format!("token lookup task panicked: {e}"),
+            );
+        }
+    };
+
+    let access_token = stored.access_token.clone();
+    let registry_url = stored.registry_url.clone();
+    // AuthClient::new builds a `reqwest::blocking::Client`, which internally
+    // drives its own single-threaded runtime — constructing (or dropping) one
+    // on the async executor thread panics ("cannot drop a runtime from within
+    // a runtime"). Build and use it entirely inside spawn_blocking so its
+    // whole lifecycle stays on the blocking thread pool.
+    let user = tokio::task::spawn_blocking(move || {
+        let client = vectorhawkd_core::auth::AuthClient::new(&registry_url);
+        client.me(&access_token)
+    })
+    .await;
+
+    let user = match user {
+        Ok(Ok(user)) => user,
+        Ok(Err(e)) => {
+            return JsonRpcResponse::error(
+                id,
+                INTERNAL_ERROR,
+                format!("failed to fetch user info: {e}"),
+            );
+        }
+        Err(e) => {
+            return JsonRpcResponse::error(
+                id,
+                INTERNAL_ERROR,
+                format!("user info task panicked: {e}"),
+            );
+        }
+    };
+
+    JsonRpcResponse::success(
+        id,
+        serde_json::json!({
+            "access_token": stored.access_token,
+            "refresh_token": stored.refresh_token,
+            "auth_scope": "portal",
+            "user": {
+                "id": user.id,
+                "email": user.email,
+                "display_name": user.display_name,
+            },
+        }),
+    )
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
