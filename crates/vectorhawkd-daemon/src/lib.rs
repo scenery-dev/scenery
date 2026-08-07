@@ -693,6 +693,8 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
                             discoveries_kick: Arc::clone(&discoveries_kick),
                             sync_controller: Arc::clone(&sync_controller),
                             pending_alert: Arc::clone(&pending_alert),
+                            state: state.clone(),
+                            registry_url: registry_url.clone(),
                         };
                         tokio::spawn(socket_dispatch::serve_connection(stream, ctx));
                     }

@@ -37,6 +37,21 @@ fn make_sync_controller(registry: Arc<BackendRegistry>) -> Arc<crate::SyncContro
     ))
 }
 
+/// Bootstrap a fresh, isolated `AppState` (real SQLite schema, no rows) for a
+/// single test's `DaemonContext`. Uses a unique temp directory that is kept
+/// (not cleaned up) for the lifetime of the process — matching this file's
+/// existing pattern of not tearing down test temp dirs — so the DB survives
+/// past the end of this function without needing to thread a `TempDir` guard
+/// through `DaemonContext` (which only derives `Clone`, not a guard holder).
+fn make_test_state() -> vectorhawkd_core::state::AppState {
+    use camino::Utf8PathBuf;
+    use vectorhawkd_core::state::AppState;
+
+    let root = Utf8PathBuf::from_path_buf(tempfile::tempdir().unwrap().keep())
+        .expect("temp dir path must be UTF-8");
+    AppState::bootstrap_in(root).expect("failed to bootstrap test AppState")
+}
+
 fn make_ctx() -> DaemonContext {
     let registry = Arc::new(BackendRegistry::new());
     registry.register_backend(BackendEntry {
@@ -62,6 +77,8 @@ fn make_ctx() -> DaemonContext {
         discoveries_kick: Arc::new(Notify::new()),
         sync_controller: make_sync_controller(registry),
         pending_alert: Arc::new(std::sync::Mutex::new(None)),
+        state: make_test_state(),
+        registry_url: "https://example.invalid".to_string(),
     }
 }
 
@@ -208,6 +225,8 @@ async fn dispatch_auth_get_oauth_listener_port_when_none() {
         discoveries_kick: Arc::new(Notify::new()),
         sync_controller: make_sync_controller(registry),
         pending_alert: Arc::new(std::sync::Mutex::new(None)),
+        state: make_test_state(),
+        registry_url: "https://example.invalid".to_string(),
     };
     let resp = dispatch(
         &ctx,
@@ -239,4 +258,22 @@ async fn dispatch_initialize_fires_kick() {
     tokio::time::timeout(std::time::Duration::from_millis(100), &mut notified)
         .await
         .expect("discoveries_kick was not notified within 100 ms after initialize");
+}
+
+#[tokio::test]
+async fn get_portal_session_returns_not_authenticated_when_no_tokens_stored() {
+    let ctx = make_ctx(); // fresh bootstrapped AppState, no auth_tokens rows
+
+    let resp = dispatch(
+        &ctx,
+        make_request("auth/get_portal_session", serde_json::json!(null)),
+    )
+    .await;
+
+    assert!(
+        resp.error.is_some(),
+        "expected an error when no tokens are stored"
+    );
+    assert_eq!(resp.error.as_ref().unwrap().code, -32001);
+    assert_eq!(resp.error.as_ref().unwrap().message, "not authenticated");
 }

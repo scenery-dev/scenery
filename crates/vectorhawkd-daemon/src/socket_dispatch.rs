@@ -108,6 +108,12 @@ pub struct DaemonContext {
     /// connection, so a one-shot take by the first (relay) connection would be
     /// dropped. After the window it is cleared and no longer sent.
     pub pending_alert: Arc<std::sync::Mutex<Option<(String, std::time::Instant)>>>,
+    /// Application state (SQLite path, root dir) — needed by `auth/*` handlers
+    /// that read stored tokens directly rather than through `RealBackend`.
+    pub state: vectorhawkd_core::state::AppState,
+    /// Registry URL the daemon is currently pointed at — needed to construct
+    /// an `AuthClient` for `auth/get_portal_session`.
+    pub registry_url: String,
 }
 
 /// How long after adoption an alert keeps being delivered to newly-connecting
@@ -310,11 +316,99 @@ pub(crate) async fn dispatch(ctx: &DaemonContext, request: JsonRpcRequest) -> Js
 
         "auth/reload" => handle_reload(id, Arc::clone(&ctx.sync_controller)).await,
 
+        "auth/get_portal_session" => {
+            handle_get_portal_session(id, &ctx.state, &ctx.registry_url).await
+        }
+
         other => {
             debug!(method = %other, "unknown method");
             JsonRpcResponse::error(id, METHOD_NOT_FOUND, format!("unknown method: {other}"))
         }
     }
+}
+
+/// Handle `auth/get_portal_session`.
+///
+/// Reuses `vectorhawkd_core::auth::load_tokens` (Keychain-vs-SQLite lookup
+/// already handled there) and `AuthClient::me()` to hand the desktop app the
+/// daemon's already-authenticated session — access token, refresh token, and
+/// user info — so it can open a portal WebView pre-authenticated without
+/// reaching into the daemon's storage directly.
+///
+/// `"auth_scope": "portal"` is correct (not a placeholder): the backend mints
+/// CLI-flow tokens with `scope="portal"` (see `portal_auth.py`'s `cli_token`
+/// handler), identical to `portal_login`. The frontend's `AuthContext` only
+/// accepts `"admin" | "portal"` for `auth_scope`; CLI-issued tokens are
+/// already portal-scoped, so no backend changes are needed here.
+async fn handle_get_portal_session(
+    id: Option<serde_json::Value>,
+    state: &vectorhawkd_core::state::AppState,
+    registry_url: &str,
+) -> JsonRpcResponse {
+    let state = state.clone();
+    let registry_url = registry_url.to_string();
+
+    let stored = tokio::task::spawn_blocking(move || {
+        vectorhawkd_core::auth::load_tokens(&state, &registry_url)
+    })
+    .await;
+
+    let stored = match stored {
+        Ok(Ok(Some(tokens))) => tokens,
+        Ok(Ok(None)) => {
+            return JsonRpcResponse::error(id, -32001, "not authenticated".to_string());
+        }
+        Ok(Err(e)) => {
+            return JsonRpcResponse::error(
+                id,
+                INTERNAL_ERROR,
+                format!("failed to load tokens: {e}"),
+            );
+        }
+        Err(e) => {
+            return JsonRpcResponse::error(
+                id,
+                INTERNAL_ERROR,
+                format!("token lookup task panicked: {e}"),
+            );
+        }
+    };
+
+    let access_token = stored.access_token.clone();
+    let client = vectorhawkd_core::auth::AuthClient::new(&stored.registry_url);
+    let user = tokio::task::spawn_blocking(move || client.me(&access_token)).await;
+
+    let user = match user {
+        Ok(Ok(user)) => user,
+        Ok(Err(e)) => {
+            return JsonRpcResponse::error(
+                id,
+                INTERNAL_ERROR,
+                format!("failed to fetch user info: {e}"),
+            );
+        }
+        Err(e) => {
+            return JsonRpcResponse::error(
+                id,
+                INTERNAL_ERROR,
+                format!("user info task panicked: {e}"),
+            );
+        }
+    };
+
+    JsonRpcResponse::success(
+        id,
+        serde_json::json!({
+            "access_token": stored.access_token,
+            "refresh_token": stored.refresh_token,
+            "auth_scope": "portal",
+            "user": {
+                "id": user.id,
+                "email": user.email,
+                "display_name": user.display_name,
+            },
+        }),
+    )
 }
 
 /// Serialize a response and write it as a length-prefixed frame.
