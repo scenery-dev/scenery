@@ -1995,6 +1995,15 @@ async fn cmd_skill_run(
         Ok(r) => ("ok", r.version.clone()),
         Err(_) => ("error", String::new()),
     };
+    // Task 9: surface model_source (e.g. "local:llama3.1:8b") in the
+    // skill_run audit payload — IT needs local-inference rows visible here
+    // since the gateway (which normally logs the inference tier) is
+    // bypassed when Block Third-Party Inference is on. None on error, since
+    // no RunResult exists.
+    let run_model_source: Option<String> = match &run_outcome {
+        Ok(r) => r.model_source.clone(),
+        Err(_) => None,
+    };
 
     let ts = chrono::Utc::now().to_rfc3339();
     write_audit_event_direct(
@@ -2007,6 +2016,7 @@ async fn cmd_skill_run(
                 "status":   run_status,
                 "invoker":  "cli",
                 "ts":       ts,
+                "model_source": run_model_source,
             }),
         },
     );
