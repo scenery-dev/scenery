@@ -1099,10 +1099,7 @@ pub fn handle_login_with_oauth(
                     let oauth_state_val = initiation.state.clone();
                     let subscriber = std::sync::Arc::clone(&ctx.subscriber);
                     let reg_url = registry_url.clone();
-                    let task_state = AppState {
-                        root_dir: state.root_dir.clone(),
-                        db_path: state.db_path.clone(),
-                    };
+                    let task_state = state.clone();
 
                     // Fire-and-forget: await browser callback → exchange code → save tokens.
                     // The AI client already has the URL; this completes silently in the background.

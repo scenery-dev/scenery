@@ -208,8 +208,7 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     // Checks every stored access token and refreshes any that are within 5 min
     // of expiry.  All sync I/O (SQLite + HTTP) happens inside spawn_blocking
     // per the spawn_blocking discipline documented at the top of this file.
-    let refresh_db_path = state.db_path.clone();
-    let refresh_root_dir = state.root_dir.clone();
+    let refresh_state = state.clone();
     let refresh_registry_url = registry_url.clone();
     tokio::spawn(async move {
         let mut interval =
@@ -220,18 +219,11 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
         loop {
             interval.tick().await;
 
-            let db = refresh_db_path.clone();
-            let root = refresh_root_dir.clone();
+            let state_view = refresh_state.clone();
             let reg_url = refresh_registry_url.clone();
 
-            let result = tokio::task::spawn_blocking(move || {
-                let state_view = AppState {
-                    root_dir: root,
-                    db_path: db,
-                };
-                refresh_one_tick(&state_view, &reg_url)
-            })
-            .await;
+            let result =
+                tokio::task::spawn_blocking(move || refresh_one_tick(&state_view, &reg_url)).await;
 
             match result {
                 Ok(Ok(())) => {}
@@ -287,13 +279,7 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     // Build a GatewayModelClient pointing at the same registry URL so that
     // LLM steps can fall through to the cloud gateway when a local Ollama
     // model is not available or not preferred.
-    let gateway = GatewayModelClient::new(
-        registry_url.clone(),
-        Arc::new(AppState {
-            root_dir: state.root_dir.clone(),
-            db_path: state.db_path.clone(),
-        }),
-    );
+    let gateway = GatewayModelClient::new(registry_url.clone(), Arc::new(state.clone()));
 
     // Wire HybridModelClient: Ollama (optional local) → GatewayModelClient.
     // The sampling fallback (McpSamplingClient) is handled at the per-shim
@@ -382,10 +368,7 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     // Set VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER=1 to skip entirely (useful
     // in tests, CI, and operator opt-out scenarios).
     if std::env::var("VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER").is_err() {
-        let state_arc_f1 = Arc::new(AppState {
-            root_dir: state.root_dir.clone(),
-            db_path: state.db_path.clone(),
-        });
+        let state_arc_f1 = Arc::new(state.clone());
         let registry_url_f1 = registry_url.clone();
         match managed_paths::ManagedPathsReconciler::new(state_arc_f1, registry_url_f1) {
             Ok(reconciler) => match reconciler.migrate_existing().await {
@@ -432,10 +415,7 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     // when mode=quarantine, holds for approval when mode=approve_required.
     // Killswitch: same VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER env var.
     if std::env::var("VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER").is_err() {
-        let state_arc_f3 = Arc::new(AppState {
-            root_dir: state.root_dir.clone(),
-            db_path: state.db_path.clone(),
-        });
+        let state_arc_f3 = Arc::new(state.clone());
         // Persist registry_url so the SSE drift-resolution handler can find it.
         if let Err(e) = state_arc_f3.set_sync_state("registry_url", &registry_url) {
             warn!(error = %e, "drift: failed to persist registry_url to sync_state");
@@ -466,10 +446,7 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     // of waiting for the next periodic tick. Debounced to 10 s inside the loop.
     let discoveries_kick = Arc::new(Notify::new());
     if std::env::var("VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER").is_err() {
-        let discoveries_state = Arc::new(AppState {
-            root_dir: state.root_dir.clone(),
-            db_path: state.db_path.clone(),
-        });
+        let discoveries_state = Arc::new(state.clone());
         Arc::new(managed_paths::discoveries::DiscoveriesScanner::new(
             discoveries_state,
             registry_url.clone(),
@@ -497,10 +474,7 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
         &state,
     ));
 
-    let state_arc = Arc::new(AppState {
-        root_dir: state.root_dir.clone(),
-        db_path: state.db_path.clone(),
-    });
+    let state_arc = Arc::new(state.clone());
 
     // Build the OAuth notification hub.
     let oauth_state = Arc::new(OAuthState::new());
@@ -530,17 +504,11 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     // After the daemon is authenticated, register this device with the backend
     // and start the SSE-driven reconciler.  Both steps are best-effort: if the
     // backend is unreachable (offline mode) we log a warning and continue.
-    let sync_state_arc = Arc::new(AppState {
-        root_dir: state.root_dir.clone(),
-        db_path: state.db_path.clone(),
-    });
+    let sync_state_arc = Arc::new(state.clone());
 
     // F2: Build the managed-paths pusher (gated by the same env var as F1).
     let f2_pusher = if std::env::var("VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER").is_err() {
-        let pusher_state = AppState {
-            root_dir: state.root_dir.clone(),
-            db_path: state.db_path.clone(),
-        };
+        let pusher_state = state.clone();
         Some(Arc::new(managed_paths::ManagedPathsPusher::new(
             &pusher_state,
         )))
@@ -727,10 +695,7 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
 
     // Final audit flush on clean shutdown (best-effort — do not abort shutdown on error).
     let final_audit = Arc::clone(&audit_buffer);
-    let shutdown_state = AppState {
-        root_dir: state.root_dir.clone(),
-        db_path: state.db_path.clone(),
-    };
+    let shutdown_state = state.clone();
     let _ = tokio::task::spawn_blocking(move || {
         if let Err(e) = final_audit.flush(&shutdown_state) {
             warn!(error = %e, "final audit flush on shutdown failed");
@@ -1163,6 +1128,7 @@ pub fn run_sync_tick(
     let state_view = AppState {
         root_dir: root_dir.clone(),
         db_path: db_path.clone(),
+        block_third_party_inference: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 
     // ── 0. Auth token + device ID sync ───────────────────────────────────────

@@ -252,10 +252,7 @@ async fn patch_callback_receives_installing_then_installed_in_order() {
         .unwrap();
     }
 
-    let state_arc = Arc::new(AppState {
-        root_dir: state.root_dir.clone(),
-        db_path: state.db_path.clone(),
-    });
+    let state_arc = Arc::new(state.clone());
     let registry_url = server.url();
 
     // Simulate the sequence: report installing, then installed.
@@ -687,10 +684,7 @@ async fn handle_install_mcp_registers_backend_in_aggregator() {
     // Arrange: fresh state + registry.
     let root = temp_root("install-registers-aggregator");
     let state = AppState::bootstrap_in(root.clone()).unwrap();
-    let state_arc = Arc::new(AppState {
-        root_dir: state.root_dir.clone(),
-        db_path: state.db_path.clone(),
-    });
+    let state_arc = Arc::new(state.clone());
 
     let registry = fresh_registry();
     let stats = Arc::new(std::sync::Mutex::new(super::ReconcilerStats::default()));
@@ -744,10 +738,7 @@ async fn handle_deactivate_mcp_removes_backend_from_aggregator() {
     // Arrange: seed a row + register it in the aggregator.
     let root = temp_root("deactivate-removes-aggregator");
     let state = AppState::bootstrap_in(root.clone()).unwrap();
-    let state_arc = Arc::new(AppState {
-        root_dir: state.root_dir.clone(),
-        db_path: state.db_path.clone(),
-    });
+    let state_arc = Arc::new(state.clone());
 
     let sid = server_id();
     let iid = install_id();
