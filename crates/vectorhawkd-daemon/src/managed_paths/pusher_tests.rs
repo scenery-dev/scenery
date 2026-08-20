@@ -38,6 +38,7 @@ fn make_pusher() -> (ManagedPathsPusher, TempDir) {
     let state = vectorhawkd_core::state::AppState {
         root_dir: camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap(),
         db_path: db_path.clone(),
+        block_third_party_inference: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     let pusher = ManagedPathsPusher::new(&state);
     (pusher, tmp)
@@ -943,6 +944,7 @@ fn push_missing_active_skills_repushes_only_absent() {
     let state = vectorhawkd_core::state::AppState {
         root_dir: camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap(),
         db_path,
+        block_third_party_inference: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     let pusher = ManagedPathsPusher::new(&state);
 

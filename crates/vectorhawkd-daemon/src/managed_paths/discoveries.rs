@@ -415,11 +415,9 @@ async fn post_discoveries(
 
 async fn access_token_for(state: &AppState, registry_url: &str) -> String {
     let reg = registry_url.to_string();
-    let db_path = state.db_path.clone();
-    let root_dir = state.root_dir.clone();
+    let state_view = state.clone();
 
     tokio::task::spawn_blocking(move || {
-        let state_view = AppState { root_dir, db_path };
         load_all_tokens(&state_view)
             .ok()
             .and_then(|rows| {

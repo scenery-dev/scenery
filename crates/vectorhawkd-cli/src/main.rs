@@ -1763,6 +1763,7 @@ async fn direct_registry_install(
     let state = AppState {
         root_dir,
         db_path: db_path.clone(),
+        block_third_party_inference: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 
     let version = tokio::task::spawn_blocking(move || {
@@ -3723,17 +3724,12 @@ async fn cmd_skill_update(id: Option<&str>, all: bool, registry_url: Option<&str
             UpdateAction::Upgrade {
                 latest: ref latest_ver,
             } => {
-                let state_db = state.db_path.clone();
-                let state_root = state.root_dir.clone();
+                let install_state = state.clone();
                 let url_clone = registry_url_owned.clone();
                 let skill_clone = skill_id.clone();
                 let ver_str = latest_ver.to_string();
 
                 let install_result = tokio::task::spawn_blocking(move || {
-                    let install_state = AppState {
-                        root_dir: state_root,
-                        db_path: state_db,
-                    };
                     let registry = RegistryClient::new(&url_clone);
                     install_from_registry(&install_state, &registry, &skill_clone, Some(&ver_str))
                 })
@@ -5169,6 +5165,7 @@ fn load_all_tokens_from_db(
     let state = AppState {
         root_dir,
         db_path: db_path.to_owned(),
+        block_third_party_inference: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 
     let tokens = load_all_tokens(&state).context("failed to load auth tokens")?;

@@ -775,7 +775,13 @@ mod tests {
         drop(conn);
 
         let root_dir = camino::Utf8PathBuf::from(db_dir.to_string_lossy().as_ref());
-        let state = AppState { root_dir, db_path };
+        let state = AppState {
+            root_dir,
+            db_path,
+            block_third_party_inference: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
+        };
 
         let report = rollback(&state, "https://app.vectorhawk.ai", home.path(), ts, None)
             .await
@@ -879,7 +885,13 @@ mod tests {
         drop(conn);
 
         let root_dir = camino::Utf8PathBuf::from(db_dir.to_string_lossy().as_ref());
-        let state = AppState { root_dir, db_path };
+        let state = AppState {
+            root_dir,
+            db_path,
+            block_third_party_inference: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
+        };
 
         let report = rollback(&state, "https://app.vectorhawk.ai", home.path(), ts, None)
             .await
@@ -966,7 +978,13 @@ mod tests {
         .unwrap();
         drop(conn);
         let root_dir = camino::Utf8PathBuf::from(db_dir.to_string_lossy().as_ref());
-        let state = AppState { root_dir, db_path };
+        let state = AppState {
+            root_dir,
+            db_path,
+            block_third_party_inference: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
+        };
 
         let report = rollback(
             &state,
@@ -1062,7 +1080,13 @@ mod tests {
         .unwrap();
         drop(conn);
         let root_dir = camino::Utf8PathBuf::from(db_dir.to_string_lossy().as_ref());
-        let state = AppState { root_dir, db_path };
+        let state = AppState {
+            root_dir,
+            db_path,
+            block_third_party_inference: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
+        };
 
         // Start a mock server that always returns 500 for the catalog DELETE.
         let mut server = mockito::Server::new_async().await;

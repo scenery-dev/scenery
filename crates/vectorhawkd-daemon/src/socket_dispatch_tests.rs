@@ -26,6 +26,7 @@ fn make_sync_controller(registry: Arc<BackendRegistry>) -> Arc<crate::SyncContro
     let state = AppState {
         root_dir: Utf8PathBuf::from_path_buf(tmp.clone()).unwrap(),
         db_path: Utf8PathBuf::from_path_buf(tmp.join("vh-dispatch-test.db")).unwrap(),
+        block_third_party_inference: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     let (tx, _rx) = broadcast::channel(16);
     Arc::new(crate::SyncController::new(

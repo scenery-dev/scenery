@@ -197,7 +197,11 @@ mod tests {
         .unwrap();
         drop(conn);
         let root_dir = camino::Utf8PathBuf::from(db_dir.to_string_lossy().as_ref());
-        AppState { root_dir, db_path }
+        AppState {
+            root_dir,
+            db_path,
+            block_third_party_inference: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
     }
 
     /// Verify that the handler returns `Err` when `source_path` does not exist
