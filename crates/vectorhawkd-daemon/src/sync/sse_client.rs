@@ -342,6 +342,31 @@ async fn dispatch_event(
         }
     }
 
+    // Task 8: backend broadcasts this when an admin toggles the org's
+    // block-third-party-inference policy. Persist to sync_state (so it
+    // survives restarts / seeds correctly) and flip the live atomic that
+    // Task 7 wired into the model client, so the change takes effect
+    // immediately without a daemon restart.
+    if event_type == "inference_policy_update" {
+        #[derive(serde::Deserialize)]
+        struct EnabledOnly {
+            enabled: bool,
+        }
+        if let Ok(w) = serde_json::from_str::<EnabledOnly>(event_data) {
+            let v = if w.enabled { "true" } else { "false" };
+            if let Err(e) = state.set_sync_state("block_third_party_inference", v) {
+                warn!(error = %e, "inference policy: failed to persist to sync_state");
+            }
+            state
+                .block_third_party_inference
+                .store(w.enabled, std::sync::atomic::Ordering::Relaxed);
+            debug!(
+                enabled = w.enabled,
+                "inference policy: block-third-party updated live"
+            );
+        }
+    }
+
     // F3: admin resolved a drift event. Apply the resolution locally and ack
     // the backend. Spawned as its own task so SSE dispatch isn't blocked on
     // the disk + HTTP round-trip.
@@ -884,6 +909,16 @@ fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
         "discovery_publish_requested" => {
             // Handled in `dispatch_event` before this parser is called — no
             // reconciler action needed.  Return an empty snapshot so the
+            // reconciler produces no diff actions.
+            Ok(SyncEvent::Snapshot {
+                installations: vec![],
+                mcp_installations: vec![],
+            })
+        }
+        "inference_policy_update" => {
+            // Task 8: handled in `dispatch_event` before this parser is
+            // called (persist to sync_state + flip the live atomic) — no
+            // reconciler action needed. Return an empty snapshot so the
             // reconciler produces no diff actions.
             Ok(SyncEvent::Snapshot {
                 installations: vec![],
