@@ -4,6 +4,7 @@ use crate::protocol::{
 };
 use anyhow::{Context, Result};
 use std::io::{BufRead, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use vectorhawkd_core::model::{ModelClient, ModelRequest, ModelResponse, ModelSource};
@@ -167,16 +168,64 @@ impl ModelClient for McpSamplingClient {
 pub struct HybridModelClient {
     ollama: Option<Box<dyn ModelClient>>,
     sampling: Box<dyn ModelClient>,
+    block_third_party: Arc<AtomicBool>,
 }
 
 impl HybridModelClient {
     pub fn new(ollama: Option<Box<dyn ModelClient>>, sampling: Box<dyn ModelClient>) -> Self {
-        Self { ollama, sampling }
+        Self {
+            ollama,
+            sampling,
+            block_third_party: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Create a `HybridModelClient` whose routing is gated by an org-wide
+    /// "Block Third-Party Inference" policy flag. When the flag is `true`,
+    /// `generate` forces the Ollama tier and fails closed for every
+    /// non-local outcome, ignoring `prefer_local`/`fallback` entirely.
+    pub fn with_third_party_blocking(
+        ollama: Option<Box<dyn ModelClient>>,
+        sampling: Box<dyn ModelClient>,
+        block_third_party: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            ollama,
+            sampling,
+            block_third_party,
+        }
     }
 }
 
 impl ModelClient for HybridModelClient {
     fn generate(&self, request: ModelRequest) -> Result<ModelResponse> {
+        // Block Third-Party Inference governance: force local, fail closed. This is
+        // the single enforcement chokepoint — it ignores prefer_local/fallback.
+        // The `sampling` tier here is the daemon's gateway client (or the shim's
+        // MCP-sampling client). Blocking it blocks Provider + McpSampling. The
+        // Ollama tier is the org's direct sovereign endpoint (on-device OR a
+        // self-hosted Ollama-API URL via `ollama_url`) → ModelSource::Local, allowed.
+        // (Allowing gateway-routed Internal/self_hosted is a deferred follow-up.)
+        if self.block_third_party.load(Ordering::Relaxed) {
+            let Some(ollama) = self.ollama.as_deref() else {
+                anyhow::bail!(
+                    "Blocked by org policy (Block Third-Party Inference): no sovereign (local/self-hosted) model endpoint is configured on this endpoint"
+                );
+            };
+            if !local_model_compatible(ollama, &request.recommended_models) {
+                anyhow::bail!(
+                    "Blocked by org policy (Block Third-Party Inference): local model {:?} does not satisfy the skill's recommended models {:?}",
+                    ollama.local_model_name().unwrap_or("(unknown)"),
+                    request.recommended_models,
+                );
+            }
+            return ollama.generate(request).map_err(|e| {
+                anyhow::anyhow!(
+                    "Blocked by org policy (Block Third-Party Inference): local model failed: {e}"
+                )
+            });
+        }
+
         // prefer_local=true:  try Ollama → fall back to MCP sampling
         // prefer_local=false: try MCP sampling → fall back to Ollama
         if request.prefer_local {
@@ -522,6 +571,182 @@ mod tests {
             .expect_err("should error with no Ollama and fallback=Error");
 
         assert!(err.to_string().contains("no Ollama backend"), "got: {err}");
+    }
+
+    // ── Block Third-Party Inference enforcement ─────────────────────────────
+
+    /// A local/Ollama test double with a configurable model name and mode
+    /// (succeed with a `Local` response, or fail).
+    struct LocalDouble {
+        name: String,
+        fail: bool,
+    }
+
+    impl LocalDouble {
+        fn ok(name: &str) -> Self {
+            Self {
+                name: name.to_string(),
+                fail: false,
+            }
+        }
+
+        fn failing(name: &str) -> Self {
+            Self {
+                name: name.to_string(),
+                fail: true,
+            }
+        }
+    }
+
+    impl ModelClient for LocalDouble {
+        fn local_model_name(&self) -> Option<&str> {
+            Some(&self.name)
+        }
+
+        fn generate(&self, _request: ModelRequest) -> Result<ModelResponse> {
+            if self.fail {
+                anyhow::bail!("local model unavailable");
+            }
+            Ok(ModelResponse {
+                text: "from local".to_string(),
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                latency_ms: 1,
+                source: ModelSource::Local(self.name.clone()),
+                cost_usd: 0.0,
+            })
+        }
+    }
+
+    /// A fallback (non-local) test double that records whether it was
+    /// called (via a shared `Arc<AtomicBool>` so the flag is observable
+    /// after the double has been moved into a `Box<dyn ModelClient>`) and
+    /// returns a source distinguishable from `Local`, so tests can assert
+    /// whether the fallback tier was reached.
+    struct FallbackDouble {
+        called: Arc<AtomicBool>,
+    }
+
+    impl FallbackDouble {
+        /// Returns the double plus a handle to its "was called" flag.
+        fn new() -> (Self, Arc<AtomicBool>) {
+            let called = Arc::new(AtomicBool::new(false));
+            (
+                Self {
+                    called: Arc::clone(&called),
+                },
+                called,
+            )
+        }
+    }
+
+    impl ModelClient for FallbackDouble {
+        fn generate(&self, _request: ModelRequest) -> Result<ModelResponse> {
+            self.called.store(true, Ordering::SeqCst);
+            Ok(ModelResponse {
+                text: "from fallback".to_string(),
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                latency_ms: 1,
+                source: ModelSource::McpSampling,
+                cost_usd: 0.0,
+            })
+        }
+    }
+
+    #[test]
+    fn block_third_party_uses_ollama_and_succeeds() {
+        let flag = Arc::new(AtomicBool::new(true));
+        let (fallback, fallback_called) = FallbackDouble::new();
+        let hybrid = HybridModelClient::with_third_party_blocking(
+            Some(Box::new(LocalDouble::ok("llama3.1:8b"))),
+            Box::new(fallback),
+            flag,
+        );
+        let resp = hybrid
+            .generate(ModelRequest {
+                prefer_local: false,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(matches!(resp.source, ModelSource::Local(_)));
+        assert!(
+            !fallback_called.load(Ordering::SeqCst),
+            "fallback tier must not be reached when Block Third-Party Inference is enforced"
+        );
+    }
+
+    #[test]
+    fn block_third_party_fails_closed_when_no_ollama() {
+        let flag = Arc::new(AtomicBool::new(true));
+        let (fallback, _fallback_called) = FallbackDouble::new();
+        let hybrid = HybridModelClient::with_third_party_blocking(None, Box::new(fallback), flag);
+        let err = hybrid.generate(ModelRequest::default()).unwrap_err();
+        assert!(
+            err.to_string().contains("Block Third-Party Inference"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn block_third_party_fails_closed_when_model_incompatible() {
+        let flag = Arc::new(AtomicBool::new(true));
+        let (fallback, _fallback_called) = FallbackDouble::new();
+        let hybrid = HybridModelClient::with_third_party_blocking(
+            Some(Box::new(LocalDouble::ok("llama3.1:8b"))),
+            Box::new(fallback),
+            flag,
+        );
+        let req = ModelRequest {
+            recommended_models: vec!["gpt-4o".to_string()],
+            ..Default::default()
+        };
+        let err = hybrid.generate(req).unwrap_err();
+        assert!(
+            err.to_string().contains("Block Third-Party Inference"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn block_third_party_fails_closed_when_ollama_errors() {
+        let flag = Arc::new(AtomicBool::new(true));
+        let (fallback, fallback_called) = FallbackDouble::new();
+        let hybrid = HybridModelClient::with_third_party_blocking(
+            Some(Box::new(LocalDouble::failing("llama3.1:8b"))),
+            Box::new(fallback),
+            flag,
+        );
+        let err = hybrid.generate(ModelRequest::default()).unwrap_err();
+        assert!(
+            err.to_string().contains("Block Third-Party Inference"),
+            "got: {err}"
+        );
+        assert!(
+            !fallback_called.load(Ordering::SeqCst),
+            "fallback tier must not be reached even when local fails, under fail-closed enforcement"
+        );
+    }
+
+    #[test]
+    fn flag_off_preserves_existing_routing() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let (fallback, fallback_called) = FallbackDouble::new();
+        let hybrid = HybridModelClient::with_third_party_blocking(
+            Some(Box::new(LocalDouble::ok("llama3.1:8b"))),
+            Box::new(fallback),
+            flag,
+        );
+        // prefer_local=false with flag off → existing behavior routes to
+        // the sampling/fallback tier first.
+        let resp = hybrid
+            .generate(ModelRequest {
+                prefer_local: false,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(matches!(resp.source, ModelSource::McpSampling));
+        assert!(fallback_called.load(Ordering::SeqCst));
     }
 
     #[test]
