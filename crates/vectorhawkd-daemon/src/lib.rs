@@ -159,6 +159,7 @@ const REFRESH_INTERVAL_SECS: u64 = 60;
 pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     let state = AppState::bootstrap().context("failed to bootstrap application state")?;
     info!(root = %state.root_dir, "application state bootstrapped");
+    state.seed_block_third_party_from_sync_state();
 
     let registry_url = opts
         .registry_url
@@ -285,9 +286,10 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     // The sampling fallback (McpSamplingClient) is handled at the per-shim
     // connection level in server.rs; the daemon-level client provides the
     // Ollama + gateway tier only.
-    let hybrid = HybridModelClient::new(
+    let hybrid = HybridModelClient::with_third_party_blocking(
         Some(Box::new(ollama) as Box<dyn ModelClient>),
         Box::new(gateway) as Box<dyn ModelClient>,
+        state.block_third_party_handle(),
     );
     let model_client: Option<Arc<dyn ModelClient>> = Some(Arc::new(hybrid) as Arc<dyn ModelClient>);
 
