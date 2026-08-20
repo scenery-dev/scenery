@@ -1,7 +1,7 @@
 //! Unit tests for the SSE event parser.
 #![allow(clippy::unwrap_used)]
 
-use super::parse_sync_event;
+use super::{dispatch_event, parse_sync_event};
 
 #[test]
 fn parses_snapshot_event() {
@@ -135,4 +135,87 @@ fn snapshot_with_multiple_records() {
         }
         other => panic!("expected Snapshot, got {other:?}"),
     }
+}
+
+// ── inference_policy_update dispatch ────────────────────────────────────────
+
+/// Boot a real `AppState` (SQLite + dirs) under a fresh temp dir, matching the
+/// pattern used elsewhere for `dispatch_event`-style tests (see
+/// `auth_dispatch_tests.rs::reload_returns_inactive_without_token_and_is_idempotent`).
+fn bootstrap_state() -> (vectorhawkd_core::state::AppState, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+    let state = vectorhawkd_core::state::AppState::bootstrap_in(root).unwrap();
+    (state, tmp)
+}
+
+#[tokio::test]
+async fn inference_policy_update_flips_flag_and_persists() {
+    use std::sync::atomic::Ordering;
+
+    let (state, _tmp) = bootstrap_state();
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let mut last_event_id = None;
+
+    // Precondition: fresh AppState starts with the kill switch off, proving
+    // the assertions below actually observe a flip rather than a no-op.
+    assert!(
+        !state.block_third_party_inference.load(Ordering::Relaxed),
+        "fresh AppState must start with block_third_party_inference = false"
+    );
+    assert_eq!(
+        state.get_sync_state("block_third_party_inference").unwrap(),
+        None,
+        "fresh AppState must have no persisted block_third_party_inference value"
+    );
+
+    dispatch_event(
+        "inference_policy_update",
+        r#"{"org_id":"default","enabled":true,"updated_at":"2026-01-01T00:00:00Z"}"#,
+        &None,
+        &mut last_event_id,
+        &state,
+        &tx,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        state.block_third_party_inference.load(Ordering::Relaxed),
+        "live atomic must flip to true"
+    );
+    assert_eq!(
+        state
+            .get_sync_state("block_third_party_inference")
+            .unwrap()
+            .as_deref(),
+        Some("true"),
+        "sync_state must persist the new value"
+    );
+
+    // Flip back to false — proves the handler isn't a one-shot / write-once
+    // and correctly tracks the live value both ways.
+    dispatch_event(
+        "inference_policy_update",
+        r#"{"org_id":"default","enabled":false,"updated_at":"2026-01-01T00:01:00Z"}"#,
+        &None,
+        &mut last_event_id,
+        &state,
+        &tx,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        !state.block_third_party_inference.load(Ordering::Relaxed),
+        "live atomic must flip back to false"
+    );
+    assert_eq!(
+        state
+            .get_sync_state("block_third_party_inference")
+            .unwrap()
+            .as_deref(),
+        Some("false"),
+        "sync_state must persist the flip back to false"
+    );
 }
