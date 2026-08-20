@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use camino::Utf8PathBuf;
 use rusqlite::Connection;
 use std::fs;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// Bootstrapped application state: root directory and SQLite path.
 ///
@@ -13,6 +15,11 @@ use std::fs;
 pub struct AppState {
     pub root_dir: Utf8PathBuf,
     pub db_path: Utf8PathBuf,
+    /// Live-flippable kill switch for third-party (non-VectorHawk-brokered)
+    /// inference calls. Seeded from `sync_state` on startup via
+    /// `seed_block_third_party_from_sync_state`; later tasks flip it in
+    /// response to remote policy pushes without a daemon restart.
+    pub block_third_party_inference: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -130,7 +137,11 @@ impl AppState {
         conn.execute_batch(SCHEMA_ADOPT_SQL)
             .context("failed to apply adopt-takeover schema additions")?;
 
-        Ok(Self { root_dir, db_path })
+        Ok(Self {
+            root_dir,
+            db_path,
+            block_third_party_inference: Arc::new(AtomicBool::new(false)),
+        })
     }
 
     /// Return all skill IDs currently tracked in `installed_skills`.
@@ -244,6 +255,27 @@ impl AppState {
         )
         .context("failed to write sync_state")?;
         Ok(())
+    }
+
+    /// Return a clone of the shared handle for the "block third-party
+    /// inference" kill switch. Cheap (`Arc` clone) — safe to call per
+    /// request/session; all clones observe flips made through any handle.
+    pub fn block_third_party_handle(&self) -> Arc<AtomicBool> {
+        self.block_third_party_inference.clone()
+    }
+
+    /// Seed the in-memory kill switch from the persisted `sync_state` value,
+    /// e.g. on daemon startup after a registry policy sync. Any string other
+    /// than exactly `"true"` (including missing/unset) is treated as off.
+    pub fn seed_block_third_party_from_sync_state(&self) {
+        let on = self
+            .get_sync_state("block_third_party_inference")
+            .ok()
+            .flatten()
+            .as_deref()
+            == Some("true");
+        self.block_third_party_inference
+            .store(on, Ordering::Relaxed);
     }
 
     /// Return the slugs of every MCP server that has been F2-pushed to
@@ -635,6 +667,46 @@ mod tests {
         let root = temp_root("idempotent");
         AppState::bootstrap_in(root.clone()).expect("first bootstrap should succeed");
         AppState::bootstrap_in(root.clone()).expect("second bootstrap should also succeed");
+        cleanup(&root);
+    }
+
+    // ── block_third_party_inference kill switch ──────────────────────────────
+
+    #[test]
+    fn seed_block_third_party_reads_sync_state() {
+        let root = temp_root("block-third-party-seed");
+        let state = AppState::bootstrap_in(root.clone()).expect("bootstrap");
+
+        assert!(
+            !state.block_third_party_handle().load(Ordering::Relaxed),
+            "should default to off before seeding"
+        );
+
+        state
+            .set_sync_state("block_third_party_inference", "true")
+            .expect("set_sync_state should succeed");
+        state.seed_block_third_party_from_sync_state();
+
+        assert!(
+            state.block_third_party_handle().load(Ordering::Relaxed),
+            "handle should observe true after seeding from sync_state"
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn seed_block_third_party_defaults_off_when_unset() {
+        let root = temp_root("block-third-party-unset");
+        let state = AppState::bootstrap_in(root.clone()).expect("bootstrap");
+
+        state.seed_block_third_party_from_sync_state();
+
+        assert!(
+            !state.block_third_party_handle().load(Ordering::Relaxed),
+            "missing sync_state key should seed to off"
+        );
+
         cleanup(&root);
     }
 
