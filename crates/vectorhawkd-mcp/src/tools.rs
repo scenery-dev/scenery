@@ -724,6 +724,11 @@ pub fn handle_tool_call(
         }
     }
 
+    // Task 9: out-param populated only on the skill-run dispatch path (the
+    // `_` arm below), and only when `run_skill` returns Ok — see the
+    // tool_called audit block after this match.
+    let mut skill_run_model_source: Option<String> = None;
+
     let result = match name {
         "vectorhawk_list" => handle_list(state),
         "vectorhawk_search" => handle_search(arguments, registry_url),
@@ -755,11 +760,23 @@ pub fn handle_tool_call(
             model_client,
             update_check_cache,
             rating_state,
+            &mut skill_run_model_source,
         ),
     };
 
     // Buffer audit event (best-effort, non-blocking for the caller)
     if !name.starts_with("vectorhawk_list") && !name.starts_with("vectorhawk_info") {
+        // Task 9: surface model_source (e.g. "local:llama3.1:8b") on the
+        // tool_called audit event for skill runs, so IT can see local
+        // inference rows in audit even when the gateway — which normally
+        // logs the inference tier — is bypassed under the Block
+        // Third-Party Inference policy. Only set when a skill RunResult
+        // was actually produced (skill_run_model_source stays None for
+        // every non-skill-run tool, and for skill runs that failed before
+        // any LLM step executed); never fabricated.
+        let metadata = skill_run_model_source
+            .as_ref()
+            .map(|ms| serde_json::json!({ "model_source": ms }));
         let event = mcp_governance::AuditEvent {
             server_name: None,
             user_id: None,
@@ -767,7 +784,7 @@ pub fn handle_tool_call(
             machine_id: None,
             event_type: "tool_called".to_string(),
             tool_name: Some(name.to_string()),
-            metadata: None,
+            metadata,
             org_id: "default".to_string(),
         };
         let _ = mcp_governance::buffer_audit_event(state, &event);
@@ -2029,6 +2046,7 @@ fn build_llm_execution_summary(result: &RunResult) -> Option<String> {
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_skill_run(
     skill_id: &str,
     arguments: &serde_json::Value,
@@ -2037,6 +2055,7 @@ fn handle_skill_run(
     model_client: Option<&dyn ModelClient>,
     update_check_cache: &UpdateCheckCache,
     rating_state: Option<&RatingState>,
+    model_source_out: &mut Option<String>,
 ) -> ToolCallResult {
     // Check if skill is deactivated before attempting execution
     if let Ok(conn) = Connection::open(&state.db_path) {
@@ -2069,6 +2088,8 @@ fn handle_skill_run(
 
     match run_skill(state, policy_client, skill_id, arguments, model_client) {
         Ok(result) => {
+            *model_source_out = result.model_source.clone();
+
             let output = result
                 .steps
                 .iter()
@@ -3665,6 +3686,7 @@ mod tests {
         .unwrap();
 
         let policy = vectorhawkd_core::policy::MockPolicyClient::new();
+        let mut model_source_out = None;
         let result = handle_skill_run(
             "test-skill",
             &serde_json::json!({"query": "test"}),
@@ -3673,12 +3695,118 @@ mod tests {
             None,
             &empty_cache(),
             None,
+            &mut model_source_out,
         );
         assert_eq!(result.is_error, Some(true));
         assert!(result.content[0].text.contains("deactivated"));
+        assert_eq!(
+            model_source_out, None,
+            "deactivated skill never reaches run_skill, so no model_source should be set"
+        );
 
         let _ = fs::remove_dir_all(&state_root);
         let _ = fs::remove_dir_all(&skill_root);
+    }
+
+    /// Task 9: the `tool_called` audit event buffered for a skill run must
+    /// carry `model_source` so IT can see `local:*` rows even when the
+    /// gateway (which normally logs the inference tier) is bypassed under
+    /// the Block Third-Party Inference policy.
+    #[test]
+    fn tool_called_audit_event_includes_model_source_for_llm_skill() {
+        use vectorhawkd_core::model::MockModelClient;
+
+        let state_root = temp_root("tool-called-model-source");
+        let skill_root = temp_root("tool-called-model-source-bundle");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+
+        write_test_skill(&skill_root);
+        let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
+        install_unpacked_skill(&state, &pkg, InstallMode::Copy).unwrap();
+
+        let policy = vectorhawkd_core::policy::MockPolicyClient::new();
+        // MockModelClient reports ModelSource::Local("mock-model") — see
+        // vectorhawkd-core/src/model.rs.
+        let model = MockModelClient::new("mock response");
+
+        let result = handle_tool_call(
+            "test-skill",
+            &serde_json::json!({"query": "test"}),
+            &state,
+            &policy,
+            Some(&model),
+            &None,
+            &empty_cache(),
+            None,
+            None,
+        );
+        assert!(
+            result.is_error.is_none() || result.is_error == Some(false),
+            "expected success, got: {}",
+            result.content[0].text
+        );
+
+        // The buffered tool_called event should carry model_source in its
+        // metadata JSON.
+        let conn = Connection::open(&state.db_path).unwrap();
+        let event_json: String = conn
+            .query_row(
+                "SELECT event_json FROM mcp_audit_buffer ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let event: serde_json::Value = serde_json::from_str(&event_json).unwrap();
+        assert_eq!(event["event_type"], "tool_called");
+        assert_eq!(
+            event["metadata"]["model_source"], "local:mock-model",
+            "expected model_source in tool_called audit metadata, got: {event}"
+        );
+
+        let _ = fs::remove_dir_all(&state_root);
+        let _ = fs::remove_dir_all(&skill_root);
+    }
+
+    /// Non-skill tool calls (no RunResult exists) must not fabricate a
+    /// model_source in the audit metadata.
+    #[test]
+    fn tool_called_audit_event_omits_model_source_for_non_skill_tool() {
+        let state_root = temp_root("tool-called-no-model-source");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+        let policy = vectorhawkd_core::policy::MockPolicyClient::new();
+
+        let result = handle_tool_call(
+            "vectorhawk_validate",
+            &serde_json::json!({}),
+            &state,
+            &policy,
+            None,
+            &None,
+            &empty_cache(),
+            None,
+            None,
+        );
+        // vectorhawk_validate with no args is expected to error, but the
+        // audit event should still be buffered without a fabricated
+        // model_source.
+        let _ = result;
+
+        let conn = Connection::open(&state.db_path).unwrap();
+        let event_json: String = conn
+            .query_row(
+                "SELECT event_json FROM mcp_audit_buffer ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let event: serde_json::Value = serde_json::from_str(&event_json).unwrap();
+        assert_eq!(event["event_type"], "tool_called");
+        assert!(
+            event["metadata"].is_null() || event["metadata"].get("model_source").is_none(),
+            "non-skill tool call should not fabricate model_source, got: {event}"
+        );
+
+        let _ = fs::remove_dir_all(&state_root);
     }
 
     // ── plugin export/import tool handler tests ───────────────────────────────

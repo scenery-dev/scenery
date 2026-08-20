@@ -142,7 +142,6 @@ pub fn run_skill_with_scope(
     // long-term local store. Aggregate counts still land in
     // `skill_execution_counts` via `ratings.rs` and get synced to the
     // registry.
-    let _ = run_model_source;
     let _ = total_cost_usd;
     let _ = state;
 
