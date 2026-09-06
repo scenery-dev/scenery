@@ -7,7 +7,9 @@
 //! |--------|-------------------------------------------------------|
 //! | Skill  | `~/.agents/skills/<slug>/` + `.vectorhawk-managed.json` marker, linked at `~/.claude/skills/<slug>` for Claude Code |
 //! | MCP    | Entry in `~/.claude.json` `mcpServers` block           |
-//! | Plugin | `~/.claude/plugins/<slug>/.claude-plugin/plugin.json`  |
+//!
+//! Plugin pushes are handled by `managed_paths::plugin_marketplace`
+//! (`install_plugin_bundle` / `uninstall_plugin_bundle`), not by this module.
 //!
 //! # Atomicity
 //!
@@ -451,98 +453,6 @@ impl ManagedPathsPusher {
         Ok(())
     }
 
-    // ── Plugin ────────────────────────────────────────────────────────────────
-
-    /// Write a plugin manifest to `~/.claude/plugins/<slug>/.claude-plugin/plugin.json`.
-    ///
-    /// TODO(F2): Plugin install fans out into skill+mcp installs which already
-    /// get pushed via `push_skill` / `push_mcp`.  This stub is a no-op for now
-    /// to satisfy the interface.  Full plugin push will be implemented when
-    /// there is a daemon-side plugin install handler.
-    pub fn push_plugin(
-        &self,
-        slug: &str,
-        installation_id: Option<&str>,
-        manifest_json: &Value,
-    ) -> Result<()> {
-        if reconciler_disabled() {
-            return Ok(());
-        }
-
-        let plugins_dir = resolve_plugins_dir()?;
-        let plugin_dir = plugins_dir.join(slug).join(".claude-plugin");
-
-        fs::create_dir_all(&plugin_dir).with_context(|| {
-            format!(
-                "pusher: failed to create plugin dir: {}",
-                plugin_dir.display()
-            )
-        })?;
-
-        let manifest_bytes = serde_json::to_vec_pretty(manifest_json)
-            .context("pusher: failed to serialise plugin manifest")?;
-
-        let dest = plugin_dir.join("plugin.json");
-        atomic_write(&dest, &manifest_bytes).context("pusher: failed to write plugin.json")?;
-
-        // Marker lives in the parent slug directory.
-        let sha256 = hex_sha256(&manifest_bytes);
-        let now_ts = chrono::Utc::now().to_rfc3339();
-        let marker_dir = plugins_dir.join(slug);
-        write_file_marker(&marker_dir, installation_id, &sha256, &now_ts)
-            .context("pusher: failed to write .vectorhawk-managed.json for plugin")?;
-
-        let path_key = marker_dir.to_string_lossy().to_string();
-        self.upsert_db_marker(&path_key, "plugin", slug, installation_id, &sha256, &now_ts)
-            .context("pusher: failed to upsert managed_path_markers for plugin")?;
-
-        self.journal_push(
-            JournalEntry::new(JournalOp::ArtifactPush, JournalSource::Managed, path_key)
-                .with_slug(slug)
-                .with_client("Claude Code")
-                .with_detail(serde_json::json!({"installation_id": installation_id})),
-        );
-
-        info!(slug, dest = %dest.display(), "pusher: plugin manifest pushed to ~/.claude/plugins/");
-        Ok(())
-    }
-
-    /// Remove a plugin from `~/.claude/plugins/<slug>/`.
-    ///
-    /// Idempotent.
-    pub fn remove_plugin(&self, slug: &str) -> Result<()> {
-        if reconciler_disabled() {
-            return Ok(());
-        }
-
-        let plugins_dir = resolve_plugins_dir()?;
-        let plugin_dir = plugins_dir.join(slug);
-        let path_key = plugin_dir.to_string_lossy().to_string();
-
-        // Delete SQLite marker first.
-        self.delete_db_marker(&path_key)
-            .context("pusher: failed to delete managed_path_markers for plugin")?;
-
-        if plugin_dir.exists() {
-            // Defense-in-depth: never delete Anthropic-native content.
-            ownership::ensure_not_native(&plugin_dir)?;
-            fs::remove_dir_all(&plugin_dir).with_context(|| {
-                format!(
-                    "pusher: failed to remove plugin dir: {}",
-                    plugin_dir.display()
-                )
-            })?;
-            info!(slug, "pusher: plugin removed from ~/.claude/plugins/");
-        } else {
-            debug!(
-                slug,
-                "pusher: plugin dir absent — nothing to remove (idempotent)"
-            );
-        }
-
-        Ok(())
-    }
-
     // ── SQLite helpers ────────────────────────────────────────────────────────
 
     fn upsert_db_marker(
@@ -797,10 +707,6 @@ fn resolve_claude_link_dir() -> Result<PathBuf> {
 pub fn managed_skill_present(slug: &str) -> Result<bool> {
     let skills_dir = resolve_skills_dir()?;
     Ok(skills_dir.join(slug).join("SKILL.md").exists())
-}
-
-fn resolve_plugins_dir() -> Result<PathBuf> {
-    Ok(resolve_home()?.join(".claude").join("plugins"))
 }
 
 fn resolve_claude_json() -> Result<PathBuf> {
