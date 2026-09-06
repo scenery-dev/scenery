@@ -72,11 +72,13 @@ fn skill_install_local_path_parses() {
             link,
             registry_url,
             all_devices,
+            version,
         }) => {
             assert_eq!(skill_ref, "./my-skill");
             assert!(!link);
             assert!(registry_url.is_none());
             assert!(!all_devices);
+            assert!(version.is_none());
         }
         other => panic!("expected Skill(Install), got {other:?}"),
     }
@@ -92,11 +94,13 @@ fn skill_install_registry_id_parses() {
             link,
             registry_url,
             all_devices,
+            version,
         }) => {
             assert_eq!(skill_ref, "contract-compare");
             assert!(!link);
             assert!(registry_url.is_none());
             assert!(!all_devices);
+            assert!(version.is_none());
         }
         other => panic!("expected Skill(Install), got {other:?}"),
     }
@@ -155,6 +159,25 @@ fn skill_install_all_devices_flag_parses() {
     match parse(&["skill", "install", "contract-compare", "--all-devices"]).command {
         Command::Skill(SkillCommand::Install { all_devices, .. }) => {
             assert!(all_devices);
+        }
+        other => panic!("expected Skill(Install), got {other:?}"),
+    }
+}
+
+#[test]
+fn skill_install_version_flag_parses() {
+    use super::{Command, SkillCommand};
+    // Default: no --version → None, so the backend resolves to latest.
+    match parse(&["skill", "install", "contract-compare"]).command {
+        Command::Skill(SkillCommand::Install { version, .. }) => {
+            assert!(version.is_none());
+        }
+        other => panic!("expected Skill(Install), got {other:?}"),
+    }
+    // --version pins to a specific registry version.
+    match parse(&["skill", "install", "contract-compare", "--version", "1.2.3"]).command {
+        Command::Skill(SkillCommand::Install { version, .. }) => {
+            assert_eq!(version.as_deref(), Some("1.2.3"));
         }
         other => panic!("expected Skill(Install), got {other:?}"),
     }

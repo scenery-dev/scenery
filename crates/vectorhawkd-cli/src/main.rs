@@ -146,6 +146,11 @@ pub enum SkillCommand {
         /// just this one (registry installs only).
         #[arg(long, default_value_t = false)]
         all_devices: bool,
+
+        /// Pin to a specific registry version instead of latest
+        /// (registry installs only).
+        #[arg(long)]
+        version: Option<String>,
     },
 
     /// Search the skill registry for available skills.
@@ -616,7 +621,17 @@ async fn run(cli: Cli) -> Result<()> {
             link,
             registry_url,
             all_devices,
-        }) => cmd_skill_install(&skill_ref, link, registry_url.as_deref(), all_devices).await,
+            version,
+        }) => {
+            cmd_skill_install(
+                &skill_ref,
+                link,
+                registry_url.as_deref(),
+                all_devices,
+                version.as_deref(),
+            )
+            .await
+        }
         Command::Skill(SkillCommand::Search {
             query,
             registry_url,
@@ -1505,6 +1520,7 @@ async fn cmd_skill_install(
     link: bool,
     registry_url: Option<&str>,
     all_devices: bool,
+    version: Option<&str>,
 ) -> Result<()> {
     use vectorhawkd_core::{
         audit::{write_audit_event_direct, AuditEvent},
@@ -1576,10 +1592,10 @@ async fn cmd_skill_install(
             } else {
                 Some(device_id.as_str())
             };
-            install_via_desired_state(skill_ref, url, &state, scope).await?;
+            install_via_desired_state(skill_ref, url, &state, scope, version).await?;
         } else {
             // No daemon registration → direct install path (pre-RUN2 behaviour).
-            direct_registry_install(skill_ref, url, state.db_path.clone()).await?;
+            direct_registry_install(skill_ref, url, state.db_path.clone(), version).await?;
         }
     }
 
@@ -1596,6 +1612,7 @@ async fn install_via_desired_state(
     registry_url: &str,
     state: &vectorhawkd_core::state::AppState,
     device_id: Option<&str>,
+    version: Option<&str>,
 ) -> Result<()> {
     use rusqlite::Connection;
     use rusqlite::OptionalExtension;
@@ -1620,7 +1637,8 @@ async fn install_via_desired_state(
                 "note: not logged in — installing directly from registry (run \
                  'vectorhawk auth login' to enable portal-driven installs)"
             );
-            return direct_registry_install(skill_id, registry_url, state.db_path.clone()).await;
+            return direct_registry_install(skill_id, registry_url, state.db_path.clone(), version)
+                .await;
         }
     };
 
@@ -1630,6 +1648,9 @@ async fn install_via_desired_state(
     });
     if let Some(id) = device_id {
         payload["device_id"] = serde_json::Value::String(id.to_string());
+    }
+    if let Some(v) = version {
+        payload["version"] = serde_json::Value::String(v.to_string());
     }
 
     eprint!("Requesting install of '{skill_id}' from backend");
@@ -1743,6 +1764,7 @@ async fn direct_registry_install(
     skill_ref: &str,
     registry_url: &str,
     db_path: camino::Utf8PathBuf,
+    version: Option<&str>,
 ) -> Result<()> {
     use vectorhawkd_core::{
         audit::{write_audit_event_direct, AuditEvent},
@@ -1766,8 +1788,9 @@ async fn direct_registry_install(
         block_third_party_inference: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 
-    let version = tokio::task::spawn_blocking(move || {
-        install_from_registry(&state, &registry, &skill_id, None)
+    let requested_version = version.map(|v| v.to_string());
+    let installed_version = tokio::task::spawn_blocking(move || {
+        install_from_registry(&state, &registry, &skill_id, requested_version.as_deref())
     })
     .await
     .context("install task panicked")?
@@ -1781,7 +1804,7 @@ async fn direct_registry_install(
             event_type: "skill_installed".to_string(),
             payload: serde_json::json!({
                 "skill_id": skill_ref,
-                "version":  version,
+                "version":  installed_version,
                 "source":   "cli-registry",
                 "mode":     "copy",
                 "ts":       ts,
@@ -1789,7 +1812,7 @@ async fn direct_registry_install(
         },
     );
 
-    println!("Installed skill '{skill_ref}' version {version} from registry.");
+    println!("Installed skill '{skill_ref}' version {installed_version} from registry.");
     Ok(())
 }
 

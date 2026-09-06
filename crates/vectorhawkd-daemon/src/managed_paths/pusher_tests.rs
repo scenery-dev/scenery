@@ -976,7 +976,7 @@ fn push_missing_active_skills_repushes_only_absent() {
 
 // ── Restore journal (F2 pushes) ─────────────────────────────────────────────
 //
-// push_skill/push_mcp/push_plugin all write into $HOME-derived paths, so
+// push_skill/push_mcp both write into $HOME-derived paths, so
 // these tests follow the existing HOME-swap convention used above (no
 // process-wide mutex — matches the accepted, documented risk noted on
 // push_adopted_discovery's tests).
@@ -1087,40 +1087,6 @@ fn push_mcp_appends_managed_entry_when_not_brokered() {
     let entries = journal.read_all().unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].source, JournalSource::Managed);
-}
-
-#[test]
-fn push_plugin_appends_managed_artifact_push_entry() {
-    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-    let (pusher, tmp) = make_pusher();
-
-    let fake_home = tempfile::tempdir().unwrap();
-    fs::create_dir_all(fake_home.path().join(".claude").join("plugins")).unwrap();
-    let prev_home = std::env::var_os("HOME");
-    std::env::set_var("HOME", fake_home.path());
-
-    let result = pusher.push_plugin(
-        "journal-plugin",
-        Some("inst-plugin-1"),
-        &serde_json::json!({"name": "journal-plugin"}),
-    );
-
-    if let Some(v) = prev_home {
-        std::env::set_var("HOME", v);
-    } else {
-        std::env::remove_var("HOME");
-    }
-    result.expect("push_plugin should succeed");
-
-    let journal =
-        RestoreJournal::new(camino::Utf8PathBuf::from_path_buf(tmp.path().to_owned()).unwrap());
-    let entries = journal.read_all().unwrap();
-    assert_eq!(entries.len(), 1);
-    let entry = &entries[0];
-    assert_eq!(entry.op, JournalOp::ArtifactPush);
-    assert_eq!(entry.source, JournalSource::Managed);
-    assert_eq!(entry.slug.as_deref(), Some("journal-plugin"));
-    assert!(entry.target_path.ends_with("journal-plugin"));
 }
 
 #[test]
