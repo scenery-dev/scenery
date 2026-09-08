@@ -695,3 +695,95 @@ fn inject_publisher_field_inserts_after_description_when_missing() {
         "publisher should appear after description"
     );
 }
+
+// ── skill init / convert produce SKILL.md-conformant manifests ────────────────
+//
+// The SKILL.md format migration (see crates/vectorhawkd-manifest/src/skill_md.rs)
+// only allows `name`, `description`, `license` at the top level; everything
+// VectorHawk-specific must nest under `metadata.vectorhawk.*`. These tests run
+// each generator's actual output through the real manifest loader / validator
+// so drift like this can't happen silently again.
+
+#[tokio::test]
+async fn skill_init_produces_a_skill_md_that_the_manifest_loader_accepts() {
+    use vectorhawkd_manifest::SkillPackage;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let base = camino::Utf8Path::from_path(tmp.path()).unwrap();
+
+    super::cmd_skill_init("widget", Some(base))
+        .await
+        .expect("skill init should succeed");
+
+    let skill_dir = base.join("widget");
+    SkillPackage::load_from_dir(&skill_dir).expect(
+        "skill init's scaffolded SKILL.md must be loadable by the manifest parser \
+         (top-level vh_* keys are no longer valid — they must nest under metadata.vectorhawk)",
+    );
+}
+
+#[tokio::test]
+async fn skill_convert_produces_a_skill_md_that_passes_validation() {
+    use vectorhawkd_core::validator::validate_bundle;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = camino::Utf8Path::from_path(tmp.path()).unwrap();
+    let legacy_root = root.join("legacy-skill");
+
+    std::fs::create_dir_all(legacy_root.join("prompts")).unwrap();
+
+    let manifest_json = serde_json::json!({
+        "schema_version": "1.0",
+        "id": "legacy-skill",
+        "name": "Legacy Skill",
+        "version": "0.2.0",
+        "publisher": "acme",
+        "description": "Does the legacy thing.",
+        "license": "MIT",
+        "entrypoint": "prompts/system.txt",
+        "inputs_schema": null,
+        "outputs_schema": null,
+        "permissions": {
+            "filesystem": "read-only",
+            "network": "none",
+            "clipboard": "none"
+        },
+        "execution": {
+            "sandbox": "strict",
+            "timeout_ms": 45000,
+            "memory_mb": 512
+        },
+        "model_requirements": null,
+        "update": null,
+        "triggers": []
+    });
+    std::fs::write(
+        legacy_root.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest_json).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        legacy_root.join("prompts").join("system.txt"),
+        "Do the legacy thing.",
+    )
+    .unwrap();
+    // A workflow.yaml present means convert must emit metadata.vectorhawk.workflow_ref.
+    std::fs::write(
+        legacy_root.join("workflow.yaml"),
+        "name: legacy_skill\nsteps:\n  - id: run\n    type: llm\n    prompt: prompts/system.txt\n    inputs: {}\n",
+    )
+    .unwrap();
+
+    let output_dir = root.join("converted");
+
+    super::cmd_skill_convert(legacy_root, Some(output_dir.as_path()))
+        .await
+        .expect("skill convert should succeed");
+
+    let report = validate_bundle(&output_dir);
+    assert!(
+        report.all_passed(),
+        "converted SKILL.md failed validation: {:#?}",
+        report.checks
+    );
+}

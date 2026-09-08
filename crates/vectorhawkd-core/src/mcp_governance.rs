@@ -471,6 +471,70 @@ impl Default for PollTiming {
     }
 }
 
+/// Minimal shape of `POST /api/installations`'s 201 response body — see
+/// `InstallationCreateResponse` in the backend's
+/// `app/schemas/installation.py`. Only `installation_id` is needed here (to
+/// correlate against `GET /api/installations/mine` later); it's optional so
+/// a response missing/renaming the field degrades to local-only polling
+/// instead of failing the request.
+#[derive(Debug, Deserialize)]
+struct InstallationCreatedBody {
+    #[serde(default)]
+    installation_id: Option<String>,
+}
+
+/// One entry of `GET /api/installations/mine`'s response — see
+/// `InstallationResponse` in the backend's `app/schemas/installation.py`.
+/// Only the fields needed to detect a reported error are declared; extra
+/// fields in the real response are ignored by serde.
+#[derive(Debug, Deserialize)]
+struct InstallationMineEntry {
+    installation_id: String,
+    state: String,
+    #[serde(default)]
+    error_message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct InstallationMineResponse {
+    installations: Vec<InstallationMineEntry>,
+}
+
+/// Every this-many local poll ticks, additionally check
+/// `GET /api/installations/mine` for a backend-reported error on this
+/// installation. At the default 500ms local poll interval that's roughly
+/// every 5 seconds — frequent enough to fail fast, infrequent enough not to
+/// hammer the backend on every tick. Checked on tick 0 too, so an
+/// already-known error surfaces on the very first iteration.
+const REMOTE_CHECK_EVERY_N_TICKS: u64 = 10;
+
+/// Ask the backend whether `installation_id` has moved to `state == "error"`
+/// and, if so, return its `error_message`. Network/parse failures are
+/// swallowed (returns `None`) so a transient hiccup on this best-effort
+/// check never interrupts the primary local-SQLite poll loop.
+fn check_remote_installation_error(
+    base_url: &str,
+    access_token: &str,
+    installation_id: &str,
+) -> Option<String> {
+    let url = format!("{}/api/installations/mine", base_url.trim_end_matches('/'));
+    let client = make_http_client().ok()?;
+    let resp = client.get(&url).bearer_auth(access_token).send().ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let parsed: InstallationMineResponse = resp.json().ok()?;
+    parsed
+        .installations
+        .into_iter()
+        .find(|entry| entry.installation_id == installation_id && entry.state == "error")
+        .map(|entry| {
+            entry
+                .error_message
+                .unwrap_or_else(|| "install failed".to_string())
+        })
+}
+
 fn install_via_desired_state_with_timing(
     state: &AppState,
     base_url: &str,
@@ -507,7 +571,16 @@ fn install_via_desired_state_with_timing(
         anyhow::bail!("install request failed (HTTP {status}): {body}");
     }
 
+    // Best-effort: capture installation_id to correlate against
+    // GET /api/installations/mine in the poll loop below. Missing/unparsable
+    // body just disables the remote fast-fail check.
+    let installation_id = resp
+        .json::<InstallationCreatedBody>()
+        .ok()
+        .and_then(|b| b.installation_id);
+
     let deadline = std::time::Instant::now() + poll.timeout;
+    let mut tick: u64 = 0;
     loop {
         if std::time::Instant::now() >= deadline {
             anyhow::bail!(
@@ -533,7 +606,25 @@ fn install_via_desired_state_with_timing(
                      `vectorhawk sync status` for details"
                 );
             }
-            _ => std::thread::sleep(poll.interval),
+            _ => {
+                // No local row yet (or not-yet-active) — this is the
+                // first-time-install-never-succeeded case where
+                // `installed_skills` may never get a row at all if the
+                // reconciler gives up. Periodically also ask the backend,
+                // which the reconciler already reports to immediately on
+                // failure via PATCH /api/installations/{id}.
+                if let Some(id) = installation_id.as_deref() {
+                    if tick % REMOTE_CHECK_EVERY_N_TICKS == 0 {
+                        if let Some(error_message) =
+                            check_remote_installation_error(base_url, access_token, id)
+                        {
+                            anyhow::bail!("install of '{skill_id}' failed: {error_message}");
+                        }
+                    }
+                }
+                tick += 1;
+                std::thread::sleep(poll.interval);
+            }
         }
     }
 }
@@ -759,6 +850,62 @@ mod tests {
 
         assert_eq!(result.unwrap(), "9.9.9");
         mock.assert();
+
+        let _ = std::fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn install_via_desired_state_surfaces_backend_error_fast_on_first_time_install_failure() {
+        // Regression for the bug where a first-time install that the daemon's
+        // reconciler gives up on (see reconciler::handle_install) never
+        // writes an `installed_skills` row at all — success-only table — so
+        // the local-SQLite-only poll loop spun silently until the full
+        // timeout even though the backend already knew about the error
+        // (reported via PATCH /api/installations/{id} within seconds). The
+        // poll loop must also consult GET /api/installations/mine and fail
+        // fast on a matching `state: "error"` entry.
+        let state_root = temp_root("remote-error-fast");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+
+        let mut server = Server::new();
+        let _post_mock = server
+            .mock("POST", "/api/installations")
+            .with_status(201)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"installation_id":"22222222-2222-2222-2222-222222222222","state":"installing","skill_id":"test-skill","version":"1.0.0"}"#,
+            )
+            .create();
+
+        let _mine_mock = server
+            .mock("GET", "/api/installations/mine")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"installations":[{"installation_id":"22222222-2222-2222-2222-222222222222","state":"error","error_message":"skill 'test-skill' not found in registry"}]}"#,
+            )
+            .create();
+
+        // No row is ever inserted into installed_skills — simulates the
+        // never-succeeded-once first-time-install-failure case.
+        let result = install_via_desired_state_with_timing(
+            &state,
+            &server.url(),
+            "test-skill",
+            "dev-123",
+            "fake-access",
+            None,
+            PollTiming {
+                timeout: Duration::from_secs(5),
+                interval: Duration::from_millis(10),
+            },
+        );
+
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("skill 'test-skill' not found in registry"),
+            "expected the backend's error_message to surface quickly, got: {err}"
+        );
 
         let _ = std::fs::remove_dir_all(&state_root);
     }
