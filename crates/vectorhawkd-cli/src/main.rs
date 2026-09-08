@@ -1678,11 +1678,28 @@ async fn install_via_desired_state(
         anyhow::bail!("install request failed (HTTP {status}): {body}");
     }
 
+    // Best-effort: capture installation_id from the 201 body so the poll
+    // loop below can also ask the backend directly (GET
+    // /api/installations/mine) whether it already knows about a failure.
+    // Missing/unparsable body just disables that fast-fail check and falls
+    // back to local-SQLite-only polling.
+    #[derive(serde::Deserialize)]
+    struct InstallationCreatedBody {
+        #[serde(default)]
+        installation_id: Option<String>,
+    }
+    let installation_id = resp
+        .json::<InstallationCreatedBody>()
+        .await
+        .ok()
+        .and_then(|b| b.installation_id);
+
     // Poll SQLite for the reconciler to confirm 'installed' state (max 30 s).
     let db_path = state.db_path.clone();
     let skill_id_str = skill_id.to_string();
     let deadline = std::time::Instant::now()
         + std::time::Duration::from_secs(REGISTRY_INSTALL_POLL_TIMEOUT_SECS);
+    let mut tick: u64 = 0;
 
     loop {
         if std::time::Instant::now() >= deadline {
@@ -1744,6 +1761,29 @@ async fn install_via_desired_state(
                 );
             }
             _ => {
+                // No local row yet (or not-yet-active) — this is the
+                // first-time-install-never-succeeded case where
+                // `installed_skills` may never get a row at all if the
+                // reconciler gives up (it's a success-only table). Every
+                // REMOTE_CHECK_EVERY_N_TICKS ticks (~5s at the default 500ms
+                // interval — checked on tick 0 too, so an already-known
+                // error surfaces on the first iteration), also ask the
+                // backend directly via GET /api/installations/mine, which
+                // the reconciler already reports to immediately on failure
+                // via PATCH /api/installations/{id}. Not done every tick so
+                // we don't hammer the backend.
+                if let Some(id) = installation_id.as_deref() {
+                    if tick % REMOTE_CHECK_EVERY_N_TICKS == 0 {
+                        if let Some(error_message) =
+                            check_remote_installation_error(&client, registry_url, &token, id).await
+                        {
+                            eprintln!();
+                            anyhow::bail!("install of '{skill_id}' failed: {error_message}");
+                        }
+                    }
+                }
+                tick += 1;
+
                 // Not yet installed; wait and retry.
                 tokio::time::sleep(std::time::Duration::from_millis(
                     REGISTRY_INSTALL_POLL_INTERVAL_MS,
@@ -1752,6 +1792,60 @@ async fn install_via_desired_state(
             }
         }
     }
+}
+
+/// Every this-many local poll ticks, `install_via_desired_state` additionally
+/// checks `GET /api/installations/mine` for a backend-reported error on the
+/// installation it just requested. See the call site for the cadence
+/// rationale (mirrors `vectorhawkd_core::mcp_governance`'s identical
+/// constant/helper for the `vectorhawk_install` MCP tool's poll loop).
+const REMOTE_CHECK_EVERY_N_TICKS: u64 = 10;
+
+/// Ask the backend whether `installation_id` has moved to `state == "error"`
+/// and, if so, return its `error_message`. Network/parse failures are
+/// swallowed (returns `None`) so this best-effort check never interrupts the
+/// primary local-SQLite poll loop.
+async fn check_remote_installation_error(
+    client: &reqwest::Client,
+    registry_url: &str,
+    access_token: &str,
+    installation_id: &str,
+) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct InstallationMineEntry {
+        installation_id: String,
+        state: String,
+        #[serde(default)]
+        error_message: Option<String>,
+    }
+    #[derive(serde::Deserialize)]
+    struct InstallationMineResponse {
+        installations: Vec<InstallationMineEntry>,
+    }
+
+    let url = format!(
+        "{}/api/installations/mine",
+        registry_url.trim_end_matches('/')
+    );
+    let resp = client
+        .get(&url)
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let parsed: InstallationMineResponse = resp.json().await.ok()?;
+    parsed
+        .installations
+        .into_iter()
+        .find(|entry| entry.installation_id == installation_id && entry.state == "error")
+        .map(|entry| {
+            entry
+                .error_message
+                .unwrap_or_else(|| "install failed".to_string())
+        })
 }
 
 /// Direct registry install — pre-RUN2 behaviour, used when the daemon is not
@@ -2453,16 +2547,18 @@ async fn cmd_skill_init(name: &str, output_dir: Option<&camino::Utf8Path>) -> Re
         r#"---
 name: {name}
 description: "TODO: describe what this skill does"
-version: 0.1.0
-publisher: YOUR_PUBLISHER_ID
-vh_permissions:
-  network: none
-  filesystem: none
-  clipboard: none
-vh_execution:
-  timeout_ms: 30000
-  memory_mb: 256
-  sandbox: strict
+metadata:
+  vectorhawk:
+    version: 0.1.0
+    publisher: YOUR_PUBLISHER_ID
+    permissions:
+      network: none
+      filesystem: none
+      clipboard: none
+    execution:
+      timeout_ms: 30000
+      memory_mb: 256
+      sandbox: strict
 ---
 
 # {name}
@@ -3493,16 +3589,18 @@ async fn cmd_skill_convert(
         r#"---
 name: {name}
 description: "{description_escaped}"
-version: {version}
-publisher: {publisher}
-vh_permissions:
-  network: {network}
-  filesystem: {filesystem}
-  clipboard: {clipboard}
-vh_execution:
-  timeout_ms: {timeout_ms}
-  memory_mb: {memory_mb}
-  sandbox: {sandbox}
+metadata:
+  vectorhawk:
+    version: {version}
+    publisher: {publisher}
+    permissions:
+      network: {network}
+      filesystem: {filesystem}
+      clipboard: {clipboard}
+    execution:
+      timeout_ms: {timeout_ms}
+      memory_mb: {memory_mb}
+      sandbox: {sandbox}
 "#,
         name = manifest.name,
         description_escaped = description_escaped,
@@ -3517,7 +3615,7 @@ vh_execution:
     );
 
     if has_workflow_yaml {
-        fm.push_str("vh_workflow_ref: ./workflow.yaml\n");
+        fm.push_str("    workflow_ref: ./workflow.yaml\n");
     }
 
     fm.push_str("---\n\n");
