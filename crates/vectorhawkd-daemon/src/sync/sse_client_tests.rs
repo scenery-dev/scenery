@@ -11,6 +11,7 @@ fn parses_snapshot_event() {
         super::SyncEvent::Snapshot {
             installations,
             mcp_installations,
+            plugin_installations,
         } => {
             assert_eq!(installations.len(), 1);
             assert_eq!(installations[0].skill_id, "my-skill");
@@ -20,6 +21,51 @@ fn parses_snapshot_event() {
                 mcp_installations.is_empty(),
                 "old-format snapshot has no mcp_installations key → default empty vec"
             );
+            assert!(
+                plugin_installations.is_empty(),
+                "old-format snapshot has no plugin_installations key → default empty vec"
+            );
+        }
+        other => panic!("expected Snapshot, got {other:?}"),
+    }
+}
+
+#[test]
+fn parses_snapshot_event_with_plugin_installations() {
+    // Wire shape matches `build_install_plugin_payload` in the backend
+    // (backend/app/services/plugin_install_payload.py) plus the extra
+    // "state" field `_get_plugin_snapshot` adds — see RB1 brief.
+    let data = r#"{
+        "installations": [],
+        "plugin_installations": [
+            {
+                "installation_id": "550e8400-e29b-41d4-a716-446655440020",
+                "plugin_slug": "superpowers",
+                "plugin_name": "Superpowers",
+                "description": "Core skills library",
+                "version": "5.0.7",
+                "author": "VectorHawk",
+                "skills": [{"skill_id": "tdd", "version": "1.0.0"}],
+                "state": "desired"
+            }
+        ]
+    }"#;
+    let event = parse_sync_event("snapshot", data).unwrap();
+    match event {
+        super::SyncEvent::Snapshot {
+            plugin_installations,
+            ..
+        } => {
+            assert_eq!(plugin_installations.len(), 1);
+            let p = &plugin_installations[0];
+            assert_eq!(p.plugin_slug, "superpowers");
+            assert_eq!(p.plugin_name, "Superpowers");
+            assert_eq!(p.version, "5.0.7");
+            assert_eq!(p.author, "VectorHawk");
+            assert_eq!(p.state, "desired");
+            assert_eq!(p.skills.len(), 1);
+            assert_eq!(p.skills[0].skill_id, "tdd");
+            assert_eq!(p.skills[0].version, "1.0.0");
         }
         other => panic!("expected Snapshot, got {other:?}"),
     }
@@ -128,6 +174,7 @@ fn snapshot_with_multiple_records() {
         super::SyncEvent::Snapshot {
             installations,
             mcp_installations: _,
+            plugin_installations: _,
         } => {
             assert_eq!(installations.len(), 2);
             assert_eq!(installations[0].skill_id, "skill-a");

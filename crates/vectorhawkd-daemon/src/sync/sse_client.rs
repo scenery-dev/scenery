@@ -570,6 +570,13 @@ pub enum SyncEvent {
         /// MCP installation desired-state from the snapshot payload.
         /// Empty when the backend is older and does not emit the key.
         mcp_installations: Vec<McpInstallationRecord>,
+        /// Plugin installation desired-state from the snapshot payload
+        /// (backend `plugin_installations` key — RB1). Delivers plugins
+        /// durably to a device that wasn't connected when the live
+        /// `install_plugin` SSE delta fired (a backfilled device, or any
+        /// device reconnecting after a dropped delta). Empty when the
+        /// backend is older and does not emit the key.
+        plugin_installations: Vec<PluginInstallationRecord>,
     },
     /// Install (or re-activate) a specific skill version.
     Install {
@@ -651,6 +658,29 @@ pub struct InstallationRecord {
     pub source: Option<String>,
 }
 
+/// One entry in a [`SyncEvent::Snapshot`] plugin installations list.
+///
+/// Mirrors the fields from a live `install_plugin` event payload (built by
+/// the same `build_install_plugin_payload` the backend uses for the SSE
+/// delta — see RB1 brief), plus a `state` field so the snapshot reconciler
+/// knows the desired disposition, exactly like [`McpInstallationRecord`].
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct PluginInstallationRecord {
+    pub installation_id: Uuid,
+    pub plugin_slug: String,
+    #[serde(default)]
+    pub plugin_name: String,
+    #[serde(default)]
+    pub description: String,
+    pub version: String,
+    #[serde(default)]
+    pub author: String,
+    #[serde(default)]
+    pub skills: Vec<PluginSkillRef>,
+    /// `"desired"` | `"installing"` | `"installed"` | `"deactivated"` | `"removed"`
+    pub state: String,
+}
+
 /// One entry in a [`SyncEvent::Snapshot`] MCP installations list.
 ///
 /// Mirrors the fields from a live `install_mcp` event payload, plus a
@@ -683,6 +713,11 @@ struct WireSnapshot {
     /// an empty vec rather than failing deserialization.
     #[serde(default)]
     mcp_installations: Vec<McpInstallationRecord>,
+    /// Plugin installation desired-state list (RB1).  `#[serde(default)]` so
+    /// snapshots from older backends (which do not emit the key) parse
+    /// successfully with an empty vec rather than failing deserialization.
+    #[serde(default)]
+    plugin_installations: Vec<PluginInstallationRecord>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -769,6 +804,7 @@ pub fn snapshot_event_from_json(data: &str) -> Result<SyncEvent> {
     Ok(SyncEvent::Snapshot {
         installations: wire.installations,
         mcp_installations: wire.mcp_installations,
+        plugin_installations: wire.plugin_installations,
     })
 }
 
@@ -860,6 +896,7 @@ fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
             Ok(SyncEvent::Snapshot {
                 installations: vec![],
                 mcp_installations: vec![],
+                plugin_installations: vec![],
             })
         }
         "managed_paths_policy_update" => {
@@ -895,6 +932,7 @@ fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
             Ok(SyncEvent::Snapshot {
                 installations: vec![],
                 mcp_installations: vec![],
+                plugin_installations: vec![],
             })
         }
         "discovery_adopted" => {
@@ -904,6 +942,7 @@ fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
             Ok(SyncEvent::Snapshot {
                 installations: vec![],
                 mcp_installations: vec![],
+                plugin_installations: vec![],
             })
         }
         "discovery_publish_requested" => {
@@ -913,6 +952,7 @@ fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
             Ok(SyncEvent::Snapshot {
                 installations: vec![],
                 mcp_installations: vec![],
+                plugin_installations: vec![],
             })
         }
         "inference_policy_update" => {
@@ -923,6 +963,7 @@ fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
             Ok(SyncEvent::Snapshot {
                 installations: vec![],
                 mcp_installations: vec![],
+                plugin_installations: vec![],
             })
         }
         other => {
