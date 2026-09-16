@@ -41,6 +41,8 @@ use serde_json::Value;
 use std::{
     cmp::Reverse,
     collections::HashMap,
+    future::Future,
+    pin::Pin,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -291,6 +293,18 @@ struct RegistryInner {
     last_synced: Option<Instant>,
 }
 
+/// Notified once after `vectorhawk_login` saves fresh OAuth tokens, so the
+/// daemon can register this device and start sync without a restart — the
+/// same outcome `auth/reload` already gives the CLI login path.
+///
+/// Defined here (not in `vectorhawkd-daemon`) so `tools::handle_login_with_oauth`
+/// can invoke it without a circular dependency on the daemon crate — mirrors
+/// `oauth::OAuthSubscriber`. The daemon implements this by wrapping its
+/// `SyncController` and calling `ensure_started()`, which is itself idempotent.
+pub trait TokensSavedHook: Send + Sync + 'static {
+    fn on_tokens_saved(&self) -> Pin<Box<dyn Future<Output = ()> + Send>>;
+}
+
 /// The central MCP aggregator. Manages all backend connections and exposes a
 /// merged, namespaced tool surface to `Server<B>`.
 ///
@@ -300,6 +314,9 @@ pub struct BackendRegistry {
     inner: Arc<Mutex<RegistryInner>>,
     /// Shared async HTTP client used for HTTP transport dispatch.
     http: reqwest::Client,
+    /// Set by the daemon after construction (see `set_tokens_saved_hook`);
+    /// `None` in the shim, which never handles `vectorhawk_login` tokens.
+    tokens_saved_hook: Arc<Mutex<Option<Arc<dyn TokensSavedHook>>>>,
 }
 
 impl BackendRegistry {
@@ -320,6 +337,23 @@ impl BackendRegistry {
                 last_synced: None,
             })),
             http,
+            tokens_saved_hook: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Install the hook invoked by `notify_tokens_saved`. Overwrites any
+    /// previously set hook. Call once, at daemon startup.
+    pub fn set_tokens_saved_hook(&self, hook: Arc<dyn TokensSavedHook>) {
+        *self.tokens_saved_hook.lock().unwrap() = Some(hook);
+    }
+
+    /// Invoke the tokens-saved hook, if one is installed. No-op (not an
+    /// error) when no hook is set — the shim's `BackendRegistry` never has
+    /// one, since only the daemon owns a `SyncController`.
+    pub async fn notify_tokens_saved(&self) {
+        let hook = self.tokens_saved_hook.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook.on_tokens_saved().await;
         }
     }
 
@@ -949,6 +983,37 @@ mod tests {
             consecutive_errors: 0,
             unhealthy: false,
         }
+    }
+
+    // ── TokensSavedHook ─────────────────────────────────────────────────────
+
+    struct CountingHook(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl TokensSavedHook for CountingHook {
+        fn on_tokens_saved(&self) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            let count = Arc::clone(&self.0);
+            Box::pin(async move {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn notify_tokens_saved_invokes_installed_hook() {
+        let registry = BackendRegistry::new();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        registry.set_tokens_saved_hook(Arc::new(CountingHook(Arc::clone(&count))));
+
+        registry.notify_tokens_saved().await;
+
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn notify_tokens_saved_is_noop_without_a_hook() {
+        // The shim's BackendRegistry never has a hook installed — must not panic.
+        let registry = BackendRegistry::new();
+        registry.notify_tokens_saved().await;
     }
 
     // ── parse_tool_name ───────────────────────────────────────────────────────

@@ -119,6 +119,31 @@ impl vectorhawkd_mcp::oauth::OAuthSubscriber for OAuthStateSubscriber {
     }
 }
 
+/// Bridges `SyncController` (daemon crate) to `TokensSavedHook` (MCP crate) so
+/// that `tools::handle_login_with_oauth`'s background task can register the
+/// device and start sync after `vectorhawk_login` saves fresh tokens, without
+/// introducing a direct dependency on the daemon crate from the MCP crate —
+/// mirrors `OAuthStateSubscriber` above. `ensure_started` is idempotent, so
+/// this is safe to call even if sync is already running (e.g. the CLI's
+/// `auth/reload` beat it to it).
+struct SyncControllerHook(Arc<SyncController>);
+
+impl vectorhawkd_mcp::aggregator::TokensSavedHook for SyncControllerHook {
+    fn on_tokens_saved(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        let sync_controller = Arc::clone(&self.0);
+        Box::pin(async move {
+            if sync_controller.ensure_started().await {
+                info!("vectorhawk_login: device registered / sync started");
+            } else {
+                warn!(
+                    "vectorhawk_login: sync did not start after login (no usable \
+                     token or registration failed) — will retry on next auth event"
+                );
+            }
+        })
+    }
+}
+
 /// Configuration for the daemon entry point.
 ///
 /// The binary's `main.rs` populates these from environment variables; the CLI
@@ -533,6 +558,12 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
              will start automatically on `auth login` / `auth pair`"
         );
     }
+
+    // R1: wire the same idempotent (re)start into the `vectorhawk_login`
+    // MCP-tool path. `vh_registry` is the same `Arc<BackendRegistry>` that
+    // `sync_controller` above and `RealBackend` below both share, so this
+    // hook fires regardless of which client called `vectorhawk_login`.
+    vh_registry.set_tokens_saved_hook(Arc::new(SyncControllerHook(Arc::clone(&sync_controller))));
 
     // Spawn the registry sync loop (300 s interval).
     // All synchronous I/O happens inside spawn_blocking so the current-thread
@@ -1781,6 +1812,10 @@ mod refresh_loop_tests;
 #[cfg(test)]
 #[path = "sync_tick_tests.rs"]
 mod sync_tick_tests;
+
+#[cfg(test)]
+#[path = "sync_controller_hook_tests.rs"]
+mod sync_controller_hook_tests;
 
 #[cfg(test)]
 mod slug_tests {
