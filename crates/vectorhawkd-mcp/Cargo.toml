@@ -46,7 +46,7 @@ uuid = { workspace = true, optional = true }
 # only by `setup::migrate_stale_vscode_settings_entry`, the daemon-boot
 # self-heal step that cleans a stale entry out of VS Code's settings.json.
 # Not needed by anything the shim's stdio relay path calls.
-jsonc-parser = { version = "0.33", default-features = false, features = ["cst"], optional = true }
+jsonc-parser = { version = "0.33", default-features = false, features = ["cst", "serde"], optional = true }
 # Format-preserving TOML editor — used only by `setup::write_mcp_entry_toml` /
 # `remove_mcp_entry_toml` / `read_vectorhawk_command_toml`, Codex CLI's
 # `~/.codex/config.toml` writer (Codex config is TOML, every other client's
