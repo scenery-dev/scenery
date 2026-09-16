@@ -869,7 +869,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use vectorhawkd_core::restore_journal::{JournalOp, JournalSource, RestoreJournal};
     use vectorhawkd_core::state::{AppState, McpInstallRow};
-    use vectorhawkd_mcp::setup::ClientConfig;
+    use vectorhawkd_mcp::setup::{ClientConfig, ConfigFormat};
 
     /// Serializes every test in this module that mutates the process-global
     /// `HOME` env var.
@@ -940,6 +940,7 @@ mod tests {
             config_path: config_path.clone(),
             mcp_key: "mcpServers".to_string(),
             already_configured: true,
+            format: ConfigFormat::Json,
         };
         let plan = Plan {
             brokered: vec![brokered_row("uuid-slack", "inst-slack-1", "Slack")],
