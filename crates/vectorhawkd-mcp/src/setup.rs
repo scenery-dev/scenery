@@ -15,6 +15,14 @@ pub struct ClientConfig {
     pub already_configured: bool,
 }
 
+/// Path segment marking a versioned Homebrew Cellar install for `vectorhawk`
+/// (`<prefix>/Cellar/vectorhawk/<ver>/bin/vectorhawk`). `brew upgrade` deletes
+/// the old version's Cellar directory, so any command still pointing inside
+/// one is either already dead or about to be on the next upgrade. Shared by
+/// [`stable_command_from_exe`] (used when writing a fresh entry) and
+/// [`command_needs_repair`] (used when checking an existing one).
+const CELLAR: &str = "/Cellar/vectorhawk/";
+
 /// The name under which VectorHawk registers itself in AI client configs.
 ///
 /// Must match what `vectorhawkd-shim` advertises and what `mcp setup` writes.
@@ -59,7 +67,6 @@ fn resolve_mcp_command() -> String {
 /// exists; otherwise return `exe` unchanged. Pure, with an injectable existence
 /// check so the rewrite is unit-testable without a real Homebrew install.
 fn stable_command_from_exe(exe: &str, exists: impl Fn(&str) -> bool) -> String {
-    const CELLAR: &str = "/Cellar/vectorhawk/";
     if let Some(idx) = exe.find(CELLAR) {
         let stable = format!("{}/bin/{}", &exe[..idx], MCP_COMMAND);
         if exists(&stable) {
@@ -761,6 +768,103 @@ pub fn detect_unmanaged_servers() -> Vec<UnmanagedServer> {
     }
 
     unmanaged
+}
+
+// ── Daemon-boot self-heal for stale MCP commands ───────────────────────────────
+
+/// Returns `true` when `command` looks like a stale `vectorhawk` MCP command
+/// that daemon-boot repair should rewrite: an absolute path that either (a)
+/// no longer exists on disk — Homebrew deleted the old Cellar version on a
+/// later upgrade — or (b) still points inside a versioned Cellar directory
+/// (written by a pre-efb7fe1 `mcp setup`, still present but due to be pruned
+/// on the next upgrade). A bare command name (resolved via `PATH`) is left
+/// alone — it was never a Cellar path to begin with.
+fn command_needs_repair(command: &str, exists: impl Fn(&str) -> bool) -> bool {
+    let path = std::path::Path::new(command);
+    if !path.is_absolute() {
+        return false;
+    }
+    if !exists(command) {
+        return true;
+    }
+    command.contains(CELLAR)
+}
+
+/// Scan all detected AI-client configs and rewrite any `vectorhawk` MCP
+/// entry whose `command` is stale (see [`command_needs_repair`]) back to the
+/// current stable path, via the same [`write_mcp_entry`] used by `mcp setup`
+/// (so the write goes through the restore journal identically).
+///
+/// This is the daemon-boot half of the self-heal for GH board bug
+/// "SSH/headless brew upgrade leaves stale versioned MCP command path":
+/// `mcp setup` writes the stable Homebrew bin path since efb7fe1, but the
+/// brew `post_install` hook that would normally re-run `mcp setup` on
+/// upgrade doesn't execute headlessly over SSH (no D-Bus/desktop session),
+/// so a config written by an older `mcp setup` — or one that's simply gone
+/// stale after an upgrade removed its Cellar dir — never self-corrects on
+/// its own. Running this on every daemon start converges the fleet without
+/// requiring anyone to manually re-run `mcp setup`.
+///
+/// Idempotent: a config whose command already matches the current stable
+/// path is left untouched. Only the `vectorhawk` entry is ever touched —
+/// every other MCP server entry in the file is left exactly as-is.
+///
+/// Returns the names of clients whose entry was rewritten. Per-client I/O
+/// failures are logged at WARN and skipped — never fatal to daemon startup.
+pub fn repair_stale_mcp_entries() -> Vec<String> {
+    match home_dir() {
+        Some(home) => repair_stale_mcp_entries_in(&home, std::path::Path::new("/")),
+        None => Vec::new(),
+    }
+}
+
+/// Core logic for [`repair_stale_mcp_entries`], parameterised on `home` and
+/// `system_root` so tests can point it at a temp directory instead of the
+/// real filesystem.
+fn repair_stale_mcp_entries_in(
+    home: &std::path::Path,
+    system_root: &std::path::Path,
+) -> Vec<String> {
+    let clients = detect_ai_clients_in(home, system_root);
+    let mut repaired = Vec::new();
+
+    for client in &clients {
+        if !client.config_path.exists() {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&client.config_path) else {
+            continue;
+        };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        let command = json
+            .get(&client.mcp_key)
+            .and_then(|v| v.get(MCP_SERVER_NAME))
+            .and_then(|entry| entry.get("command"))
+            .and_then(|c| c.as_str())
+            .map(str::to_string);
+        let Some(command) = command else {
+            continue;
+        };
+        if !command_needs_repair(&command, |p| std::path::Path::new(p).exists()) {
+            continue;
+        }
+
+        match write_mcp_entry(client) {
+            Ok(()) => repaired.push(client.name.clone()),
+            Err(e) => {
+                tracing::warn!(
+                    client = %client.name,
+                    path = %client.config_path.display(),
+                    error = %e,
+                    "heal: failed to repair stale vectorhawk MCP command"
+                );
+            }
+        }
+    }
+
+    repaired
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
@@ -1599,6 +1703,148 @@ mod tests {
             "vectorhawk entry should be removed"
         );
 
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // ── command_needs_repair ──────────────────────────────────────────────────
+
+    #[test]
+    fn command_needs_repair_when_path_does_not_exist() {
+        assert!(command_needs_repair(
+            "/home/linuxbrew/.linuxbrew/Cellar/vectorhawk/1.0.65/bin/vectorhawk",
+            |_| false,
+        ));
+    }
+
+    #[test]
+    fn command_needs_repair_when_versioned_cellar_path_exists() {
+        // Old Cellar dir hasn't been pruned yet (e.g. mid-upgrade), but it's
+        // still a versioned path that must be rewritten to the stable one.
+        assert!(command_needs_repair(
+            "/opt/homebrew/Cellar/vectorhawk/1.0.65/bin/vectorhawk",
+            |_| true,
+        ));
+    }
+
+    #[test]
+    fn command_does_not_need_repair_when_stable_path_exists() {
+        assert!(!command_needs_repair(
+            "/home/linuxbrew/.linuxbrew/bin/vectorhawk",
+            |_| true,
+        ));
+    }
+
+    #[test]
+    fn command_does_not_need_repair_for_bare_command() {
+        // Not an absolute path — nothing for the repair pass to rewrite.
+        assert!(!command_needs_repair("vectorhawk", |_| false));
+    }
+
+    // ── repair_stale_mcp_entries ──────────────────────────────────────────────
+
+    #[test]
+    fn repair_rewrites_stale_versioned_cellar_command() {
+        let tmp = temp_root("repair-stale");
+        fs::create_dir_all(tmp.join(".claude")).unwrap();
+        let config_path = tmp.join(".claude.json");
+        fs::write(
+            &config_path,
+            r#"{"mcpServers":{"vectorhawk":{"command":"/home/linuxbrew/.linuxbrew/Cellar/vectorhawk/1.0.65/bin/vectorhawk","args":["mcp","serve"]}}}"#,
+        )
+        .unwrap();
+
+        let repaired = with_fake_home(&tmp, || repair_stale_mcp_entries_in(&tmp, &tmp));
+        assert_eq!(
+            repaired,
+            vec!["Claude Code".to_string()],
+            "the stale Claude Code entry should be repaired"
+        );
+
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(
+            json["mcpServers"]["vectorhawk"]["command"],
+            expected_command(),
+            "command should be rewritten to the current stable path"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn repair_leaves_current_command_untouched() {
+        let tmp = temp_root("repair-current");
+        fs::create_dir_all(tmp.join(".claude")).unwrap();
+        let config_path = tmp.join(".claude.json");
+        let existing = serde_json::json!({
+            "mcpServers": {
+                "vectorhawk": {"command": expected_command(), "args": ["mcp", "serve"]}
+            }
+        });
+        fs::write(&config_path, serde_json::to_string(&existing).unwrap()).unwrap();
+
+        let repaired = with_fake_home(&tmp, || repair_stale_mcp_entries_in(&tmp, &tmp));
+        assert!(
+            repaired.is_empty(),
+            "an already-current command must not be rewritten"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn repair_is_idempotent() {
+        let tmp = temp_root("repair-idempotent");
+        fs::create_dir_all(tmp.join(".claude")).unwrap();
+        let config_path = tmp.join(".claude.json");
+        fs::write(
+            &config_path,
+            r#"{"mcpServers":{"vectorhawk":{"command":"/opt/homebrew/Cellar/vectorhawk/1.0.65/bin/vectorhawk","args":["mcp","serve"]}}}"#,
+        )
+        .unwrap();
+
+        let first = with_fake_home(&tmp, || repair_stale_mcp_entries_in(&tmp, &tmp));
+        assert_eq!(first, vec!["Claude Code".to_string()]);
+
+        let second = with_fake_home(&tmp, || repair_stale_mcp_entries_in(&tmp, &tmp));
+        assert!(
+            second.is_empty(),
+            "a second repair pass must be a no-op once the entry is stable"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn repair_preserves_other_entries_and_only_touches_vectorhawk() {
+        let tmp = temp_root("repair-preserves");
+        fs::create_dir_all(tmp.join(".claude")).unwrap();
+        let config_path = tmp.join(".claude.json");
+        fs::write(
+            &config_path,
+            r#"{"mcpServers":{"vectorhawk":{"command":"/opt/homebrew/Cellar/vectorhawk/1.0.65/bin/vectorhawk","args":["mcp","serve"]},"other-tool":{"command":"/does/not/exist/other","args":[]}}}"#,
+        )
+        .unwrap();
+
+        with_fake_home(&tmp, || repair_stale_mcp_entries_in(&tmp, &tmp));
+
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(
+            json["mcpServers"]["other-tool"]["command"], "/does/not/exist/other",
+            "unrelated MCP entries must never be touched by this repair pass"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn repair_skips_missing_config_files() {
+        let tmp = temp_root("repair-missing");
+        fs::create_dir_all(&tmp).unwrap();
+        // No client config files exist at all.
+        let repaired = with_fake_home(&tmp, || repair_stale_mcp_entries_in(&tmp, &tmp));
+        assert!(repaired.is_empty());
         let _ = fs::remove_dir_all(&tmp);
     }
 
