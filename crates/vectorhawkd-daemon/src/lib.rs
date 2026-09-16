@@ -45,6 +45,13 @@
 //! - Registry sync loop: wraps `run_sync_tick` in `spawn_blocking`. This
 //!   function issues sync HTTP (`reqwest::blocking`) and sync SQLite calls.
 //!   Adding any new sync I/O to `run_sync_tick` is safe.
+//! - Discoveries scanner (`managed_paths::discoveries::run_once`): wraps its
+//!   skill/MCP collection step (`extra_roots()`, `detect_ai_clients()`, and
+//!   `collect_all_discoveries`) in `spawn_blocking`. Covers extra-root
+//!   directory walks, per-client `Path::exists()` checks, MCP config file
+//!   reads (JSON/JSONC/TOML), SHA-256 hashing, and the
+//!   `managed_path_markers` SQLite lookup — all sync I/O. Only the final
+//!   HTTP POST stays on the async executor (native `reqwest`, non-blocking).
 //! - Final audit flush on shutdown: wrapped in `spawn_blocking`.
 //!
 //! ## Startup (before accept loop)
