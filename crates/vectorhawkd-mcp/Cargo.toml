@@ -30,6 +30,7 @@ daemon = [
     "dep:rusqlite",
     "dep:semver",
     "dep:uuid",
+    "dep:jsonc-parser",
 ]
 
 [dependencies]
@@ -40,6 +41,11 @@ camino = { workspace = true, optional = true }
 rusqlite = { workspace = true, optional = true }
 semver = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
+# Format-preserving JSONC editor (comments/trailing commas kept intact) — used
+# only by `setup::migrate_stale_vscode_settings_entry`, the daemon-boot
+# self-heal step that cleans a stale entry out of VS Code's settings.json.
+# Not needed by anything the shim's stdio relay path calls.
+jsonc-parser = { version = "0.33", default-features = false, features = ["cst"], optional = true }
 
 # Always-available dependencies used by protocol, aggregator, backend, server,
 # stdio_process, and setup — all paths that the shim also exercises.

@@ -83,6 +83,28 @@ pub fn build_mcp_servers_block() -> serde_json::Value {
     })
 }
 
+/// Build the MCP server config entry for a specific client, layering any
+/// client-specific required fields on top of [`build_mcp_entry`]'s common
+/// `command`/`args` shape.
+///
+/// VS Code's `mcp.json` schema requires an explicit `type` field per server
+/// (`"stdio"` for a locally-spawned process) — see the field table in the
+/// VS Code MCP configuration reference (`type` — Required — `"stdio"`):
+/// <https://code.visualstudio.com/docs/agents/reference/mcp-configuration>.
+/// Every other client's config format only needs `command`/`args`.
+fn mcp_entry_for(config: &ClientConfig) -> serde_json::Value {
+    let mut entry = build_mcp_entry();
+    if config.name == "VS Code" {
+        if let serde_json::Value::Object(ref mut map) = entry {
+            map.insert(
+                "type".to_string(),
+                serde_json::Value::String("stdio".to_string()),
+            );
+        }
+    }
+    entry
+}
+
 /// Detect Claude Code installation and return config info.
 ///
 /// Detected by `~/.claude`, `~/.claude.json`, or the presence of the app bundle
@@ -178,15 +200,17 @@ fn detect_ai_clients_in(
         });
     }
 
-    // VS Code — platform-specific settings.json
-    if let Some(vscode_config) = vscode_settings_path(home) {
+    // VS Code — user-level `Code/User/mcp.json`, top-level `servers` key.
+    // NOT `settings.json`'s `mcpServers` — VS Code doesn't read that at all;
+    // see `vscode_mcp_json_path` / `migrate_stale_vscode_settings_entry`.
+    if let Some(vscode_config) = vscode_mcp_json_path(home) {
         let vscode_dir = vscode_config.parent().map(|p| p.to_path_buf());
         if vscode_dir.as_ref().map(|d| d.exists()).unwrap_or(false) || vscode_config.exists() {
-            let already = is_vectorhawk_configured(&vscode_config, "mcpServers");
+            let already = is_vectorhawk_configured(&vscode_config, "servers");
             clients.push(ClientConfig {
                 name: "VS Code".to_string(),
                 config_path: vscode_config,
-                mcp_key: "mcpServers".to_string(),
+                mcp_key: "servers".to_string(),
                 already_configured: already,
             });
         }
@@ -236,7 +260,7 @@ pub fn write_mcp_entry(config: &ClientConfig) -> Result<()> {
         .entry(config.mcp_key.clone())
         .or_insert_with(|| serde_json::Value::Object(Default::default()));
     if let serde_json::Value::Object(ref mut map) = servers {
-        map.insert(MCP_SERVER_NAME.to_string(), build_mcp_entry());
+        map.insert(MCP_SERVER_NAME.to_string(), mcp_entry_for(config));
     }
 
     if let Some(parent) = config.config_path.parent() {
@@ -650,32 +674,56 @@ fn claude_desktop_config_path(home: &std::path::Path) -> Option<PathBuf> {
     }
 }
 
-/// Return the VS Code user settings path for the current OS.
-fn vscode_settings_path(home: &std::path::Path) -> Option<PathBuf> {
+/// Return VS Code's per-user config directory (`Code/User/`) for the current
+/// OS. Shared by [`vscode_mcp_json_path`] (the config file VS Code actually
+/// reads) and [`vscode_settings_path`] (legacy location, kept only so
+/// [`migrate_stale_vscode_settings_entry`] can clean up a stale entry an
+/// older build left there).
+fn vscode_user_dir(home: &std::path::Path) -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
         Some(
             home.join("Library")
                 .join("Application Support")
                 .join("Code")
-                .join("User")
-                .join("settings.json"),
+                .join("User"),
         )
     }
     #[cfg(target_os = "linux")]
     {
-        Some(
-            home.join(".config")
-                .join("Code")
-                .join("User")
-                .join("settings.json"),
-        )
+        Some(home.join(".config").join("Code").join("User"))
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = home;
         None
     }
+}
+
+/// Return VS Code's user-level MCP server config path: `Code/User/mcp.json`.
+///
+/// This is the file VS Code actually reads for user-profile MCP servers,
+/// under a top-level `servers` key. See the VS Code MCP configuration
+/// reference: <https://code.visualstudio.com/docs/agents/reference/mcp-configuration>
+/// ("MCP server configuration is stored in the `mcp.json` JSON file. This
+/// file can be in your workspace (`.vscode/mcp.json`) or in your user
+/// profile."; `"servers": {}` — "an object that maps server names to their
+/// configurations"). `settings.json`'s `mcpServers` key (the pre-fix
+/// location this code used to write) is not read by VS Code at all.
+fn vscode_mcp_json_path(home: &std::path::Path) -> Option<PathBuf> {
+    vscode_user_dir(home).map(|d| d.join("mcp.json"))
+}
+
+/// Return the legacy VS Code user *settings* path (`Code/User/settings.json`).
+///
+/// No longer written to by `mcp setup` / the repair pass — kept only so
+/// [`migrate_stale_vscode_settings_entry`] can find and remove a stale
+/// `mcpServers.vectorhawk` key a pre-fix build left there. Gated behind
+/// `daemon` because that's its only (non-test) caller — see the feature-gate
+/// note on `migrate_stale_vscode_settings_entry` itself.
+#[cfg(feature = "daemon")]
+fn vscode_settings_path(home: &std::path::Path) -> Option<PathBuf> {
+    vscode_user_dir(home).map(|d| d.join("settings.json"))
 }
 
 /// Returns `true` if the config file at `path` already contains a
@@ -864,7 +912,100 @@ fn repair_stale_mcp_entries_in(
         }
     }
 
+    // Legacy-location cleanup: a pre-fix build may have left a dead
+    // `mcpServers.vectorhawk` key in Code/User/settings.json (the wrong
+    // file/key — VS Code never read it). Clean it up here too, alongside the
+    // per-client loop above, so it doesn't linger forever now that fresh
+    // writes/repairs only ever touch the real `mcp.json` location.
+    //
+    // Gated behind `daemon` because it needs both the restore-journal
+    // machinery and the `jsonc-parser` CST editor (see
+    // [`migrate_stale_vscode_settings_entry`]), the same as
+    // `record_config_edit_journal` already is.
+    #[cfg(feature = "daemon")]
+    if migrate_stale_vscode_settings_entry(home) {
+        repaired.push("VS Code (settings.json cleanup)".to_string());
+    }
+
     repaired
+}
+
+// ── VS Code settings.json → mcp.json migration ─────────────────────────────────
+
+/// Remove a stale `mcpServers.vectorhawk` key left in the legacy
+/// `Code/User/settings.json` by a pre-fix `mcp setup`/self-heal build. VS
+/// Code never reads `mcpServers` out of `settings.json` — the real location
+/// is `Code/User/mcp.json` → `servers` (see [`vscode_mcp_json_path`]) — so a
+/// leftover key there is permanently dead weight once fresh writes/repairs
+/// target the correct file.
+///
+/// `settings.json` is JSONC: VS Code allows comments and trailing commas in
+/// it. Round-tripping it through `serde_json` (as this function used to)
+/// would silently drop every comment on a successful parse, or — on a parse
+/// failure, which is the *common* case for a real hand-edited settings.json
+/// — skip the edit entirely, so the stale key would never actually get
+/// cleaned up for most real users. Instead this uses `jsonc_parser`'s `cst`
+/// (concrete syntax tree) editor: it parses the full token stream —
+/// comments, whitespace, trailing commas and all — as real nodes, so
+/// removing one property node leaves everything else (including comments
+/// attached to neighboring properties) byte-for-byte as written.
+/// `CstRootNode::parse` is lenient about JSONC syntax but still returns
+/// `Err` for genuinely malformed JSON (e.g. unmatched braces); that case,
+/// same as a non-object root or a missing `mcpServers`/`vectorhawk` key,
+/// leaves the file completely untouched.
+///
+/// Returns `true` if the stale entry was found and removed.
+#[cfg(feature = "daemon")]
+fn migrate_stale_vscode_settings_entry(home: &std::path::Path) -> bool {
+    use jsonc_parser::cst::CstRootNode;
+    use jsonc_parser::ParseOptions;
+
+    let Some(settings_path) = vscode_settings_path(home) else {
+        return false;
+    };
+    if !settings_path.exists() {
+        return false;
+    }
+    let Ok(text) = fs::read_to_string(&settings_path) else {
+        return false;
+    };
+
+    let Ok(root) = CstRootNode::parse(&text, &ParseOptions::default()) else {
+        // Not even valid JSONC (e.g. unmatched braces) — leave it alone
+        // rather than risk corrupting the user's file.
+        return false;
+    };
+    let Some(root_obj) = root.object_value() else {
+        return false;
+    };
+    let Some(mcp_servers_obj) = root_obj.object_value("mcpServers") else {
+        return false;
+    };
+    let Some(vectorhawk_prop) = mcp_servers_obj.get(MCP_SERVER_NAME) else {
+        return false;
+    };
+
+    // Journal this edit the same way `write_mcp_entry` journals a fresh
+    // write, so `vectorhawk uninstall` still restores the user's true
+    // pre-VectorHawk settings.json. `record_config_edit_journal` reuses the
+    // *original* backup captured the first time VectorHawk ever touched
+    // this file (see its backup-reuse doc comment) rather than backing up
+    // the already-VectorHawk-modified content we're about to write below.
+    // Runs before the write, same ordering `write_mcp_entry` uses.
+    let legacy_config = ClientConfig {
+        name: "VS Code".to_string(),
+        config_path: settings_path.clone(),
+        mcp_key: "mcpServers".to_string(),
+        already_configured: false,
+    };
+    record_config_edit_journal(&legacy_config);
+
+    // Removing the property node preserves every comment, blank line, and
+    // the rest of the file's formatting exactly as written — only the
+    // `"vectorhawk": {...}` property (and its now-dangling comma, if any)
+    // is excised.
+    vectorhawk_prop.remove();
+    fs::write(&settings_path, root.to_string()).is_ok()
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
@@ -1292,7 +1433,7 @@ mod tests {
     }
 
     #[test]
-    fn detect_vscode_when_settings_dir_exists() {
+    fn detect_vscode_uses_mcp_json_and_servers_key() {
         let tmp = temp_root("detect-vscode");
 
         #[cfg(target_os = "macos")]
@@ -1313,7 +1454,16 @@ mod tests {
         let clients = detect_ai_clients_in(&tmp, &tmp);
         let found = clients.iter().find(|c| c.name == "VS Code");
         assert!(found.is_some(), "VS Code should be detected");
-        assert_eq!(found.unwrap().mcp_key, "mcpServers");
+        let found = found.unwrap();
+        assert_eq!(
+            found.mcp_key, "servers",
+            "VS Code's user-level MCP config uses a top-level `servers` key, not `mcpServers`"
+        );
+        assert_eq!(
+            found.config_path,
+            vscode_dir.join("mcp.json"),
+            "VS Code's user-level MCP config lives in Code/User/mcp.json, not settings.json"
+        );
 
         let _ = fs::remove_dir_all(&tmp);
     }
@@ -1437,6 +1587,242 @@ mod tests {
             json["mcpServers"]["vectorhawk"]["command"],
             expected_command()
         );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn vscode_write_has_correct_mcp_entry_shape() {
+        let tmp = temp_root("vscode-write");
+        fs::create_dir_all(&tmp).unwrap();
+        let config_path = tmp.join("mcp.json");
+
+        let config = ClientConfig {
+            name: "VS Code".to_string(),
+            config_path: config_path.clone(),
+            mcp_key: "servers".to_string(),
+            already_configured: false,
+        };
+
+        with_fake_home(&tmp, || write_mcp_entry(&config)).unwrap();
+
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(
+            json["servers"]["vectorhawk"]["type"], "stdio",
+            "VS Code's mcp.json requires an explicit `type` field per server"
+        );
+        assert_eq!(json["servers"]["vectorhawk"]["command"], expected_command());
+        assert_eq!(json["servers"]["vectorhawk"]["args"][0], "mcp");
+        assert_eq!(json["servers"]["vectorhawk"]["args"][1], "serve");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn other_clients_write_has_no_type_field() {
+        // `type` is a VS Code-specific requirement; other clients' written
+        // entries must stay exactly `{command, args}` — verified against the
+        // actual file `write_mcp_entry` produces, not just `build_mcp_entry`
+        // in isolation.
+        let tmp = temp_root("cursor-no-type");
+        fs::create_dir_all(&tmp).unwrap();
+        let config_path = tmp.join("mcp.json");
+
+        let config = ClientConfig {
+            name: "Cursor".to_string(),
+            config_path: config_path.clone(),
+            mcp_key: "mcpServers".to_string(),
+            already_configured: false,
+        };
+        with_fake_home(&tmp, || write_mcp_entry(&config)).unwrap();
+
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert!(json["mcpServers"]["vectorhawk"].get("type").is_none());
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // ── repair_stale_mcp_entries: VS Code targets mcp.json, not settings.json ──
+
+    #[test]
+    fn repair_rewrites_stale_vscode_entry_in_mcp_json_not_settings_json() {
+        let tmp = temp_root("repair-vscode-mcp");
+        let vscode_dir = vscode_user_dir(&tmp).unwrap();
+        fs::create_dir_all(&vscode_dir).unwrap();
+        let mcp_json = vscode_mcp_json_path(&tmp).unwrap();
+        fs::write(
+            &mcp_json,
+            r#"{"servers":{"vectorhawk":{"type":"stdio","command":"/opt/homebrew/Cellar/vectorhawk/1.0.65/bin/vectorhawk","args":["mcp","serve"]}}}"#,
+        )
+        .unwrap();
+
+        let repaired = with_fake_home(&tmp, || repair_stale_mcp_entries_in(&tmp, &tmp));
+        assert!(
+            repaired.contains(&"VS Code".to_string()),
+            "stale VS Code entry in mcp.json should be repaired, got: {repaired:?}"
+        );
+
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&mcp_json).unwrap()).unwrap();
+        assert_eq!(json["servers"]["vectorhawk"]["command"], expected_command());
+        assert_eq!(
+            json["servers"]["vectorhawk"]["type"], "stdio",
+            "repair goes through write_mcp_entry, which must keep the required `type` field"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // ── migrate_stale_vscode_settings_entry ───────────────────────────────────
+    // Uses the real platform data dir via $HOME (redirected by `with_fake_home`)
+    // to record a restore-journal entry, same as the `write_mcp_entry` tests —
+    // hence `#[cfg(feature = "daemon")]` throughout, matching
+    // `record_config_edit_journal`'s own gating.
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn migrate_removes_stale_vscode_settings_entry_when_json_is_strict() {
+        let tmp = temp_root("migrate-strict");
+        let vscode_dir = vscode_user_dir(&tmp).unwrap();
+        fs::create_dir_all(&vscode_dir).unwrap();
+        let settings_path = vscode_settings_path(&tmp).unwrap();
+        fs::write(
+            &settings_path,
+            r#"{"editor.fontSize": 14, "mcpServers": {"vectorhawk": {"command": "vectorhawk", "args": ["mcp", "serve"]}}}"#,
+        )
+        .unwrap();
+
+        let removed = with_fake_home(&tmp, || migrate_stale_vscode_settings_entry(&tmp));
+        assert!(removed, "stale entry should be found and removed");
+
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert!(
+            json["mcpServers"].get("vectorhawk").is_none(),
+            "vectorhawk key must be gone"
+        );
+        assert_eq!(
+            json["editor.fontSize"], 14,
+            "unrelated settings must survive"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn migrate_removes_stale_entry_from_jsonc_preserving_comments_and_trailing_commas() {
+        // The common real-world case: a hand-edited settings.json with line
+        // comments, a block comment, and a trailing comma. The card requires
+        // the stale key be removed unconditionally here too — not skipped —
+        // while every comment and the rest of the formatting survive intact.
+        let tmp = temp_root("migrate-jsonc-preserve");
+        let vscode_dir = vscode_user_dir(&tmp).unwrap();
+        fs::create_dir_all(&vscode_dir).unwrap();
+        let settings_path = vscode_settings_path(&tmp).unwrap();
+        let original = "{\n  // my favorite theme\n  \"workbench.colorTheme\": \"Dark+\",\n  /* block comment */\n  \"mcpServers\": {\"vectorhawk\": {\"command\": \"vectorhawk\"}},\n}\n";
+        fs::write(&settings_path, original).unwrap();
+
+        let removed = with_fake_home(&tmp, || migrate_stale_vscode_settings_entry(&tmp));
+        assert!(
+            removed,
+            "stale entry must be removed even from a JSONC file with comments"
+        );
+
+        let after = fs::read_to_string(&settings_path).unwrap();
+        assert!(
+            after.contains("// my favorite theme"),
+            "line comment must survive: {after:?}"
+        );
+        assert!(
+            after.contains("/* block comment */"),
+            "block comment must survive: {after:?}"
+        );
+        assert!(
+            after.contains("\"workbench.colorTheme\": \"Dark+\""),
+            "unrelated setting must survive untouched: {after:?}"
+        );
+        assert!(
+            !after.contains("vectorhawk"),
+            "stale vectorhawk entry must be gone: {after:?}"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn migrate_leaves_genuinely_invalid_json_untouched() {
+        // Not even valid JSONC — an unmatched brace. Even the lenient CST
+        // parser must fail closed here rather than guess at a repair.
+        let tmp = temp_root("migrate-invalid");
+        let vscode_dir = vscode_user_dir(&tmp).unwrap();
+        fs::create_dir_all(&vscode_dir).unwrap();
+        let settings_path = vscode_settings_path(&tmp).unwrap();
+        let original = r#"{"mcpServers": {"vectorhawk": {"command": "vectorhawk"}}"#; // missing closing brace
+        fs::write(&settings_path, original).unwrap();
+
+        let removed = with_fake_home(&tmp, || migrate_stale_vscode_settings_entry(&tmp));
+        assert!(!removed, "must not touch a file that isn't valid JSONC");
+
+        let after = fs::read_to_string(&settings_path).unwrap();
+        assert_eq!(
+            after, original,
+            "invalid settings.json must be left byte-for-byte untouched"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn migrate_is_noop_when_no_stale_entry_present() {
+        let tmp = temp_root("migrate-noop");
+        let vscode_dir = vscode_user_dir(&tmp).unwrap();
+        fs::create_dir_all(&vscode_dir).unwrap();
+        let settings_path = vscode_settings_path(&tmp).unwrap();
+        fs::write(&settings_path, r#"{"editor.fontSize": 14}"#).unwrap();
+
+        let removed = with_fake_home(&tmp, || migrate_stale_vscode_settings_entry(&tmp));
+        assert!(!removed);
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn migrate_is_noop_when_settings_file_does_not_exist() {
+        let tmp = temp_root("migrate-missing");
+        fs::create_dir_all(&tmp).unwrap();
+        let removed = with_fake_home(&tmp, || migrate_stale_vscode_settings_entry(&tmp));
+        assert!(!removed);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn repair_also_migrates_stale_vscode_settings_entry() {
+        let tmp = temp_root("repair-migrate");
+        let vscode_dir = vscode_user_dir(&tmp).unwrap();
+        fs::create_dir_all(&vscode_dir).unwrap();
+        let settings_path = vscode_settings_path(&tmp).unwrap();
+        fs::write(
+            &settings_path,
+            r#"{"mcpServers": {"vectorhawk": {"command": "vectorhawk", "args": ["mcp", "serve"]}}}"#,
+        )
+        .unwrap();
+
+        let repaired = with_fake_home(&tmp, || repair_stale_mcp_entries_in(&tmp, &tmp));
+        assert!(
+            repaired.iter().any(|c| c.contains("VS Code")),
+            "repair pass should report the settings.json migration, got: {repaired:?}"
+        );
+
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert!(json["mcpServers"].get("vectorhawk").is_none());
 
         let _ = fs::remove_dir_all(&tmp);
     }
