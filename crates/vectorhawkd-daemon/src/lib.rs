@@ -914,6 +914,41 @@ fn classify_refresh_failure(
 
 // ── RUN2: Device registration + sync startup ─────────────────────────────────
 
+/// The sync subsystem as last started by [`SyncController::ensure_started`]:
+/// its reconciler handle, its event-channel sender, an abort handle for the
+/// separately-spawned SSE-client task, and the LIVE credential fingerprint —
+/// `device_id` (fixed at start) plus the SSE client's *current* access token
+/// (tracked live, not just what it started with) — so a later call can tell
+/// whether the credentials this connection is actually using right now are
+/// still current.
+struct RunningSync {
+    reconciler: sync::ReconcilerHandle,
+    event_tx: mpsc::Sender<SyncEvent>,
+    /// Abort handle for the spawned `sse_client::run` task. Aborting this
+    /// (alongside `reconciler.abort()`) is how `ensure_started` tears down a
+    /// stale connection before starting a fresh one with new credentials.
+    sse_abort: tokio::task::AbortHandle,
+    /// `device_id` this subsystem was started with. Unlike the access token,
+    /// device_id is not rewritten by token refresh — only a fresh device
+    /// registration changes `sync_state["device_id"]`, which does not happen
+    /// while this subsystem is running — so this half of the fingerprint is
+    /// captured once and compared as-is.
+    device_id: String,
+    /// The SSE client's *current* access token — the same
+    /// `Arc<tokio::sync::RwLock<String>>` handed to the running task via
+    /// `sync::SyncConfig::live_token`. Seeded with the token used to start
+    /// the connection, then overwritten in place by
+    /// `sse_client`'s internal `try_refresh_token` on every successful
+    /// 401-triggered refresh. Reading this (rather than a value captured
+    /// once at spawn) is what makes `ensure_started` compare against the
+    /// token the connection is ACTUALLY using now — fixing a bug where a
+    /// silent internal refresh left the on-disk token ahead of a
+    /// spawn-frozen fingerprint, causing the next legitimate
+    /// `auth login`/`auth pair` call to see a spurious mismatch and restart
+    /// an already-healthy connection.
+    live_token: Arc<tokio::sync::RwLock<String>>,
+}
+
 /// Runtime-controllable handle to the SSE sync subsystem.
 ///
 /// At daemon boot we frequently have no auth token yet: the user runs
@@ -923,22 +958,33 @@ fn classify_refresh_failure(
 /// feed delivered nothing (no governed skills/MCP reached the machine).
 ///
 /// The CLI calls the `auth/reload` JSON-RPC method after saving tokens, which
-/// invokes [`SyncController::ensure_started`].  The call is idempotent: if sync
-/// is already running it is a no-op, so it is safe to call from every auth path
-/// and on every invocation.
+/// invokes [`SyncController::ensure_started`].
+///
+/// **Credential-aware, not blindly idempotent.** If sync is already running
+/// *and* was started with the same `(access_token, device_id)` still on disk,
+/// the call is a cheap no-op. But if the on-disk credentials have changed
+/// since sync was started — e.g. the daemon's SSE connection went stale
+/// (expired token) and the user ran `auth pair`/`auth login`/`auth token` to
+/// fix it, writing a fresh access token (and possibly a new device_id) —
+/// `ensure_started` tears down the stale SSE-client and reconciler tasks and
+/// starts fresh ones with the current credentials. Without this, a daemon
+/// whose SSE loop was already up would keep looping forever on the *old*
+/// captured token (only refreshable via its own stale refresh_token on a
+/// 401), silently ignoring the new tokens the user just supplied — matching
+/// the "needs re-auth" portal badge that only `vectorhawk daemon restart`
+/// used to clear. It is still safe to call from every auth path and on every
+/// invocation: unchanged credentials remain a no-op, so a healthy connection
+/// is never thrashed.
 pub struct SyncController {
     registry_url: String,
     state: Arc<AppState>,
     list_changed_tx: broadcast::Sender<()>,
     backend_registry: Arc<BackendRegistry>,
     pusher: Option<Arc<managed_paths::ManagedPathsPusher>>,
-    /// Current reconciler handle + its event-channel sender, or `None` if
-    /// sync has not started yet. Holding the handle keeps the (detached) sync
-    /// tasks' status queryable; the mutex also serializes concurrent
-    /// `ensure_started` callers. The sender lets `run_sync_tick`'s periodic
-    /// snapshot-reconcile step feed a polled snapshot into the same
-    /// reconciler that consumes live SSE events (see `event_sender`).
-    handle: tokio::sync::Mutex<Option<(sync::ReconcilerHandle, mpsc::Sender<SyncEvent>)>>,
+    /// The currently running sync subsystem, or `None` if sync has not
+    /// started yet (or was torn down because credentials vanished). The mutex
+    /// also serializes concurrent `ensure_started` callers.
+    handle: tokio::sync::Mutex<Option<RunningSync>>,
 }
 
 impl SyncController {
@@ -959,17 +1005,49 @@ impl SyncController {
         }
     }
 
-    /// Idempotently (re)start the sync subsystem: register the device (if not
-    /// already registered) and spin up the SSE client + reconciler.
+    /// (Re)start the sync subsystem if it isn't already running with the
+    /// current on-disk credentials: register the device (if not already
+    /// registered) and spin up the SSE client + reconciler.
+    ///
+    /// Credential-aware: if sync is already running with the same `(access
+    /// token, device_id)` still on disk, this is a cheap no-op. If it's
+    /// running but those credentials have since changed (a fresh `auth
+    /// login`/`auth pair`/`auth token` wrote new ones — see the struct doc
+    /// comment) — or vanished — the stale SSE-client and reconciler tasks are
+    /// aborted first, and this falls through to the same start path used when
+    /// nothing was running.
     ///
     /// Returns `true` if sync is active after the call.  Returns `false` when
     /// there is still no usable auth token or device registration failed — the
     /// daemon keeps running and a later `ensure_started` can succeed.
     pub(crate) async fn ensure_started(&self) -> bool {
         let mut guard = self.handle.lock().await;
-        if guard.is_some() {
-            return true;
+
+        if let Some(running) = guard.as_ref() {
+            let current = current_credential_fingerprint(&self.registry_url, &self.state);
+            // Read the SSE client's LIVE token rather than a value frozen at
+            // spawn time — see `RunningSync::live_token`'s doc comment. This
+            // is what stops a silent internal 401-refresh from looking like
+            // a credential change on the next `ensure_started` call.
+            let running_token = running.live_token.read().await.clone();
+            let running_fingerprint = (running_token, running.device_id.clone());
+            if current.as_ref() == Some(&running_fingerprint) {
+                // Already running with exactly the credentials still on disk
+                // — nothing to do. This is what keeps a healthy connection
+                // from being thrashed on every `auth/reload` call.
+                return true;
+            }
+
+            info!(
+                registry_url = %self.registry_url,
+                "sync: on-disk credentials changed since sync subsystem started — \
+                 restarting SSE client + reconciler with current credentials"
+            );
+            running.sse_abort.abort();
+            running.reconciler.abort();
+            *guard = None;
         }
+
         let started = try_start_sync(
             &self.registry_url,
             Arc::clone(&self.state),
@@ -987,21 +1065,58 @@ impl SyncController {
     /// subsystem has started. `None` before the device is paired (no auth
     /// token yet) — callers should skip whatever they wanted to feed in.
     pub(crate) async fn event_sender(&self) -> Option<mpsc::Sender<SyncEvent>> {
-        self.handle.lock().await.as_ref().map(|(_, tx)| tx.clone())
+        self.handle
+            .lock()
+            .await
+            .as_ref()
+            .map(|running| running.event_tx.clone())
     }
+}
+
+/// Read the `(access_token, device_id)` currently on disk for `registry_url`,
+/// or `None` if either half is missing (no token saved yet, or the device
+/// hasn't completed registration yet — no `sync_state["device_id"]` row).
+///
+/// This is the "on-disk fingerprint" [`SyncController::ensure_started`]
+/// compares against the running sync subsystem's LIVE fingerprint — its
+/// `device_id` plus the SSE client's *current* access token, kept current
+/// across the client's own internal refreshes rather than frozen at spawn
+/// time (see `RunningSync::live_token`) — to decide whether credentials have
+/// changed since. It is safe to call
+/// on every `ensure_started` invocation: `ensure_started` is only ever called
+/// right after a genuine user-initiated auth action (CLI `auth/reload`, or
+/// the `vectorhawk_login` MCP tool's `notify_tokens_saved` hook) — never by
+/// the SSE client's own internal 401-triggered background token refresh
+/// (which calls `save_tokens` directly, bypassing this hook) — so there is no
+/// risk of a routine background refresh spuriously tripping this comparison
+/// and restarting a healthy connection.
+fn current_credential_fingerprint(
+    registry_url: &str,
+    state: &AppState,
+) -> Option<(String, String)> {
+    let token = load_all_tokens(state)
+        .ok()?
+        .into_iter()
+        .find(|r| r.registry_url == registry_url)?
+        .access_token;
+    let device_id = state.get_sync_state("device_id").ok().flatten()?;
+    Some((token, device_id))
 }
 
 /// Register this device with the backend and start the SSE sync subsystem.
 ///
 /// Returns `None` if no auth token is available or registration fails.
-/// The daemon continues to operate without sync in that case.
+/// The daemon continues to operate without sync in that case. On success, the
+/// returned [`RunningSync`] carries the `(access_token, device_id)`
+/// fingerprint sync was started with, for later comparison by
+/// [`SyncController::ensure_started`].
 async fn try_start_sync(
     registry_url: &str,
     state: Arc<AppState>,
     list_changed_tx: broadcast::Sender<()>,
     backend_registry: Arc<BackendRegistry>,
     pusher: Option<Arc<managed_paths::ManagedPathsPusher>>,
-) -> Option<(sync::ReconcilerHandle, mpsc::Sender<SyncEvent>)> {
+) -> Option<RunningSync> {
     // Load the access token from SQLite.
     let token = match load_all_tokens(&state) {
         Ok(rows) => rows
@@ -1034,16 +1149,30 @@ async fn try_start_sync(
     // Retrieve the last SSE event ID for resume.
     let last_event_id = state.get_sync_state("last_event_id").ok().flatten();
 
+    // The SSE client's live-token handle: seeded with the token used to
+    // start it, then kept current by its own internal 401-refresh (see
+    // `sync::SyncConfig::live_token`'s doc comment). Cloned into
+    // `RunningSync` below so `ensure_started` reads the connection's actual
+    // current token rather than a value frozen at spawn time.
+    let live_token = Arc::new(tokio::sync::RwLock::new(token.clone()));
+
     let sync_config = sync::SyncConfig {
         registry_url: registry_url.to_string(),
         token,
-        device_id,
+        device_id: device_id.clone(),
         last_event_id,
         pusher,
+        live_token: Arc::clone(&live_token),
     };
 
     match sync::run(sync_config, state, list_changed_tx, backend_registry) {
-        Ok((handle, event_tx)) => Some((handle, event_tx)),
+        Ok((reconciler, event_tx, sse_abort)) => Some(RunningSync {
+            reconciler,
+            event_tx,
+            sse_abort,
+            device_id,
+            live_token,
+        }),
         Err(e) => {
             warn!(error = %e, "sync: failed to start sync subsystem");
             None
