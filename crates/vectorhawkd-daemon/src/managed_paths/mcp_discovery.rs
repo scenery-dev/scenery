@@ -59,10 +59,14 @@
 //! this struct at all — there is nothing to remember to redact because
 //! there is nowhere for a raw value to leak into.
 //!
-//! [`McpDiscoveryItem::source_path`] gets the same treatment as
-//! `command_basename`: `$HOME` is masked to `~` via [`mask_home_dir`] rather
-//! than emitting the raw absolute config path, which would otherwise embed
-//! the local username (`/Users/<username>/...` / `/home/<username>/...`).
+//! [`McpDiscoveryItem::source_path`] gets the same `$HOME`-masking treatment
+//! as `command_basename` (via [`mask_home_dir`], never the raw absolute
+//! config path, which would otherwise embed the local username), and then
+//! (review round 4) has `#<server key>` appended so it's unique per server,
+//! not just per config file — see the field doc on
+//! [`McpDiscoveryItem::source_path`] for why the plain masked path alone
+//! caused a backend dedupe collision when a client config held more than one
+//! shadow server.
 //!
 //! # What counts as "already governed" (and therefore excluded)
 //!
@@ -159,9 +163,22 @@ pub struct McpDiscoveryItem {
     /// two different clients (e.g. `"github-mcp"` in both Cursor and VS
     /// Code) doesn't collide.
     pub slug: String,
-    /// The client's config file path with `$HOME` masked to `~` (see
-    /// [`mask_home_dir`]) — never the raw absolute path, which would embed
-    /// the local username.
+    /// `"<~-masked client config path>#<server key>"` (see [`mask_home_dir`]
+    /// for the masking, applied before the `#`-suffix is appended) — never
+    /// the raw absolute path alone.
+    ///
+    /// **Must be unique per server, not per config file** (review round 4):
+    /// the backend dedupes uploaded discoveries on `(user_id, kind,
+    /// source_path)` (`managed_path_discoveries` unique constraint /
+    /// `upload_discoveries`'s existing-row lookup). A client config file
+    /// (e.g. `~/.cursor/mcp.json`) commonly holds more than one shadow MCP
+    /// server; using the bare masked config path as `source_path` for every
+    /// server in that file would make the 2nd+ server collide with the 1st
+    /// on that dedupe key and be silently dropped by the backend as a
+    /// repeat sighting. Appending `#<server key>` (the same `key` that makes
+    /// [`slug`](Self::slug) unique) keeps `source_path` unique and stable
+    /// per server while still surfacing the config file path for IT/audit
+    /// readability.
     pub source_path: String,
     /// SHA-256 of the (already-allowlisted) [`McpDiscoveryDetail`],
     /// hex-encoded.
@@ -218,10 +235,17 @@ pub fn collect_mcp_discoveries(
             let detail = build_detail(client, &entry.key, &entry.value);
             let canonical_hash = hex_sha256_of(&detail);
 
+            let masked_config_path = mask_home_dir(&client.config_path.display().to_string());
+
             items.push(McpDiscoveryItem {
                 kind: "mcp".to_string(),
                 slug: format!("{}:{}", client.name, entry.key),
-                source_path: mask_home_dir(&client.config_path.display().to_string()),
+                // `#<server key>` suffix keeps this unique per server — see
+                // the field doc on `McpDiscoveryItem::source_path` (review
+                // round 4: without it, every server in the same client
+                // config file collided on the backend's dedupe key and only
+                // the first one ever got reported).
+                source_path: format!("{masked_config_path}#{}", entry.key),
                 canonical_hash,
                 detail,
             });
@@ -1749,6 +1773,52 @@ mod tests {
             "the raw temp-dir-as-$HOME path must not survive masking: {}",
             items[0].source_path
         );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // ── Review round 4: source_path must be unique per server ─────────────────
+
+    #[test]
+    fn two_servers_in_one_client_config_get_distinct_source_paths() {
+        // Both servers share one config file — before the fix, both got the
+        // same bare masked-config-path source_path, which the backend's
+        // (user_id, kind, source_path) dedupe key would collapse into one
+        // row, silently dropping the second server.
+        let tmp = temp_root("two-servers-one-config");
+        let client = write_json_client(
+            &tmp,
+            "Cursor",
+            "mcpServers",
+            serde_json::json!({
+                "linear-mcp": {"command": "npx", "args": ["-y", "linear-mcp"]},
+                "notion-mcp": {"command": "npx", "args": ["-y", "notion-mcp"]}
+            }),
+        );
+        let (state, _guard) = temp_state();
+
+        let items = collect_mcp_discoveries(&[client], &state, "https://app.vectorhawk.ai");
+
+        assert_eq!(
+            items.len(),
+            2,
+            "both servers in the one config must be reported"
+        );
+        let source_paths: std::collections::HashSet<&str> =
+            items.iter().map(|i| i.source_path.as_str()).collect();
+        assert_eq!(
+            source_paths.len(),
+            2,
+            "source_path must be unique per server, not shared per config file: {source_paths:?}"
+        );
+        for item in &items {
+            assert!(
+                item.source_path
+                    .ends_with(&format!("#{}", item.detail.server_key)),
+                "source_path must end with #<server key>: {}",
+                item.source_path
+            );
+        }
 
         let _ = fs::remove_dir_all(&tmp);
     }
