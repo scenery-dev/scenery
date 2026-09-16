@@ -36,6 +36,7 @@ use clap::{Parser, Subcommand};
 
 mod commands_migrate;
 mod install;
+mod logging;
 mod uninstall;
 
 // ── CLI structure ─────────────────────────────────────────────────────────────
@@ -586,18 +587,36 @@ pub enum SyncCommand {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
-fn main() {
-    // Structured logging to stderr. The AI client reads stdout (MCP JSON-RPC)
-    // and ignores stderr, so tracing output is safe on all subcommands.
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
-        .init();
+/// True when the parsed command is `daemon run` — the exact invocation the
+/// installed LaunchAgent (macOS) and systemd user unit (Linux) both use.
+/// Determines which logging profile `main()` initializes (see
+/// `logging.rs`): INFO to a size-bounded rotating file under the daemon's
+/// state directory, vs. WARN to stderr for every other interactive
+/// subcommand.
+fn is_daemon_foreground(command: &Command) -> bool {
+    matches!(command, Command::Daemon(DaemonCommand::Run { .. }))
+}
 
+fn main() {
     let cli = Cli::parse();
+
+    // See `logging.rs` for why the daemon gets its own profile (INFO,
+    // size-bounded rotating file) instead of the interactive-CLI default
+    // (WARN, stderr). `RUST_LOG` overrides either default.
+    let _logging_guard = if is_daemon_foreground(&cli.command) {
+        match vectorhawkd_core::state::AppState::resolve_root_dir() {
+            Ok(root) => logging::init_daemon(root.join("logs").as_std_path()),
+            Err(e) => {
+                eprintln!(
+                    "vectorhawk: warning: failed to resolve state directory for daemon \
+                     logs: {e:#} — falling back to stderr logging"
+                );
+                logging::init_cli()
+            }
+        }
+    } else {
+        logging::init_cli()
+    };
 
     let result = tokio::runtime::Builder::new_current_thread()
         .enable_all()

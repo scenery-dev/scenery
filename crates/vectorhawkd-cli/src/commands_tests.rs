@@ -528,6 +528,30 @@ fn unknown_command_fails() {
     assert!(try_parse(&["notacommand"]).is_err());
 }
 
+// ── daemon logging profile routing (D1) ────────────────────────────────────────
+//
+// `main()` picks the daemon's INFO/rotating-file logging profile vs. the
+// interactive CLI's WARN/stderr profile based on this predicate — see
+// `logging.rs` for the profiles themselves and
+// `rotates_and_bounds_total_log_size` for the rotation/cap behavior.
+
+#[test]
+fn is_daemon_foreground_true_only_for_daemon_run() {
+    use super::is_daemon_foreground;
+    assert!(is_daemon_foreground(&parse(&["daemon", "run"]).command));
+    assert!(is_daemon_foreground(
+        &parse(&["daemon", "run", "--foreground"]).command
+    ));
+    assert!(!is_daemon_foreground(&parse(&["doctor"]).command));
+    assert!(!is_daemon_foreground(
+        &parse(&["daemon", "install"]).command
+    ));
+    assert!(!is_daemon_foreground(
+        &parse(&["daemon", "uninstall"]).command
+    ));
+    assert!(!is_daemon_foreground(&parse(&["mcp", "serve"]).command));
+}
+
 // ── M3: doctor OAuth listener line ───────────────────────────────────────────
 
 /// AC5 (M3): `vectorhawk doctor` must emit an `OAuth listener:` line.

@@ -3,6 +3,17 @@
 //! Primary path: systemd user unit at
 //! `~/.config/systemd/user/vectorhawk-agent.service`.
 //!
+//! Durable log: `$XDG_DATA_HOME/VectorHawk/logs/vectorhawkd.log` (falls back
+//! to `~/.local/share/VectorHawk/logs/`) — INFO-level tracing output written
+//! by an in-process size-bounded rotating appender (see
+//! `crates/vectorhawkd-cli/src/logging.rs`), ~50 MB total cap, identical to
+//! the macOS appender. The unit sets no `StandardOutput=`/`StandardError=`,
+//! so crash/early-startup output (the only thing still written to stderr)
+//! goes to journald, which already vacuum-bounds total size by default
+//! (`journald.conf` `SystemMaxUse`, ~10%/4GB cap) — `LogRateLimitIntervalSec`/
+//! `LogRateLimitBurst` below add a per-unit backstop against a crash-loop
+//! flooding that shared cap.
+//!
 //! Fallback (no systemctl): XDG autostart desktop entry at
 //! `~/.config/autostart/vectorhawk.desktop` with a printed notice.
 //!
@@ -42,6 +53,14 @@ fn desktop_path() -> Result<std::path::PathBuf> {
 }
 
 /// Generate the systemd user unit content.
+///
+/// `RUST_LOG=info` turns on INFO-level daemon logging by default (D1 board
+/// card — the daemon's own default is already `info` for `daemon run`, this
+/// makes the level explicit and editable in the unit file). The durable log
+/// is the daemon's own size-bounded rotating file appender (see
+/// `logging.rs`), not systemd's journal — `LogRateLimitIntervalSec`/
+/// `LogRateLimitBurst` bound the (crash-only) stderr stream journald
+/// receives, as a per-unit backstop on top of journald's own vacuum cap.
 fn render_unit(bin_path: &std::path::Path) -> Result<String> {
     let bin_str = bin_path
         .to_str()
@@ -55,9 +74,12 @@ After=network.target
 [Service]
 Type=simple
 Environment="PATH=/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="RUST_LOG=info"
 ExecStart={bin_str} daemon run --foreground
 Restart=on-failure
 RestartSec=2
+LogRateLimitIntervalSec=30
+LogRateLimitBurst=1000
 
 [Install]
 WantedBy=default.target
@@ -449,5 +471,32 @@ pub fn status() -> Result<InstallStatus> {
         Ok(InstallStatus::InstalledNotRunning {
             unit_path: unit_path_str,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_unit;
+    use std::path::Path;
+
+    // D1 board card: INFO logging on by default via the unit file, plus a
+    // per-unit rate-limit backstop on the (crash-only) stderr stream that
+    // still reaches journald.
+    #[test]
+    fn unit_sets_rust_log_info() {
+        let unit = render_unit(Path::new("/home/linuxbrew/.linuxbrew/bin/vectorhawk")).unwrap();
+        assert!(
+            unit.contains(r#"Environment="RUST_LOG=info""#),
+            "expected RUST_LOG=info in the unit, got:\n{unit}"
+        );
+    }
+
+    #[test]
+    fn unit_sets_log_rate_limit() {
+        let unit = render_unit(Path::new("/home/linuxbrew/.linuxbrew/bin/vectorhawk")).unwrap();
+        assert!(
+            unit.contains("LogRateLimitIntervalSec=") && unit.contains("LogRateLimitBurst="),
+            "expected a journald rate-limit backstop in the unit, got:\n{unit}"
+        );
     }
 }
