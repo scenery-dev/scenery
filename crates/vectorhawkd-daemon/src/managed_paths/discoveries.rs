@@ -10,6 +10,34 @@
 //! and never takes any local action. If the POST fails the daemon continues
 //! without error.
 //!
+//! # MCP discoveries (runner task R2)
+//!
+//! Runner task R1 (`super::mcp_discovery`) built a read-only scanner for
+//! shadow MCP servers configured in AI clients outside VectorHawk governance,
+//! but stopped short of reporting them — this module is where that happens.
+//! [`run_once`] now calls both scans — [`collect_discoveries`] for skills and
+//! [`mcp_discovery::collect_mcp_discoveries`] for MCP entries, merged via
+//! [`collect_all_discoveries`] — and POSTs the combined result in one
+//! [`DiscoveriesBody`] batch to the same `/portal/managed-paths/discoveries`
+//! endpoint, using the same interval/kick/debounce machinery skills already
+//! use. Each [`super::mcp_discovery::McpDiscoveryItem`] is mapped onto
+//! [`DiscoveryItem`] via [`mcp_item_to_discovery_item`]: its already-
+//! allowlisted, already-`~`-masked `detail`/`source_path` (see
+//! `mcp_discovery`'s privacy doc) are carried across verbatim — nothing here
+//! re-adds raw args, commands, URLs, or env values.
+//!
+//! This is additive-only against the backend as it stands today
+//! (`portal_managed_paths_discoveries.py`): `DiscoveryItem.detail` is already
+//! `dict[str, Any] | None = None`, and `managed_path_discoveries.kind`'s
+//! CHECK constraint already allows `'skill' | 'plugin' | 'mcp'` — an older or
+//! unmodified backend accepts a `kind="mcp"` item in the same batch as
+//! `kind="skill"` items today (verified by reading
+//! `backend/app/routers/portal_managed_paths_discoveries.py` and
+//! `backend/app/models/managed_path_discovery.py`, both read-only from this
+//! repo); `upload_discoveries` processes each item in the batch
+//! independently, so one item's `kind` can never cause the whole batch (or a
+//! sibling skill item) to be rejected.
+//!
 //! ## Killswitch
 //!
 //! Setting `VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER=1` makes `run_once` a
@@ -34,6 +62,9 @@ use std::{
 use tokio::{sync::Notify, time::interval};
 use tracing::{debug, info, warn};
 use vectorhawkd_core::{auth::load_all_tokens, state::AppState};
+use vectorhawkd_mcp::setup::ClientConfig;
+
+use super::mcp_discovery;
 
 const ENV_DISABLE: &str = "VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER";
 const ENV_EXTRA_ROOTS: &str = "VECTORHAWK_EXTRA_SKILL_ROOTS";
@@ -54,6 +85,15 @@ pub struct DiscoveryItem {
     pub slug: String,
     pub source_path: String,
     pub canonical_hash: String,
+    /// Kind-specific metadata. `None` for skill items (which carry nothing
+    /// beyond the fields above); `Some(...)` for `kind="mcp"` items, holding
+    /// the JSON-serialized, already-allowlisted
+    /// [`super::mcp_discovery::McpDiscoveryDetail`] — see
+    /// [`mcp_item_to_discovery_item`]. The backend's `DiscoveryItem` schema
+    /// already accepts an optional `detail` object and its `kind` check
+    /// constraint already allows `'mcp'`, so this is additive on both ends
+    /// (see the module-level MCP-wiring doc below).
+    pub detail: Option<serde_json::Value>,
 }
 
 /// Top-level reporter: wraps state + registry URL. Cheaply clonable via `Arc`.
@@ -155,7 +195,8 @@ pub fn should_skip_debounced_kick(trigger_is_kick: bool, elapsed: Duration) -> b
 
 // ── Free-function entry point (testable) ──────────────────────────────────────
 
-/// Scan extra roots, filter already-managed slugs, POST the batch.
+/// Scan extra roots and every detected AI client, filter already-managed
+/// slugs/entries, POST the merged batch (skills + MCP).
 ///
 /// Returns the count of items reported (0 when no new discoveries or when
 /// killswitch is active).
@@ -165,8 +206,26 @@ pub async fn run_once(state: Arc<AppState>, registry_url: String) -> Result<usiz
         return Ok(0);
     }
 
-    let roots = extra_roots();
-    let items = collect_discoveries(&roots, &state);
+    // The daemon runs on a current-thread Tokio executor (see the
+    // spawn_blocking discipline doc at the top of `lib.rs`) — any blocking
+    // call here stalls every concurrent shim connection. `extra_roots()` +
+    // `detect_ai_clients()` (per-client `Path::exists()` checks) +
+    // `collect_all_discoveries` (skill-dir walks, MCP config file reads in
+    // JSON/JSONC/TOML, SHA-256 hashing, and `managed_path_markers` SQLite
+    // lookups via `rusqlite`) are all synchronous I/O, so the whole
+    // collection step is wrapped in `spawn_blocking`, the same way the
+    // registry sync loop wraps `run_sync_tick`.
+    let items = {
+        let state_for_scan = Arc::clone(&state);
+        let registry_url_for_scan = registry_url.clone();
+        tokio::task::spawn_blocking(move || {
+            let roots = extra_roots();
+            let clients = vectorhawkd_mcp::setup::detect_ai_clients();
+            collect_all_discoveries(&roots, &clients, &state_for_scan, &registry_url_for_scan)
+        })
+        .await
+        .unwrap_or_default()
+    };
 
     if items.is_empty() {
         debug!("discoveries: no new items found");
@@ -257,6 +316,47 @@ pub fn collect_discoveries(roots: &[PathBuf], state: &AppState) -> Vec<Discovery
     items
 }
 
+/// Merge skill discoveries (scanned from `roots`, via [`collect_discoveries`])
+/// with MCP discoveries (scanned from `clients`, via
+/// [`mcp_discovery::collect_mcp_discoveries`]) into one batch.
+///
+/// Kept as a free function taking explicit `clients` (rather than calling
+/// `vectorhawkd_mcp::setup::detect_ai_clients()` internally) so it's testable
+/// with fixture [`ClientConfig`]s, the same way `collect_mcp_discoveries`
+/// itself is — no need to redirect the process-global `$HOME`. Production
+/// call sites ([`run_once`]) pass `detect_ai_clients()`'s real result.
+pub fn collect_all_discoveries(
+    roots: &[PathBuf],
+    clients: &[ClientConfig],
+    state: &AppState,
+    registry_url: &str,
+) -> Vec<DiscoveryItem> {
+    let mut items = collect_discoveries(roots, state);
+    items.extend(
+        mcp_discovery::collect_mcp_discoveries(clients, state, registry_url)
+            .into_iter()
+            .map(mcp_item_to_discovery_item),
+    );
+    items
+}
+
+/// Map an already-redacted [`mcp_discovery::McpDiscoveryItem`] onto the
+/// generalized [`DiscoveryItem`] the batch POST uses. Carries `kind`, `slug`,
+/// `source_path` (already `~`-masked), and `canonical_hash` across verbatim,
+/// and JSON-serializes the already-allowlisted `detail` struct into
+/// `DiscoveryItem.detail` — never re-derives anything from raw args/commands/
+/// URLs/env here.
+fn mcp_item_to_discovery_item(item: mcp_discovery::McpDiscoveryItem) -> DiscoveryItem {
+    let detail = serde_json::to_value(&item.detail).ok();
+    DiscoveryItem {
+        kind: item.kind,
+        slug: item.slug,
+        source_path: item.source_path,
+        canonical_hash: item.canonical_hash,
+        detail,
+    }
+}
+
 /// Scan one root directory and return a `DiscoveryItem` per subdir containing
 /// `SKILL.md`.
 fn scan_root(root: &Path) -> Result<Vec<DiscoveryItem>> {
@@ -320,6 +420,17 @@ fn scan_root(root: &Path) -> Result<Vec<DiscoveryItem>> {
         };
 
         let canonical_hash = hex_sha256(&skill_md_bytes);
+        // Deliberately NOT `~`-masked, unlike `mcp_discovery`'s
+        // `McpDiscoveryItem::source_path`. Investigated per the brief's note
+        // to mask every uploaded source_path uniformly; confirmed (review
+        // round 4) that skill/plugin source_path is dereferenced as a real
+        // filesystem path downstream on both take/adopt paths — e.g.
+        // `pusher::push_skill`, `takeover::remove_source_path`, the F1
+        // migrator, and `publish.rs` all read or act on this exact absolute
+        // path — so masking it here would silently break adopt/takeover.
+        // MCP's `source_path` has no such downstream dereference (the
+        // backend only ever displays/dedupes it), which is why only it gets
+        // masked. Left absolute intentionally, not an oversight.
         let source_path = path.to_string_lossy().to_string();
 
         items.push(DiscoveryItem {
@@ -327,6 +438,7 @@ fn scan_root(root: &Path) -> Result<Vec<DiscoveryItem>> {
             slug,
             source_path,
             canonical_hash,
+            detail: None,
         });
     }
 
@@ -480,6 +592,7 @@ mod tests {
     use crate::managed_paths::ENV_MUTEX;
     use std::fs;
     use vectorhawkd_core::state::AppState;
+    use vectorhawkd_mcp::setup::ConfigFormat;
 
     /// Bootstrap a minimal AppState in a temp dir. Returns both the state and
     /// the `TempDir` guard so the caller keeps the dir alive.
@@ -758,5 +871,147 @@ mod tests {
         let slugs: Vec<&str> = found.iter().map(|d| d.slug.as_str()).collect();
 
         assert_eq!(slugs, vec!["foreign-skill"]);
+    }
+
+    // ── 9. R2: merged batch contains both a skill and an MCP item ─────────────
+
+    #[test]
+    fn merges_skill_and_mcp_items_into_one_batch() {
+        // Skill side: one foreign skill dir in an extra root.
+        let skill_root_tmp = tempfile::tempdir().unwrap();
+        let skill_root = skill_root_tmp.path().to_path_buf();
+        write_skill(&skill_root, "foreign-skill");
+
+        // MCP side: one foreign Cursor entry, via a fixture ClientConfig —
+        // no need to redirect $HOME (see collect_all_discoveries's doc).
+        let mcp_tmp = tempfile::tempdir().unwrap();
+        let config_path = mcp_tmp.path().join("mcp.json");
+        fs::write(
+            &config_path,
+            serde_json::to_vec(&serde_json::json!({
+                "mcpServers": {
+                    "linear-mcp": {"command": "npx", "args": ["-y", "linear-mcp"]}
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let client = ClientConfig {
+            name: "Cursor".to_string(),
+            config_path,
+            mcp_key: "mcpServers".to_string(),
+            already_configured: false,
+            format: ConfigFormat::Json,
+        };
+
+        let (state, _guard) = temp_state();
+        let items = collect_all_discoveries(
+            &[skill_root],
+            &[client],
+            &state,
+            "https://app.vectorhawk.ai",
+        );
+
+        assert_eq!(
+            items.len(),
+            2,
+            "expected exactly one skill item and one mcp item"
+        );
+
+        let skill_item = items
+            .iter()
+            .find(|i| i.kind == "skill")
+            .expect("skill item present in merged batch");
+        assert_eq!(skill_item.slug, "foreign-skill");
+        assert!(
+            skill_item.detail.is_none(),
+            "skill items carry no detail blob"
+        );
+
+        let mcp_item = items
+            .iter()
+            .find(|i| i.kind == "mcp")
+            .expect("mcp item present in merged batch");
+        assert_eq!(mcp_item.slug, "Cursor:linear-mcp");
+        let detail = mcp_item
+            .detail
+            .as_ref()
+            .expect("mcp items must carry a detail blob");
+        assert_eq!(detail["client_name"], "Cursor");
+        assert_eq!(detail["server_key"], "linear-mcp");
+        assert_eq!(detail["package_identifier"], "linear-mcp");
+        // The allowlist contract (mcp_discovery.rs) must survive the mapping
+        // into DiscoveryItem unchanged: no raw args/command/env value ever
+        // appears in the serialized batch.
+        let serialized = serde_json::to_string(&items).unwrap();
+        assert!(!serialized.contains("\"args\""));
+        assert!(!serialized.contains("\"command\""));
+        assert!(!serialized.contains("\"env\""));
+    }
+
+    // ── 10. R2: full batch payload never leaks secrets from an MCP fixture ────
+
+    #[test]
+    fn batch_payload_never_leaks_secrets_from_mcp_fixture() {
+        // A config file "full of secrets" per the brief: a bearer-style env
+        // value, a space-separated --token flag/value pair, and a URL with
+        // userinfo + a secret query-string token. Asserts the actual
+        // DiscoveriesBody-shaped payload (device_id + items, exactly what
+        // gets POSTed) never contains any of these secret strings anywhere.
+        let mcp_tmp = tempfile::tempdir().unwrap();
+        let config_path = mcp_tmp.path().join("mcp.json");
+        fs::write(
+            &config_path,
+            serde_json::to_vec(&serde_json::json!({
+                "mcpServers": {
+                    "leaky-mcp": {
+                        "command": "custom-mcp",
+                        "args": ["--token", "OPAQUEBATCHSECRETVALUE"],
+                        "env": {"API_KEY": "sk-batchtestsecretvalue"}
+                    },
+                    "remote-leaky": {
+                        "url": "https://svc-user:s3cr3t-batch-pass@mcp.example.com/sse?refresh_token=RTOKENBATCHSECRET",
+                        "headers": {"Authorization": "Bearer HEADERBATCHSECRETVALUE"}
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let client = ClientConfig {
+            name: "Cursor".to_string(),
+            config_path,
+            mcp_key: "mcpServers".to_string(),
+            already_configured: false,
+            format: ConfigFormat::Json,
+        };
+
+        let (state, _guard) = temp_state();
+        let items = collect_all_discoveries(&[], &[client], &state, "https://app.vectorhawk.ai");
+        assert_eq!(items.len(), 2, "both leaky-mcp and remote-leaky reported");
+
+        // Build the exact upload payload shape post_discoveries serializes.
+        let body = DiscoveriesBody {
+            device_id: Some("test-device-id".to_string()),
+            items,
+        };
+        let serialized = serde_json::to_string(&body).unwrap();
+
+        for secret in [
+            "OPAQUEBATCHSECRETVALUE",
+            "sk-batchtestsecretvalue",
+            "svc-user",
+            "s3cr3t-batch-pass",
+            "RTOKENBATCHSECRET",
+            "refresh_token",
+            "HEADERBATCHSECRETVALUE",
+            "Bearer HEADERBATCHSECRETVALUE",
+            "--token",
+        ] {
+            assert!(
+                !serialized.contains(secret),
+                "secret {secret:?} must never appear in the serialized upload payload: {serialized}"
+            );
+        }
     }
 }

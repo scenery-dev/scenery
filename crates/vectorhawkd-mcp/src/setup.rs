@@ -9,11 +9,37 @@ use std::path::PathBuf;
 pub struct ClientConfig {
     pub name: String,
     pub config_path: PathBuf,
-    /// Top-level JSON key in the client's config file that holds the MCP
-    /// server map (e.g. `"mcpServers"` for Claude Code).
+    /// Top-level key in the client's config file that holds the MCP server
+    /// map (e.g. `"mcpServers"` for Claude Code's JSON, `"mcp_servers"` for
+    /// Codex's TOML).
     pub mcp_key: String,
     pub already_configured: bool,
+    /// On-disk format of `config_path` — determines which of `write_mcp_entry`
+    /// / `remove_mcp_entry` / staleness-check logic in this module applies.
+    pub format: ConfigFormat,
 }
+
+/// The on-disk format of a client's MCP config file.
+///
+/// Every JSON client (Claude Code, Claude Desktop, Cursor, Windsurf, VS Code,
+/// Gemini CLI) shares one JSON merge/read/remove implementation. Codex CLI's
+/// `~/.codex/config.toml` is TOML, not JSON, so the handful of functions that
+/// touch a config file branch on this field rather than assuming JSON
+/// everywhere. Kept to exactly the two formats VectorHawk actually writes —
+/// add a variant only when a third client needs one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigFormat {
+    Json,
+    Toml,
+}
+
+/// Path segment marking a versioned Homebrew Cellar install for `vectorhawk`
+/// (`<prefix>/Cellar/vectorhawk/<ver>/bin/vectorhawk`). `brew upgrade` deletes
+/// the old version's Cellar directory, so any command still pointing inside
+/// one is either already dead or about to be on the next upgrade. Shared by
+/// [`stable_command_from_exe`] (used when writing a fresh entry) and
+/// [`command_needs_repair`] (used when checking an existing one).
+const CELLAR: &str = "/Cellar/vectorhawk/";
 
 /// The name under which VectorHawk registers itself in AI client configs.
 ///
@@ -59,7 +85,6 @@ fn resolve_mcp_command() -> String {
 /// exists; otherwise return `exe` unchanged. Pure, with an injectable existence
 /// check so the rewrite is unit-testable without a real Homebrew install.
 fn stable_command_from_exe(exe: &str, exists: impl Fn(&str) -> bool) -> String {
-    const CELLAR: &str = "/Cellar/vectorhawk/";
     if let Some(idx) = exe.find(CELLAR) {
         let stable = format!("{}/bin/{}", &exe[..idx], MCP_COMMAND);
         if exists(&stable) {
@@ -76,6 +101,28 @@ pub fn build_mcp_servers_block() -> serde_json::Value {
     })
 }
 
+/// Build the MCP server config entry for a specific client, layering any
+/// client-specific required fields on top of [`build_mcp_entry`]'s common
+/// `command`/`args` shape.
+///
+/// VS Code's `mcp.json` schema requires an explicit `type` field per server
+/// (`"stdio"` for a locally-spawned process) — see the field table in the
+/// VS Code MCP configuration reference (`type` — Required — `"stdio"`):
+/// <https://code.visualstudio.com/docs/agents/reference/mcp-configuration>.
+/// Every other client's config format only needs `command`/`args`.
+fn mcp_entry_for(config: &ClientConfig) -> serde_json::Value {
+    let mut entry = build_mcp_entry();
+    if config.name == "VS Code" {
+        if let serde_json::Value::Object(ref mut map) = entry {
+            map.insert(
+                "type".to_string(),
+                serde_json::Value::String("stdio".to_string()),
+            );
+        }
+    }
+    entry
+}
+
 /// Detect Claude Code installation and return config info.
 ///
 /// Detected by `~/.claude`, `~/.claude.json`, or the presence of the app bundle
@@ -88,17 +135,20 @@ pub fn detect_claude_code() -> Option<ClientConfig> {
     if !claude_dir.exists() && !claude_config.exists() && !app_present {
         return None;
     }
-    let already = is_vectorhawk_configured(&claude_config, "mcpServers");
+    let already = is_vectorhawk_configured(&claude_config, "mcpServers", ConfigFormat::Json);
     Some(ClientConfig {
         name: "Claude Code".to_string(),
         config_path: claude_config,
         mcp_key: "mcpServers".to_string(),
         already_configured: already,
+        format: ConfigFormat::Json,
     })
 }
 
-/// Detect all supported AI clients (6 clients: Claude Code, Claude Desktop,
-/// Cursor, Windsurf, VS Code, Gemini CLI).
+/// Detect all supported AI clients: Claude Code, Claude Desktop, Cursor,
+/// Windsurf, VS Code, Gemini CLI (6 clients always), plus Codex CLI when
+/// built with the `daemon` feature (7 clients — see the Codex block in
+/// [`detect_ai_clients_in`]).
 pub fn detect_ai_clients() -> Vec<ClientConfig> {
     match home_dir() {
         Some(home) => detect_ai_clients_in(&home, std::path::Path::new("/")),
@@ -122,12 +172,13 @@ fn detect_ai_clients_in(
     let claude_config = home.join(".claude.json");
     let claude_dir = home.join(".claude");
     if claude_dir.exists() || claude_config.exists() || claude_code_app_present(system_root) {
-        let already = is_vectorhawk_configured(&claude_config, "mcpServers");
+        let already = is_vectorhawk_configured(&claude_config, "mcpServers", ConfigFormat::Json);
         clients.push(ClientConfig {
             name: "Claude Code".to_string(),
             config_path: claude_config,
             mcp_key: "mcpServers".to_string(),
             already_configured: already,
+            format: ConfigFormat::Json,
         });
     }
 
@@ -135,12 +186,14 @@ fn detect_ai_clients_in(
     if let Some(desktop_config) = claude_desktop_config_path(home) {
         let desktop_dir = desktop_config.parent().map(|p| p.to_path_buf());
         if desktop_dir.as_ref().map(|d| d.exists()).unwrap_or(false) || desktop_config.exists() {
-            let already = is_vectorhawk_configured(&desktop_config, "mcpServers");
+            let already =
+                is_vectorhawk_configured(&desktop_config, "mcpServers", ConfigFormat::Json);
             clients.push(ClientConfig {
                 name: "Claude Desktop".to_string(),
                 config_path: desktop_config,
                 mcp_key: "mcpServers".to_string(),
                 already_configured: already,
+                format: ConfigFormat::Json,
             });
         }
     }
@@ -149,12 +202,13 @@ fn detect_ai_clients_in(
     let cursor_dir = home.join(".cursor");
     if cursor_dir.exists() {
         let cursor_config = cursor_dir.join("mcp.json");
-        let already = is_vectorhawk_configured(&cursor_config, "mcpServers");
+        let already = is_vectorhawk_configured(&cursor_config, "mcpServers", ConfigFormat::Json);
         clients.push(ClientConfig {
             name: "Cursor".to_string(),
             config_path: cursor_config,
             mcp_key: "mcpServers".to_string(),
             already_configured: already,
+            format: ConfigFormat::Json,
         });
     }
 
@@ -162,25 +216,29 @@ fn detect_ai_clients_in(
     let windsurf_dir = home.join(".codeium").join("windsurf");
     if windsurf_dir.exists() {
         let windsurf_config = windsurf_dir.join("mcp_config.json");
-        let already = is_vectorhawk_configured(&windsurf_config, "mcpServers");
+        let already = is_vectorhawk_configured(&windsurf_config, "mcpServers", ConfigFormat::Json);
         clients.push(ClientConfig {
             name: "Windsurf".to_string(),
             config_path: windsurf_config,
             mcp_key: "mcpServers".to_string(),
             already_configured: already,
+            format: ConfigFormat::Json,
         });
     }
 
-    // VS Code — platform-specific settings.json
-    if let Some(vscode_config) = vscode_settings_path(home) {
+    // VS Code — user-level `Code/User/mcp.json`, top-level `servers` key.
+    // NOT `settings.json`'s `mcpServers` — VS Code doesn't read that at all;
+    // see `vscode_mcp_json_path` / `migrate_stale_vscode_settings_entry`.
+    if let Some(vscode_config) = vscode_mcp_json_path(home) {
         let vscode_dir = vscode_config.parent().map(|p| p.to_path_buf());
         if vscode_dir.as_ref().map(|d| d.exists()).unwrap_or(false) || vscode_config.exists() {
-            let already = is_vectorhawk_configured(&vscode_config, "mcpServers");
+            let already = is_vectorhawk_configured(&vscode_config, "servers", ConfigFormat::Json);
             clients.push(ClientConfig {
                 name: "VS Code".to_string(),
                 config_path: vscode_config,
-                mcp_key: "mcpServers".to_string(),
+                mcp_key: "servers".to_string(),
                 already_configured: already,
+                format: ConfigFormat::Json,
             });
         }
     }
@@ -189,13 +247,42 @@ fn detect_ai_clients_in(
     let gemini_dir = home.join(".gemini");
     if gemini_dir.exists() {
         let gemini_config = gemini_dir.join("settings.json");
-        let already = is_vectorhawk_configured(&gemini_config, "mcpServers");
+        let already = is_vectorhawk_configured(&gemini_config, "mcpServers", ConfigFormat::Json);
         clients.push(ClientConfig {
             name: "Gemini CLI".to_string(),
             config_path: gemini_config,
             mcp_key: "mcpServers".to_string(),
             already_configured: already,
+            format: ConfigFormat::Json,
         });
+    }
+
+    // Codex CLI — ~/.codex/config.toml, TOML `[mcp_servers.<name>]` table
+    // (confirmed against openai/codex: `codex-rs/config/src/mcp_edit.rs`
+    // reads a top-level `mcp_servers` table into `McpServerConfig`, and the
+    // `Stdio` variant in `codex-rs/config/src/mcp_types.rs` takes `command:
+    // String` + `args: Vec<String>` — the same shape every other client's
+    // entry uses, just TOML instead of JSON). `~/.codex` is Codex's default
+    // config dir (`codex-rs/utils/home-dir/src/lib.rs`), overridable via
+    // `CODEX_HOME` — same convention as `~/.claude`, `~/.cursor`, etc. here.
+    //
+    // Gated behind `daemon`: reading/writing TOML needs `toml_edit`, which
+    // the shim (never runs `mcp setup` or `uninstall`) has no reason to link.
+    #[cfg(feature = "daemon")]
+    {
+        let codex_dir = home.join(".codex");
+        if codex_dir.exists() {
+            let codex_config = codex_dir.join("config.toml");
+            let already =
+                is_vectorhawk_configured(&codex_config, "mcp_servers", ConfigFormat::Toml);
+            clients.push(ClientConfig {
+                name: "Codex".to_string(),
+                config_path: codex_config,
+                mcp_key: "mcp_servers".to_string(),
+                already_configured: already,
+                format: ConfigFormat::Toml,
+            });
+        }
     }
 
     clients
@@ -212,7 +299,18 @@ fn detect_ai_clients_in(
 /// exactly what it was before VectorHawk touched it. Journal/backup failures
 /// are logged and never block the actual config write — see
 /// [`record_config_edit_journal`].
+///
+/// Dispatches on `config.format`: JSON clients merge via `serde_json`
+/// ([`write_mcp_entry_json`]); Codex's TOML config merges via `toml_edit`
+/// ([`write_mcp_entry_toml`]) so the user's formatting/comments survive.
 pub fn write_mcp_entry(config: &ClientConfig) -> Result<()> {
+    match config.format {
+        ConfigFormat::Json => write_mcp_entry_json(config),
+        ConfigFormat::Toml => write_mcp_entry_toml(config),
+    }
+}
+
+fn write_mcp_entry_json(config: &ClientConfig) -> Result<()> {
     let existing: serde_json::Value = if config.config_path.exists() {
         let text = fs::read_to_string(&config.config_path)?;
         serde_json::from_str(&text).unwrap_or(serde_json::Value::Object(Default::default()))
@@ -229,7 +327,7 @@ pub fn write_mcp_entry(config: &ClientConfig) -> Result<()> {
         .entry(config.mcp_key.clone())
         .or_insert_with(|| serde_json::Value::Object(Default::default()));
     if let serde_json::Value::Object(ref mut map) = servers {
-        map.insert(MCP_SERVER_NAME.to_string(), build_mcp_entry());
+        map.insert(MCP_SERVER_NAME.to_string(), mcp_entry_for(config));
     }
 
     if let Some(parent) = config.config_path.parent() {
@@ -245,6 +343,88 @@ pub fn write_mcp_entry(config: &ClientConfig) -> Result<()> {
     let output = serde_json::to_string_pretty(&serde_json::Value::Object(obj))?;
     fs::write(&config.config_path, output)?;
     Ok(())
+}
+
+/// Write/merge the `[mcp_servers.vectorhawk]` table into a Codex-style TOML
+/// config via `toml_edit`'s format-preserving document model, so any other
+/// tables, keys, comments, or formatting in the user's `config.toml` survive
+/// byte-for-byte. Mirrors [`write_mcp_entry_json`]'s merge-then-write shape
+/// and journaling order.
+///
+/// Only compiled with the `daemon` feature — see the `daemon` feature note
+/// on `toml_edit` in `Cargo.toml`. The shim never calls `write_mcp_entry` on
+/// a TOML client (Codex detection itself is gated the same way), so this
+/// fallback is unreachable in practice; it exists only so the match in
+/// `write_mcp_entry` stays exhaustive without pulling `toml_edit` into
+/// shim builds.
+#[cfg(feature = "daemon")]
+fn write_mcp_entry_toml(config: &ClientConfig) -> Result<()> {
+    use anyhow::Context;
+    use toml_edit::{value, Array, DocumentMut, Item, Table};
+
+    let text = if config.config_path.exists() {
+        fs::read_to_string(&config.config_path)?
+    } else {
+        String::new()
+    };
+    let mut doc: DocumentMut = if text.trim().is_empty() {
+        DocumentMut::new()
+    } else {
+        text.parse()
+            .with_context(|| format!("failed to parse {} as TOML", config.config_path.display()))?
+    };
+
+    if doc.get(config.mcp_key.as_str()).is_none() {
+        doc[config.mcp_key.as_str()] = Item::Table(Table::new());
+    }
+    // `as_table_like_mut` (not `as_table_mut`) so this also handles a user's
+    // `mcp_servers = { ... }` written as a TOML *inline* table, not just a
+    // standard `[mcp_servers]` header — both are valid TOML and Codex reads
+    // either (see `mcp_types.rs`'s `try_into::<BTreeMap<...>>()`, which is
+    // agnostic to the source table's syntax). Only a genuinely non-table
+    // value (e.g. `mcp_servers = 5`) still hits the error below.
+    let servers = doc[config.mcp_key.as_str()]
+        .as_table_like_mut()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} already has a top-level `{}` key that isn't a table",
+                config.config_path.display(),
+                config.mcp_key
+            )
+        })?;
+
+    let mut entry = Table::new();
+    entry["command"] = value(resolve_mcp_command());
+    let mut args = Array::new();
+    for arg in MCP_ARGS {
+        args.push(*arg);
+    }
+    entry["args"] = value(args);
+    // `TableLike::insert` on an inline table converts this `Item::Table` into
+    // a nested inline table via `Item::into_value` (`Table::into_inline_table`
+    // under the hood) rather than panicking, so the outer `mcp_servers = {
+    // ... }` stays inline and the new `vectorhawk = { command = ..., args =
+    // [...] }` entry matches its sibling entries' style; on a standard table
+    // it inserts as `[mcp_servers.vectorhawk]` exactly as before.
+    servers.insert(MCP_SERVER_NAME, Item::Table(entry));
+
+    if let Some(parent) = config.config_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    // Same journal-before-write ordering as the JSON path.
+    record_config_edit_journal(config);
+
+    fs::write(&config.config_path, doc.to_string())?;
+    Ok(())
+}
+
+#[cfg(not(feature = "daemon"))]
+fn write_mcp_entry_toml(_config: &ClientConfig) -> Result<()> {
+    anyhow::bail!(
+        "TOML client config writing requires the `daemon` feature (vectorhawkd-mcp built \
+         without it, e.g. the shim, never calls this)"
+    )
 }
 
 /// Record the restore-journal entry for a `write_mcp_entry` call.
@@ -338,7 +518,16 @@ fn record_config_edit_journal_in(config: &ClientConfig, root_dir: camino::Utf8Pa
 ///
 /// Returns `true` if the entry existed and was removed, `false` if it wasn't
 /// present. The file is left unchanged when the entry is absent.
+///
+/// Dispatches on `config.format`, same as [`write_mcp_entry`].
 pub fn remove_mcp_entry(config: &ClientConfig) -> Result<bool> {
+    match config.format {
+        ConfigFormat::Json => remove_mcp_entry_json(config),
+        ConfigFormat::Toml => remove_mcp_entry_toml(config),
+    }
+}
+
+fn remove_mcp_entry_json(config: &ClientConfig) -> Result<bool> {
     if !config.config_path.exists() {
         return Ok(false);
     }
@@ -364,6 +553,45 @@ pub fn remove_mcp_entry(config: &ClientConfig) -> Result<bool> {
     }
 
     Ok(removed)
+}
+
+/// TOML counterpart of [`remove_mcp_entry_json`], via `toml_edit` so removing
+/// the `vectorhawk` sub-table leaves every other table/comment/formatting in
+/// the file untouched. Same `daemon`-only gating as [`write_mcp_entry_toml`].
+#[cfg(feature = "daemon")]
+fn remove_mcp_entry_toml(config: &ClientConfig) -> Result<bool> {
+    use toml_edit::DocumentMut;
+
+    if !config.config_path.exists() {
+        return Ok(false);
+    }
+    let text = fs::read_to_string(&config.config_path)?;
+    let Ok(mut doc) = text.parse::<DocumentMut>() else {
+        return Ok(false);
+    };
+    // Same `as_table_like_mut` reasoning as `write_mcp_entry_toml`: an inline
+    // `mcp_servers = { vectorhawk = {...} }` must be removable too, not just
+    // a standard `[mcp_servers]` table.
+    let Some(servers) = doc
+        .get_mut(config.mcp_key.as_str())
+        .and_then(|item| item.as_table_like_mut())
+    else {
+        return Ok(false);
+    };
+    let removed = servers.remove(MCP_SERVER_NAME).is_some();
+
+    if removed {
+        fs::write(&config.config_path, doc.to_string())?;
+    }
+    Ok(removed)
+}
+
+#[cfg(not(feature = "daemon"))]
+fn remove_mcp_entry_toml(_config: &ClientConfig) -> Result<bool> {
+    anyhow::bail!(
+        "TOML client config removal requires the `daemon` feature (vectorhawkd-mcp built \
+         without it, e.g. the shim, never calls this)"
+    )
 }
 
 // ── Slash command skills ───────────────────────────────────────────────────────
@@ -643,26 +871,24 @@ fn claude_desktop_config_path(home: &std::path::Path) -> Option<PathBuf> {
     }
 }
 
-/// Return the VS Code user settings path for the current OS.
-fn vscode_settings_path(home: &std::path::Path) -> Option<PathBuf> {
+/// Return VS Code's per-user config directory (`Code/User/`) for the current
+/// OS. Shared by [`vscode_mcp_json_path`] (the config file VS Code actually
+/// reads) and [`vscode_settings_path`] (legacy location, kept only so
+/// [`migrate_stale_vscode_settings_entry`] can clean up a stale entry an
+/// older build left there).
+fn vscode_user_dir(home: &std::path::Path) -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
         Some(
             home.join("Library")
                 .join("Application Support")
                 .join("Code")
-                .join("User")
-                .join("settings.json"),
+                .join("User"),
         )
     }
     #[cfg(target_os = "linux")]
     {
-        Some(
-            home.join(".config")
-                .join("Code")
-                .join("User")
-                .join("settings.json"),
-        )
+        Some(home.join(".config").join("Code").join("User"))
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
@@ -671,41 +897,109 @@ fn vscode_settings_path(home: &std::path::Path) -> Option<PathBuf> {
     }
 }
 
+/// Return VS Code's user-level MCP server config path: `Code/User/mcp.json`.
+///
+/// This is the file VS Code actually reads for user-profile MCP servers,
+/// under a top-level `servers` key. See the VS Code MCP configuration
+/// reference: <https://code.visualstudio.com/docs/agents/reference/mcp-configuration>
+/// ("MCP server configuration is stored in the `mcp.json` JSON file. This
+/// file can be in your workspace (`.vscode/mcp.json`) or in your user
+/// profile."; `"servers": {}` — "an object that maps server names to their
+/// configurations"). `settings.json`'s `mcpServers` key (the pre-fix
+/// location this code used to write) is not read by VS Code at all.
+fn vscode_mcp_json_path(home: &std::path::Path) -> Option<PathBuf> {
+    vscode_user_dir(home).map(|d| d.join("mcp.json"))
+}
+
+/// Return the legacy VS Code user *settings* path (`Code/User/settings.json`).
+///
+/// No longer written to by `mcp setup` / the repair pass — kept only so
+/// [`migrate_stale_vscode_settings_entry`] can find and remove a stale
+/// `mcpServers.vectorhawk` key a pre-fix build left there. Gated behind
+/// `daemon` because that's its only (non-test) caller — see the feature-gate
+/// note on `migrate_stale_vscode_settings_entry` itself.
+#[cfg(feature = "daemon")]
+fn vscode_settings_path(home: &std::path::Path) -> Option<PathBuf> {
+    vscode_user_dir(home).map(|d| d.join("settings.json"))
+}
+
 /// Returns `true` if the config file at `path` already contains a
-/// `vectorhawk` entry under `mcp_key`.
-fn is_vectorhawk_configured(path: &std::path::Path, mcp_key: &str) -> bool {
-    let Ok(text) = fs::read_to_string(path) else {
+/// `vectorhawk` entry under `mcp_key`, with a `command` that's current.
+///
+/// Format-agnostic: reads the entry via [`read_vectorhawk_command`], then
+/// applies the same staleness rule regardless of whether it came from JSON
+/// or TOML — see [`command_is_current`].
+fn is_vectorhawk_configured(path: &std::path::Path, mcp_key: &str, format: ConfigFormat) -> bool {
+    match read_vectorhawk_command(path, mcp_key, format) {
+        Some(command) => command_is_current(&command),
+        None => false,
+    }
+}
+
+/// Returns `true` if `command` is a `vectorhawk` MCP entry's command that's
+/// still current — i.e. does NOT need `mcp setup`/repair to rewrite it.
+///
+/// Treated as stale (returns `false`) if the command is:
+///   - not an absolute path (bare command name), or
+///   - the binary no longer exists (old Cellar removed after brew upgrade), or
+///   - doesn't match the currently-running binary (stale Cellar path from a
+///     previous brew upgrade where the old Cellar was still present during
+///     post_install).
+fn command_is_current(command: &str) -> bool {
+    let p = std::path::Path::new(command);
+    if !p.is_absolute() {
         return false;
-    };
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return false;
-    };
-    let Some(entry) = json.get(mcp_key).and_then(|v| v.get(MCP_SERVER_NAME)) else {
-        return false;
-    };
-    // Treat as unconfigured if the command is:
-    //   - not an absolute path (bare command name), or
-    //   - the binary no longer exists (old Cellar removed after brew upgrade), or
-    //   - doesn't match the currently-running binary (stale Cellar path from a
-    //     previous brew upgrade where the old Cellar was still present during
-    //     post_install).
-    // All three cases require mcp setup to rewrite with the current binary path.
-    let current_exe = std::env::current_exe().ok();
-    let command_is_current = entry
-        .get("command")
-        .and_then(|c| c.as_str())
-        .map(|s| {
-            let p = std::path::Path::new(s);
-            if !p.is_absolute() {
-                return false;
-            }
-            if let Some(ref exe) = current_exe {
-                return p == exe.as_path();
-            }
-            p.exists()
-        })
-        .unwrap_or(false);
-    command_is_current
+    }
+    match std::env::current_exe().ok() {
+        Some(exe) => p == exe.as_path(),
+        None => p.exists(),
+    }
+}
+
+/// Read the `command` string of the `vectorhawk` entry (`{mcp_key}.vectorhawk.command`)
+/// out of a client config file, whatever its on-disk format. Returns `None`
+/// if the file is missing, unparsable, or the entry simply isn't present —
+/// callers ([`is_vectorhawk_configured`], [`repair_stale_mcp_entries_in`])
+/// treat that the same as "nothing to check/repair".
+fn read_vectorhawk_command(
+    path: &std::path::Path,
+    mcp_key: &str,
+    format: ConfigFormat,
+) -> Option<String> {
+    match format {
+        ConfigFormat::Json => {
+            let text = fs::read_to_string(path).ok()?;
+            let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+            json.get(mcp_key)?
+                .get(MCP_SERVER_NAME)?
+                .get("command")?
+                .as_str()
+                .map(str::to_string)
+        }
+        ConfigFormat::Toml => read_vectorhawk_command_toml(path, mcp_key),
+    }
+}
+
+#[cfg(feature = "daemon")]
+fn read_vectorhawk_command_toml(path: &std::path::Path, mcp_key: &str) -> Option<String> {
+    let text = fs::read_to_string(path).ok()?;
+    let doc = text.parse::<toml_edit::DocumentMut>().ok()?;
+    // `Item::get` (unlike `as_table_mut`) already looks inside both a
+    // standard `[mcp_servers]` table *and* an inline `mcp_servers = { ... }`
+    // — `toml_edit`'s string `Index` impl matches `Item::Table` and
+    // `Item::Value(Value::InlineTable)` alike — so this needs no
+    // `as_table_like` dance the way the write/remove paths below do.
+    // Covered by `codex_read_command_from_inline_table`.
+    doc.get(mcp_key)?
+        .get(MCP_SERVER_NAME)?
+        .get("command")?
+        .as_str()
+        .map(str::to_string)
+}
+
+#[cfg(not(feature = "daemon"))]
+fn read_vectorhawk_command_toml(_path: &std::path::Path, _mcp_key: &str) -> Option<String> {
+    None
 }
 
 // ── Unmanaged server detection (GAP-06) ───────────────────────────────────────
@@ -761,6 +1055,342 @@ pub fn detect_unmanaged_servers() -> Vec<UnmanagedServer> {
     }
 
     unmanaged
+}
+
+// ── Full MCP entry enumeration (read-only, Shadow-AI discovery) ────────────────
+
+/// One MCP server entry found in a client's config file: its key plus its
+/// full value, normalized to `serde_json::Value` regardless of the file's
+/// on-disk format — see [`read_all_mcp_entries`].
+#[derive(Debug, Clone)]
+pub struct RawMcpEntry {
+    pub key: String,
+    pub value: serde_json::Value,
+}
+
+/// Read every entry under `config.mcp_key` in `config.config_path`, whatever
+/// the file's on-disk format, normalized to `serde_json::Value` so callers
+/// (the Shadow-AI discovery scanner in `vectorhawkd-daemon`) work with one
+/// representation regardless of which AI client produced it.
+///
+/// Reuses each format's existing reader rather than introducing a second
+/// parser: `jsonc-parser` for JSON clients — JSONC-tolerant (see
+/// [`read_all_mcp_entries_json`]), the same dependency
+/// [`migrate_stale_vscode_settings_entry`] already uses (its `cst` feature)
+/// for the same underlying reason: VS Code's `mcp.json` and similar configs
+/// routinely carry `//`/`/* */` comments and trailing commas — and
+/// `toml_edit` for Codex's TOML client (the same parse
+/// [`write_mcp_entry_toml`] / [`read_vectorhawk_command_toml`] already use)
+/// — including Codex's `[mcp_servers]` table, which
+/// [`detect_unmanaged_servers`] (GAP-06, JSON-only) does not cover.
+///
+/// Strictly read-only: never writes to `config.config_path`. Returns an
+/// empty vec if the file is missing, unparsable, or the `mcp_key`
+/// object/table is absent, empty, or not object-shaped — callers treat that
+/// the same as "nothing configured for this client".
+#[cfg(feature = "daemon")]
+pub fn read_all_mcp_entries(config: &ClientConfig) -> Vec<RawMcpEntry> {
+    match config.format {
+        ConfigFormat::Json => read_all_mcp_entries_json(config),
+        ConfigFormat::Toml => read_all_mcp_entries_toml(config),
+    }
+}
+
+/// JSONC-tolerant read: a strict `serde_json::from_str` silently yields zero
+/// servers on a config file that has `//`/`/* */` comments or a trailing
+/// comma (VS Code's `mcp.json` and Cursor's config commonly do) — a total
+/// discovery blind spot rather than an error, since "unparsable → empty
+/// vec" is exactly the same result as "nothing configured". Parsing via
+/// `jsonc_parser::parse_to_serde_value` (the `serde` feature of the same
+/// `jsonc-parser` dependency already used for `cst` editing elsewhere in
+/// this module) accepts comments/trailing-commas and yields an ordinary
+/// `serde_json::Value`, so every downstream call site is unaffected. JSONC
+/// is a superset of JSON, so this is a strict superset of what
+/// `serde_json::from_str` already accepted — never a behavior regression
+/// for a plain-JSON file.
+#[cfg(feature = "daemon")]
+fn read_all_mcp_entries_json(config: &ClientConfig) -> Vec<RawMcpEntry> {
+    let Ok(text) = fs::read_to_string(&config.config_path) else {
+        return Vec::new();
+    };
+    let Ok(root) = jsonc_parser::parse_to_serde_value::<serde_json::Value>(
+        &text,
+        &jsonc_parser::ParseOptions::default(),
+    ) else {
+        return Vec::new();
+    };
+    let Some(obj) = root.get(&config.mcp_key).and_then(|v| v.as_object()) else {
+        return Vec::new();
+    };
+    obj.iter()
+        .map(|(key, value)| RawMcpEntry {
+            key: key.clone(),
+            value: value.clone(),
+        })
+        .collect()
+}
+
+/// TOML counterpart of [`read_all_mcp_entries_json`]. Uses `as_table_like`
+/// (not `as_table`) so an inline `mcp_servers = { ... }` is enumerated the
+/// same as a standard `[mcp_servers]` table — same reasoning as
+/// `write_mcp_entry_toml`'s `as_table_like_mut`.
+#[cfg(feature = "daemon")]
+fn read_all_mcp_entries_toml(config: &ClientConfig) -> Vec<RawMcpEntry> {
+    let Ok(text) = fs::read_to_string(&config.config_path) else {
+        return Vec::new();
+    };
+    let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else {
+        return Vec::new();
+    };
+    let Some(servers) = doc
+        .get(config.mcp_key.as_str())
+        .and_then(|item| item.as_table_like())
+    else {
+        return Vec::new();
+    };
+    servers
+        .iter()
+        .map(|(key, item)| RawMcpEntry {
+            key: key.to_string(),
+            value: toml_item_to_json(item),
+        })
+        .collect()
+}
+
+/// Convert a `toml_edit` document item into an equivalent `serde_json::Value`
+/// so [`read_all_mcp_entries_toml`] can hand TOML entries to the same
+/// downstream (format-agnostic) code that already works with JSON values.
+#[cfg(feature = "daemon")]
+fn toml_item_to_json(item: &toml_edit::Item) -> serde_json::Value {
+    use toml_edit::Item;
+    match item {
+        Item::None => serde_json::Value::Null,
+        Item::Value(v) => toml_value_to_json(v),
+        Item::Table(t) => {
+            let mut map = serde_json::Map::new();
+            for (k, v) in t.iter() {
+                map.insert(k.to_string(), toml_item_to_json(v));
+            }
+            serde_json::Value::Object(map)
+        }
+        Item::ArrayOfTables(arr) => serde_json::Value::Array(
+            arr.iter()
+                .map(|t| {
+                    let mut map = serde_json::Map::new();
+                    for (k, v) in t.iter() {
+                        map.insert(k.to_string(), toml_item_to_json(v));
+                    }
+                    serde_json::Value::Object(map)
+                })
+                .collect(),
+        ),
+    }
+}
+
+#[cfg(feature = "daemon")]
+fn toml_value_to_json(value: &toml_edit::Value) -> serde_json::Value {
+    use toml_edit::Value;
+    match value {
+        Value::String(s) => serde_json::Value::String(s.value().clone()),
+        Value::Integer(i) => serde_json::Value::from(*i.value()),
+        Value::Float(f) => serde_json::Number::from_f64(*f.value())
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        Value::Boolean(b) => serde_json::Value::Bool(*b.value()),
+        Value::Datetime(d) => serde_json::Value::String(d.value().to_string()),
+        Value::Array(arr) => serde_json::Value::Array(arr.iter().map(toml_value_to_json).collect()),
+        Value::InlineTable(t) => {
+            let mut map = serde_json::Map::new();
+            for (k, v) in t.iter() {
+                map.insert(k.to_string(), toml_value_to_json(v));
+            }
+            serde_json::Value::Object(map)
+        }
+    }
+}
+
+// ── Daemon-boot self-heal for stale MCP commands ───────────────────────────────
+
+/// Returns `true` when `command` looks like a stale `vectorhawk` MCP command
+/// that daemon-boot repair should rewrite: an absolute path that either (a)
+/// no longer exists on disk — Homebrew deleted the old Cellar version on a
+/// later upgrade — or (b) still points inside a versioned Cellar directory
+/// (written by a pre-efb7fe1 `mcp setup`, still present but due to be pruned
+/// on the next upgrade). A bare command name (resolved via `PATH`) is left
+/// alone — it was never a Cellar path to begin with.
+fn command_needs_repair(command: &str, exists: impl Fn(&str) -> bool) -> bool {
+    let path = std::path::Path::new(command);
+    if !path.is_absolute() {
+        return false;
+    }
+    if !exists(command) {
+        return true;
+    }
+    command.contains(CELLAR)
+}
+
+/// Scan all detected AI-client configs and rewrite any `vectorhawk` MCP
+/// entry whose `command` is stale (see [`command_needs_repair`]) back to the
+/// current stable path, via the same [`write_mcp_entry`] used by `mcp setup`
+/// (so the write goes through the restore journal identically).
+///
+/// This is the daemon-boot half of the self-heal for GH board bug
+/// "SSH/headless brew upgrade leaves stale versioned MCP command path":
+/// `mcp setup` writes the stable Homebrew bin path since efb7fe1, but the
+/// brew `post_install` hook that would normally re-run `mcp setup` on
+/// upgrade doesn't execute headlessly over SSH (no D-Bus/desktop session),
+/// so a config written by an older `mcp setup` — or one that's simply gone
+/// stale after an upgrade removed its Cellar dir — never self-corrects on
+/// its own. Running this on every daemon start converges the fleet without
+/// requiring anyone to manually re-run `mcp setup`.
+///
+/// Idempotent: a config whose command already matches the current stable
+/// path is left untouched. Only the `vectorhawk` entry is ever touched —
+/// every other MCP server entry in the file is left exactly as-is.
+///
+/// Returns the names of clients whose entry was rewritten. Per-client I/O
+/// failures are logged at WARN and skipped — never fatal to daemon startup.
+pub fn repair_stale_mcp_entries() -> Vec<String> {
+    match home_dir() {
+        Some(home) => repair_stale_mcp_entries_in(&home, std::path::Path::new("/")),
+        None => Vec::new(),
+    }
+}
+
+/// Core logic for [`repair_stale_mcp_entries`], parameterised on `home` and
+/// `system_root` so tests can point it at a temp directory instead of the
+/// real filesystem.
+fn repair_stale_mcp_entries_in(
+    home: &std::path::Path,
+    system_root: &std::path::Path,
+) -> Vec<String> {
+    let clients = detect_ai_clients_in(home, system_root);
+    let mut repaired = Vec::new();
+
+    for client in &clients {
+        if !client.config_path.exists() {
+            continue;
+        }
+        // Format-agnostic: covers both JSON clients and Codex's TOML config,
+        // so a stale versioned `command` in `~/.codex/config.toml` gets
+        // rewritten by the same daemon-boot self-heal as every other client.
+        let Some(command) =
+            read_vectorhawk_command(&client.config_path, &client.mcp_key, client.format)
+        else {
+            continue;
+        };
+        if !command_needs_repair(&command, |p| std::path::Path::new(p).exists()) {
+            continue;
+        }
+
+        match write_mcp_entry(client) {
+            Ok(()) => repaired.push(client.name.clone()),
+            Err(e) => {
+                tracing::warn!(
+                    client = %client.name,
+                    path = %client.config_path.display(),
+                    error = %e,
+                    "heal: failed to repair stale vectorhawk MCP command"
+                );
+            }
+        }
+    }
+
+    // Legacy-location cleanup: a pre-fix build may have left a dead
+    // `mcpServers.vectorhawk` key in Code/User/settings.json (the wrong
+    // file/key — VS Code never read it). Clean it up here too, alongside the
+    // per-client loop above, so it doesn't linger forever now that fresh
+    // writes/repairs only ever touch the real `mcp.json` location.
+    //
+    // Gated behind `daemon` because it needs both the restore-journal
+    // machinery and the `jsonc-parser` CST editor (see
+    // [`migrate_stale_vscode_settings_entry`]), the same as
+    // `record_config_edit_journal` already is.
+    #[cfg(feature = "daemon")]
+    if migrate_stale_vscode_settings_entry(home) {
+        repaired.push("VS Code (settings.json cleanup)".to_string());
+    }
+
+    repaired
+}
+
+// ── VS Code settings.json → mcp.json migration ─────────────────────────────────
+
+/// Remove a stale `mcpServers.vectorhawk` key left in the legacy
+/// `Code/User/settings.json` by a pre-fix `mcp setup`/self-heal build. VS
+/// Code never reads `mcpServers` out of `settings.json` — the real location
+/// is `Code/User/mcp.json` → `servers` (see [`vscode_mcp_json_path`]) — so a
+/// leftover key there is permanently dead weight once fresh writes/repairs
+/// target the correct file.
+///
+/// `settings.json` is JSONC: VS Code allows comments and trailing commas in
+/// it. Round-tripping it through `serde_json` (as this function used to)
+/// would silently drop every comment on a successful parse, or — on a parse
+/// failure, which is the *common* case for a real hand-edited settings.json
+/// — skip the edit entirely, so the stale key would never actually get
+/// cleaned up for most real users. Instead this uses `jsonc_parser`'s `cst`
+/// (concrete syntax tree) editor: it parses the full token stream —
+/// comments, whitespace, trailing commas and all — as real nodes, so
+/// removing one property node leaves everything else (including comments
+/// attached to neighboring properties) byte-for-byte as written.
+/// `CstRootNode::parse` is lenient about JSONC syntax but still returns
+/// `Err` for genuinely malformed JSON (e.g. unmatched braces); that case,
+/// same as a non-object root or a missing `mcpServers`/`vectorhawk` key,
+/// leaves the file completely untouched.
+///
+/// Returns `true` if the stale entry was found and removed.
+#[cfg(feature = "daemon")]
+fn migrate_stale_vscode_settings_entry(home: &std::path::Path) -> bool {
+    use jsonc_parser::cst::CstRootNode;
+    use jsonc_parser::ParseOptions;
+
+    let Some(settings_path) = vscode_settings_path(home) else {
+        return false;
+    };
+    if !settings_path.exists() {
+        return false;
+    }
+    let Ok(text) = fs::read_to_string(&settings_path) else {
+        return false;
+    };
+
+    let Ok(root) = CstRootNode::parse(&text, &ParseOptions::default()) else {
+        // Not even valid JSONC (e.g. unmatched braces) — leave it alone
+        // rather than risk corrupting the user's file.
+        return false;
+    };
+    let Some(root_obj) = root.object_value() else {
+        return false;
+    };
+    let Some(mcp_servers_obj) = root_obj.object_value("mcpServers") else {
+        return false;
+    };
+    let Some(vectorhawk_prop) = mcp_servers_obj.get(MCP_SERVER_NAME) else {
+        return false;
+    };
+
+    // Journal this edit the same way `write_mcp_entry` journals a fresh
+    // write, so `vectorhawk uninstall` still restores the user's true
+    // pre-VectorHawk settings.json. `record_config_edit_journal` reuses the
+    // *original* backup captured the first time VectorHawk ever touched
+    // this file (see its backup-reuse doc comment) rather than backing up
+    // the already-VectorHawk-modified content we're about to write below.
+    // Runs before the write, same ordering `write_mcp_entry` uses.
+    let legacy_config = ClientConfig {
+        name: "VS Code".to_string(),
+        config_path: settings_path.clone(),
+        mcp_key: "mcpServers".to_string(),
+        already_configured: false,
+        format: ConfigFormat::Json,
+    };
+    record_config_edit_journal(&legacy_config);
+
+    // Removing the property node preserves every comment, blank line, and
+    // the rest of the file's formatting exactly as written — only the
+    // `"vectorhawk": {...}` property (and its now-dangling comma, if any)
+    // is excised.
+    vectorhawk_prop.remove();
+    fs::write(&settings_path, root.to_string()).is_ok()
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
@@ -882,6 +1512,7 @@ mod tests {
             config_path: config_path.clone(),
             mcp_key: "mcpServers".to_string(),
             already_configured: false,
+            format: ConfigFormat::Json,
         };
 
         // write_mcp_entry's restore-journal side effect resolves the real
@@ -922,6 +1553,7 @@ mod tests {
             config_path: config_path.clone(),
             mcp_key: "mcpServers".to_string(),
             already_configured: false,
+            format: ConfigFormat::Json,
         };
 
         with_fake_home(&tmp, || write_mcp_entry(&config)).expect("write should succeed");
@@ -968,6 +1600,7 @@ mod tests {
             config_path: config_path.clone(),
             mcp_key: "mcpServers".to_string(),
             already_configured: false,
+            format: ConfigFormat::Json,
         };
 
         record_config_edit_journal_in(&config, root_dir.clone());
@@ -1018,6 +1651,7 @@ mod tests {
             config_path: config_path.clone(),
             mcp_key: "mcpServers".to_string(),
             already_configured: false,
+            format: ConfigFormat::Json,
         };
 
         record_config_edit_journal_in(&config, root_dir.clone());
@@ -1046,6 +1680,7 @@ mod tests {
             config_path: config_path.clone(),
             mcp_key: "mcpServers".to_string(),
             already_configured: false,
+            format: ConfigFormat::Json,
         };
 
         // First edit: backs up "original content".
@@ -1188,7 +1823,7 @@ mod tests {
     }
 
     #[test]
-    fn detect_vscode_when_settings_dir_exists() {
+    fn detect_vscode_uses_mcp_json_and_servers_key() {
         let tmp = temp_root("detect-vscode");
 
         #[cfg(target_os = "macos")]
@@ -1209,7 +1844,16 @@ mod tests {
         let clients = detect_ai_clients_in(&tmp, &tmp);
         let found = clients.iter().find(|c| c.name == "VS Code");
         assert!(found.is_some(), "VS Code should be detected");
-        assert_eq!(found.unwrap().mcp_key, "mcpServers");
+        let found = found.unwrap();
+        assert_eq!(
+            found.mcp_key, "servers",
+            "VS Code's user-level MCP config uses a top-level `servers` key, not `mcpServers`"
+        );
+        assert_eq!(
+            found.config_path,
+            vscode_dir.join("mcp.json"),
+            "VS Code's user-level MCP config lives in Code/User/mcp.json, not settings.json"
+        );
 
         let _ = fs::remove_dir_all(&tmp);
     }
@@ -1297,6 +1941,7 @@ mod tests {
             config_path: config_path.clone(),
             mcp_key: "mcpServers".to_string(),
             already_configured: false,
+            format: ConfigFormat::Json,
         };
 
         with_fake_home(&tmp, || write_mcp_entry(&config)).unwrap();
@@ -1323,6 +1968,7 @@ mod tests {
             config_path: config_path.clone(),
             mcp_key: "mcpServers".to_string(),
             already_configured: false,
+            format: ConfigFormat::Json,
         };
 
         with_fake_home(&tmp, || write_mcp_entry(&config)).unwrap();
@@ -1333,6 +1979,244 @@ mod tests {
             json["mcpServers"]["vectorhawk"]["command"],
             expected_command()
         );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn vscode_write_has_correct_mcp_entry_shape() {
+        let tmp = temp_root("vscode-write");
+        fs::create_dir_all(&tmp).unwrap();
+        let config_path = tmp.join("mcp.json");
+
+        let config = ClientConfig {
+            name: "VS Code".to_string(),
+            config_path: config_path.clone(),
+            mcp_key: "servers".to_string(),
+            already_configured: false,
+            format: ConfigFormat::Json,
+        };
+
+        with_fake_home(&tmp, || write_mcp_entry(&config)).unwrap();
+
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(
+            json["servers"]["vectorhawk"]["type"], "stdio",
+            "VS Code's mcp.json requires an explicit `type` field per server"
+        );
+        assert_eq!(json["servers"]["vectorhawk"]["command"], expected_command());
+        assert_eq!(json["servers"]["vectorhawk"]["args"][0], "mcp");
+        assert_eq!(json["servers"]["vectorhawk"]["args"][1], "serve");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn other_clients_write_has_no_type_field() {
+        // `type` is a VS Code-specific requirement; other clients' written
+        // entries must stay exactly `{command, args}` — verified against the
+        // actual file `write_mcp_entry` produces, not just `build_mcp_entry`
+        // in isolation.
+        let tmp = temp_root("cursor-no-type");
+        fs::create_dir_all(&tmp).unwrap();
+        let config_path = tmp.join("mcp.json");
+
+        let config = ClientConfig {
+            name: "Cursor".to_string(),
+            config_path: config_path.clone(),
+            mcp_key: "mcpServers".to_string(),
+            already_configured: false,
+            format: ConfigFormat::Json,
+        };
+        with_fake_home(&tmp, || write_mcp_entry(&config)).unwrap();
+
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert!(json["mcpServers"]["vectorhawk"].get("type").is_none());
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // ── repair_stale_mcp_entries: VS Code targets mcp.json, not settings.json ──
+
+    #[test]
+    fn repair_rewrites_stale_vscode_entry_in_mcp_json_not_settings_json() {
+        let tmp = temp_root("repair-vscode-mcp");
+        let vscode_dir = vscode_user_dir(&tmp).unwrap();
+        fs::create_dir_all(&vscode_dir).unwrap();
+        let mcp_json = vscode_mcp_json_path(&tmp).unwrap();
+        fs::write(
+            &mcp_json,
+            r#"{"servers":{"vectorhawk":{"type":"stdio","command":"/opt/homebrew/Cellar/vectorhawk/1.0.65/bin/vectorhawk","args":["mcp","serve"]}}}"#,
+        )
+        .unwrap();
+
+        let repaired = with_fake_home(&tmp, || repair_stale_mcp_entries_in(&tmp, &tmp));
+        assert!(
+            repaired.contains(&"VS Code".to_string()),
+            "stale VS Code entry in mcp.json should be repaired, got: {repaired:?}"
+        );
+
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&mcp_json).unwrap()).unwrap();
+        assert_eq!(json["servers"]["vectorhawk"]["command"], expected_command());
+        assert_eq!(
+            json["servers"]["vectorhawk"]["type"], "stdio",
+            "repair goes through write_mcp_entry, which must keep the required `type` field"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // ── migrate_stale_vscode_settings_entry ───────────────────────────────────
+    // Uses the real platform data dir via $HOME (redirected by `with_fake_home`)
+    // to record a restore-journal entry, same as the `write_mcp_entry` tests —
+    // hence `#[cfg(feature = "daemon")]` throughout, matching
+    // `record_config_edit_journal`'s own gating.
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn migrate_removes_stale_vscode_settings_entry_when_json_is_strict() {
+        let tmp = temp_root("migrate-strict");
+        let vscode_dir = vscode_user_dir(&tmp).unwrap();
+        fs::create_dir_all(&vscode_dir).unwrap();
+        let settings_path = vscode_settings_path(&tmp).unwrap();
+        fs::write(
+            &settings_path,
+            r#"{"editor.fontSize": 14, "mcpServers": {"vectorhawk": {"command": "vectorhawk", "args": ["mcp", "serve"]}}}"#,
+        )
+        .unwrap();
+
+        let removed = with_fake_home(&tmp, || migrate_stale_vscode_settings_entry(&tmp));
+        assert!(removed, "stale entry should be found and removed");
+
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert!(
+            json["mcpServers"].get("vectorhawk").is_none(),
+            "vectorhawk key must be gone"
+        );
+        assert_eq!(
+            json["editor.fontSize"], 14,
+            "unrelated settings must survive"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn migrate_removes_stale_entry_from_jsonc_preserving_comments_and_trailing_commas() {
+        // The common real-world case: a hand-edited settings.json with line
+        // comments, a block comment, and a trailing comma. The card requires
+        // the stale key be removed unconditionally here too — not skipped —
+        // while every comment and the rest of the formatting survive intact.
+        let tmp = temp_root("migrate-jsonc-preserve");
+        let vscode_dir = vscode_user_dir(&tmp).unwrap();
+        fs::create_dir_all(&vscode_dir).unwrap();
+        let settings_path = vscode_settings_path(&tmp).unwrap();
+        let original = "{\n  // my favorite theme\n  \"workbench.colorTheme\": \"Dark+\",\n  /* block comment */\n  \"mcpServers\": {\"vectorhawk\": {\"command\": \"vectorhawk\"}},\n}\n";
+        fs::write(&settings_path, original).unwrap();
+
+        let removed = with_fake_home(&tmp, || migrate_stale_vscode_settings_entry(&tmp));
+        assert!(
+            removed,
+            "stale entry must be removed even from a JSONC file with comments"
+        );
+
+        let after = fs::read_to_string(&settings_path).unwrap();
+        assert!(
+            after.contains("// my favorite theme"),
+            "line comment must survive: {after:?}"
+        );
+        assert!(
+            after.contains("/* block comment */"),
+            "block comment must survive: {after:?}"
+        );
+        assert!(
+            after.contains("\"workbench.colorTheme\": \"Dark+\""),
+            "unrelated setting must survive untouched: {after:?}"
+        );
+        assert!(
+            !after.contains("vectorhawk"),
+            "stale vectorhawk entry must be gone: {after:?}"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn migrate_leaves_genuinely_invalid_json_untouched() {
+        // Not even valid JSONC — an unmatched brace. Even the lenient CST
+        // parser must fail closed here rather than guess at a repair.
+        let tmp = temp_root("migrate-invalid");
+        let vscode_dir = vscode_user_dir(&tmp).unwrap();
+        fs::create_dir_all(&vscode_dir).unwrap();
+        let settings_path = vscode_settings_path(&tmp).unwrap();
+        let original = r#"{"mcpServers": {"vectorhawk": {"command": "vectorhawk"}}"#; // missing closing brace
+        fs::write(&settings_path, original).unwrap();
+
+        let removed = with_fake_home(&tmp, || migrate_stale_vscode_settings_entry(&tmp));
+        assert!(!removed, "must not touch a file that isn't valid JSONC");
+
+        let after = fs::read_to_string(&settings_path).unwrap();
+        assert_eq!(
+            after, original,
+            "invalid settings.json must be left byte-for-byte untouched"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn migrate_is_noop_when_no_stale_entry_present() {
+        let tmp = temp_root("migrate-noop");
+        let vscode_dir = vscode_user_dir(&tmp).unwrap();
+        fs::create_dir_all(&vscode_dir).unwrap();
+        let settings_path = vscode_settings_path(&tmp).unwrap();
+        fs::write(&settings_path, r#"{"editor.fontSize": 14}"#).unwrap();
+
+        let removed = with_fake_home(&tmp, || migrate_stale_vscode_settings_entry(&tmp));
+        assert!(!removed);
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn migrate_is_noop_when_settings_file_does_not_exist() {
+        let tmp = temp_root("migrate-missing");
+        fs::create_dir_all(&tmp).unwrap();
+        let removed = with_fake_home(&tmp, || migrate_stale_vscode_settings_entry(&tmp));
+        assert!(!removed);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn repair_also_migrates_stale_vscode_settings_entry() {
+        let tmp = temp_root("repair-migrate");
+        let vscode_dir = vscode_user_dir(&tmp).unwrap();
+        fs::create_dir_all(&vscode_dir).unwrap();
+        let settings_path = vscode_settings_path(&tmp).unwrap();
+        fs::write(
+            &settings_path,
+            r#"{"mcpServers": {"vectorhawk": {"command": "vectorhawk", "args": ["mcp", "serve"]}}}"#,
+        )
+        .unwrap();
+
+        let repaired = with_fake_home(&tmp, || repair_stale_mcp_entries_in(&tmp, &tmp));
+        assert!(
+            repaired.iter().any(|c| c.contains("VS Code")),
+            "repair pass should report the settings.json migration, got: {repaired:?}"
+        );
+
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert!(json["mcpServers"].get("vectorhawk").is_none());
 
         let _ = fs::remove_dir_all(&tmp);
     }
@@ -1506,15 +2390,20 @@ mod tests {
             config_path: config_path.clone(),
             mcp_key: "mcpServers".to_string(),
             already_configured: false,
+            format: ConfigFormat::Json,
         };
 
         with_fake_home(&tmp, || write_mcp_entry(&config)).unwrap();
-        assert!(is_vectorhawk_configured(&config_path, "mcpServers"));
+        assert!(is_vectorhawk_configured(
+            &config_path,
+            "mcpServers",
+            ConfigFormat::Json
+        ));
 
         let removed = remove_mcp_entry(&config).unwrap();
         assert!(removed, "should report entry was removed");
         assert!(
-            !is_vectorhawk_configured(&config_path, "mcpServers"),
+            !is_vectorhawk_configured(&config_path, "mcpServers", ConfigFormat::Json),
             "entry should be gone after remove"
         );
 
@@ -1545,6 +2434,7 @@ mod tests {
             config_path: config_path.clone(),
             mcp_key: "mcpServers".to_string(),
             already_configured: false,
+            format: ConfigFormat::Json,
         };
 
         let removed = remove_mcp_entry(&config).unwrap();
@@ -1561,6 +2451,7 @@ mod tests {
             config_path: tmp.join("does-not-exist.json"),
             mcp_key: "mcpServers".to_string(),
             already_configured: false,
+            format: ConfigFormat::Json,
         };
 
         let removed = remove_mcp_entry(&config).unwrap();
@@ -1583,6 +2474,7 @@ mod tests {
             config_path: config_path.clone(),
             mcp_key: "mcpServers".to_string(),
             already_configured: true,
+            format: ConfigFormat::Json,
         };
 
         let removed = remove_mcp_entry(&config).unwrap();
@@ -1598,6 +2490,650 @@ mod tests {
             json["mcpServers"].get("vectorhawk").is_none(),
             "vectorhawk entry should be removed"
         );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // ── command_needs_repair ──────────────────────────────────────────────────
+
+    #[test]
+    fn command_needs_repair_when_path_does_not_exist() {
+        assert!(command_needs_repair(
+            "/home/linuxbrew/.linuxbrew/Cellar/vectorhawk/1.0.65/bin/vectorhawk",
+            |_| false,
+        ));
+    }
+
+    #[test]
+    fn command_needs_repair_when_versioned_cellar_path_exists() {
+        // Old Cellar dir hasn't been pruned yet (e.g. mid-upgrade), but it's
+        // still a versioned path that must be rewritten to the stable one.
+        assert!(command_needs_repair(
+            "/opt/homebrew/Cellar/vectorhawk/1.0.65/bin/vectorhawk",
+            |_| true,
+        ));
+    }
+
+    #[test]
+    fn command_does_not_need_repair_when_stable_path_exists() {
+        assert!(!command_needs_repair(
+            "/home/linuxbrew/.linuxbrew/bin/vectorhawk",
+            |_| true,
+        ));
+    }
+
+    #[test]
+    fn command_does_not_need_repair_for_bare_command() {
+        // Not an absolute path — nothing for the repair pass to rewrite.
+        assert!(!command_needs_repair("vectorhawk", |_| false));
+    }
+
+    // ── repair_stale_mcp_entries ──────────────────────────────────────────────
+
+    #[test]
+    fn repair_rewrites_stale_versioned_cellar_command() {
+        let tmp = temp_root("repair-stale");
+        fs::create_dir_all(tmp.join(".claude")).unwrap();
+        let config_path = tmp.join(".claude.json");
+        fs::write(
+            &config_path,
+            r#"{"mcpServers":{"vectorhawk":{"command":"/home/linuxbrew/.linuxbrew/Cellar/vectorhawk/1.0.65/bin/vectorhawk","args":["mcp","serve"]}}}"#,
+        )
+        .unwrap();
+
+        let repaired = with_fake_home(&tmp, || repair_stale_mcp_entries_in(&tmp, &tmp));
+        assert_eq!(
+            repaired,
+            vec!["Claude Code".to_string()],
+            "the stale Claude Code entry should be repaired"
+        );
+
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(
+            json["mcpServers"]["vectorhawk"]["command"],
+            expected_command(),
+            "command should be rewritten to the current stable path"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn repair_leaves_current_command_untouched() {
+        let tmp = temp_root("repair-current");
+        fs::create_dir_all(tmp.join(".claude")).unwrap();
+        let config_path = tmp.join(".claude.json");
+        let existing = serde_json::json!({
+            "mcpServers": {
+                "vectorhawk": {"command": expected_command(), "args": ["mcp", "serve"]}
+            }
+        });
+        fs::write(&config_path, serde_json::to_string(&existing).unwrap()).unwrap();
+
+        let repaired = with_fake_home(&tmp, || repair_stale_mcp_entries_in(&tmp, &tmp));
+        assert!(
+            repaired.is_empty(),
+            "an already-current command must not be rewritten"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn repair_is_idempotent() {
+        let tmp = temp_root("repair-idempotent");
+        fs::create_dir_all(tmp.join(".claude")).unwrap();
+        let config_path = tmp.join(".claude.json");
+        fs::write(
+            &config_path,
+            r#"{"mcpServers":{"vectorhawk":{"command":"/opt/homebrew/Cellar/vectorhawk/1.0.65/bin/vectorhawk","args":["mcp","serve"]}}}"#,
+        )
+        .unwrap();
+
+        let first = with_fake_home(&tmp, || repair_stale_mcp_entries_in(&tmp, &tmp));
+        assert_eq!(first, vec!["Claude Code".to_string()]);
+
+        let second = with_fake_home(&tmp, || repair_stale_mcp_entries_in(&tmp, &tmp));
+        assert!(
+            second.is_empty(),
+            "a second repair pass must be a no-op once the entry is stable"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn repair_preserves_other_entries_and_only_touches_vectorhawk() {
+        let tmp = temp_root("repair-preserves");
+        fs::create_dir_all(tmp.join(".claude")).unwrap();
+        let config_path = tmp.join(".claude.json");
+        fs::write(
+            &config_path,
+            r#"{"mcpServers":{"vectorhawk":{"command":"/opt/homebrew/Cellar/vectorhawk/1.0.65/bin/vectorhawk","args":["mcp","serve"]},"other-tool":{"command":"/does/not/exist/other","args":[]}}}"#,
+        )
+        .unwrap();
+
+        with_fake_home(&tmp, || repair_stale_mcp_entries_in(&tmp, &tmp));
+
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(
+            json["mcpServers"]["other-tool"]["command"], "/does/not/exist/other",
+            "unrelated MCP entries must never be touched by this repair pass"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn repair_skips_missing_config_files() {
+        let tmp = temp_root("repair-missing");
+        fs::create_dir_all(&tmp).unwrap();
+        // No client config files exist at all.
+        let repaired = with_fake_home(&tmp, || repair_stale_mcp_entries_in(&tmp, &tmp));
+        assert!(repaired.is_empty());
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // ── Codex CLI — TOML client ────────────────────────────────────────────────
+    // Codex writes to `~/.codex/config.toml` under `[mcp_servers.<name>]`,
+    // confirmed against openai/codex `codex-rs/config/src/{mcp_edit,mcp_types}.rs`
+    // — a top-level `mcp_servers` table of `{command, args}` stdio entries.
+    // All gated `#[cfg(feature = "daemon")]`: Codex detection itself only
+    // exists under that feature (needs `toml_edit`), same as the VS Code
+    // settings.json migration tests above.
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn detect_codex_when_dir_exists() {
+        let tmp = temp_root("detect-codex");
+        fs::create_dir_all(tmp.join(".codex")).unwrap();
+
+        let clients = detect_ai_clients_in(&tmp, &tmp);
+        let found = clients.iter().find(|c| c.name == "Codex");
+        assert!(found.is_some(), "Codex should be detected");
+        let found = found.unwrap();
+        assert_eq!(found.mcp_key, "mcp_servers");
+        assert_eq!(found.format, ConfigFormat::Toml);
+        assert_eq!(found.config_path, tmp.join(".codex").join("config.toml"));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn detect_codex_absent_when_dir_missing() {
+        let tmp = temp_root("detect-codex-absent");
+        fs::create_dir_all(&tmp).unwrap();
+
+        let clients = detect_ai_clients_in(&tmp, &tmp);
+        assert!(!clients.iter().any(|c| c.name == "Codex"));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn codex_write_creates_toml_entry_preserving_existing_content() {
+        let tmp = temp_root("codex-write");
+        let codex_dir = tmp.join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        let config_path = codex_dir.join("config.toml");
+        fs::write(
+            &config_path,
+            "model = \"gpt-5.1\"\n\n# Consider setting [mcp_servers] here!\n",
+        )
+        .unwrap();
+
+        let config = ClientConfig {
+            name: "Codex".to_string(),
+            config_path: config_path.clone(),
+            mcp_key: "mcp_servers".to_string(),
+            already_configured: false,
+            format: ConfigFormat::Toml,
+        };
+
+        with_fake_home(&tmp, || write_mcp_entry(&config)).expect("write should succeed");
+
+        let after = fs::read_to_string(&config_path).unwrap();
+        let doc: toml_edit::DocumentMut = after.parse().expect("output must be valid TOML");
+        assert_eq!(
+            doc["mcp_servers"]["vectorhawk"]["command"].as_str(),
+            Some(expected_command().as_str())
+        );
+        let args = doc["mcp_servers"]["vectorhawk"]["args"]
+            .as_array()
+            .expect("args must be an array");
+        assert_eq!(args.get(0).and_then(|v| v.as_str()), Some("mcp"));
+        assert_eq!(args.get(1).and_then(|v| v.as_str()), Some("serve"));
+
+        assert!(
+            after.contains("model = \"gpt-5.1\""),
+            "pre-existing top-level keys must survive: {after:?}"
+        );
+        assert!(
+            after.contains("# Consider setting [mcp_servers] here!"),
+            "comments must survive the format-preserving TOML edit: {after:?}"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn codex_write_into_fresh_file_creates_parent_dirs() {
+        let tmp = temp_root("codex-write-fresh");
+        let config_path = tmp.join(".codex").join("config.toml");
+        // Deliberately don't create ~/.codex — write_mcp_entry must create it.
+
+        let config = ClientConfig {
+            name: "Codex".to_string(),
+            config_path: config_path.clone(),
+            mcp_key: "mcp_servers".to_string(),
+            already_configured: false,
+            format: ConfigFormat::Toml,
+        };
+
+        with_fake_home(&tmp, || write_mcp_entry(&config)).expect("write should succeed");
+
+        let doc: toml_edit::DocumentMut = fs::read_to_string(&config_path)
+            .unwrap()
+            .parse()
+            .expect("output must be valid TOML");
+        assert_eq!(
+            doc["mcp_servers"]["vectorhawk"]["command"].as_str(),
+            Some(expected_command().as_str())
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn codex_already_configured_becomes_true_after_write() {
+        let tmp = temp_root("codex-idempotent");
+        fs::create_dir_all(tmp.join(".codex")).unwrap();
+
+        let before = with_fake_home(&tmp, || detect_ai_clients_in(&tmp, &tmp));
+        let codex_before = before.iter().find(|c| c.name == "Codex").unwrap();
+        assert!(
+            !codex_before.already_configured,
+            "must not be configured before the first write"
+        );
+
+        with_fake_home(&tmp, || write_mcp_entry(codex_before)).unwrap();
+
+        let after = with_fake_home(&tmp, || detect_ai_clients_in(&tmp, &tmp));
+        let codex_after = after.iter().find(|c| c.name == "Codex").unwrap();
+        assert!(
+            codex_after.already_configured,
+            "a second `mcp setup` run must see Codex as already configured"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn codex_remove_mcp_entry_removes_only_vectorhawk_table() {
+        let tmp = temp_root("codex-remove");
+        let codex_dir = tmp.join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        let config_path = codex_dir.join("config.toml");
+        fs::write(
+            &config_path,
+            "model = \"gpt-5.1\"\n\n[mcp_servers.other-tool]\ncommand = \"other\"\nargs = []\n\n[mcp_servers.vectorhawk]\ncommand = \"/opt/homebrew/bin/vectorhawk\"\nargs = [\"mcp\", \"serve\"]\n",
+        )
+        .unwrap();
+
+        let config = ClientConfig {
+            name: "Codex".to_string(),
+            config_path: config_path.clone(),
+            mcp_key: "mcp_servers".to_string(),
+            already_configured: true,
+            format: ConfigFormat::Toml,
+        };
+
+        let removed = remove_mcp_entry(&config).expect("remove should succeed");
+        assert!(removed);
+
+        let after = fs::read_to_string(&config_path).unwrap();
+        let doc: toml_edit::DocumentMut = after.parse().unwrap();
+        assert!(
+            doc["mcp_servers"].get("vectorhawk").is_none(),
+            "vectorhawk table must be gone: {after:?}"
+        );
+        assert_eq!(
+            doc["mcp_servers"]["other-tool"]["command"].as_str(),
+            Some("other"),
+            "the user's own server entry must survive"
+        );
+        assert!(
+            after.contains("model = \"gpt-5.1\""),
+            "unrelated top-level keys must survive"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn codex_remove_mcp_entry_is_noop_when_absent() {
+        let tmp = temp_root("codex-remove-noop");
+        let codex_dir = tmp.join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        let config_path = codex_dir.join("config.toml");
+        fs::write(&config_path, "model = \"gpt-5.1\"\n").unwrap();
+
+        let config = ClientConfig {
+            name: "Codex".to_string(),
+            config_path: config_path.clone(),
+            mcp_key: "mcp_servers".to_string(),
+            already_configured: false,
+            format: ConfigFormat::Toml,
+        };
+
+        let removed = remove_mcp_entry(&config).expect("remove should succeed");
+        assert!(!removed);
+        assert_eq!(
+            fs::read_to_string(&config_path).unwrap(),
+            "model = \"gpt-5.1\"\n"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // ── Codex — inline-table `mcp_servers` (review finding, Fix Round 1) ──────
+    // `mcp_servers = { foo = {...} }` is valid TOML and Codex reads it fine
+    // (`mcp_types.rs`'s `try_into::<BTreeMap<...>>()` doesn't care about the
+    // source table's syntax) — `as_table_mut()` alone doesn't see it (only
+    // matches `Item::Table`, not `Item::Value(Value::InlineTable)`), so the
+    // write/remove paths must use `as_table_like_mut()` instead.
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn codex_write_into_inline_table_mcp_servers_preserves_style_and_siblings() {
+        let tmp = temp_root("codex-write-inline");
+        let codex_dir = tmp.join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        let config_path = codex_dir.join("config.toml");
+        fs::write(
+            &config_path,
+            "model = \"gpt-5.1\"\nmcp_servers = { other-tool = { command = \"other\", args = [] } }\n",
+        )
+        .unwrap();
+
+        let config = ClientConfig {
+            name: "Codex".to_string(),
+            config_path: config_path.clone(),
+            mcp_key: "mcp_servers".to_string(),
+            already_configured: false,
+            format: ConfigFormat::Toml,
+        };
+
+        with_fake_home(&tmp, || write_mcp_entry(&config))
+            .expect("write must succeed against an inline-table mcp_servers");
+
+        let after = fs::read_to_string(&config_path).unwrap();
+        let doc: toml_edit::DocumentMut = after.parse().expect("output must be valid TOML");
+        assert_eq!(
+            doc["mcp_servers"]["vectorhawk"]["command"].as_str(),
+            Some(expected_command().as_str())
+        );
+        assert_eq!(
+            doc["mcp_servers"]["other-tool"]["command"].as_str(),
+            Some("other"),
+            "the user's other inline-table entry must survive: {after:?}"
+        );
+        assert!(
+            after.contains("model = \"gpt-5.1\""),
+            "unrelated top-level keys must survive: {after:?}"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn codex_already_configured_true_after_write_into_inline_table() {
+        // Idempotency (review finding covers "detection ... agree" too): a
+        // second `mcp setup` run against an inline-table config must see
+        // Codex as already configured, exactly like the standard-table case.
+        let tmp = temp_root("codex-inline-idempotent");
+        let codex_dir = tmp.join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        let config_path = codex_dir.join("config.toml");
+        fs::write(
+            &config_path,
+            "mcp_servers = { other-tool = { command = \"other\" } }\n",
+        )
+        .unwrap();
+
+        let config = ClientConfig {
+            name: "Codex".to_string(),
+            config_path: config_path.clone(),
+            mcp_key: "mcp_servers".to_string(),
+            already_configured: false,
+            format: ConfigFormat::Toml,
+        };
+        with_fake_home(&tmp, || write_mcp_entry(&config)).unwrap();
+
+        assert!(
+            is_vectorhawk_configured(&config_path, "mcp_servers", ConfigFormat::Toml),
+            "must detect vectorhawk as configured inside an inline mcp_servers table"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn codex_remove_mcp_entry_removes_from_inline_table_preserving_siblings() {
+        let tmp = temp_root("codex-remove-inline");
+        let codex_dir = tmp.join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        let config_path = codex_dir.join("config.toml");
+        fs::write(
+            &config_path,
+            "mcp_servers = { other-tool = { command = \"other\" }, vectorhawk = { command = \"/opt/homebrew/bin/vectorhawk\", args = [\"mcp\", \"serve\"] } }\n",
+        )
+        .unwrap();
+
+        let config = ClientConfig {
+            name: "Codex".to_string(),
+            config_path: config_path.clone(),
+            mcp_key: "mcp_servers".to_string(),
+            already_configured: true,
+            format: ConfigFormat::Toml,
+        };
+
+        let removed = remove_mcp_entry(&config).expect("remove must succeed against inline table");
+        assert!(removed);
+
+        let after = fs::read_to_string(&config_path).unwrap();
+        let doc: toml_edit::DocumentMut = after.parse().unwrap();
+        assert!(
+            doc["mcp_servers"].get("vectorhawk").is_none(),
+            "vectorhawk entry must be gone: {after:?}"
+        );
+        assert_eq!(
+            doc["mcp_servers"]["other-tool"]["command"].as_str(),
+            Some("other"),
+            "sibling inline-table entry must survive: {after:?}"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn repair_rewrites_stale_codex_command_in_inline_table() {
+        let tmp = temp_root("repair-codex-inline");
+        let codex_dir = tmp.join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        let config_path = codex_dir.join("config.toml");
+        fs::write(
+            &config_path,
+            "mcp_servers = { vectorhawk = { command = \"/opt/homebrew/Cellar/vectorhawk/1.0.65/bin/vectorhawk\", args = [\"mcp\", \"serve\"] } }\n",
+        )
+        .unwrap();
+
+        let repaired = with_fake_home(&tmp, || repair_stale_mcp_entries_in(&tmp, &tmp));
+        assert!(
+            repaired.contains(&"Codex".to_string()),
+            "stale Codex command inside an inline mcp_servers table should be repaired, got: {repaired:?}"
+        );
+
+        let doc: toml_edit::DocumentMut =
+            fs::read_to_string(&config_path).unwrap().parse().unwrap();
+        assert_eq!(
+            doc["mcp_servers"]["vectorhawk"]["command"].as_str(),
+            Some(expected_command().as_str())
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn codex_read_command_from_inline_table() {
+        // Documents/verifies that `read_vectorhawk_command`'s TOML path
+        // already handles inline tables via `Item::get`'s generic `Index`
+        // impl — no `as_table_like` needed on the read side, unlike write/
+        // remove. See the doc comment on `read_vectorhawk_command_toml`.
+        let tmp = temp_root("codex-read-inline");
+        fs::create_dir_all(&tmp).unwrap();
+        let config_path = tmp.join("config.toml");
+        fs::write(
+            &config_path,
+            "mcp_servers = { vectorhawk = { command = \"/opt/homebrew/bin/vectorhawk\" } }\n",
+        )
+        .unwrap();
+
+        let command = read_vectorhawk_command(&config_path, "mcp_servers", ConfigFormat::Toml);
+        assert_eq!(command.as_deref(), Some("/opt/homebrew/bin/vectorhawk"));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn codex_write_fails_gracefully_when_mcp_servers_is_not_a_table() {
+        // Genuinely non-table values must still fail — the fix widens what
+        // counts as "a table" (inline tables too), it doesn't make every
+        // value acceptable.
+        let tmp = temp_root("codex-write-not-a-table");
+        let codex_dir = tmp.join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        let config_path = codex_dir.join("config.toml");
+        fs::write(&config_path, "mcp_servers = 5\n").unwrap();
+
+        let config = ClientConfig {
+            name: "Codex".to_string(),
+            config_path: config_path.clone(),
+            mcp_key: "mcp_servers".to_string(),
+            already_configured: false,
+            format: ConfigFormat::Toml,
+        };
+
+        let err = with_fake_home(&tmp, || write_mcp_entry(&config))
+            .expect_err("a non-table mcp_servers value must still be rejected");
+        assert!(err.to_string().contains("isn't a table"), "got: {err:#}");
+        assert_eq!(
+            fs::read_to_string(&config_path).unwrap(),
+            "mcp_servers = 5\n",
+            "file must be left untouched on this error path"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn repair_rewrites_stale_codex_command() {
+        let tmp = temp_root("repair-codex");
+        let codex_dir = tmp.join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        let config_path = codex_dir.join("config.toml");
+        fs::write(
+            &config_path,
+            "[mcp_servers.vectorhawk]\ncommand = \"/opt/homebrew/Cellar/vectorhawk/1.0.65/bin/vectorhawk\"\nargs = [\"mcp\", \"serve\"]\n",
+        )
+        .unwrap();
+
+        let repaired = with_fake_home(&tmp, || repair_stale_mcp_entries_in(&tmp, &tmp));
+        assert!(
+            repaired.contains(&"Codex".to_string()),
+            "stale Codex TOML command should be repaired, got: {repaired:?}"
+        );
+
+        let doc: toml_edit::DocumentMut =
+            fs::read_to_string(&config_path).unwrap().parse().unwrap();
+        assert_eq!(
+            doc["mcp_servers"]["vectorhawk"]["command"].as_str(),
+            Some(expected_command().as_str())
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn record_config_edit_journal_backs_up_codex_toml_and_appends_entry() {
+        // Mirrors `record_config_edit_journal_backs_up_pre_existing_file_and_appends_entry`
+        // above, but for a TOML (Codex) client, so the restore-journal path
+        // that `vectorhawk uninstall` relies on is verified for TOML too.
+        let tmp = temp_root("journal-codex");
+        let config_path = tmp.join("config.toml");
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(&config_path, "model = \"gpt-5.1\"\n").unwrap();
+
+        let root_dir = camino::Utf8PathBuf::from_path_buf(tmp.join("vh-root")).unwrap();
+
+        let config = ClientConfig {
+            name: "Codex".to_string(),
+            config_path: config_path.clone(),
+            mcp_key: "mcp_servers".to_string(),
+            already_configured: false,
+            format: ConfigFormat::Toml,
+        };
+
+        record_config_edit_journal_in(&config, root_dir.clone());
+
+        let journal = journal_for(&root_dir);
+        let entries = journal.read_all().unwrap();
+        assert_eq!(entries.len(), 1);
+
+        let entry = &entries[0];
+        assert_eq!(entry.client.as_deref(), Some("Codex"));
+        assert_eq!(entry.detail["mcp_key"], "mcp_servers");
+        let backup_path = entry
+            .backup_path
+            .as_ref()
+            .expect("pre-existing file must be backed up");
+        assert_eq!(
+            fs::read_to_string(backup_path).unwrap(),
+            "model = \"gpt-5.1\"\n",
+            "backup must capture the pre-edit TOML content"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn detect_all_clients_including_codex_when_all_dirs_exist() {
+        let tmp = temp_root("detect-all-with-codex");
+        fs::create_dir_all(tmp.join(".claude")).unwrap();
+        fs::create_dir_all(tmp.join(".cursor")).unwrap();
+        fs::create_dir_all(tmp.join(".codeium").join("windsurf")).unwrap();
+        fs::create_dir_all(tmp.join(".gemini")).unwrap();
+        fs::create_dir_all(tmp.join(".codex")).unwrap();
+
+        let clients = detect_ai_clients_in(&tmp, &tmp);
+        let names: Vec<&str> = clients.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"Codex"), "got: {names:?}");
 
         let _ = fs::remove_dir_all(&tmp);
     }
@@ -1632,6 +3168,178 @@ mod tests {
             removed.is_empty(),
             "should return empty list when nothing installed"
         );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // ── read_all_mcp_entries (Shadow-AI discovery building block) ─────────────
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn read_all_mcp_entries_json_returns_every_server() {
+        let tmp = temp_root("read-all-json");
+        fs::create_dir_all(&tmp).unwrap();
+        let config_path = tmp.join("mcp.json");
+        fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "mcpServers": {
+                    "vectorhawk": {"command": "/opt/homebrew/bin/vectorhawk", "args": ["mcp", "serve"]},
+                    "github-mcp": {"command": "npx", "args": ["-y", "@github/mcp"], "env": {"GITHUB_TOKEN": "ghp_secret"}}
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let config = ClientConfig {
+            name: "Cursor".to_string(),
+            config_path,
+            mcp_key: "mcpServers".to_string(),
+            already_configured: true,
+            format: ConfigFormat::Json,
+        };
+
+        let mut entries = read_all_mcp_entries(&config);
+        entries.sort_by(|a, b| a.key.cmp(&b.key));
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].key, "github-mcp");
+        assert_eq!(entries[0].value["command"], "npx");
+        assert_eq!(entries[0].value["env"]["GITHUB_TOKEN"], "ghp_secret");
+        assert_eq!(entries[1].key, "vectorhawk");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn read_all_mcp_entries_toml_reads_codex_standard_table() {
+        let tmp = temp_root("read-all-toml-standard");
+        fs::create_dir_all(&tmp).unwrap();
+        let config_path = tmp.join("config.toml");
+        fs::write(
+            &config_path,
+            "model = \"gpt-5.1\"\n\n[mcp_servers.linear-mcp]\ncommand = \"npx\"\nargs = [\"-y\", \"linear-mcp\"]\n",
+        )
+        .unwrap();
+
+        let config = ClientConfig {
+            name: "Codex".to_string(),
+            config_path,
+            mcp_key: "mcp_servers".to_string(),
+            already_configured: false,
+            format: ConfigFormat::Toml,
+        };
+
+        let entries = read_all_mcp_entries(&config);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].key, "linear-mcp");
+        assert_eq!(entries[0].value["command"], "npx");
+        assert_eq!(entries[0].value["args"][0], "-y");
+        assert_eq!(entries[0].value["args"][1], "linear-mcp");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn read_all_mcp_entries_toml_reads_inline_table() {
+        let tmp = temp_root("read-all-toml-inline");
+        fs::create_dir_all(&tmp).unwrap();
+        let config_path = tmp.join("config.toml");
+        fs::write(
+            &config_path,
+            "mcp_servers = { notion-mcp = { command = \"npx\", args = [\"notion-mcp\"] } }\n",
+        )
+        .unwrap();
+
+        let config = ClientConfig {
+            name: "Codex".to_string(),
+            config_path,
+            mcp_key: "mcp_servers".to_string(),
+            already_configured: false,
+            format: ConfigFormat::Toml,
+        };
+
+        let entries = read_all_mcp_entries(&config);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].key, "notion-mcp");
+        assert_eq!(entries[0].value["command"], "npx");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn read_all_mcp_entries_returns_empty_when_file_missing() {
+        let tmp = temp_root("read-all-missing");
+        fs::create_dir_all(&tmp).unwrap();
+        let config = ClientConfig {
+            name: "Cursor".to_string(),
+            config_path: tmp.join("does-not-exist.json"),
+            mcp_key: "mcpServers".to_string(),
+            already_configured: false,
+            format: ConfigFormat::Json,
+        };
+
+        assert!(read_all_mcp_entries(&config).is_empty());
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn read_all_mcp_entries_returns_empty_when_key_absent() {
+        let tmp = temp_root("read-all-key-absent");
+        fs::create_dir_all(&tmp).unwrap();
+        let config_path = tmp.join("mcp.json");
+        fs::write(&config_path, r#"{"other":"stuff"}"#).unwrap();
+        let config = ClientConfig {
+            name: "Cursor".to_string(),
+            config_path,
+            mcp_key: "mcpServers".to_string(),
+            already_configured: false,
+            format: ConfigFormat::Json,
+        };
+
+        assert!(read_all_mcp_entries(&config).is_empty());
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// Review finding 5: a strict `serde_json` parse silently yields zero
+    /// servers on a JSONC file (comments + trailing comma) — a total
+    /// discovery blind spot for VS Code's `mcp.json` / Cursor's config,
+    /// which commonly carry both. `read_all_mcp_entries_json` must read
+    /// these leniently via `jsonc_parser::parse_to_serde_value` instead.
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn read_all_mcp_entries_json_tolerates_jsonc_comments_and_trailing_commas() {
+        let tmp = temp_root("read-all-jsonc");
+        fs::create_dir_all(&tmp).unwrap();
+        let config_path = tmp.join("mcp.json");
+        fs::write(
+            &config_path,
+            "{\n  // a user comment\n  \"servers\": {\n    \"linear-mcp\": {\"command\": \"npx\", \"args\": [\"-y\", \"linear-mcp\"]}, // trailing comment\n  },\n}\n",
+        )
+        .unwrap();
+
+        let config = ClientConfig {
+            name: "VS Code".to_string(),
+            config_path,
+            mcp_key: "servers".to_string(),
+            already_configured: false,
+            format: ConfigFormat::Json,
+        };
+
+        let entries = read_all_mcp_entries(&config);
+        assert_eq!(
+            entries.len(),
+            1,
+            "a commented JSONC config must not silently parse to zero servers"
+        );
+        assert_eq!(entries[0].key, "linear-mcp");
+        assert_eq!(entries[0].value["command"], "npx");
 
         let _ = fs::remove_dir_all(&tmp);
     }

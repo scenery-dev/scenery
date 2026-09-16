@@ -45,6 +45,13 @@
 //! - Registry sync loop: wraps `run_sync_tick` in `spawn_blocking`. This
 //!   function issues sync HTTP (`reqwest::blocking`) and sync SQLite calls.
 //!   Adding any new sync I/O to `run_sync_tick` is safe.
+//! - Discoveries scanner (`managed_paths::discoveries::run_once`): wraps its
+//!   skill/MCP collection step (`extra_roots()`, `detect_ai_clients()`, and
+//!   `collect_all_discoveries`) in `spawn_blocking`. Covers extra-root
+//!   directory walks, per-client `Path::exists()` checks, MCP config file
+//!   reads (JSON/JSONC/TOML), SHA-256 hashing, and the
+//!   `managed_path_markers` SQLite lookup — all sync I/O. Only the final
+//!   HTTP POST stays on the async executor (native `reqwest`, non-blocking).
 //! - Final audit flush on shutdown: wrapped in `spawn_blocking`.
 //!
 //! ## Startup (before accept loop)
@@ -318,6 +325,22 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
             ),
             Ok(_) => {}
             Err(e) => warn!(error = %e, "heal: active-skill self-heal failed (non-fatal)"),
+        }
+
+        // Self-heal: rewrite any `vectorhawk` MCP entry in a known AI-client
+        // config (~/.claude.json, Cursor, Windsurf, ...) whose `command` is a
+        // stale absolute path — either removed by a later `brew upgrade`, or
+        // a pre-efb7fe1 versioned Homebrew Cellar path — back to the current
+        // stable bin path. Covers machines upgraded headlessly over SSH,
+        // where the brew post_install `mcp setup` hook can't run (no
+        // D-Bus/desktop session) and a stale entry would otherwise never
+        // self-correct. Idempotent; only the `vectorhawk` entry is touched.
+        let repaired_mcp_clients = vectorhawkd_mcp::setup::repair_stale_mcp_entries();
+        if !repaired_mcp_clients.is_empty() {
+            info!(
+                clients = ?repaired_mcp_clients,
+                "heal: rewrote stale vectorhawk MCP command to the stable bin path"
+            );
         }
 
         // De-bloat: remove VectorHawk's own management command-skills
