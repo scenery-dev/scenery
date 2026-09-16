@@ -310,6 +310,124 @@ pub fn write_mcp_entry(config: &ClientConfig) -> Result<()> {
     }
 }
 
+/// Write `contents` to `path` atomically: write to a temp file in the same
+/// directory, then [`fs::rename`] it over `path`. `rename` within one
+/// filesystem is a single atomic directory-entry swap on both macOS and
+/// Linux — a crash, power loss, or full disk partway through leaves the temp
+/// file (or nothing at all) on disk and `path` byte-for-byte as it was
+/// before the call, never a truncated or half-written file.
+///
+/// This matters because `write_mcp_entry`/`remove_mcp_entry` now run
+/// unattended from the daemon-boot repair pass on every start, across every
+/// detected AI client, not just from an interactive `mcp setup` run — a
+/// crash mid-write used to be able to corrupt a live client config in place.
+///
+/// Preserves `path`'s existing Unix permissions on the replacement file when
+/// `path` already exists: `rename` onto an existing file adopts the new
+/// inode's mode, not the old one's, so without this a plain temp file's
+/// default `umask` mode would silently replace whatever mode the user's
+/// config file had.
+///
+/// On any failure (including the rename itself) the temp file is removed
+/// rather than left behind, and `path` is guaranteed untouched — the rename
+/// is the only step that can affect `path`, and it either fully applies or
+/// doesn't happen at all.
+/// Resolve `path` through any symlink — or chain of symlinks — it may be, to
+/// the real (non-symlink) path that should actually be written.
+///
+/// `fs::rename` does not follow a destination symlink: renaming onto a
+/// symlink unlinks the symlink itself and puts the new file in its place.
+/// [`atomic_write`] must never do that to a client config someone manages as
+/// a symlink (a common dotfiles-repo pattern for VS Code/Cursor configs) —
+/// it must write *through* the link, exactly like the plain `fs::write` this
+/// replaced did, and leave the symlink pointing at the (now updated) real
+/// file.
+///
+/// Each hop's target is resolved relative to the *link's own* directory
+/// (POSIX symlink semantics — a relative target is not relative to the
+/// caller's cwd). Follows an arbitrary chain (link → link → file) until it
+/// reaches something that either isn't a symlink or doesn't exist at all —
+/// the latter covers both "never existed" and "dangling symlink": either
+/// way, that not-a-symlink path is exactly where the real content belongs,
+/// so the eventual link(s) start resolving to real data instead of staying
+/// broken or losing the write. A cycle (a link that eventually points back
+/// to itself) bails out at the repeated path rather than looping forever.
+fn resolve_symlink_target(path: &std::path::Path) -> PathBuf {
+    let mut current = path.to_path_buf();
+    let mut seen = std::collections::HashSet::new();
+    loop {
+        let Ok(meta) = fs::symlink_metadata(&current) else {
+            // Nothing at `current` at all — either `path` never existed, or
+            // this is the dangling end of a symlink chain. Either way, this
+            // is where the real file belongs.
+            return current;
+        };
+        if !meta.file_type().is_symlink() {
+            return current;
+        }
+        if !seen.insert(current.clone()) {
+            // Symlink cycle — give up resolving further and write at the
+            // link itself rather than loop forever.
+            return current;
+        }
+        let Ok(target) = fs::read_link(&current) else {
+            return current;
+        };
+        current = if target.is_absolute() {
+            target
+        } else {
+            current.parent().map(|p| p.join(&target)).unwrap_or(target)
+        };
+    }
+}
+
+fn atomic_write(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    // Write through any symlink to the real file, not over the link itself
+    // — see `resolve_symlink_target`'s doc comment.
+    let real_path = resolve_symlink_target(path);
+
+    let parent = real_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    // A dangling symlink can point into a directory that doesn't exist yet
+    // (e.g. a fresh dotfiles checkout); create it so the write below can
+    // still land there rather than failing.
+    fs::create_dir_all(parent)?;
+    let file_name = real_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("config");
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp_path = parent.join(format!(
+        ".{file_name}.vh-tmp-{}-{unique}",
+        std::process::id()
+    ));
+
+    fs::write(&tmp_path, contents)?;
+
+    // Preserve the resolved file's own permissions (not the symlink's —
+    // symlink permissions are meaningless on the platforms this runs on).
+    #[cfg(unix)]
+    if let Ok(meta) = fs::metadata(&real_path) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(
+            &tmp_path,
+            fs::Permissions::from_mode(meta.permissions().mode()),
+        );
+    }
+
+    match fs::rename(&tmp_path, &real_path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = fs::remove_file(&tmp_path);
+            Err(e)
+        }
+    }
+}
+
 fn write_mcp_entry_json(config: &ClientConfig) -> Result<()> {
     let existing: serde_json::Value = if config.config_path.exists() {
         let text = fs::read_to_string(&config.config_path)?;
@@ -341,7 +459,7 @@ fn write_mcp_entry_json(config: &ClientConfig) -> Result<()> {
     record_config_edit_journal(config);
 
     let output = serde_json::to_string_pretty(&serde_json::Value::Object(obj))?;
-    fs::write(&config.config_path, output)?;
+    atomic_write(&config.config_path, &output)?;
     Ok(())
 }
 
@@ -415,7 +533,7 @@ fn write_mcp_entry_toml(config: &ClientConfig) -> Result<()> {
     // Same journal-before-write ordering as the JSON path.
     record_config_edit_journal(config);
 
-    fs::write(&config.config_path, doc.to_string())?;
+    atomic_write(&config.config_path, &doc.to_string())?;
     Ok(())
 }
 
@@ -549,7 +667,7 @@ fn remove_mcp_entry_json(config: &ClientConfig) -> Result<bool> {
 
     if removed {
         let output = serde_json::to_string_pretty(&serde_json::Value::Object(obj))?;
-        fs::write(&config.config_path, output)?;
+        atomic_write(&config.config_path, &output)?;
     }
 
     Ok(removed)
@@ -581,7 +699,7 @@ fn remove_mcp_entry_toml(config: &ClientConfig) -> Result<bool> {
     let removed = servers.remove(MCP_SERVER_NAME).is_some();
 
     if removed {
-        fs::write(&config.config_path, doc.to_string())?;
+        atomic_write(&config.config_path, &doc.to_string())?;
     }
     Ok(removed)
 }
@@ -1309,6 +1427,39 @@ fn repair_stale_mcp_entries_in(
     #[cfg(feature = "daemon")]
     if migrate_stale_vscode_settings_entry(home) {
         repaired.push("VS Code (settings.json cleanup)".to_string());
+
+        // The per-client loop above only rewrites an entry that already
+        // exists at `client.config_path` (`mcp.json`) — it never creates one.
+        // An existing VS Code user configured by a pre-fix build only ever
+        // had the entry in `settings.json`, which the migration above just
+        // deleted, so without this they'd be left with no VectorHawk MCP
+        // entry anywhere. Write the working entry at the real location
+        // through the same journaled `write_mcp_entry` path fresh installs
+        // and the per-client repair loop use — never a second hand-rolled
+        // writer. Gated on the migration actually having found (and
+        // removed) a legacy entry: if there was no legacy entry, any
+        // missing `mcp.json` entry is either already handled by the loop
+        // above or was deliberately removed by the user, and must not be
+        // silently recreated here.
+        if let Some(vscode_config) = vscode_mcp_json_path(home) {
+            let config = ClientConfig {
+                name: "VS Code".to_string(),
+                config_path: vscode_config,
+                mcp_key: "servers".to_string(),
+                already_configured: false,
+                format: ConfigFormat::Json,
+            };
+            match write_mcp_entry(&config) {
+                Ok(()) => repaired.push("VS Code (mcp.json)".to_string()),
+                Err(e) => {
+                    tracing::warn!(
+                        path = %config.config_path.display(),
+                        error = %e,
+                        "heal: failed to write vectorhawk MCP entry to mcp.json after settings.json migration"
+                    );
+                }
+            }
+        }
     }
 
     repaired
@@ -1390,7 +1541,7 @@ fn migrate_stale_vscode_settings_entry(home: &std::path::Path) -> bool {
     // `"vectorhawk": {...}` property (and its now-dangling comma, if any)
     // is excised.
     vectorhawk_prop.remove();
-    fs::write(&settings_path, root.to_string()).is_ok()
+    atomic_write(&settings_path, &root.to_string()).is_ok()
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
@@ -1566,6 +1717,341 @@ mod tests {
             expected_command()
         );
         assert_eq!(json["mcpServers"]["other-tool"]["command"], "other");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // ── atomic_write ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn atomic_write_creates_and_replaces_file_content() {
+        let tmp = temp_root("atomic-basic");
+        fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("target.json");
+
+        atomic_write(&path, "first").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "first");
+
+        atomic_write(&path, "second, and longer than the first value").unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "second, and longer than the first value"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn atomic_write_leaves_no_stray_temp_file_after_success() {
+        let tmp = temp_root("atomic-cleanup");
+        fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("target.json");
+
+        atomic_write(&path, "content").unwrap();
+
+        let entries: Vec<_> = fs::read_dir(&tmp)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            entries,
+            vec!["target.json".to_string()],
+            "only the final file should remain, no leftover .vh-tmp- file: {entries:?}"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_preserves_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = temp_root("atomic-perms");
+        fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("target.json");
+        fs::write(&path, "original").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        atomic_write(&path, "replacement").unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "replacement file should keep the original mode"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// Simulates a failure partway through the write: the rename step fails
+    /// (here, because the target path is itself a directory, so no regular
+    /// file can ever be renamed onto it) and the on-disk target must come
+    /// through completely untouched, with no half-written temp file left
+    /// behind masquerading as — or corrupting — the real config.
+    #[test]
+    fn atomic_write_leaves_target_untouched_when_rename_fails() {
+        let tmp = temp_root("atomic-fail");
+        fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("target.json");
+        fs::create_dir_all(&path).unwrap();
+
+        let result = atomic_write(&path, "new content");
+        assert!(result.is_err(), "rename onto a directory should fail");
+        assert!(path.is_dir(), "target must be left exactly as it was");
+
+        let leftovers: Vec<_> = fs::read_dir(&tmp)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".vh-tmp-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp file must be cleaned up after a failed rename, found: {leftovers:?}"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// A config file managed as a symlink (a common dotfiles-repo pattern for
+    /// VS Code/Cursor configs) must stay a symlink after a write — `rename`
+    /// does not follow a destination symlink, so writing naively onto the
+    /// link path would silently replace the link with a plain file and
+    /// disconnect it from whatever it used to point at.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_through_a_symlink_updates_the_real_file_and_keeps_the_link() {
+        let tmp = temp_root("atomic-symlink");
+        fs::create_dir_all(&tmp).unwrap();
+        let real_dir = tmp.join("dotfiles");
+        fs::create_dir_all(&real_dir).unwrap();
+        let real_file = real_dir.join("mcp.json");
+        fs::write(&real_file, "original").unwrap();
+
+        let link_path = tmp.join("mcp.json");
+        std::os::unix::fs::symlink(&real_file, &link_path).unwrap();
+
+        atomic_write(&link_path, "updated").unwrap();
+
+        assert!(
+            fs::symlink_metadata(&link_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link path must still be a symlink after the write"
+        );
+        assert_eq!(
+            fs::read_link(&link_path).unwrap(),
+            real_file,
+            "the symlink must still point at the same real file"
+        );
+        assert_eq!(
+            fs::read_to_string(&real_file).unwrap(),
+            "updated",
+            "the real file behind the link must have the new content"
+        );
+        assert_eq!(
+            fs::read_to_string(&link_path).unwrap(),
+            "updated",
+            "reading through the link must see the new content too"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// A chain of symlinks (link → link → file) resolves all the way through
+    /// to the real file, and every link in the chain survives unchanged.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_follows_a_symlink_chain() {
+        let tmp = temp_root("atomic-symlink-chain");
+        fs::create_dir_all(&tmp).unwrap();
+        let real_file = tmp.join("real.json");
+        fs::write(&real_file, "original").unwrap();
+
+        let link1 = tmp.join("link1.json");
+        std::os::unix::fs::symlink(&real_file, &link1).unwrap();
+        let link2 = tmp.join("link2.json");
+        std::os::unix::fs::symlink(&link1, &link2).unwrap();
+
+        atomic_write(&link2, "updated via chain").unwrap();
+
+        assert!(fs::symlink_metadata(&link2)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(fs::symlink_metadata(&link1)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read_link(&link2).unwrap(), link1);
+        assert_eq!(fs::read_link(&link1).unwrap(), real_file);
+        assert_eq!(fs::read_to_string(&real_file).unwrap(), "updated via chain");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// A dangling symlink (points at a path that doesn't exist yet) must not
+    /// lose the write: the target it names gets created with the new
+    /// content, and the symlink itself is left alone — it now simply
+    /// resolves to real data instead of staying broken.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_through_a_dangling_symlink_creates_the_named_target() {
+        let tmp = temp_root("atomic-symlink-dangling");
+        fs::create_dir_all(&tmp).unwrap();
+        let target = tmp.join("not-created-yet.json");
+        let link_path = tmp.join("mcp.json");
+        std::os::unix::fs::symlink(&target, &link_path).unwrap();
+        assert!(!target.exists());
+
+        atomic_write(&link_path, "fresh content").unwrap();
+
+        assert!(
+            fs::symlink_metadata(&link_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the dangling symlink itself must not be replaced"
+        );
+        assert_eq!(fs::read_link(&link_path).unwrap(), target);
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "fresh content",
+            "the named target should now exist with the write's content"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// A dangling symlink whose named directory doesn't exist yet either
+    /// (deeper than just the leaf file) must still not lose data — the
+    /// directory gets created so the target can be written.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_through_a_dangling_symlink_creates_missing_parent_dir() {
+        let tmp = temp_root("atomic-symlink-dangling-dir");
+        fs::create_dir_all(&tmp).unwrap();
+        let target = tmp.join("not-yet-a-dir").join("mcp.json");
+        let link_path = tmp.join("mcp.json");
+        std::os::unix::fs::symlink(&target, &link_path).unwrap();
+
+        atomic_write(&link_path, "content").unwrap();
+
+        assert_eq!(fs::read_to_string(&target).unwrap(), "content");
+        assert!(fs::symlink_metadata(&link_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// Regular (non-symlink) files behave exactly as before: the write lands
+    /// directly on the given path.
+    #[test]
+    fn atomic_write_regular_file_is_unaffected_by_symlink_handling() {
+        let tmp = temp_root("atomic-regular");
+        fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("plain.json");
+        fs::write(&path, "original").unwrap();
+
+        atomic_write(&path, "updated").unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "updated");
+        #[cfg(unix)]
+        assert!(!fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// End-to-end through `write_mcp_entry`: a symlinked client config keeps
+    /// working as a symlink across the daemon-boot repair path, not just the
+    /// low-level `atomic_write` helper.
+    #[cfg(unix)]
+    #[test]
+    fn write_mcp_entry_through_a_symlinked_config_keeps_the_symlink() {
+        let tmp = temp_root("write-mcp-entry-symlink");
+        fs::create_dir_all(&tmp).unwrap();
+        let real_dir = tmp.join("dotfiles");
+        fs::create_dir_all(&real_dir).unwrap();
+        let real_file = real_dir.join("claude.json");
+        fs::write(
+            &real_file,
+            r#"{"mcpServers":{"other":{"command":"other"}}}"#,
+        )
+        .unwrap();
+
+        let link_path = tmp.join("claude.json");
+        std::os::unix::fs::symlink(&real_file, &link_path).unwrap();
+
+        let config = ClientConfig {
+            name: "Test".to_string(),
+            config_path: link_path.clone(),
+            mcp_key: "mcpServers".to_string(),
+            already_configured: false,
+            format: ConfigFormat::Json,
+        };
+        with_fake_home(&tmp, || write_mcp_entry(&config)).expect("write should succeed");
+
+        assert!(
+            fs::symlink_metadata(&link_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "config_path must still be a symlink after write_mcp_entry"
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&real_file).unwrap()).unwrap();
+        assert_eq!(
+            json["mcpServers"]["vectorhawk"]["command"],
+            expected_command()
+        );
+        assert_eq!(json["mcpServers"]["other"]["command"], "other");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// A stray, never-renamed temp file left behind by a prior crashed write
+    /// (same naming scheme `atomic_write` uses) must be inert: subsequent
+    /// reads/writes go through `config_path` only, never accidentally pick
+    /// up the leftover temp file as if it were the real config.
+    #[test]
+    fn write_mcp_entry_survives_stray_temp_file_from_a_prior_crash() {
+        let tmp = temp_root("atomic-crash-recovery");
+        fs::create_dir_all(&tmp).unwrap();
+        let config_path = tmp.join("claude.json");
+        fs::write(
+            &config_path,
+            r#"{"mcpServers":{"other":{"command":"other"}}}"#,
+        )
+        .unwrap();
+
+        // Simulate a crash between the temp-file write and the rename in a
+        // prior run: an incomplete temp file left in the same directory.
+        let stray = tmp.join(".claude.json.vh-tmp-99999-123456789");
+        fs::write(&stray, "{ not valid json, truncated mid-wr").unwrap();
+
+        let config = ClientConfig {
+            name: "Test".to_string(),
+            config_path: config_path.clone(),
+            mcp_key: "mcpServers".to_string(),
+            already_configured: false,
+            format: ConfigFormat::Json,
+        };
+        with_fake_home(&tmp, || write_mcp_entry(&config)).expect("write should succeed");
+
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(
+            json["mcpServers"]["vectorhawk"]["command"],
+            expected_command()
+        );
+        assert_eq!(json["mcpServers"]["other"]["command"], "other");
 
         let _ = fs::remove_dir_all(&tmp);
     }
@@ -2207,6 +2693,10 @@ mod tests {
             r#"{"mcpServers": {"vectorhawk": {"command": "vectorhawk", "args": ["mcp", "serve"]}}}"#,
         )
         .unwrap();
+        // No mcp.json yet — this is the pre-fix-build state: the user only
+        // ever had the (non-functional) entry in settings.json.
+        let mcp_json_path = vscode_mcp_json_path(&tmp).unwrap();
+        assert!(!mcp_json_path.exists());
 
         let repaired = with_fake_home(&tmp, || repair_stale_mcp_entries_in(&tmp, &tmp));
         assert!(
@@ -2214,9 +2704,52 @@ mod tests {
             "repair pass should report the settings.json migration, got: {repaired:?}"
         );
 
-        let json: serde_json::Value =
+        // The stale legacy entry is gone from settings.json...
+        let settings_json: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
-        assert!(json["mcpServers"].get("vectorhawk").is_none());
+        assert!(settings_json["mcpServers"].get("vectorhawk").is_none());
+
+        // ...and the working entry now exists at the location VS Code
+        // actually reads, written through the normal journaled path.
+        assert!(
+            mcp_json_path.exists(),
+            "mcp.json should be created with the vectorhawk entry"
+        );
+        let mcp_json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&mcp_json_path).unwrap()).unwrap();
+        assert_eq!(
+            mcp_json["servers"]["vectorhawk"]["command"],
+            expected_command()
+        );
+        assert_eq!(mcp_json["servers"]["vectorhawk"]["type"], "stdio");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn repair_does_not_create_mcp_json_when_no_legacy_entry_existed() {
+        let tmp = temp_root("repair-no-legacy");
+        let vscode_dir = vscode_user_dir(&tmp).unwrap();
+        fs::create_dir_all(&vscode_dir).unwrap();
+        // settings.json exists but has no stale vectorhawk entry, and
+        // mcp.json doesn't exist at all — nothing for the migration to do,
+        // and nothing should be created (covers both a user who never
+        // configured VS Code and one who deliberately removed the entry).
+        let settings_path = vscode_settings_path(&tmp).unwrap();
+        fs::write(&settings_path, r#"{"editor.fontSize": 14}"#).unwrap();
+        let mcp_json_path = vscode_mcp_json_path(&tmp).unwrap();
+        assert!(!mcp_json_path.exists());
+
+        let repaired = with_fake_home(&tmp, || repair_stale_mcp_entries_in(&tmp, &tmp));
+        assert!(
+            !repaired.iter().any(|c| c.contains("VS Code")),
+            "no VS Code migration/write should have happened, got: {repaired:?}"
+        );
+        assert!(
+            !mcp_json_path.exists(),
+            "mcp.json must not be created when no legacy entry ever existed"
+        );
 
         let _ = fs::remove_dir_all(&tmp);
     }
