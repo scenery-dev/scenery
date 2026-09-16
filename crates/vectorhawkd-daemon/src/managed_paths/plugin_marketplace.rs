@@ -28,7 +28,7 @@
 use anyhow::{Context, Result};
 use fs2::FileExt;
 use serde_json::{json, Map, Value};
-use std::{fs, path::Path, path::PathBuf};
+use std::{collections::HashMap, fs, path::Path, path::PathBuf};
 use tracing::{debug, info};
 
 /// Marketplace name (the `@<marketplace>` suffix Claude Code uses).
@@ -127,6 +127,49 @@ pub fn install_plugin_bundle(bundle: &PluginBundle) -> Result<()> {
         "plugin_marketplace: installed plugin into vectorhawk marketplace"
     );
     Ok(())
+}
+
+/// List governed plugins currently recorded in `installed_plugins.json`,
+/// scoped to entries registered under the `vectorhawk` marketplace (keys of
+/// shape `<slug>@vectorhawk`). Returns `plugin_slug -> version`.
+///
+/// This is the local-state side of the RB1 snapshot reconcile (see
+/// `sync::reconciler::build_derived_plugin_events_blocking`) — the daemon has
+/// no separate SQLite table for plugin installs (unlike `mcp_installations`),
+/// so `installed_plugins.json` itself is the durable local record.
+///
+/// Deliberately excludes every other marketplace's entries: a plugin the user
+/// installed manually via `claude plugin install` (or from any marketplace
+/// other than ours) must never be treated as a governed install — the
+/// snapshot reconciler's orphan-removal only ever acts on what this returns,
+/// so a non-governed plugin can never be deleted by convergence.
+pub fn list_governed_plugins() -> Result<HashMap<String, String>> {
+    if reconciler_disabled() {
+        return Ok(HashMap::new());
+    }
+    let home = home()?;
+    let path = plugins_dir(&home).join("installed_plugins.json");
+    let Some(root) = read_json(&path) else {
+        return Ok(HashMap::new());
+    };
+    let suffix = format!("@{MARKETPLACE_NAME}");
+    let mut out = HashMap::new();
+    if let Some(plugins) = root.get("plugins").and_then(Value::as_object) {
+        for (key, entries) in plugins {
+            let Some(slug) = key.strip_suffix(suffix.as_str()) else {
+                continue;
+            };
+            let version = entries
+                .as_array()
+                .and_then(|arr| arr.first())
+                .and_then(|e| e.get("version"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            out.insert(slug.to_string(), version);
+        }
+    }
+    Ok(out)
 }
 
 /// Remove a governed plugin from the marketplace, cache, and Claude Code
