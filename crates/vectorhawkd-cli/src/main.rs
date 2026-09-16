@@ -4501,6 +4501,49 @@ async fn cmd_plugin_install(
 
 // ── mcp setup ────────────────────────────────────────────────────────────────
 
+/// Outcome of attempting to configure one AI client during `mcp setup --auto`.
+#[derive(Debug, PartialEq)]
+enum ClientOutcome {
+    AlreadyConfigured,
+    Wrote,
+    /// Carries the formatted error message (`format!("{e:#}")`) rather than
+    /// the `anyhow::Error` itself so this stays `PartialEq`/cheaply testable.
+    Failed(String),
+}
+
+/// Attempt to write the VectorHawk MCP entry into every client in `clients`,
+/// in order, via the injected `write` closure (`write_mcp_entry` in
+/// production; a stub in tests, so this control flow is unit-testable
+/// without touching the filesystem).
+///
+/// Critically, one client's failure is recorded as `ClientOutcome::Failed`
+/// and does **not** abort the loop — every other client still gets its
+/// chance to be configured. (Review finding: the previous `?`-propagating
+/// version aborted the whole `mcp setup` run on the first failing client,
+/// e.g. a Codex `config.toml` with a `mcp_servers` value that isn't a table,
+/// leaving every client after it in iteration order unconfigured too.)
+///
+/// Returns one outcome per input client, same order, for the caller to print
+/// and to decide the process exit code from.
+fn write_all_client_entries(
+    clients: &[vectorhawkd_mcp::setup::ClientConfig],
+    mut write: impl FnMut(&vectorhawkd_mcp::setup::ClientConfig) -> Result<()>,
+) -> Vec<ClientOutcome> {
+    clients
+        .iter()
+        .map(|config| {
+            if config.already_configured {
+                ClientOutcome::AlreadyConfigured
+            } else {
+                match write(config) {
+                    Ok(()) => ClientOutcome::Wrote,
+                    Err(e) => ClientOutcome::Failed(format!("{e:#}")),
+                }
+            }
+        })
+        .collect()
+}
+
 async fn cmd_mcp_setup(client: Option<&str>, dry_run: bool) -> Result<()> {
     use vectorhawkd_mcp::setup::{
         build_mcp_entry, detect_ai_clients, detect_claude_code, uninstall_claude_skills,
@@ -4561,31 +4604,44 @@ async fn cmd_mcp_setup(client: Option<&str>, dry_run: bool) -> Result<()> {
         if clients.is_empty() {
             anyhow::bail!(
                 "No supported AI clients detected. \
-                 Install Claude Code, Cursor, Windsurf, VS Code, Gemini CLI, or \
+                 Install Claude Code, Cursor, Windsurf, VS Code, Gemini CLI, Codex CLI, or \
                  Claude Desktop first, or use --dry-run to preview the entry."
             );
         }
 
-        let mut wrote_claude_code = false;
-        for config in &clients {
-            if config.already_configured {
-                println!("{}: vectorhawk already configured — skipped.", config.name);
-                continue;
-            }
+        let outcomes = write_all_client_entries(&clients, |config| {
             write_mcp_entry(config).with_context(|| {
                 format!(
                     "failed to write {} config at {}",
                     config.name,
                     config.config_path.display()
                 )
-            })?;
-            println!(
-                "{}: wrote vectorhawk MCP entry to {}.",
-                config.name,
-                config.config_path.display()
-            );
-            if config.name == "Claude Code" {
-                wrote_claude_code = true;
+            })
+        });
+
+        let mut wrote_claude_code = false;
+        let mut had_error = false;
+        for (config, outcome) in clients.iter().zip(outcomes.iter()) {
+            match outcome {
+                ClientOutcome::AlreadyConfigured => {
+                    println!("{}: vectorhawk already configured — skipped.", config.name);
+                }
+                ClientOutcome::Wrote => {
+                    println!(
+                        "{}: wrote vectorhawk MCP entry to {}.",
+                        config.name,
+                        config.config_path.display()
+                    );
+                    if config.name == "Claude Code" {
+                        wrote_claude_code = true;
+                    }
+                }
+                ClientOutcome::Failed(msg) => {
+                    // Reported, not propagated — the rest of `clients` still
+                    // gets configured below; see `write_all_client_entries`.
+                    eprintln!("warning: {msg}");
+                    had_error = true;
+                }
             }
         }
 
@@ -4608,6 +4664,10 @@ async fn cmd_mcp_setup(client: Option<&str>, dry_run: bool) -> Result<()> {
                     eprintln!("warning: failed to remove command-skills: {e:#}");
                 }
             }
+        }
+
+        if had_error {
+            anyhow::bail!("one or more AI clients could not be configured — see warnings above");
         }
 
         return Ok(());

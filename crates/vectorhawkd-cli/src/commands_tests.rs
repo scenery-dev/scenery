@@ -373,6 +373,107 @@ fn decide_update_action_upgrades_on_patch_bump() {
     );
 }
 
+// ── write_all_client_entries unit tests ────────────────────────────────────────
+// Review finding (S4 fix round 1): `cmd_mcp_setup`'s per-client loop used to
+// propagate the first client's `write_mcp_entry` error with `?`, aborting the
+// whole `mcp setup` run and leaving every client after it in iteration order
+// unconfigured — e.g. one Codex user's malformed `config.toml` blocked Claude
+// Code/Cursor/etc. from getting configured too. `write_all_client_entries` is
+// the extracted, injectable-`write` control flow so that's testable without
+// touching the filesystem or spinning up the daemon `cmd_mcp_setup` needs.
+
+fn fake_client(name: &str) -> vectorhawkd_mcp::setup::ClientConfig {
+    vectorhawkd_mcp::setup::ClientConfig {
+        name: name.to_string(),
+        config_path: std::path::PathBuf::from(format!("/fake/{name}/config")),
+        mcp_key: "mcpServers".to_string(),
+        already_configured: false,
+        format: vectorhawkd_mcp::setup::ConfigFormat::Json,
+    }
+}
+
+fn fake_client_already_configured(name: &str) -> vectorhawkd_mcp::setup::ClientConfig {
+    vectorhawkd_mcp::setup::ClientConfig {
+        already_configured: true,
+        ..fake_client(name)
+    }
+}
+
+#[test]
+fn write_all_client_entries_reports_already_configured_without_calling_write() {
+    let clients = vec![fake_client_already_configured("A")];
+    let mut calls = 0;
+    let outcomes = super::write_all_client_entries(&clients, |_| {
+        calls += 1;
+        Ok(())
+    });
+    assert_eq!(outcomes, vec![super::ClientOutcome::AlreadyConfigured]);
+    assert_eq!(
+        calls, 0,
+        "already-configured clients must not be re-written"
+    );
+}
+
+#[test]
+fn write_all_client_entries_all_succeed() {
+    let clients = vec![fake_client("A"), fake_client("B"), fake_client("C")];
+    let outcomes = super::write_all_client_entries(&clients, |_| Ok(()));
+    assert_eq!(
+        outcomes,
+        vec![
+            super::ClientOutcome::Wrote,
+            super::ClientOutcome::Wrote,
+            super::ClientOutcome::Wrote,
+        ]
+    );
+}
+
+#[test]
+fn write_all_client_entries_one_failure_does_not_abort_the_rest() {
+    // The exact bug from the review finding: client B's write fails (think:
+    // a Codex config.toml with `mcp_servers` set to a non-table value). A
+    // and C — every other client — must still be attempted and succeed.
+    let clients = vec![fake_client("A"), fake_client("B"), fake_client("C")];
+    let outcomes = super::write_all_client_entries(&clients, |c| {
+        if c.name == "B" {
+            anyhow::bail!(
+                "config.toml already has a top-level `mcp_servers` key that isn't a table"
+            );
+        }
+        Ok(())
+    });
+    assert_eq!(outcomes.len(), 3);
+    assert_eq!(
+        outcomes[0],
+        super::ClientOutcome::Wrote,
+        "A must still succeed"
+    );
+    assert!(
+        matches!(&outcomes[1], super::ClientOutcome::Failed(msg) if msg.contains("isn't a table")),
+        "B's failure must be captured, not propagated: {:?}",
+        outcomes[1]
+    );
+    assert_eq!(
+        outcomes[2],
+        super::ClientOutcome::Wrote,
+        "C must still be attempted and succeed even though B failed"
+    );
+}
+
+#[test]
+fn write_all_client_entries_multiple_failures_all_captured() {
+    let clients = vec![fake_client("A"), fake_client("B"), fake_client("C")];
+    let outcomes = super::write_all_client_entries(&clients, |c| {
+        if c.name == "A" || c.name == "C" {
+            anyhow::bail!("boom: {}", c.name);
+        }
+        Ok(())
+    });
+    assert!(matches!(&outcomes[0], super::ClientOutcome::Failed(m) if m.contains("boom: A")));
+    assert_eq!(outcomes[1], super::ClientOutcome::Wrote);
+    assert!(matches!(&outcomes[2], super::ClientOutcome::Failed(m) if m.contains("boom: C")));
+}
+
 // ── auth subcommands ──────────────────────────────────────────────────────────
 
 #[test]
