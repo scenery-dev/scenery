@@ -1,7 +1,16 @@
 //! macOS LaunchAgent install/uninstall for the VectorHawk daemon.
 //!
-//! Plist path: `~/Library/LaunchAgents/com.vectorhawk.agent.plist`
-//! Log dir:    `~/Library/Logs/VectorHawk/`
+//! Plist path:   `~/Library/LaunchAgents/com.vectorhawk.agent.plist`
+//! Crash log:    `~/Library/Logs/VectorHawk/stderr.log` (StandardErrorPath —
+//!               launchd does NOT rotate this, so it carries panic/early-
+//!               startup output only, never the durable daemon log)
+//! Durable log:  `~/Library/Application Support/VectorHawk/logs/vectorhawkd.log`
+//!               — INFO-level tracing output, written by an in-process
+//!               size-bounded rotating appender (see
+//!               `crates/vectorhawkd-cli/src/logging.rs`), ~50 MB total cap.
+//!               `StandardOutPath` is intentionally NOT set: tracing no
+//!               longer writes to stdout, and launchd would otherwise leave
+//!               an unbounded, always-empty file behind.
 //!
 //! Install sequence:
 //! 1. Write plist with the current binary path.
@@ -55,15 +64,20 @@ fn domain_target(uid: u32) -> String {
 }
 
 /// Generate the LaunchAgent plist XML from the given binary path and log dir.
+///
+/// `RUST_LOG=info` turns on INFO-level daemon logging by default (D1 board
+/// card — override-able by re-running with a different `RUST_LOG` in the
+/// environment before `daemon install`, or by editing the plist). The
+/// durable log destination is NOT `StandardOutPath`/`StandardErrorPath`:
+/// `vectorhawk daemon run` initializes its own size-bounded rotating file
+/// appender under the state directory (see `logging.rs`), so `StandardOutPath`
+/// is omitted entirely (nothing writes to stdout) and `StandardErrorPath`
+/// carries only panic/early-startup crash output — launchd doesn't rotate
+/// it, but crashes are rare relative to INFO-volume logging.
 fn render_plist(bin_path: &std::path::Path, log_dir: &std::path::Path) -> Result<String> {
     let bin_str = bin_path
         .to_str()
         .context("binary path is not valid UTF-8")?;
-    let stdout_log = log_dir
-        .join("stdout.log")
-        .to_str()
-        .context("log dir path is not valid UTF-8")?
-        .to_string();
     let stderr_log = log_dir
         .join("stderr.log")
         .to_str()
@@ -91,6 +105,8 @@ fn render_plist(bin_path: &std::path::Path, log_dir: &std::path::Path) -> Result
     <dict>
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>RUST_LOG</key>
+        <string>info</string>
     </dict>
     <key>RunAtLoad</key>
     <true/>
@@ -99,8 +115,6 @@ fn render_plist(bin_path: &std::path::Path, log_dir: &std::path::Path) -> Result
         <key>SuccessfulExit</key>
         <false/>
     </dict>
-    <key>StandardOutPath</key>
-    <string>{stdout_log}</string>
     <key>StandardErrorPath</key>
     <string>{stderr_log}</string>
     <key>ProcessType</key>
@@ -297,5 +311,56 @@ pub fn status() -> Result<InstallStatus> {
         Ok(InstallStatus::InstalledAndRunning { unit_path })
     } else {
         Ok(InstallStatus::InstalledNotRunning { unit_path })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_plist;
+    use std::path::Path;
+
+    // D1 board card: INFO logging on by default, bounded log footprint on
+    // disk. `render_plist` must set RUST_LOG=info, must no longer point
+    // StandardOutPath at the unbounded launchd redirect (the durable log is
+    // now the in-process rotating file appender — see logging.rs), and must
+    // keep StandardErrorPath for crash-only output.
+    #[test]
+    fn plist_sets_rust_log_info() {
+        let plist = render_plist(
+            Path::new("/opt/homebrew/bin/vectorhawk"),
+            Path::new("/Users/test/Library/Logs/VectorHawk"),
+        )
+        .unwrap();
+        assert!(
+            plist.contains("<key>RUST_LOG</key>\n        <string>info</string>"),
+            "expected RUST_LOG=info in EnvironmentVariables, got:\n{plist}"
+        );
+    }
+
+    #[test]
+    fn plist_does_not_set_standard_out_path() {
+        let plist = render_plist(
+            Path::new("/opt/homebrew/bin/vectorhawk"),
+            Path::new("/Users/test/Library/Logs/VectorHawk"),
+        )
+        .unwrap();
+        assert!(
+            !plist.contains("StandardOutPath"),
+            "StandardOutPath should be omitted — launchd does not rotate it \
+             and nothing writes to stdout anymore, got:\n{plist}"
+        );
+    }
+
+    #[test]
+    fn plist_still_sets_standard_error_path_for_crash_output() {
+        let plist = render_plist(
+            Path::new("/opt/homebrew/bin/vectorhawk"),
+            Path::new("/Users/test/Library/Logs/VectorHawk"),
+        )
+        .unwrap();
+        assert!(
+            plist.contains("<key>StandardErrorPath</key>\n    <string>/Users/test/Library/Logs/VectorHawk/stderr.log</string>"),
+            "expected StandardErrorPath pointing at stderr.log for crash-only output, got:\n{plist}"
+        );
     }
 }

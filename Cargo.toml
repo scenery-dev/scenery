@@ -45,6 +45,8 @@ flate2 = "1"
 tar = "0.4"
 base64 = "0.22"
 getrandom = "0.2"
+tracing-appender = "0.2"
+rolling-file = "0.2"
 
 [profile.release]
 lto = "thin"
