@@ -69,7 +69,8 @@ pub use drift::DriftScanner;
 pub use marker::ManagedPathMarker;
 pub use mcp_discovery::{collect_mcp_discoveries, McpDiscoveryDetail, McpDiscoveryItem};
 pub use plugin_marketplace::{
-    install_plugin_bundle, uninstall_plugin_bundle, BundledSkill, PluginBundle,
+    install_plugin_bundle, list_governed_plugins, uninstall_plugin_bundle, BundledSkill,
+    PluginBundle,
 };
 pub use pusher::{push_missing_active_skills, ManagedPathsPusher};
 pub use rollback::{list_backups, rollback, BackupSummary, RollbackReport};

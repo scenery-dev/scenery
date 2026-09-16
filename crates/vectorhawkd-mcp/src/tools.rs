@@ -737,7 +737,7 @@ pub fn handle_tool_call(
         "vectorhawk_validate" => handle_validate(arguments),
         "vectorhawk_import" => handle_import(arguments, state, registry_url),
         "vectorhawk_scan" => handle_scan(arguments, state, registry_url),
-        "vectorhawk_login" => handle_login(arguments, state, registry_url),
+        "vectorhawk_login" => handle_login(arguments, state, registry_url, aggregator),
         "vectorhawk_logout" => handle_logout(state, registry_url),
         "vectorhawk_mcp_catalog" => handle_mcp_catalog(state, registry_url),
         "vectorhawk_mcp_request" => handle_mcp_request(arguments, state, registry_url),
@@ -1074,11 +1074,18 @@ fn auth_elicitation_prompt(registry_url: &str) -> ToolCallResult {
 ///
 /// When `oauth` is `None` (shim fallback / test), falls back to the legacy
 /// no-redirect URL and returns a hint that login cannot complete automatically.
+///
+/// `backend_registry`, when present, has its `notify_tokens_saved` hook fired
+/// once the background task above finishes saving tokens — this is how the
+/// daemon registers the device and starts sync for the MCP-tool login path,
+/// mirroring what `auth/reload` already does for `vectorhawk auth login`.
+/// `None` in the shim, which never sets a hook (see `BackendRegistry`).
 pub fn handle_login_with_oauth(
     arguments: &serde_json::Value,
     state: &AppState,
     server_registry_url: &Option<String>,
     oauth: Option<&crate::oauth::OAuthContext>,
+    backend_registry: Option<&BackendRegistry>,
 ) -> ToolCallResult {
     let registry_url_arg = arguments
         .get("registry_url")
@@ -1103,6 +1110,17 @@ pub fn handle_login_with_oauth(
         return ToolCallResult::success("Already logged in to VectorHawk. No action needed.");
     }
 
+    // `AuthClient::new` eagerly builds a `reqwest::blocking::Client`.
+    // Constructing (or dropping) that client on a thread Tokio is currently
+    // using to poll an async task panics — "Cannot drop a runtime in a
+    // context where blocking is not allowed". This function is synchronous
+    // and MUST only be called from inside a `tokio::task::spawn_blocking`
+    // closure — the dedicated blocking-pool thread that runs on does not have
+    // Tokio's "blocking forbidden" flag set, so constructing (and later
+    // dropping) the client here is safe. Both production call sites already
+    // do this (`RealBackend::call_tool`'s `vectorhawk_login` intercept and the
+    // `handle_tool_call` dispatch it shares with every other management tool,
+    // both in `backend.rs`); tests must do the same (see `tools::tests`).
     let auth_client = AuthClient::new(&registry_url);
 
     match oauth {
@@ -1117,6 +1135,10 @@ pub fn handle_login_with_oauth(
                     let subscriber = std::sync::Arc::clone(&ctx.subscriber);
                     let reg_url = registry_url.clone();
                     let task_state = state.clone();
+                    // Cloned (not just referenced) so it can move into the
+                    // 'static async block below. `BackendRegistry::clone` is
+                    // cheap — the inner state is an `Arc<Mutex<_>>`.
+                    let task_backend_registry = backend_registry.cloned();
 
                     // Fire-and-forget: await browser callback → exchange code → save tokens.
                     // The AI client already has the URL; this completes silently in the background.
@@ -1146,7 +1168,15 @@ pub fn handle_login_with_oauth(
 
                         match result {
                             Ok(Ok(())) => {
-                                tracing::info!("vectorhawk_login: PKCE complete, tokens saved")
+                                tracing::info!("vectorhawk_login: PKCE complete, tokens saved");
+                                // R1: register the device / start sync now that
+                                // fresh tokens exist, same as the CLI's
+                                // `auth/reload` path. `notify_tokens_saved` is a
+                                // no-op when no hook was installed (shim) and
+                                // the hook itself (daemon-side) is idempotent.
+                                if let Some(registry) = &task_backend_registry {
+                                    registry.notify_tokens_saved().await;
+                                }
                             }
                             Ok(Err(e)) => tracing::warn!(
                                 error = %e,
@@ -1218,9 +1248,10 @@ fn handle_login(
     arguments: &serde_json::Value,
     state: &AppState,
     server_registry_url: &Option<String>,
+    aggregator: Option<&BackendRegistry>,
 ) -> ToolCallResult {
     // Delegate to the OAuth-aware handler with no OAuth context (legacy / shim fallback).
-    handle_login_with_oauth(arguments, state, server_registry_url, None)
+    handle_login_with_oauth(arguments, state, server_registry_url, None, aggregator)
 }
 
 fn handle_logout(state: &AppState, server_registry_url: &Option<String>) -> ToolCallResult {
@@ -3195,7 +3226,12 @@ mod tests {
         let url = "http://localhost:8000".to_string();
         fake_login(&state, &url);
 
-        let result = handle_login(&serde_json::json!({"registry_url": url}), &state, &None);
+        let result = handle_login(
+            &serde_json::json!({"registry_url": url}),
+            &state,
+            &None,
+            None,
+        );
         // Should succeed without starting an OAuth flow
         assert_eq!(result.is_error, None);
         assert!(result.content[0].text.contains("Already logged in"));
@@ -3208,9 +3244,169 @@ mod tests {
         let state_root = temp_root("handle-login-no-url");
         let state = AppState::bootstrap_in(state_root.clone()).unwrap();
 
-        let result = handle_login(&serde_json::json!({}), &state, &None);
+        let result = handle_login(&serde_json::json!({}), &state, &None, None);
         assert_eq!(result.is_error, Some(true));
         assert!(result.content[0].text.contains("registry"));
+
+        let _ = fs::remove_dir_all(&state_root);
+    }
+
+    // ── R1: device registration on the vectorhawk_login MCP-tool path ───────
+    //
+    // These exercise `handle_login_with_oauth`'s `backend_registry` hook: a
+    // successful PKCE completion must fire `TokensSavedHook::on_tokens_saved`
+    // exactly once, and the "already logged in" short-circuit must never fire
+    // it (mirrors the CLI's idempotent `auth/reload` behavior, but this test
+    // only needs to prove the tool path *reaches* the hook — idempotency of
+    // repeated `ensure_started` calls is the daemon-side `SyncController`'s
+    // own contract, already covered elsewhere).
+
+    /// Always resolves immediately with a fixed code, regardless of the
+    /// `state` value passed in — good enough for driving the background task
+    /// deterministically in a test.
+    struct ImmediateCodeSubscriber;
+
+    impl crate::oauth::OAuthSubscriber for ImmediateCodeSubscriber {
+        fn wait_for_code(
+            &self,
+            _state: String,
+            _timeout_secs: u64,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>> {
+            Box::pin(async { Some("test-auth-code".to_string()) })
+        }
+    }
+
+    /// Counts invocations and wakes a `Notify` so the test can await
+    /// completion of the background task instead of polling with a sleep.
+    struct SpyHook {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        notify: Arc<tokio::sync::Notify>,
+    }
+
+    impl crate::aggregator::TokensSavedHook for SpyHook {
+        fn on_tokens_saved(
+            &self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+            let calls = Arc::clone(&self.calls);
+            let notify = Arc::clone(&self.notify);
+            Box::pin(async move {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                notify.notify_one();
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn login_with_oauth_triggers_device_registration_hook_exactly_once() {
+        use mockito::Server;
+
+        let state_root = temp_root("login-hook-fires");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+
+        // `Server::new()` (sync) spins up its own blocking runtime internally
+        // and panics with "Cannot start a runtime from within a runtime" when
+        // called from inside a `#[tokio::test]`. Use the async constructor —
+        // this test needs `#[tokio::test]` regardless, since it awaits the
+        // background task's completion signal below.
+        let mut server = Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/portal/auth/cli/token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"access_token":"acc","refresh_token":"ref","token_type":"bearer"}"#)
+            .create_async()
+            .await;
+        let registry_url = Some(server.url());
+
+        let registry = BackendRegistry::new();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        registry.set_tokens_saved_hook(Arc::new(SpyHook {
+            calls: Arc::clone(&calls),
+            notify: Arc::clone(&notify),
+        }));
+
+        let oauth_ctx = crate::oauth::OAuthContext {
+            listener_port: 39127,
+            subscriber: Arc::new(ImmediateCodeSubscriber),
+        };
+
+        // Production only ever calls `handle_login_with_oauth` from inside a
+        // `tokio::task::spawn_blocking` closure (see `RealBackend::call_tool`'s
+        // `vectorhawk_login` intercept and the `handle_tool_call` dispatch it
+        // shares with every other management tool, both in backend.rs) —
+        // required because the function constructs a blocking
+        // `reqwest::blocking::Client`. Mirror that here rather than calling it
+        // directly on the test's own async task.
+        let task_state = state.clone();
+        let task_registry_url = registry_url.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            handle_login_with_oauth(
+                &serde_json::json!({}),
+                &task_state,
+                &task_registry_url,
+                Some(&oauth_ctx),
+                Some(&registry),
+            )
+        })
+        .await
+        .expect("handle_login_with_oauth should not panic");
+        assert_ne!(result.is_error, Some(true), "initiation should succeed");
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), notify.notified())
+            .await
+            .expect("hook should fire once the background task saves tokens");
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "hook must fire exactly once"
+        );
+
+        let _ = fs::remove_dir_all(&state_root);
+    }
+
+    #[tokio::test]
+    async fn login_with_oauth_does_not_trigger_hook_when_already_logged_in() {
+        let state_root = temp_root("login-hook-short-circuit");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+        let registry_url = Some("http://localhost:1".to_string());
+        fake_login(&state, registry_url.as_ref().unwrap());
+
+        let registry = BackendRegistry::new();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        registry.set_tokens_saved_hook(Arc::new(SpyHook {
+            calls: Arc::clone(&calls),
+            notify: Arc::new(tokio::sync::Notify::new()),
+        }));
+
+        let oauth_ctx = crate::oauth::OAuthContext {
+            listener_port: 39127,
+            subscriber: Arc::new(ImmediateCodeSubscriber),
+        };
+
+        // See the matching comment in the "fires exactly once" test above:
+        // mirror production's spawn_blocking call site.
+        let task_state = state.clone();
+        let task_registry_url = registry_url.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            handle_login_with_oauth(
+                &serde_json::json!({}),
+                &task_state,
+                &task_registry_url,
+                Some(&oauth_ctx),
+                Some(&registry),
+            )
+        })
+        .await
+        .expect("handle_login_with_oauth should not panic");
+        assert_ne!(result.is_error, Some(true));
+        assert!(result.content[0].text.contains("Already logged in"));
+
+        // No OAuth flow was started at all, so nothing should ever fire the
+        // hook — give any accidental background task a moment to (not) run.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
 
         let _ = fs::remove_dir_all(&state_root);
     }
