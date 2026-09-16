@@ -40,6 +40,7 @@ pub mod discoveries;
 pub mod drift;
 pub mod links;
 pub mod marker;
+pub mod mcp_discovery;
 pub mod migrator;
 pub mod paths;
 pub mod plugin_marketplace;
@@ -66,6 +67,7 @@ use vectorhawkd_core::state::AppState;
 pub use discoveries::DiscoveriesScanner;
 pub use drift::DriftScanner;
 pub use marker::ManagedPathMarker;
+pub use mcp_discovery::{collect_mcp_discoveries, McpDiscoveryDetail, McpDiscoveryItem};
 pub use plugin_marketplace::{
     install_plugin_bundle, uninstall_plugin_bundle, BundledSkill, PluginBundle,
 };

@@ -1057,6 +1057,158 @@ pub fn detect_unmanaged_servers() -> Vec<UnmanagedServer> {
     unmanaged
 }
 
+// ── Full MCP entry enumeration (read-only, Shadow-AI discovery) ────────────────
+
+/// One MCP server entry found in a client's config file: its key plus its
+/// full value, normalized to `serde_json::Value` regardless of the file's
+/// on-disk format — see [`read_all_mcp_entries`].
+#[derive(Debug, Clone)]
+pub struct RawMcpEntry {
+    pub key: String,
+    pub value: serde_json::Value,
+}
+
+/// Read every entry under `config.mcp_key` in `config.config_path`, whatever
+/// the file's on-disk format, normalized to `serde_json::Value` so callers
+/// (the Shadow-AI discovery scanner in `vectorhawkd-daemon`) work with one
+/// representation regardless of which AI client produced it.
+///
+/// Reuses each format's existing reader rather than introducing a second
+/// parser: `jsonc-parser` for JSON clients — JSONC-tolerant (see
+/// [`read_all_mcp_entries_json`]), the same dependency
+/// [`migrate_stale_vscode_settings_entry`] already uses (its `cst` feature)
+/// for the same underlying reason: VS Code's `mcp.json` and similar configs
+/// routinely carry `//`/`/* */` comments and trailing commas — and
+/// `toml_edit` for Codex's TOML client (the same parse
+/// [`write_mcp_entry_toml`] / [`read_vectorhawk_command_toml`] already use)
+/// — including Codex's `[mcp_servers]` table, which
+/// [`detect_unmanaged_servers`] (GAP-06, JSON-only) does not cover.
+///
+/// Strictly read-only: never writes to `config.config_path`. Returns an
+/// empty vec if the file is missing, unparsable, or the `mcp_key`
+/// object/table is absent, empty, or not object-shaped — callers treat that
+/// the same as "nothing configured for this client".
+#[cfg(feature = "daemon")]
+pub fn read_all_mcp_entries(config: &ClientConfig) -> Vec<RawMcpEntry> {
+    match config.format {
+        ConfigFormat::Json => read_all_mcp_entries_json(config),
+        ConfigFormat::Toml => read_all_mcp_entries_toml(config),
+    }
+}
+
+/// JSONC-tolerant read: a strict `serde_json::from_str` silently yields zero
+/// servers on a config file that has `//`/`/* */` comments or a trailing
+/// comma (VS Code's `mcp.json` and Cursor's config commonly do) — a total
+/// discovery blind spot rather than an error, since "unparsable → empty
+/// vec" is exactly the same result as "nothing configured". Parsing via
+/// `jsonc_parser::parse_to_serde_value` (the `serde` feature of the same
+/// `jsonc-parser` dependency already used for `cst` editing elsewhere in
+/// this module) accepts comments/trailing-commas and yields an ordinary
+/// `serde_json::Value`, so every downstream call site is unaffected. JSONC
+/// is a superset of JSON, so this is a strict superset of what
+/// `serde_json::from_str` already accepted — never a behavior regression
+/// for a plain-JSON file.
+#[cfg(feature = "daemon")]
+fn read_all_mcp_entries_json(config: &ClientConfig) -> Vec<RawMcpEntry> {
+    let Ok(text) = fs::read_to_string(&config.config_path) else {
+        return Vec::new();
+    };
+    let Ok(root) = jsonc_parser::parse_to_serde_value::<serde_json::Value>(
+        &text,
+        &jsonc_parser::ParseOptions::default(),
+    ) else {
+        return Vec::new();
+    };
+    let Some(obj) = root.get(&config.mcp_key).and_then(|v| v.as_object()) else {
+        return Vec::new();
+    };
+    obj.iter()
+        .map(|(key, value)| RawMcpEntry {
+            key: key.clone(),
+            value: value.clone(),
+        })
+        .collect()
+}
+
+/// TOML counterpart of [`read_all_mcp_entries_json`]. Uses `as_table_like`
+/// (not `as_table`) so an inline `mcp_servers = { ... }` is enumerated the
+/// same as a standard `[mcp_servers]` table — same reasoning as
+/// `write_mcp_entry_toml`'s `as_table_like_mut`.
+#[cfg(feature = "daemon")]
+fn read_all_mcp_entries_toml(config: &ClientConfig) -> Vec<RawMcpEntry> {
+    let Ok(text) = fs::read_to_string(&config.config_path) else {
+        return Vec::new();
+    };
+    let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else {
+        return Vec::new();
+    };
+    let Some(servers) = doc
+        .get(config.mcp_key.as_str())
+        .and_then(|item| item.as_table_like())
+    else {
+        return Vec::new();
+    };
+    servers
+        .iter()
+        .map(|(key, item)| RawMcpEntry {
+            key: key.to_string(),
+            value: toml_item_to_json(item),
+        })
+        .collect()
+}
+
+/// Convert a `toml_edit` document item into an equivalent `serde_json::Value`
+/// so [`read_all_mcp_entries_toml`] can hand TOML entries to the same
+/// downstream (format-agnostic) code that already works with JSON values.
+#[cfg(feature = "daemon")]
+fn toml_item_to_json(item: &toml_edit::Item) -> serde_json::Value {
+    use toml_edit::Item;
+    match item {
+        Item::None => serde_json::Value::Null,
+        Item::Value(v) => toml_value_to_json(v),
+        Item::Table(t) => {
+            let mut map = serde_json::Map::new();
+            for (k, v) in t.iter() {
+                map.insert(k.to_string(), toml_item_to_json(v));
+            }
+            serde_json::Value::Object(map)
+        }
+        Item::ArrayOfTables(arr) => serde_json::Value::Array(
+            arr.iter()
+                .map(|t| {
+                    let mut map = serde_json::Map::new();
+                    for (k, v) in t.iter() {
+                        map.insert(k.to_string(), toml_item_to_json(v));
+                    }
+                    serde_json::Value::Object(map)
+                })
+                .collect(),
+        ),
+    }
+}
+
+#[cfg(feature = "daemon")]
+fn toml_value_to_json(value: &toml_edit::Value) -> serde_json::Value {
+    use toml_edit::Value;
+    match value {
+        Value::String(s) => serde_json::Value::String(s.value().clone()),
+        Value::Integer(i) => serde_json::Value::from(*i.value()),
+        Value::Float(f) => serde_json::Number::from_f64(*f.value())
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        Value::Boolean(b) => serde_json::Value::Bool(*b.value()),
+        Value::Datetime(d) => serde_json::Value::String(d.value().to_string()),
+        Value::Array(arr) => serde_json::Value::Array(arr.iter().map(toml_value_to_json).collect()),
+        Value::InlineTable(t) => {
+            let mut map = serde_json::Map::new();
+            for (k, v) in t.iter() {
+                map.insert(k.to_string(), toml_value_to_json(v));
+            }
+            serde_json::Value::Object(map)
+        }
+    }
+}
+
 // ── Daemon-boot self-heal for stale MCP commands ───────────────────────────────
 
 /// Returns `true` when `command` looks like a stale `vectorhawk` MCP command
@@ -3016,6 +3168,178 @@ mod tests {
             removed.is_empty(),
             "should return empty list when nothing installed"
         );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // ── read_all_mcp_entries (Shadow-AI discovery building block) ─────────────
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn read_all_mcp_entries_json_returns_every_server() {
+        let tmp = temp_root("read-all-json");
+        fs::create_dir_all(&tmp).unwrap();
+        let config_path = tmp.join("mcp.json");
+        fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "mcpServers": {
+                    "vectorhawk": {"command": "/opt/homebrew/bin/vectorhawk", "args": ["mcp", "serve"]},
+                    "github-mcp": {"command": "npx", "args": ["-y", "@github/mcp"], "env": {"GITHUB_TOKEN": "ghp_secret"}}
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let config = ClientConfig {
+            name: "Cursor".to_string(),
+            config_path,
+            mcp_key: "mcpServers".to_string(),
+            already_configured: true,
+            format: ConfigFormat::Json,
+        };
+
+        let mut entries = read_all_mcp_entries(&config);
+        entries.sort_by(|a, b| a.key.cmp(&b.key));
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].key, "github-mcp");
+        assert_eq!(entries[0].value["command"], "npx");
+        assert_eq!(entries[0].value["env"]["GITHUB_TOKEN"], "ghp_secret");
+        assert_eq!(entries[1].key, "vectorhawk");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn read_all_mcp_entries_toml_reads_codex_standard_table() {
+        let tmp = temp_root("read-all-toml-standard");
+        fs::create_dir_all(&tmp).unwrap();
+        let config_path = tmp.join("config.toml");
+        fs::write(
+            &config_path,
+            "model = \"gpt-5.1\"\n\n[mcp_servers.linear-mcp]\ncommand = \"npx\"\nargs = [\"-y\", \"linear-mcp\"]\n",
+        )
+        .unwrap();
+
+        let config = ClientConfig {
+            name: "Codex".to_string(),
+            config_path,
+            mcp_key: "mcp_servers".to_string(),
+            already_configured: false,
+            format: ConfigFormat::Toml,
+        };
+
+        let entries = read_all_mcp_entries(&config);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].key, "linear-mcp");
+        assert_eq!(entries[0].value["command"], "npx");
+        assert_eq!(entries[0].value["args"][0], "-y");
+        assert_eq!(entries[0].value["args"][1], "linear-mcp");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn read_all_mcp_entries_toml_reads_inline_table() {
+        let tmp = temp_root("read-all-toml-inline");
+        fs::create_dir_all(&tmp).unwrap();
+        let config_path = tmp.join("config.toml");
+        fs::write(
+            &config_path,
+            "mcp_servers = { notion-mcp = { command = \"npx\", args = [\"notion-mcp\"] } }\n",
+        )
+        .unwrap();
+
+        let config = ClientConfig {
+            name: "Codex".to_string(),
+            config_path,
+            mcp_key: "mcp_servers".to_string(),
+            already_configured: false,
+            format: ConfigFormat::Toml,
+        };
+
+        let entries = read_all_mcp_entries(&config);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].key, "notion-mcp");
+        assert_eq!(entries[0].value["command"], "npx");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn read_all_mcp_entries_returns_empty_when_file_missing() {
+        let tmp = temp_root("read-all-missing");
+        fs::create_dir_all(&tmp).unwrap();
+        let config = ClientConfig {
+            name: "Cursor".to_string(),
+            config_path: tmp.join("does-not-exist.json"),
+            mcp_key: "mcpServers".to_string(),
+            already_configured: false,
+            format: ConfigFormat::Json,
+        };
+
+        assert!(read_all_mcp_entries(&config).is_empty());
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn read_all_mcp_entries_returns_empty_when_key_absent() {
+        let tmp = temp_root("read-all-key-absent");
+        fs::create_dir_all(&tmp).unwrap();
+        let config_path = tmp.join("mcp.json");
+        fs::write(&config_path, r#"{"other":"stuff"}"#).unwrap();
+        let config = ClientConfig {
+            name: "Cursor".to_string(),
+            config_path,
+            mcp_key: "mcpServers".to_string(),
+            already_configured: false,
+            format: ConfigFormat::Json,
+        };
+
+        assert!(read_all_mcp_entries(&config).is_empty());
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// Review finding 5: a strict `serde_json` parse silently yields zero
+    /// servers on a JSONC file (comments + trailing comma) — a total
+    /// discovery blind spot for VS Code's `mcp.json` / Cursor's config,
+    /// which commonly carry both. `read_all_mcp_entries_json` must read
+    /// these leniently via `jsonc_parser::parse_to_serde_value` instead.
+    #[cfg(feature = "daemon")]
+    #[test]
+    fn read_all_mcp_entries_json_tolerates_jsonc_comments_and_trailing_commas() {
+        let tmp = temp_root("read-all-jsonc");
+        fs::create_dir_all(&tmp).unwrap();
+        let config_path = tmp.join("mcp.json");
+        fs::write(
+            &config_path,
+            "{\n  // a user comment\n  \"servers\": {\n    \"linear-mcp\": {\"command\": \"npx\", \"args\": [\"-y\", \"linear-mcp\"]}, // trailing comment\n  },\n}\n",
+        )
+        .unwrap();
+
+        let config = ClientConfig {
+            name: "VS Code".to_string(),
+            config_path,
+            mcp_key: "servers".to_string(),
+            already_configured: false,
+            format: ConfigFormat::Json,
+        };
+
+        let entries = read_all_mcp_entries(&config);
+        assert_eq!(
+            entries.len(),
+            1,
+            "a commented JSONC config must not silently parse to zero servers"
+        );
+        assert_eq!(entries[0].key, "linear-mcp");
+        assert_eq!(entries[0].value["command"], "npx");
 
         let _ = fs::remove_dir_all(&tmp);
     }
