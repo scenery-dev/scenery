@@ -1,9 +1,9 @@
 //! F-Tier2: Report-only discovery for non-canonical skill roots.
 //!
-//! Scans extra roots (`~/.agents/skills/` and any paths in
-//! `VECTORHAWK_EXTRA_SKILL_ROOTS`) for skills that are NOT already tracked
-//! in `managed_path_markers`. Found items are POSTed to the backend in a
-//! single batch so the portal can present them to the user for optional
+//! Scans extra roots (`~/.agents/skills/`, `~/.pi/agent/skills/`, and any
+//! paths in `VECTORHAWK_EXTRA_SKILL_ROOTS`) for skills that are NOT already
+//! tracked in `managed_path_markers`. Found items are POSTed to the backend
+//! in a single batch so the portal can present them to the user for optional
 //! adoption.
 //!
 //! **This module is REPORT-ONLY.** It never writes markers, never moves files,
@@ -197,12 +197,23 @@ pub async fn run_once(state: Arc<AppState>, registry_url: String) -> Result<usiz
 /// Always includes `~/.agents/skills/` (if it exists) — note this is now also
 /// VectorHawk's own canonical write location, so the scan filters out
 /// directories carrying a `.vectorhawk-managed.json` marker.
+///
+/// Also always includes `~/.pi/agent/skills/` — Pi (the pi coding agent,
+/// github.com/earendil-works/pi) already scans `~/.agents/skills/` natively
+/// (per `packages/coding-agent/docs/skills.md`'s "Locations" section), so
+/// governed skills reach it with no adapter work. It additionally has its
+/// own user-level skill root that only Pi reads, so unmanaged skills placed
+/// there directly (not via `~/.agents/skills/`) would otherwise never be
+/// reported. `collect_discoveries` skips roots that don't exist, so this is
+/// a no-op scan on machines without Pi installed.
+///
 /// Also includes any paths from `VECTORHAWK_EXTRA_SKILL_ROOTS`.
 pub fn extra_roots() -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = Vec::new();
 
     if let Some(home) = dirs::home_dir() {
         roots.push(home.join(".agents").join("skills"));
+        roots.push(home.join(".pi").join("agent").join("skills"));
     }
 
     if let Ok(extra) = std::env::var(ENV_EXTRA_ROOTS) {
@@ -758,5 +769,39 @@ mod tests {
         let slugs: Vec<&str> = found.iter().map(|d| d.slug.as_str()).collect();
 
         assert_eq!(slugs, vec!["foreign-skill"]);
+    }
+
+    // ── 9. extra_roots includes Pi's own skill dir ─────────────────────────────
+
+    #[test]
+    fn extra_roots_includes_pi_skill_dir() {
+        // Pi (pi coding agent, github.com/earendil-works/pi) scans skills from
+        // two global locations: `~/.agents/skills/` (already covered above) and
+        // its own `~/.pi/agent/skills/` — see
+        // packages/coding-agent/docs/skills.md ("Locations" section) in that
+        // repo. Unmanaged skills that live only under the Pi-specific root
+        // would never be reported without this entry.
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let fake_home = tempfile::tempdir().unwrap();
+        let prev_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+        }
+
+        let roots = extra_roots();
+
+        match prev_home {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+
+        assert!(
+            roots.contains(&fake_home.path().join(".agents").join("skills")),
+            "expected ~/.agents/skills in extra_roots, got {roots:?}"
+        );
+        assert!(
+            roots.contains(&fake_home.path().join(".pi").join("agent").join("skills")),
+            "expected ~/.pi/agent/skills in extra_roots, got {roots:?}"
+        );
     }
 }
