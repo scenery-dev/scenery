@@ -34,7 +34,7 @@ use uuid::Uuid;
 
 use crate::managed_paths::ManagedPathsPusher;
 use crate::sync::sse_client::{
-    InstallationRecord, McpInstallationRecord, PluginSkillRef, SyncEvent,
+    InstallationRecord, McpInstallationRecord, PluginInstallationRecord, PluginSkillRef, SyncEvent,
 };
 use vectorhawkd_core::{
     auth::load_all_tokens,
@@ -394,6 +394,7 @@ async fn dispatch_event(
                 state,
                 registry_url,
                 sem,
+                skill_locks,
                 stats,
                 install_tasks,
             );
@@ -407,12 +408,14 @@ async fn dispatch_event(
                 plugin_slug,
                 state,
                 registry_url,
+                skill_locks,
                 install_tasks,
             );
         }
         SyncEvent::Snapshot {
             installations,
             mcp_installations,
+            plugin_installations,
         } => {
             // ── Skill reconciliation (unchanged) ─────────────────────────────
             let derived = build_derived_events(installations, Arc::clone(state)).await;
@@ -535,6 +538,70 @@ async fn dispatch_event(
                         }
                         _ => {}
                     }
+                }
+            }
+
+            // ── Plugin reconciliation (RB1) ──────────────────────────────────
+            //
+            // An empty `plugin_installations` vec means the backend did not
+            // emit the key (old backend, backwards compat, mirrors the MCP
+            // guard above) — do NOT treat it as "desired state is zero
+            // plugins", that would remove every governed plugin on a stale
+            // backend. Only reconcile when the vec is non-empty.
+            //
+            // Installs are dispatched through `spawn_install_plugin`, the
+            // exact same function the live `install_plugin` SSE event uses
+            // (see `SyncEvent::InstallPlugin` arm above) — no separate
+            // snapshot-only install path.
+            if !plugin_installations.is_empty() {
+                let plugin_derived = build_derived_plugin_events(plugin_installations).await;
+                for d in plugin_derived.events {
+                    match d {
+                        SyncEvent::InstallPlugin {
+                            installation_id,
+                            plugin_slug,
+                            plugin_name,
+                            description,
+                            version,
+                            author,
+                            skills,
+                        } => {
+                            spawn_install_plugin(
+                                installation_id,
+                                plugin_slug,
+                                plugin_name,
+                                description,
+                                version,
+                                author,
+                                skills,
+                                state,
+                                registry_url,
+                                sem,
+                                skill_locks,
+                                stats,
+                                install_tasks,
+                            );
+                        }
+                        SyncEvent::DeactivatePlugin {
+                            installation_id,
+                            plugin_slug,
+                        } => {
+                            spawn_deactivate_plugin(
+                                installation_id,
+                                plugin_slug,
+                                state,
+                                registry_url,
+                                skill_locks,
+                                install_tasks,
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+                // Orphans and `state == "removed"` rows: locked local purge,
+                // no PATCH callback (see `spawn_purge_plugin` doc comment).
+                for slug in plugin_derived.silent_purges {
+                    spawn_purge_plugin(slug, skill_locks, install_tasks);
                 }
             }
         }
@@ -720,6 +787,7 @@ fn spawn_install_plugin(
     state: &Arc<AppState>,
     registry_url: &str,
     sem: &Arc<tokio::sync::Semaphore>,
+    skill_locks: &SkillLockMap,
     stats: &Arc<Mutex<ReconcilerStats>>,
     install_tasks: &mut tokio::task::JoinSet<bool>,
 ) {
@@ -727,10 +795,23 @@ fn spawn_install_plugin(
     let reg_url = registry_url.to_string();
     let sem_clone = Arc::clone(sem);
     let stats_clone = Arc::clone(stats);
+    // Namespaced ("plugin:<slug>") so a plugin can never share a lock with a
+    // skill or MCP server of the same name/id — those callers key by raw
+    // skill_id / mcp_server_id with no prefix (see spawn_install /
+    // spawn_install_mcp above). Serializes the live `install_plugin` SSE
+    // handler against the snapshot-derived one (RB1: both now dispatch
+    // through this same function) plus any concurrent deactivate for the
+    // same slug — install_plugin_bundle does an unlocked remove_dir_all +
+    // rewrite of the plugin source tree, so two concurrent installs for the
+    // same slug could otherwise interleave and mix versions.
+    let lock = skill_lock(skill_locks, &format!("plugin:{plugin_slug}"));
 
     increment_pending(stats);
 
     install_tasks.spawn(async move {
+        // Acquired before the semaphore, same rationale as spawn_install: a
+        // stalled per-plugin queue shouldn't burn a semaphore permit.
+        let _plugin_guard = lock.lock_owned().await;
         let _permit = sem_clone.acquire().await;
         handle_install_plugin(
             installation_id,
@@ -949,11 +1030,17 @@ fn spawn_deactivate_plugin(
     plugin_slug: String,
     state: &Arc<AppState>,
     registry_url: &str,
+    skill_locks: &SkillLockMap,
     install_tasks: &mut tokio::task::JoinSet<bool>,
 ) {
     let st = Arc::clone(state);
     let reg_url = registry_url.to_string();
+    // Same "plugin:<slug>" namespaced lock spawn_install_plugin takes —
+    // serializes against a concurrent install/deactivate for the same slug
+    // from either the live SSE event or the snapshot-derived diff.
+    let lock = skill_lock(skill_locks, &format!("plugin:{plugin_slug}"));
     install_tasks.spawn(async move {
+        let _plugin_guard = lock.lock_owned().await;
         let slug = plugin_slug.clone();
         let res = tokio::task::spawn_blocking(move || {
             crate::managed_paths::uninstall_plugin_bundle(&plugin_slug)
@@ -977,6 +1064,50 @@ fn spawn_deactivate_plugin(
             }
             Err(e) => {
                 warn!(plugin_slug = %slug, error = %e, "reconciler: plugin deactivate task panicked");
+                false
+            }
+        }
+    });
+}
+
+/// Locked, unreported local purge for a governed plugin — used for the two
+/// snapshot-diff cases where there is nothing to tell the backend: an
+/// orphan (the row is gone from the catalog entirely, no `installation_id`
+/// even exists to PATCH against) and `state == "removed"` (the backend
+/// already knows). Mirrors the MCP diff's own orphan/`"removed"` handling
+/// (direct local mutation, no PATCH callback), except here the mutation is
+/// deferred to this locked handler instead of happening inline in the pure
+/// diff function — `install_plugin_bundle`/`uninstall_plugin_bundle` do an
+/// unlocked `remove_dir_all` + rewrite of the plugin source tree, so running
+/// this outside the `"plugin:<slug>"` lock could race a concurrent live
+/// `install_plugin` for the same slug (RB1 fix round 2).
+fn spawn_purge_plugin(
+    plugin_slug: String,
+    skill_locks: &SkillLockMap,
+    install_tasks: &mut tokio::task::JoinSet<bool>,
+) {
+    let lock = skill_lock(skill_locks, &format!("plugin:{plugin_slug}"));
+    install_tasks.spawn(async move {
+        let _plugin_guard = lock.lock_owned().await;
+        let slug = plugin_slug.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            crate::managed_paths::uninstall_plugin_bundle(&plugin_slug)
+        })
+        .await;
+        match res {
+            Ok(Ok(())) => {
+                info!(
+                    plugin_slug = %slug,
+                    "reconciler: plugin purged from local state (snapshot orphan/removed)"
+                );
+                true
+            }
+            Ok(Err(e)) => {
+                warn!(plugin_slug = %slug, error = %e, "reconciler: plugin purge failed");
+                false
+            }
+            Err(e) => {
+                warn!(plugin_slug = %slug, error = %e, "reconciler: plugin purge task panicked");
                 false
             }
         }
@@ -2653,6 +2784,150 @@ pub(crate) fn build_derived_mcp_events_blocking(
     events
 }
 
+/// Result of diffing snapshot plugin records against local governed-plugin
+/// state: events to dispatch through the normal (locked) install/deactivate
+/// handlers, plus slugs to uninstall locally with **no backend report**
+/// (orphans and `state == "removed"` rows — see [`build_derived_plugin_events_blocking`]).
+#[derive(Debug, Default, Clone)]
+pub(crate) struct PluginDiff {
+    pub events: Vec<SyncEvent>,
+    /// Governed plugin slugs to purge locally with no PATCH callback —
+    /// mirrors the MCP diff's own orphan/`"removed"` handling, which mutates
+    /// `mcp_installations` directly with no event because there is nothing
+    /// to tell the backend (either the row is gone from the catalog
+    /// entirely, or the backend already knows). Execution is deferred to the
+    /// caller (a locked `spawn_purge_plugin`, keyed the same as
+    /// `spawn_install_plugin`/`spawn_deactivate_plugin`) — this function
+    /// itself performs no filesystem mutation.
+    pub silent_purges: Vec<String>,
+}
+
+/// Diff snapshot plugin records against the local governed-plugin state
+/// (`installed_plugins.json`, read via `list_governed_plugins`) and return
+/// the [`PluginDiff`] needed to converge — the plugin-snapshot analogue of
+/// `build_derived_mcp_events` above (RB1). There is no
+/// `mcp_installations`-style SQLite table for plugins: `installed_plugins.json`
+/// itself is the durable local record.
+///
+/// **This function is pure — it performs no filesystem mutation.** It only
+/// reads `installed_plugins.json` (via `list_governed_plugins`) and computes
+/// what should happen; every actual install/uninstall is executed by the
+/// caller through the `"plugin:<slug>"`-locked handlers
+/// (`spawn_install_plugin`, `spawn_deactivate_plugin`, `spawn_purge_plugin`).
+/// A prior version of this function called `uninstall_plugin_bundle`
+/// directly and unlocked for orphans/`"deactivated"`/`"removed"` — that
+/// raced a locked live `install_plugin` writing the same plugin tree
+/// (`install_plugin_bundle` does an unlocked-by-design `remove_dir_all` +
+/// rewrite, so two concurrent mutations for the same slug could interleave
+/// and corrupt it). See RB1 fix round 2.
+///
+/// Removal semantics mirror the MCP diff exactly: a governed plugin absent
+/// from the snapshot entirely (orphan — deleted from the backend catalog
+/// while offline) is queued into `silent_purges`, `state == "deactivated"`
+/// emits `DeactivatePlugin` so the backend PATCH callback fires once the
+/// locked handler actually uninstalls it, and `state == "removed"` is queued
+/// into `silent_purges` (no event — the backend already knows, exactly like
+/// the MCP diff's `"removed"` arm). `list_governed_plugins` only ever
+/// returns entries registered under the `vectorhawk` marketplace, so a
+/// plugin the user installed manually from elsewhere is never touched by
+/// this diff.
+async fn build_derived_plugin_events(records: Vec<PluginInstallationRecord>) -> PluginDiff {
+    tokio::task::spawn_blocking(move || build_derived_plugin_events_blocking(records))
+        .await
+        .unwrap_or_else(|e| {
+            warn!(error = %e, "reconciler: plugin snapshot diff task panicked");
+            PluginDiff::default()
+        })
+}
+
+pub(crate) fn build_derived_plugin_events_blocking(
+    records: Vec<PluginInstallationRecord>,
+) -> PluginDiff {
+    // An empty records slice means "old backend — no plugin_installations
+    // key". Treat as a no-op: do not remove existing installs. The caller in
+    // dispatch_event already guards `if !plugin_installations.is_empty()`
+    // before calling the async wrapper; this guard makes the function safe
+    // to call directly from tests with an empty slice.
+    if records.is_empty() {
+        return PluginDiff::default();
+    }
+
+    let local = match crate::managed_paths::list_governed_plugins() {
+        Ok(m) => m,
+        Err(e) => {
+            warn!(error = %e, "reconciler: cannot read installed_plugins.json for snapshot diff");
+            return PluginDiff::default();
+        }
+    };
+
+    let snapshot_slugs: std::collections::HashSet<&str> =
+        records.iter().map(|r| r.plugin_slug.as_str()).collect();
+
+    let mut events: Vec<SyncEvent> = Vec::new();
+    let mut silent_purges: Vec<String> = Vec::new();
+
+    // Orphans: governed plugins installed locally but absent from the
+    // snapshot entirely (backend catalog row deleted while offline) — mirrors
+    // MCP's orphan removal for mcp_installations, except the actual mutation
+    // happens in the locked `spawn_purge_plugin` handler, not here.
+    for slug in local.keys() {
+        if !snapshot_slugs.contains(slug.as_str()) {
+            silent_purges.push(slug.clone());
+        }
+    }
+
+    for record in &records {
+        match record.state.as_str() {
+            // "desired", "installing", "installed" → plugin should be present locally.
+            "desired" | "installing" | "installed" => {
+                if !local.contains_key(&record.plugin_slug) {
+                    events.push(SyncEvent::InstallPlugin {
+                        installation_id: record.installation_id,
+                        plugin_slug: record.plugin_slug.clone(),
+                        plugin_name: record.plugin_name.clone(),
+                        description: record.description.clone(),
+                        version: record.version.clone(),
+                        author: record.author.clone(),
+                        skills: record.skills.clone(),
+                    });
+                }
+                // Already installed: no event needed.
+            }
+            "deactivated" => {
+                // Should be removed locally. If it's still installed, queue a
+                // DeactivatePlugin — the locked handler performs the actual
+                // uninstall and reports the PATCH callback.
+                if local.contains_key(&record.plugin_slug) {
+                    events.push(SyncEvent::DeactivatePlugin {
+                        installation_id: record.installation_id,
+                        plugin_slug: record.plugin_slug.clone(),
+                    });
+                }
+            }
+            "removed" => {
+                // Fully deleted on the backend; purge locally with no report
+                // — nothing to tell the backend, it already knows. Same
+                // no-event treatment as an orphan.
+                if local.contains_key(&record.plugin_slug) {
+                    silent_purges.push(record.plugin_slug.clone());
+                }
+            }
+            other => {
+                warn!(
+                    plugin_slug = %record.plugin_slug,
+                    state = other,
+                    "reconciler: unknown plugin installation state in snapshot — skipping"
+                );
+            }
+        }
+    }
+
+    PluginDiff {
+        events,
+        silent_purges,
+    }
+}
+
 /// Load all locally installed skills as a map: skill_id → (version, deactivated).
 fn load_local_skill_state(conn: &rusqlite::Connection) -> HashMap<String, (String, bool)> {
     let mut stmt =
@@ -2834,6 +3109,13 @@ pub(crate) fn build_derived_mcp_events_blocking_for_test(
 }
 
 #[cfg(test)]
+pub(crate) fn build_derived_plugin_events_blocking_for_test(
+    records: Vec<PluginInstallationRecord>,
+) -> PluginDiff {
+    build_derived_plugin_events_blocking(records)
+}
+
+#[cfg(test)]
 pub(crate) async fn report_mcp_installation_status_for_test(
     installation_id: Uuid,
     status: &str,
@@ -2913,3 +3195,7 @@ mod tests;
 #[cfg(test)]
 #[path = "mcp_reconciler_tests.rs"]
 mod mcp_tests;
+
+#[cfg(test)]
+#[path = "plugin_reconciler_tests.rs"]
+mod plugin_tests;

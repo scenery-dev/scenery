@@ -744,12 +744,32 @@ impl Backend for RealBackend {
                     }),
                     _ => None,
                 };
-                let tool_result = crate::tools::handle_login_with_oauth(
-                    &params.arguments,
-                    state,
-                    &self.registry_url,
-                    oauth_ctx.as_ref(),
-                );
+                // `handle_login_with_oauth` constructs a blocking
+                // `reqwest::blocking::Client` (via `AuthClient::new`) to build
+                // the PKCE URL. Constructing that on the thread Tokio is using
+                // to poll this task panics ("Cannot drop a runtime in a
+                // context where blocking is not allowed") — run it on the
+                // blocking pool instead, same as the `handle_tool_call`
+                // dispatch below does for every other management tool.
+                let arguments = params.arguments.clone();
+                let state_arc = Arc::clone(state);
+                let registry_url = self.registry_url.clone();
+                let registry_arc = Arc::clone(&self.registry);
+                let tool_result = tokio::task::spawn_blocking(move || {
+                    crate::tools::handle_login_with_oauth(
+                        &arguments,
+                        &state_arc,
+                        &registry_url,
+                        oauth_ctx.as_ref(),
+                        Some(registry_arc.as_ref()),
+                    )
+                })
+                .await
+                .unwrap_or_else(|join_err| {
+                    crate::protocol::ToolCallResult::error_result(format!(
+                        "vectorhawk_login handler panicked: {join_err}"
+                    ))
+                });
 
                 let latency_ms = started.elapsed().as_millis() as u64;
                 let status = if tool_result.is_error == Some(true) {
