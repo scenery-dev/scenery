@@ -103,15 +103,32 @@ pub struct ReconcilerStats {
 }
 
 /// Handle returned by [`spawn`], consumed by `doctor` output.
+///
+/// Also carries an [`tokio::task::AbortHandle`] for the spawned `run_loop`
+/// task so [`crate::SyncController::ensure_started`] can cleanly tear down a
+/// stale reconciler when on-disk credentials change out from under it (see
+/// that function's doc comment) — cancelling the task rather than merely
+/// dropping the handle, since `run_loop` is otherwise detached and keeps
+/// running until its event channel closes.
 #[derive(Clone)]
 pub struct ReconcilerHandle {
     stats: Arc<Mutex<ReconcilerStats>>,
+    task: tokio::task::AbortHandle,
 }
 
 impl ReconcilerHandle {
     /// Return a snapshot of the current reconciler statistics.
     pub fn stats(&self) -> ReconcilerStats {
         self.stats.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// Abort the reconciler's `run_loop` task immediately.
+    ///
+    /// Used only when restarting the sync subsystem with fresh credentials
+    /// (stale task must not keep processing events with the old device
+    /// context in parallel with the new one).
+    pub(crate) fn abort(&self) {
+        self.task.abort();
     }
 }
 
@@ -126,9 +143,6 @@ pub fn spawn(
     pusher: Option<Arc<ManagedPathsPusher>>,
 ) -> ReconcilerHandle {
     let stats = Arc::new(Mutex::new(ReconcilerStats::default()));
-    let handle = ReconcilerHandle {
-        stats: Arc::clone(&stats),
-    };
 
     let registry_url = {
         // We read the registry URL from sync_state if available; otherwise the
@@ -144,17 +158,20 @@ pub fn spawn(
     // the token at any time (on 401).  `report_installation_status` loads the
     // current token from SQLite each call so it always uses the latest value.
 
-    tokio::spawn(run_loop(
+    let join = tokio::spawn(run_loop(
         rx,
         state,
         registry_url,
         list_changed_tx,
-        stats,
+        stats.clone(),
         backend_registry,
         pusher,
     ));
 
-    handle
+    ReconcilerHandle {
+        stats,
+        task: join.abort_handle(),
+    }
 }
 
 // ── Main reconciler loop ──────────────────────────────────────────────────────

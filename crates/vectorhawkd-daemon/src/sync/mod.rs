@@ -38,23 +38,48 @@ pub struct SyncConfig {
     /// F2: pusher for writing installs into Claude Code's native directories.
     /// `None` when `VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER` is set.
     pub pusher: Option<Arc<ManagedPathsPusher>>,
+    /// The SSE client's *current* access token, live-updated.
+    ///
+    /// Seeded with `token` at spawn time. `sse_client::run`'s internal
+    /// 401-triggered `try_refresh_token` writes the newly-rotated access
+    /// token here (in addition to persisting it via `save_tokens`) so that
+    /// anything holding a clone of this handle — namely
+    /// [`crate::SyncController::ensure_started`]'s stored [`crate::RunningSync`]
+    /// — can read the token the connection is ACTUALLY using right now,
+    /// rather than the value frozen at spawn. Without this, a silent internal
+    /// refresh leaves the on-disk token ahead of what `ensure_started`
+    /// believes the connection is using, and the next legitimate
+    /// `auth login`/`auth pair` call sees a spurious mismatch and restarts an
+    /// already-healthy connection for no reason.
+    pub live_token: Arc<tokio::sync::RwLock<String>>,
 }
 
 /// Spawn the SSE client and reconciler tasks.
 ///
 /// Returns a [`ReconcilerHandle`] that the daemon's sync loop can use to query
-/// reconciler status (for `doctor` output), plus a clone of the event channel
-/// sender. The sender lets the periodic sync tick (`run_sync_tick`) feed a
+/// reconciler status (for `doctor` output), a clone of the event channel
+/// sender, and an [`tokio::task::AbortHandle`] for the spawned SSE-client
+/// task. The sender lets the periodic sync tick (`run_sync_tick`) feed a
 /// polled `GET /api/sync/snapshot` result into the *same* reconciler that
 /// consumes live SSE events — a safety net for a delta dropped while the SSE
-/// connection stays healthy. The two spawned tasks run independently until the
-/// process exits or the SSE connection is torn down via token invalidation.
+/// connection stays healthy. The abort handle lets
+/// [`crate::SyncController::ensure_started`] cancel a stale SSE connection
+/// (started with credentials that have since been superseded by a fresh
+/// `auth login`/`auth pair`) rather than leaving it running forever alongside
+/// a freshly-started replacement. The two spawned tasks otherwise run
+/// independently until the process exits, the SSE connection is torn down via
+/// token invalidation, or `SyncController` aborts them for a credential-aware
+/// restart.
 pub fn run(
     config: SyncConfig,
     state: Arc<AppState>,
     list_changed_tx: broadcast::Sender<()>,
     backend_registry: Arc<BackendRegistry>,
-) -> Result<(ReconcilerHandle, mpsc::Sender<SyncEvent>)> {
+) -> Result<(
+    ReconcilerHandle,
+    mpsc::Sender<SyncEvent>,
+    tokio::task::AbortHandle,
+)> {
     let (event_tx, event_rx) = mpsc::channel::<SyncEvent>(64);
 
     info!(
@@ -67,7 +92,8 @@ pub fn run(
     let sse_config = config.clone();
     let sse_state = Arc::clone(&state);
     let sse_tx = event_tx.clone();
-    tokio::spawn(sse_client::run(sse_config, sse_state, sse_tx));
+    let sse_join = tokio::spawn(sse_client::run(sse_config, sse_state, sse_tx));
+    let sse_abort = sse_join.abort_handle();
 
     // Spawn reconciler — consumes events and converges local state.
     let handle = reconciler::spawn(
@@ -78,5 +104,5 @@ pub fn run(
         config.pusher,
     );
 
-    Ok((handle, event_tx))
+    Ok((handle, event_tx, sse_abort))
 }

@@ -77,7 +77,13 @@ pub async fn run(config: SyncConfig, state: Arc<AppState>, tx: mpsc::Sender<Sync
             ConnectResult::Unauthorized => {
                 // 401: try to refresh the JWT before reconnecting.
                 info!("SSE: received 401 — attempting token refresh");
-                match try_refresh_token(&config.registry_url, Arc::clone(&state)).await {
+                match try_refresh_token(
+                    &config.registry_url,
+                    Arc::clone(&state),
+                    &config.live_token,
+                )
+                .await
+                {
                     Ok(new_token) => {
                         current_token = new_token;
                         info!("SSE: token refreshed — reconnecting immediately");
@@ -977,12 +983,20 @@ fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
 /// Attempt to refresh the stored JWT for `registry_url`.
 ///
 /// Uses the existing token store (SQLite `auth_tokens`).  On success, saves the
-/// new tokens back and returns the new access token.
-async fn try_refresh_token(registry_url: &str, state: Arc<AppState>) -> Result<String> {
+/// new tokens back, publishes the new access token to `live_token` — so
+/// `SyncController::ensure_started`'s credential-fingerprint comparison sees
+/// the token this connection is actually using now, not a value frozen at
+/// spawn time (see the doc comment on `SyncConfig::live_token`) — and returns
+/// the new access token.
+async fn try_refresh_token(
+    registry_url: &str,
+    state: Arc<AppState>,
+    live_token: &tokio::sync::RwLock<String>,
+) -> Result<String> {
     let reg_url = registry_url.to_string();
     let state_clone = Arc::clone(&state);
 
-    tokio::task::spawn_blocking(move || {
+    let new_access_token = tokio::task::spawn_blocking(move || {
         let rows =
             load_all_tokens(&state_clone).context("failed to load auth tokens for refresh")?;
 
@@ -1004,10 +1018,14 @@ async fn try_refresh_token(registry_url: &str, state: Arc<AppState>) -> Result<S
         )
         .context("failed to save refreshed tokens")?;
 
-        Ok(new_tokens.access_token)
+        Ok::<String, anyhow::Error>(new_tokens.access_token)
     })
     .await
-    .context("token refresh task panicked")?
+    .context("token refresh task panicked")??;
+
+    *live_token.write().await = new_access_token.clone();
+
+    Ok(new_access_token)
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
