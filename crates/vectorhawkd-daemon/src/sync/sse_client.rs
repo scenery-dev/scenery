@@ -26,7 +26,7 @@
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -51,22 +51,49 @@ const BACKOFF_MAX_SECS: u64 = 60;
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 /// Run the SSE client loop (never returns unless the channel is closed).
-pub async fn run(config: SyncConfig, state: Arc<AppState>, tx: mpsc::Sender<SyncEvent>) {
+///
+/// `connected_tx` is set to `true` (once, permanently — never reset back to
+/// `false`) the moment a connection attempt gets a successful (non-401, 2xx)
+/// response from `/api/sync/events` — i.e. right where the `"SSE: connected
+/// to {url}"` log line fires below, *before* the (potentially long-lived)
+/// event stream is read. `SyncController::ensure_started` waits on this
+/// (bounded) after (re)starting the subsystem to learn whether sync is
+/// genuinely running rather than merely spawned (see that function's doc
+/// comment for why "spawned" and "connected" used to be conflated). It is
+/// intentionally a one-shot latch rather than a live up/down flag: a later
+/// disconnect (watchdog, transient error, backoff) does not un-set it,
+/// because `wait_for` on a `watch` channel only ever observes the *latest*
+/// value — a producer that flipped true→false within the same scheduling
+/// tick (as happens whenever a mocked SSE response closes immediately after
+/// the connect, and in principle could happen with a real backend that
+/// drops the connection right away) can race a waiter out of ever
+/// observing the transient `true`. "Connected at least once since this
+/// (re)start" is both race-free and exactly what `ensure_started` needs to
+/// answer "is the credential-change restart it just performed working" —
+/// ongoing health thereafter is `doctor`'s job, not `auth/reload`'s.
+pub async fn run(
+    config: SyncConfig,
+    state: Arc<AppState>,
+    tx: mpsc::Sender<SyncEvent>,
+    connected_tx: watch::Sender<bool>,
+) {
     let mut backoff_secs = BACKOFF_INIT_SECS;
     let mut last_event_id = config.last_event_id.clone();
     let mut current_token = config.token.clone();
 
     loop {
-        match connect_and_stream(
+        let result = connect_and_stream(
             &config.registry_url,
             &current_token,
             &config.device_id,
             last_event_id.clone(),
             Arc::clone(&state),
             &tx,
+            &connected_tx,
         )
-        .await
-        {
+        .await;
+
+        match result {
             ConnectResult::Reconnect { new_last_id } => {
                 // Clean reconnect (EOF or watchdog).  Reset backoff.
                 backoff_secs = BACKOFF_INIT_SECS;
@@ -133,6 +160,7 @@ async fn connect_and_stream(
     last_event_id: Option<String>,
     state: Arc<AppState>,
     tx: &mpsc::Sender<SyncEvent>,
+    connected_tx: &watch::Sender<bool>,
 ) -> ConnectResult {
     let url = format!("{}/api/sync/events", registry_url.trim_end_matches('/'));
     debug!(url, device_id, "SSE: opening connection");
@@ -178,6 +206,10 @@ async fn connect_and_stream(
     }
 
     info!(device_id, "SSE: connected to {url}");
+    // Signal genuine connectivity — this is what `ensure_started` waits on
+    // (with a bounded timeout) instead of returning as soon as this task was
+    // merely spawned. See `run`'s doc comment.
+    let _ = connected_tx.send(true);
 
     // Stream lines.
     let mut new_last_id: Option<String> = last_event_id;

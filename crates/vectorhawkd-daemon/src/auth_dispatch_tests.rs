@@ -65,6 +65,164 @@ async fn reload_returns_inactive_without_token_and_is_idempotent() {
     assert!(!controller.ensure_started().await);
 }
 
+/// Regression test for the sales-demo bug: `vectorhawk auth pair` against a
+/// daemon whose SSE sync loop is already running under *different*
+/// credentials must report `sync_active: true` once the credential-change
+/// restart it triggers actually connects — not `false` just because the
+/// restart was still "in flight" (task freshly spawned, connection not yet
+/// confirmed) at the moment `ensure_started` used to sample it. Goes through
+/// `handle_reload` itself (the real `auth/reload` RPC handler CLI's
+/// `daemon_auth_reload` calls), not `SyncController::ensure_started`
+/// directly, so this exercises the exact code path the CLI hit.
+#[tokio::test]
+async fn reload_reports_active_after_credential_change_on_running_daemon() {
+    use crate::SyncController;
+    use tokio::sync::broadcast;
+    use vectorhawkd_mcp::aggregator::BackendRegistry;
+
+    let _guard = KeychainOff::enable();
+    let (state, _tmp) = bootstrap_state();
+    let state = Arc::new(state);
+
+    let mut server = mockito::Server::new_async().await;
+    let registry_url = server.url();
+
+    let register_mock = server
+        .mock("POST", "/api/devices/register")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"device_id":"dev-1"}"#)
+        .expect(1)
+        .create_async()
+        .await;
+
+    let sse_tok1 = server
+        .mock("GET", "/api/sync/events")
+        .match_header("authorization", "Bearer tok-1")
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body("")
+        .expect_at_least(1)
+        .create_async()
+        .await;
+
+    let sse_tok2 = server
+        .mock("GET", "/api/sync/events")
+        .match_header("authorization", "Bearer tok-2")
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body("")
+        .expect_at_least(1)
+        .create_async()
+        .await;
+
+    let (tx, _rx) = broadcast::channel(16);
+    let controller = Arc::new(SyncController::new(
+        registry_url.clone(),
+        Arc::clone(&state),
+        tx,
+        Arc::new(BackendRegistry::new()),
+        None,
+    ));
+
+    // First auth (e.g. `vectorhawk auth login`) — sync starts and connects
+    // with tok-1.
+    vectorhawkd_core::auth::save_tokens(&state, &registry_url, "tok-1", "ref-1")
+        .expect("save_tokens tok-1");
+    let resp = handle_reload(id(), Arc::clone(&controller)).await;
+    assert!(resp.error.is_none(), "should not error: {:?}", resp.error);
+    assert_eq!(
+        resp.result.unwrap()["sync_active"],
+        true,
+        "sync should report active once tok-1's SSE connection is up"
+    );
+    sse_tok1.assert_async().await;
+
+    // The reproduction: `vectorhawk auth pair` (or `auth login`/`auth
+    // token`) writes a *different* access token while the daemon's SSE loop
+    // from above is still running — exactly what a re-pair mid-demo does.
+    vectorhawkd_core::auth::save_tokens(&state, &registry_url, "tok-2", "ref-2")
+        .expect("save_tokens tok-2");
+    let resp = handle_reload(id(), Arc::clone(&controller)).await;
+    assert!(resp.error.is_none(), "should not error: {:?}", resp.error);
+    assert_eq!(
+        resp.result.unwrap()["sync_active"],
+        true,
+        "reload must report active once the credential-change restart's new \
+         SSE connection is genuinely up — not merely because the replacement \
+         task was spawned (the bug: reporting inactive while the restart \
+         this same call triggered was still connecting)"
+    );
+    sse_tok2.assert_async().await;
+
+    // Device registration is idempotent (cached device_id) — never repeated.
+    register_mock.assert_async().await;
+}
+
+/// The honest-failure counterpart: when the SSE connection genuinely cannot
+/// be established (backend rejects every attempt), `auth/reload` must still
+/// report `sync_active: false` — the fix must not soften a real failure into
+/// a false "success" alongside fixing the false "failure".
+#[tokio::test]
+async fn reload_reports_inactive_when_sse_connection_genuinely_fails() {
+    use crate::SyncController;
+    use tokio::sync::broadcast;
+    use vectorhawkd_mcp::aggregator::BackendRegistry;
+
+    let _guard = KeychainOff::enable();
+    let (state, _tmp) = bootstrap_state();
+    let state = Arc::new(state);
+
+    let mut server = mockito::Server::new_async().await;
+    let registry_url = server.url();
+
+    // Device registration succeeds — the failure is specifically in getting
+    // the SSE stream up, e.g. the registry rejecting every connection
+    // attempt (a real "registry unreachable" would look the same from
+    // `ensure_started`'s point of view: the task spawns fine, the
+    // connection itself never comes up).
+    let register_mock = server
+        .mock("POST", "/api/devices/register")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"device_id":"dev-1"}"#)
+        .expect(1)
+        .create_async()
+        .await;
+
+    let sse_fail = server
+        .mock("GET", "/api/sync/events")
+        .with_status(500)
+        .with_body("internal error")
+        .expect_at_least(1)
+        .create_async()
+        .await;
+
+    let (tx, _rx) = broadcast::channel(16);
+    let controller = Arc::new(SyncController::new(
+        registry_url.clone(),
+        Arc::clone(&state),
+        tx,
+        Arc::new(BackendRegistry::new()),
+        None,
+    ));
+
+    vectorhawkd_core::auth::save_tokens(&state, &registry_url, "tok-1", "ref-1")
+        .expect("save_tokens");
+
+    let resp = handle_reload(id(), Arc::clone(&controller)).await;
+    assert!(resp.error.is_none(), "should not error: {:?}", resp.error);
+    assert_eq!(
+        resp.result.unwrap()["sync_active"],
+        false,
+        "reload must report inactive — a real diagnostic, not a softened \
+         success — when the SSE connection never comes up"
+    );
+
+    register_mock.assert_async().await;
+    sse_fail.assert_async().await;
+}
+
 // ── auth/wait_for_callback ───────────────────────────────────────────────────
 
 #[tokio::test]

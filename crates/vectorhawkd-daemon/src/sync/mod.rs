@@ -17,7 +17,7 @@ pub use sse_client::SyncEvent;
 
 use anyhow::Result;
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 use tracing::info;
 use vectorhawkd_core::state::AppState;
 use vectorhawkd_mcp::aggregator::BackendRegistry;
@@ -58,18 +58,23 @@ pub struct SyncConfig {
 ///
 /// Returns a [`ReconcilerHandle`] that the daemon's sync loop can use to query
 /// reconciler status (for `doctor` output), a clone of the event channel
-/// sender, and an [`tokio::task::AbortHandle`] for the spawned SSE-client
-/// task. The sender lets the periodic sync tick (`run_sync_tick`) feed a
-/// polled `GET /api/sync/snapshot` result into the *same* reconciler that
-/// consumes live SSE events — a safety net for a delta dropped while the SSE
-/// connection stays healthy. The abort handle lets
+/// sender, an [`tokio::task::AbortHandle`] for the spawned SSE-client task,
+/// and a `watch::Receiver<bool>` that reports whether the SSE client is
+/// *currently* connected. The sender lets the periodic sync tick
+/// (`run_sync_tick`) feed a polled `GET /api/sync/snapshot` result into the
+/// *same* reconciler that consumes live SSE events — a safety net for a delta
+/// dropped while the SSE connection stays healthy. The abort handle lets
 /// [`crate::SyncController::ensure_started`] cancel a stale SSE connection
 /// (started with credentials that have since been superseded by a fresh
 /// `auth login`/`auth pair`) rather than leaving it running forever alongside
-/// a freshly-started replacement. The two spawned tasks otherwise run
-/// independently until the process exits, the SSE connection is torn down via
-/// token invalidation, or `SyncController` aborts them for a credential-aware
-/// restart.
+/// a freshly-started replacement. The connected-receiver lets
+/// `ensure_started` distinguish "the SSE task was spawned" from "the SSE
+/// connection is actually up" — spawning a task always succeeds, so
+/// `is_some()` on this function's `Ok` result alone cannot tell a caller
+/// whether sync is genuinely running (see `ensure_started`'s doc comment).
+/// The two spawned tasks otherwise run independently until the process exits,
+/// the SSE connection is torn down via token invalidation, or
+/// `SyncController` aborts them for a credential-aware restart.
 pub fn run(
     config: SyncConfig,
     state: Arc<AppState>,
@@ -79,8 +84,10 @@ pub fn run(
     ReconcilerHandle,
     mpsc::Sender<SyncEvent>,
     tokio::task::AbortHandle,
+    watch::Receiver<bool>,
 )> {
     let (event_tx, event_rx) = mpsc::channel::<SyncEvent>(64);
+    let (connected_tx, connected_rx) = watch::channel(false);
 
     info!(
         registry_url = %config.registry_url,
@@ -92,7 +99,7 @@ pub fn run(
     let sse_config = config.clone();
     let sse_state = Arc::clone(&state);
     let sse_tx = event_tx.clone();
-    let sse_join = tokio::spawn(sse_client::run(sse_config, sse_state, sse_tx));
+    let sse_join = tokio::spawn(sse_client::run(sse_config, sse_state, sse_tx, connected_tx));
     let sse_abort = sse_join.abort_handle();
 
     // Spawn reconciler — consumes events and converges local state.
@@ -104,5 +111,5 @@ pub fn run(
         config.pusher,
     );
 
-    Ok((handle, event_tx, sse_abort))
+    Ok((handle, event_tx, sse_abort, connected_rx))
 }

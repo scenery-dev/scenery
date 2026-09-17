@@ -72,6 +72,22 @@ async fn hook_registers_device_exactly_once_even_when_fired_twice() {
         .create_async()
         .await;
 
+    // `ensure_started` now waits for a genuine SSE connection (not just a
+    // successfully-spawned task) before reporting active — see
+    // `ensure_started_reconnects_sse_when_saved_token_changes` below — so
+    // this needs a reachable `/api/sync/events` mock too, or the assertion
+    // below would time out waiting for a connection that can never happen.
+    let sse_mock = server
+        .mock("GET", "/api/sync/events")
+        .match_header("authorization", "Bearer acc-tok")
+        .match_header("x-device-id", "dev-abc123")
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body("")
+        .expect_at_least(1)
+        .create_async()
+        .await;
+
     vectorhawkd_core::auth::save_tokens(&state, &registry_url, "acc-tok", "ref-tok")
         .expect("save_tokens");
 
@@ -105,6 +121,7 @@ async fn hook_registers_device_exactly_once_even_when_fired_twice() {
     assert_eq!(device_id, "dev-abc123");
 
     mock.assert_async().await;
+    sse_mock.assert_async().await;
 }
 
 /// No auth token saved yet (e.g. a race where the hook fires before the
@@ -385,4 +402,125 @@ async fn ensure_started_is_noop_after_sse_clients_own_internal_refresh() {
     // No second device registration, and neither endpoint the running
     // connection wasn't already using should have been touched.
     register_mock.assert_async().await;
+}
+
+/// Regression test for fix-round-1 of the same bug this file is about:
+/// `run_daemon`'s RUN2 boot section used to `.await` `ensure_started()`
+/// directly, sequentially *before* `UnixListener::bind` further down in
+/// `lib.rs`. Before `ensure_started` waited on a real connection it returned
+/// in sub-millisecond time (spawn-and-return), so awaiting it inline at boot
+/// was harmless. After making it wait (bounded, up to
+/// `SSE_CONNECT_CONFIRM_TIMEOUT`) for a genuine SSE connection, awaiting it
+/// inline at boot would delay the socket bind itself by up to that timeout
+/// whenever a token exists and the connect is slow or hangs — a registry
+/// hiccup, wifi/VPN reconnect. That is exactly the window in which the
+/// shim's socket-connect probe (2 s timeout, `vectorhawkd-mcp/src/backend.rs`)
+/// fails and latches every AI client's shim into `DaemonRequired` for the
+/// rest of its session (`vectorhawkd-shim/src/lib.rs`, no retry) — a worse
+/// failure mode than the false "could not start syncing" message this whole
+/// fix targets. `run_daemon` now fires `ensure_started()` via `tokio::spawn`
+/// instead of awaiting it inline.
+///
+/// `run_daemon` itself can't be exercised directly in a unit test (it always
+/// bootstraps `AppState` in the real platform data directory and only
+/// returns on SIGTERM), so this proves the invariant its fix relies on
+/// directly: spawning `ensure_started()` (exactly as `run_daemon` does) must
+/// not delay whatever the boot sequence does immediately afterward —
+/// modeled here by an actual `UnixListener::bind` + `accept`, the real next
+/// step `run_daemon` takes. The "registry" is a raw TCP listener that
+/// accepts the connection and then never responds, so the SSE client's
+/// `req.send().await` (deliberately given no response timeout — see
+/// `sse_client.rs`'s doc comment) hangs indefinitely. If `run_daemon`'s boot
+/// call ever regresses back to `ensure_started().await` directly, the
+/// equivalent of that hang would show up here as this test timing out
+/// instead of finishing in well under a second.
+#[tokio::test]
+async fn boot_time_sync_start_does_not_block_socket_accept() {
+    let _guard = KeychainOff::enable();
+    let (state, _tmp) = bootstrap_state();
+
+    // A "registry" that accepts the TCP connection and then never responds —
+    // simulates a hung/slow connection, not a fast rejection. Accepted
+    // sockets are held in `held` for the life of the loop so the connection
+    // genuinely stays open (never closed/reset) rather than getting an
+    // immediate EOF.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind hanging registry listener");
+    let port = listener.local_addr().expect("local_addr").port();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            held.push(socket);
+        }
+    });
+    let registry_url = format!("http://127.0.0.1:{port}");
+
+    // Pre-seed a token AND a cached device_id so `register_device` takes its
+    // early-return path (no network call) — isolating this test to the SSE
+    // connect specifically, which is where the real bug's hang would land.
+    vectorhawkd_core::auth::save_tokens(&state, &registry_url, "tok-1", "ref-1")
+        .expect("save_tokens");
+    state
+        .set_sync_state("device_id", "dev-1")
+        .expect("set device_id");
+
+    let (list_changed_tx, _rx) = broadcast::channel(16);
+    let sync_controller = Arc::new(SyncController::new(
+        registry_url,
+        Arc::clone(&state),
+        list_changed_tx,
+        Arc::new(BackendRegistry::new()),
+        None,
+    ));
+
+    // The timed block below mirrors `run_daemon`'s actual boot sequence:
+    // start the sync subsystem (RUN2), then immediately bind the daemon's
+    // Unix socket and accept a connection (the real next step `run_daemon`
+    // takes). The whole sequence — not just the bind+accept in isolation —
+    // is wrapped in one bounded timeout: if the sync-start step regressed to
+    // `ensure_started().await` directly (blocking), the bind+accept below
+    // would never even begin running until the background sync attempt
+    // finished (up to `SSE_CONNECT_CONFIRM_TIMEOUT`, 8s), which is what
+    // would trip the 1s timeout here. Timing only the bind+accept step in
+    // isolation would miss that regression entirely, since binding a Unix
+    // socket is fast on its own — the bug is in how long it takes to *reach*
+    // that step.
+    let socket_dir = tempfile::tempdir().expect("tempdir");
+    let socket_path = socket_dir.path().join("agent.sock");
+    // Holds the spawned sync task's handle so it can be aborted once the
+    // timed block below finishes — assigned *inside* that block (not
+    // returned as its tail expression, which clippy's `async_yields_async`
+    // flags as likely-accidental since a `JoinHandle` is itself awaitable).
+    let mut sync_task: Option<tokio::task::JoinHandle<()>> = None;
+    let boot_then_accept = async {
+        // Mirrors `run_daemon`'s RUN2 section exactly: fire-and-forget,
+        // never awaited inline before the boot sequence continues.
+        let boot_sync_controller = Arc::clone(&sync_controller);
+        sync_task = Some(tokio::spawn(async move {
+            boot_sync_controller.ensure_started().await;
+        }));
+
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind unix socket");
+        let client = tokio::net::UnixStream::connect(&socket_path)
+            .await
+            .expect("connect to daemon socket");
+        let (server_side, _) = listener.accept().await.expect("accept shim connection");
+        drop(client);
+        drop(server_side);
+    };
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), boot_then_accept)
+        .await
+        .expect(
+            "the boot sequence (start sync, then bind+accept the daemon socket) must \
+             complete promptly even with a slow/hanging SSE connect attempt in flight \
+             — if this times out, `ensure_started()` is being awaited inline again \
+             somewhere before the socket bind instead of fired-and-forgotten",
+        );
+    let sync_task = sync_task.expect("sync task should have been spawned");
+
+    // Clean up the still-hanging background sync attempt rather than leaving
+    // it to be dropped implicitly at test end.
+    sync_task.abort();
 }

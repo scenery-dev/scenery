@@ -573,14 +573,36 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
         Arc::clone(&vh_registry),
         f2_pusher,
     ));
-    if sync_controller.ensure_started().await {
-        info!("sync subsystem started");
-    } else {
-        info!(
-            "sync subsystem not started (no auth token or registration failed) — \
-             will start automatically on `auth login` / `auth pair`"
-        );
-    }
+    // Fire-and-forget: do NOT await this at boot. `ensure_started` now waits
+    // (bounded, up to `SSE_CONNECT_CONFIRM_TIMEOUT` — 8s) for the SSE
+    // connection to actually come up, so it can no longer be assumed to
+    // return promptly — it used to be a sub-millisecond spawn-and-return.
+    // Awaiting it here, before `UnixListener::bind` further down, would delay
+    // the socket bind itself by up to that timeout whenever a token exists
+    // but the connect is slow (registry hiccup, wifi/VPN reconnect). That
+    // window is exactly when it matters most: the shim's socket-connect
+    // probe has its own much shorter timeout
+    // (`vectorhawkd-mcp/src/backend.rs`) and, on failure, latches into
+    // `DaemonRequired` for the rest of the client session with no retry
+    // (`vectorhawkd-shim/src/lib.rs`) — so a slow boot-time sync connect
+    // would have made every AI client whose shim starts during that window
+    // hard-fail for its entire session. The socket must be accepting
+    // connections immediately regardless of how long the first sync attempt
+    // takes; sync starting a few seconds late is a background concern
+    // (logged below, from the spawned task) and still self-heals via the
+    // periodic sync tick / `auth/reload` / the `vectorhawk_login` hook.
+    let boot_sync_controller = Arc::clone(&sync_controller);
+    tokio::spawn(async move {
+        if boot_sync_controller.ensure_started().await {
+            info!("sync subsystem started");
+        } else {
+            info!(
+                "sync subsystem not started (no auth token, registration failed, or the \
+                 SSE connection did not come up in time) — will keep retrying in the \
+                 background and start automatically on `auth login` / `auth pair`"
+            );
+        }
+    });
 
     // R1: wire the same idempotent (re)start into the `vectorhawk_login`
     // MCP-tool path. `vh_registry` is the same `Arc<BackendRegistry>` that
@@ -947,6 +969,14 @@ struct RunningSync {
     /// `auth login`/`auth pair` call to see a spurious mismatch and restart
     /// an already-healthy connection.
     live_token: Arc<tokio::sync::RwLock<String>>,
+    /// `true` while the SSE client currently has a live connection to
+    /// `/api/sync/events` — `false` from spawn until the first successful
+    /// connect, and `false` again for the gap between any disconnect and the
+    /// next reconnect. `ensure_started` waits on this (bounded) to answer
+    /// "is sync genuinely running", rather than treating "the task was
+    /// spawned" as equivalent to "sync is active" (see that function's doc
+    /// comment for the bug this fixes).
+    connected_rx: tokio::sync::watch::Receiver<bool>,
 }
 
 /// Runtime-controllable handle to the SSE sync subsystem.
@@ -1017,9 +1047,33 @@ impl SyncController {
     /// aborted first, and this falls through to the same start path used when
     /// nothing was running.
     ///
-    /// Returns `true` if sync is active after the call.  Returns `false` when
-    /// there is still no usable auth token or device registration failed — the
-    /// daemon keeps running and a later `ensure_started` can succeed.
+    /// Returns `true` once sync is genuinely running after the call — the
+    /// SSE client has an actual live connection to `/api/sync/events`, not
+    /// merely "the task was spawned" (see [`wait_for_connected`] and
+    /// [`RunningSync::connected_rx`]). Returns `false` when there is still no
+    /// usable auth token, device registration failed, or the SSE connection
+    /// didn't come up within [`SSE_CONNECT_CONFIRM_TIMEOUT`] — the daemon
+    /// keeps running and retrying in the background regardless, so a later
+    /// `ensure_started` (or the connection simply catching up on its own)
+    /// can still succeed.
+    ///
+    /// **Why "spawned" isn't "active".** Spawning the SSE-client and
+    /// reconciler tasks (`try_start_sync` / `sync::run`) can never itself
+    /// fail — `tokio::spawn` always succeeds — so treating `try_start_sync`'s
+    /// `Some(..)` as proof of a working connection made `auth/reload` report
+    /// `sync_active: true` (or blindly assume an unchanged-fingerprint
+    /// connection was still healthy) even when the connection had not
+    /// actually come up yet, or had since dropped. That produced exactly the
+    /// inverse-looking bug this fixes: a live sales-demo `vectorhawk auth
+    /// pair` printed "the daemon could not start syncing yet" — false —
+    /// because the (correct) credential-change restart this same call
+    /// triggered was sampled for "active" before its freshly-spawned SSE
+    /// task had actually connected; the daemon log showed the connection
+    /// succeed a few milliseconds later, after the RPC response had already
+    /// gone out. Waiting here on the connection's own live state (bounded, so
+    /// a genuine failure — bad credentials, unreachable registry — still gets
+    /// reported within the CLI's 15 s `auth/reload` read timeout) closes that
+    /// gap in both directions.
     pub(crate) async fn ensure_started(&self) -> bool {
         let mut guard = self.handle.lock().await;
 
@@ -1033,9 +1087,15 @@ impl SyncController {
             let running_fingerprint = (running_token, running.device_id.clone());
             if current.as_ref() == Some(&running_fingerprint) {
                 // Already running with exactly the credentials still on disk
-                // — nothing to do. This is what keeps a healthy connection
-                // from being thrashed on every `auth/reload` call.
-                return true;
+                // — nothing to restart. That is not the same guarantee as
+                // "connected right now" (the existing task could be
+                // mid-backoff after a drop), so confirm live state instead of
+                // assuming success — this is what keeps a healthy connection
+                // from being thrashed on every `auth/reload` call while still
+                // answering honestly.
+                let mut rx = running.connected_rx.clone();
+                drop(guard);
+                return wait_for_connected(&mut rx).await;
             }
 
             info!(
@@ -1056,9 +1116,16 @@ impl SyncController {
             self.pusher.clone(),
         )
         .await;
-        let active = started.is_some();
+        let mut connected_rx = started.as_ref().map(|r| r.connected_rx.clone());
         *guard = started;
-        active
+        drop(guard);
+
+        match connected_rx.as_mut() {
+            Some(rx) => wait_for_connected(rx).await,
+            // No token, or device registration failed — nothing was spawned,
+            // so there is no connection to wait for.
+            None => false,
+        }
     }
 
     /// Return a clone of the reconciler's event-channel sender, if the sync
@@ -1071,6 +1138,38 @@ impl SyncController {
             .as_ref()
             .map(|running| running.event_tx.clone())
     }
+}
+
+/// Upper bound on how long [`SyncController::ensure_started`] waits for a
+/// (re)started SSE connection to actually come up before reporting
+/// `sync_active: false`.
+///
+/// Chosen to leave headroom inside the CLI's 15 s `auth/reload` read timeout
+/// (`daemon_auth_reload` in `vectorhawkd-cli/src/main.rs`) alongside
+/// `register_device`'s own network round trip and RPC framing/socket
+/// overhead — a real connect is typically well under a second (the demo
+/// reproduction that motivated this connected 32 ms after being spawned);
+/// this budget is generous slack for a slow network, not the expected case.
+const SSE_CONNECT_CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Wait up to [`SSE_CONNECT_CONFIRM_TIMEOUT`] for `rx` to report a live SSE
+/// connection, returning whether one was observed within the budget.
+///
+/// `watch::Receiver::wait_for` re-checks the *current* value first, so this
+/// returns immediately (no wait at all) if the connection is already up —
+/// the common case for an established, credential-unchanged connection. On
+/// timeout the underlying SSE-client task is left running and retrying: this
+/// only affects what `ensure_started` reports for *this* call, matching its
+/// existing "the daemon keeps running and a later call can succeed" contract.
+async fn wait_for_connected(rx: &mut tokio::sync::watch::Receiver<bool>) -> bool {
+    matches!(
+        tokio::time::timeout(
+            SSE_CONNECT_CONFIRM_TIMEOUT,
+            rx.wait_for(|&connected| connected)
+        )
+        .await,
+        Ok(Ok(_))
+    )
 }
 
 /// Read the `(access_token, device_id)` currently on disk for `registry_url`,
@@ -1166,12 +1265,13 @@ async fn try_start_sync(
     };
 
     match sync::run(sync_config, state, list_changed_tx, backend_registry) {
-        Ok((reconciler, event_tx, sse_abort)) => Some(RunningSync {
+        Ok((reconciler, event_tx, sse_abort, connected_rx)) => Some(RunningSync {
             reconciler,
             event_tx,
             sse_abort,
             device_id,
             live_token,
+            connected_rx,
         }),
         Err(e) => {
             warn!(error = %e, "sync: failed to start sync subsystem");
