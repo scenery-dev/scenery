@@ -957,13 +957,27 @@ async fn probe_oauth_listener_port(socket_path: &str) -> String {
     }
 
     // Read response with a 500 ms timeout.
+    //
+    // Skip any unsolicited notification frame (no `id`) — e.g. the pending
+    // adoption alert `socket_dispatch::run_loop` writes to every fresh
+    // connection within `ALERT_WINDOW` of daemon boot — the same class of bug
+    // that made `daemon_auth_reload` misreport sync status; see its doc
+    // comment for the full mechanism.
     let read_result = timeout(Duration::from_millis(500), async {
-        let mut len_buf = [0u8; 4];
-        reader.read_exact(&mut len_buf).await?;
-        let resp_len = u32::from_be_bytes(len_buf) as usize;
-        let mut resp_body = vec![0u8; resp_len];
-        reader.read_exact(&mut resp_body).await?;
-        Ok::<Vec<u8>, tokio::io::Error>(resp_body)
+        loop {
+            let mut len_buf = [0u8; 4];
+            reader.read_exact(&mut len_buf).await?;
+            let resp_len = u32::from_be_bytes(len_buf) as usize;
+            let mut resp_body = vec![0u8; resp_len];
+            reader.read_exact(&mut resp_body).await?;
+            let is_notification = serde_json::from_slice::<serde_json::Value>(&resp_body)
+                .map(|v| v.get("id").is_none())
+                .unwrap_or(false);
+            if is_notification {
+                continue;
+            }
+            return Ok::<Vec<u8>, tokio::io::Error>(resp_body);
+        }
     })
     .await;
 
@@ -1003,6 +1017,7 @@ async fn probe_oauth_listener_port(_socket_path: &str) -> String {
 }
 
 /// Result of asking a running daemon to reload credentials and start syncing.
+#[derive(Debug, PartialEq, Eq)]
 enum DaemonReload {
     /// Daemon reloaded and the SSE sync subsystem is now active.
     SyncActive,
@@ -1056,13 +1071,36 @@ async fn daemon_auth_reload(socket_path: &str) -> DaemonReload {
 
     // Device registration involves a network round-trip on the daemon side;
     // give it up to 15 s before giving up.
+    //
+    // A freshly-opened connection isn't guaranteed to see our `auth/reload`
+    // response as the FIRST frame: `socket_dispatch::run_loop` unconditionally
+    // writes a pending adoption alert (a `notifications/message` frame, no
+    // `id`) to every new connection while it's still fresh (within
+    // `ALERT_WINDOW`, 120s after daemon boot), before it ever looks at our
+    // request. Reading exactly one frame and assuming it's our response
+    // mistook that unsolicited notification for the reply — parsing it found
+    // no `result.sync_active`, so this silently fell through to
+    // `DaemonReload::SyncInactive` and printed "could not start syncing yet"
+    // even though the daemon (proven by driving `auth/reload` directly over
+    // the socket, bypassing the CLI entirely) answered `sync_active: true`
+    // within milliseconds. JSON-RPC responses always carry the `id` we sent;
+    // notifications never carry an `id` — skip any frame without one and keep
+    // reading for the actual response, still bounded by this same timeout.
     let read_result = timeout(Duration::from_secs(15), async {
-        let mut len_buf = [0u8; 4];
-        reader.read_exact(&mut len_buf).await?;
-        let resp_len = u32::from_be_bytes(len_buf) as usize;
-        let mut resp_body = vec![0u8; resp_len];
-        reader.read_exact(&mut resp_body).await?;
-        Ok::<Vec<u8>, tokio::io::Error>(resp_body)
+        loop {
+            let mut len_buf = [0u8; 4];
+            reader.read_exact(&mut len_buf).await?;
+            let resp_len = u32::from_be_bytes(len_buf) as usize;
+            let mut resp_body = vec![0u8; resp_len];
+            reader.read_exact(&mut resp_body).await?;
+            let is_notification = serde_json::from_slice::<serde_json::Value>(&resp_body)
+                .map(|v| v.get("id").is_none())
+                .unwrap_or(false);
+            if is_notification {
+                continue;
+            }
+            return Ok::<Vec<u8>, tokio::io::Error>(resp_body);
+        }
     })
     .await;
 
@@ -4009,19 +4047,31 @@ async fn cmd_auth_login(registry_url: &str) -> Result<()> {
         Ok(())
     }
 
+    // Skips unsolicited notification frames (no `id`) rather than mistaking
+    // one for the response to our request — e.g. the pending adoption alert
+    // `socket_dispatch::run_loop` writes to every fresh connection within
+    // `ALERT_WINDOW` of daemon boot. See `daemon_auth_reload`'s doc comment
+    // for the full mechanism this class of bug produces.
     async fn recv_rpc<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<serde_json::Value> {
-        let mut len_buf = [0u8; 4];
-        reader
-            .read_exact(&mut len_buf)
-            .await
-            .context("failed to read frame length")?;
-        let len = u32::from_be_bytes(len_buf) as usize;
-        let mut body = vec![0u8; len];
-        reader
-            .read_exact(&mut body)
-            .await
-            .context("failed to read frame body")?;
-        serde_json::from_slice(&body).context("failed to parse JSON-RPC response")
+        loop {
+            let mut len_buf = [0u8; 4];
+            reader
+                .read_exact(&mut len_buf)
+                .await
+                .context("failed to read frame length")?;
+            let len = u32::from_be_bytes(len_buf) as usize;
+            let mut body = vec![0u8; len];
+            reader
+                .read_exact(&mut body)
+                .await
+                .context("failed to read frame body")?;
+            let value: serde_json::Value =
+                serde_json::from_slice(&body).context("failed to parse JSON-RPC response")?;
+            if value.get("id").is_none() {
+                continue;
+            }
+            return Ok(value);
+        }
     }
 
     // ── Step 2: get the OAuth listener port ──────────────────────────────────
@@ -5515,3 +5565,7 @@ fn is_plugin_installed_locally(slug: &str) -> Result<bool> {
 #[cfg(test)]
 #[path = "commands_tests.rs"]
 mod commands_tests;
+
+#[cfg(all(test, unix))]
+#[path = "daemon_reload_tests.rs"]
+mod daemon_reload_tests;
