@@ -37,6 +37,7 @@ use clap::{Parser, Subcommand};
 mod commands_migrate;
 mod install;
 mod logging;
+mod pair;
 mod uninstall;
 
 // ── CLI structure ─────────────────────────────────────────────────────────────
@@ -404,9 +405,17 @@ pub enum AuthCommand {
     ///
     /// This registers the device and authenticates the CLI in one step,
     /// without a separate browser login.
+    ///
+    /// The code argument is optional — when omitted it's resolved, in
+    /// order: the VH_PAIR_CODE env var (unattended path for MDM / Intune /
+    /// Jamf rollouts, used without prompting); otherwise an interactive
+    /// prompt, if a terminal is available; otherwise the command exits
+    /// non-zero with an error naming both escapes.
     Pair {
         /// The pairing code shown in the portal (e.g. VH-7X4K-9M2P).
-        code: String,
+        /// Optional: falls back to VH_PAIR_CODE, then an interactive
+        /// prompt when a terminal is available.
+        code: Option<String>,
 
         #[arg(
             long,
@@ -732,7 +741,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Auth(AuthCommand::Logout { registry_url }) => cmd_auth_logout(&registry_url).await,
         Command::Auth(AuthCommand::Status { registry_url }) => cmd_auth_status(&registry_url).await,
         Command::Auth(AuthCommand::Pair { code, registry_url }) => {
-            cmd_auth_pair(&code, &registry_url).await
+            cmd_auth_pair(code.as_deref(), &registry_url).await
         }
         Command::Auth(AuthCommand::Token {
             token,
@@ -4363,8 +4372,14 @@ async fn cmd_auth_token(token: &str, registry_url: &str) -> Result<()> {
 
 // ── auth pair ────────────────────────────────────────────────────────────────
 
-async fn cmd_auth_pair(code: &str, registry_url: &str) -> Result<()> {
+async fn cmd_auth_pair(code: Option<&str>, registry_url: &str) -> Result<()> {
     use vectorhawkd_core::{auth::save_tokens, state::AppState};
+
+    // Resolution order: explicit argument > VH_PAIR_CODE > interactive
+    // prompt (if a terminal is available) > clear non-zero-exit error.
+    // See `pair::resolve_pair_code` for the testable decision logic.
+    let code = pair::resolve_pair_code_live(code).map_err(|e| anyhow::anyhow!(e))?;
+    let code = code.as_str();
 
     let state = AppState::bootstrap().context("failed to bootstrap application state")?;
 
