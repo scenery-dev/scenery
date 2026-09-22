@@ -18,6 +18,18 @@ pub mod macos;
 #[cfg(target_os = "linux")]
 pub mod linux;
 
+/// Escape hatch for the `HOME`-override gate in [`install`]: set to any
+/// non-empty value to skip the check.
+///
+/// The gate exists to catch Homebrew's `post_install` sandbox (see
+/// `home_is_overridden`'s docs), but a handful of setups deliberately run
+/// with `HOME` pointed away from the invoking user's passwd entry —
+/// containers that set `HOME` themselves, or a deliberate `sudo -u other`
+/// install on behalf of a service account. Those are legitimate; this var
+/// lets them opt out of the gate explicitly rather than silently disabling
+/// it.
+pub const ALLOW_HOME_MISMATCH_ENV: &str = "VH_ALLOW_HOME_MISMATCH";
+
 // ── Public types ──────────────────────────────────────────────────────────────
 
 /// Result of [`status`], consumed by the `doctor` command.
@@ -45,6 +57,17 @@ pub enum InstallStatus {
 /// (prints a notice and returns `Ok`). If it is installed but not running, the
 /// daemon is restarted.
 pub fn install() -> Result<()> {
+    // Refuse to "install" into an overridden HOME (Homebrew `post_install`
+    // sandbox, most commonly). Both platform installers below resolve their
+    // unit path from HOME — macOS via `dirs::home_dir()`, Linux via
+    // `dirs::config_dir()` — so writing the unit into a HOME that isn't this
+    // user's real home writes it somewhere the service manager never reads,
+    // then reports success on a unit that's about to vanish. Only `install`
+    // is gated: `uninstall`/`status`/`restart` don't write anything into
+    // HOME that matters here, and `ensure_installed` calls `install` so it
+    // inherits this for free.
+    check_home_not_overridden()?;
+
     #[cfg(target_os = "macos")]
     return macos::install();
 
@@ -122,6 +145,136 @@ pub fn status() -> Result<InstallStatus> {
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     Ok(InstallStatus::NotInstalled)
+}
+
+// ── HOME-override guard ──────────────────────────────────────────────────────
+//
+// Homebrew's `post_install` runs with HOME pointed at a throwaway sandbox
+// directory it deletes seconds later. Both platform installers resolve their
+// unit path from HOME (`dirs::config_dir()` on Linux, `dirs::home_dir()` on
+// macOS), so a real `daemon install` under that sandbox wrote the systemd
+// unit into a tree that no longer existed by the time anything went looking
+// for it — while printing "Wrote systemd user unit: …" and "Systemd user
+// unit enabled and started" right after. The second line wasn't a lie:
+// `systemctl --user` keys off XDG_RUNTIME_DIR, not HOME, so it genuinely
+// started whatever unit already happened to be registered. The first line
+// was: the file it just wrote was never in a place systemd (or Launchd) will
+// ever read again. Net effect, live on a real `brew upgrade`: Homebrew never
+// installed a working auto-start unit, while reporting that it did. This
+// guard turns that into a hard error before any file gets written, rather
+// than a print-and-continue.
+
+/// Pure decision: has `HOME` been overridden away from the current user's
+/// real home directory?
+///
+/// `env_home` is the raw `HOME` environment variable; `passwd_home` is the
+/// `pw_dir` field from the password database entry for the current uid (see
+/// [`passwd_home_dir`]) — a lookup that does not go through `HOME` at all,
+/// so it reflects the *real* home directory regardless of what the process
+/// environment claims.
+///
+/// - Both `Some` and they differ (after trimming a single trailing `/` from
+///   each, so `/home/x` and `/home/x/` count as equal) → `true`.
+/// - Either side is `None`, or they're equal → `false`. This is deliberately
+///   conservative: when we can't determine the real home (odd NSS setup, no
+///   `HOME` set at all), we must not block the install on a guess.
+///
+/// Compares the raw strings only — does not canonicalize. A symlinked home
+/// directory must not be treated as an override just because one path is a
+/// symlink and the other its target; the caller may canonicalize both sides
+/// first (see `check_home_not_overridden`) when it can do so without
+/// failing, and fall back to these raw values otherwise.
+pub(crate) fn home_is_overridden(env_home: Option<&str>, passwd_home: Option<&str>) -> bool {
+    match (env_home, passwd_home) {
+        (Some(env), Some(passwd)) => {
+            env.strip_suffix('/').unwrap_or(env) != passwd.strip_suffix('/').unwrap_or(passwd)
+        }
+        _ => false,
+    }
+}
+
+/// Look up the current user's home directory from the password database
+/// (`getpwuid(getuid())`), independent of the `HOME` environment variable —
+/// this is the "ground truth" [`home_is_overridden`] compares `HOME`
+/// against.
+///
+/// Returns `None` when the uid has no passwd entry or its `pw_dir` is null
+/// (both effectively "unknown," not "overridden" — see
+/// `home_is_overridden`'s conservative-fallback rule).
+#[cfg(unix)]
+pub(crate) fn passwd_home_dir() -> Option<String> {
+    // SAFETY: getuid() cannot fail. getpwuid() returns either a null
+    // pointer or a pointer to a struct passwd owned by libc (static/TLS
+    // storage) that stays valid until the next passwd-database call on this
+    // thread; nothing else in this block calls into libc's passwd/group
+    // APIs, and the CStr is copied into an owned String before the block
+    // ends, so nothing borrowed from it escapes.
+    unsafe {
+        let pw = libc::getpwuid(libc::getuid());
+        if pw.is_null() {
+            return None;
+        }
+        let pw_dir = (*pw).pw_dir;
+        if pw_dir.is_null() {
+            return None;
+        }
+        Some(
+            std::ffi::CStr::from_ptr(pw_dir)
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
+}
+
+/// Gate for [`install`]: refuse to proceed when `HOME` has been overridden
+/// away from the real home directory, unless [`ALLOW_HOME_MISMATCH_ENV`] is
+/// set.
+#[cfg(unix)]
+fn check_home_not_overridden() -> Result<()> {
+    if std::env::var_os(ALLOW_HOME_MISMATCH_ENV).is_some_and(|v| !v.is_empty()) {
+        return Ok(());
+    }
+
+    let env_home = std::env::var("HOME").ok();
+    let passwd_home = passwd_home_dir();
+
+    // Prefer comparing canonical forms so a symlinked home (e.g. macOS's
+    // /Users -> /System/Volumes/Data/Users) isn't mistaken for an override.
+    // Only use the canonical forms when *both* sides resolve — a HOME that
+    // doesn't exist (the Homebrew sandbox case, or just a typo) must still
+    // be compared, not silently ignored because canonicalize() errored.
+    let canonical = match (&env_home, &passwd_home) {
+        (Some(e), Some(p)) => match (std::fs::canonicalize(e), std::fs::canonicalize(p)) {
+            (Ok(e), Ok(p)) => Some((
+                e.to_string_lossy().into_owned(),
+                p.to_string_lossy().into_owned(),
+            )),
+            _ => None,
+        },
+        _ => None,
+    };
+    let (cmp_env, cmp_passwd): (Option<&str>, Option<&str>) = match &canonical {
+        Some((e, p)) => (Some(e.as_str()), Some(p.as_str())),
+        None => (env_home.as_deref(), passwd_home.as_deref()),
+    };
+
+    if home_is_overridden(cmp_env, cmp_passwd) {
+        anyhow::bail!(
+            "refusing to install: HOME is {} but this user's home is {}. \
+             The auto-start unit would be written somewhere the service \
+             manager never reads, so the install would silently do \
+             nothing. Re-run with the correct HOME, or set \
+             {ALLOW_HOME_MISMATCH_ENV}=1 to override.",
+            env_home.unwrap_or_default(),
+            passwd_home.unwrap_or_default(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn check_home_not_overridden() -> Result<()> {
+    Ok(())
 }
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
@@ -455,10 +608,65 @@ pub(crate) fn daemon_socket_path() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        cgroup_is_service, cmdline_is_daemon_run, exe_is_stale, rewrite_homebrew_cellar_to_symlink,
-        should_direct_spawn, unit_is_healthy, SystemdState,
+        cgroup_is_service, cmdline_is_daemon_run, exe_is_stale, home_is_overridden,
+        rewrite_homebrew_cellar_to_symlink, should_direct_spawn, unit_is_healthy, SystemdState,
     };
     use std::path::Path;
+
+    // ── home_is_overridden ─────────────────────────────────────────────────
+
+    #[test]
+    fn home_equal_paths_is_not_overridden() {
+        assert!(!home_is_overridden(
+            Some("/home/spaceghost"),
+            Some("/home/spaceghost")
+        ));
+    }
+
+    #[test]
+    fn home_trailing_slash_difference_is_not_overridden() {
+        // A single trailing slash is not a meaningful difference.
+        assert!(!home_is_overridden(
+            Some("/home/spaceghost/"),
+            Some("/home/spaceghost")
+        ));
+        assert!(!home_is_overridden(
+            Some("/home/spaceghost"),
+            Some("/home/spaceghost/")
+        ));
+    }
+
+    #[test]
+    fn home_genuine_mismatch_is_overridden() {
+        // The live Homebrew post_install repro.
+        assert!(home_is_overridden(
+            Some("/var/tmp/s-7l6HKUXr/vectorhawk-postinstall-abc"),
+            Some("/home/spaceghost")
+        ));
+    }
+
+    #[test]
+    fn home_env_none_is_conservatively_not_overridden() {
+        assert!(!home_is_overridden(None, Some("/home/spaceghost")));
+    }
+
+    #[test]
+    fn home_passwd_none_is_conservatively_not_overridden() {
+        assert!(!home_is_overridden(
+            Some("/var/tmp/s-7l6HKUXr/whatever"),
+            None
+        ));
+    }
+
+    #[test]
+    fn home_both_none_is_not_overridden() {
+        assert!(!home_is_overridden(None, None));
+    }
+
+    #[test]
+    fn home_both_empty_strings_are_equal_so_not_overridden() {
+        assert!(!home_is_overridden(Some(""), Some("")));
+    }
 
     // ── cgroup_is_service ──────────────────────────────────────────────────
 
