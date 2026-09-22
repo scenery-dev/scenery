@@ -36,8 +36,9 @@ use anyhow::{Context, Result};
 use std::{fs, process::Command};
 
 use super::{
-    cgroup_is_service, daemon_socket_path, resolve_daemon_bin_path, should_direct_spawn,
-    socket_is_reachable, unit_is_healthy, wait_for_socket, InstallStatus, SystemdState,
+    cgroup_is_service, cmdline_is_daemon_run, daemon_socket_path, resolve_daemon_bin_path,
+    should_direct_spawn, socket_is_reachable, unit_is_healthy, wait_for_socket, InstallStatus,
+    SystemdState,
 };
 
 const SERVICE_NAME: &str = "vectorhawk-agent.service";
@@ -403,10 +404,12 @@ fn reap_stray_daemons() {
         let Ok(raw_cmdline) = fs::read(entry.path().join("cmdline")) else {
             continue;
         };
-        let cmdline = String::from_utf8_lossy(&raw_cmdline);
-        let is_daemon_process =
-            cmdline.contains("vectorhawk") && cmdline.contains("daemon") && cmdline.contains("run");
-        if !is_daemon_process {
+        // Positional argv match (see `cmdline_is_daemon_run`'s doc comment)
+        // — not a substring test. A prior substring-based version of this
+        // check killed an innocent shell whose command line happened to
+        // mention "vectorhawk", "daemon" and "/run/user/1000/bus" as
+        // unrelated tokens.
+        if !cmdline_is_daemon_run(&raw_cmdline) {
             continue;
         }
 
@@ -658,12 +661,19 @@ fn install_systemd(bin_path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// Send SIGTERM to any running `vectorhawk daemon run --foreground` process.
+/// Send SIGTERM to any running `vectorhawk daemon run` process (with or
+/// without `--foreground`).
 ///
 /// Used during upgrades when `systemctl --user restart` fails (no D-Bus
 /// session in Homebrew post_install). On Linux a process keeps running after
 /// its binary is deleted, so we must explicitly kill it before spawning the
 /// replacement. Non-fatal: errors are silently ignored.
+///
+/// Uses the same positional-argv [`cmdline_is_daemon_run`] matcher as
+/// `reap_stray_daemons` — this function used to match by substring
+/// (`contains("vectorhawk") && contains("daemon") && contains("foreground")`),
+/// which is the same class of bug that made `reap_stray_daemons` kill an
+/// innocent process; see that function's call site for the live incident.
 fn kill_daemon_process() {
     let Ok(proc_entries) = fs::read_dir("/proc") else {
         return;
@@ -678,15 +688,11 @@ fn kill_daemon_process() {
         let Ok(raw) = fs::read(&cmdline_path) else {
             continue;
         };
-        // cmdline is NUL-separated; check it contains our marker tokens
-        let cmdline = String::from_utf8_lossy(&raw);
-        if cmdline.contains("vectorhawk")
-            && cmdline.contains("daemon")
-            && cmdline.contains("foreground")
-        {
-            if let Ok(pid) = pid_str.parse::<i32>() {
-                unsafe { libc::kill(pid, libc::SIGTERM) };
-            }
+        if !cmdline_is_daemon_run(&raw) {
+            continue;
+        }
+        if let Ok(pid) = pid_str.parse::<i32>() {
+            unsafe { libc::kill(pid, libc::SIGTERM) };
         }
     }
 }
