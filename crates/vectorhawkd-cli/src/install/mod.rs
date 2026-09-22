@@ -306,6 +306,44 @@ pub(crate) fn should_direct_spawn(socket_up: bool, systemd_state: Option<Systemd
     }
 }
 
+/// Given the raw, NUL-separated `/proc/<pid>/cmdline` bytes of a process,
+/// report whether it is a `vectorhawk daemon run` invocation (with or
+/// without trailing args such as `--foreground`).
+///
+/// Matches **positionally on argv**, not by substring: `argv[0]`'s basename
+/// must be exactly `vectorhawk` (argv[0] may be a bare name or an absolute
+/// path, e.g. `/home/linuxbrew/.linuxbrew/bin/vectorhawk`), `argv[1]` must
+/// be exactly `daemon`, and `argv[2]` must be exactly `run`. Trailing args
+/// are ignored.
+///
+/// This is a hard requirement, not a style preference: an earlier version
+/// of both `reap_stray_daemons` and `kill_daemon_process` matched by
+/// substring against the whole cmdline blob (`contains("vectorhawk") &&
+/// contains("daemon") && contains("run"/"foreground")`), and that killed an
+/// innocent process during live verification — a `bash -c …` shell whose
+/// command line happened to mention `vectorhawk`, `daemon`, and
+/// `/run/user/1000/bus` nowhere near each other. Positional argv matching
+/// cannot be fooled by unrelated tokens elsewhere on the line, and it also
+/// naturally excludes `vectorhawk daemon install`/`restart` (the CLI
+/// invocation doing the reaping/killing itself), since `argv[2]` there is
+/// `install`/`restart`, not `run`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn cmdline_is_daemon_run(raw: &[u8]) -> bool {
+    let mut argv = raw.split(|&b| b == 0);
+    let Some(argv0) = argv.next() else {
+        return false;
+    };
+    let Some(argv1) = argv.next() else {
+        return false;
+    };
+    let Some(argv2) = argv.next() else {
+        return false;
+    };
+
+    let basename = argv0.rsplit(|&b| b == b'/').next().unwrap_or(argv0);
+    basename == b"vectorhawk" && argv1 == b"daemon" && argv2 == b"run"
+}
+
 /// Pure decision: is the systemd-managed daemon actually healthy, i.e. is it
 /// safe to treat `daemon install` as a no-op ("already installed and up to
 /// date")?
@@ -355,8 +393,8 @@ pub(crate) fn daemon_socket_path() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        cgroup_is_service, rewrite_homebrew_cellar_to_symlink, should_direct_spawn,
-        unit_is_healthy, SystemdState,
+        cgroup_is_service, cmdline_is_daemon_run, rewrite_homebrew_cellar_to_symlink,
+        should_direct_spawn, unit_is_healthy, SystemdState,
     };
     use std::path::Path;
 
@@ -459,6 +497,73 @@ mod tests {
     fn spawns_when_no_systemd_session_at_all() {
         // Genuine Homebrew post_install / no-D-Bus case.
         assert!(should_direct_spawn(false, None));
+    }
+
+    // ── cmdline_is_daemon_run ───────────────────────────────────────────────
+    //
+    // Regression coverage for the live incident: substring matching against
+    // the raw cmdline blob killed an innocent `bash -c …` shell whose
+    // command line happened to contain "vectorhawk", "daemon", and
+    // "/run/user/1000/bus" as unrelated tokens.
+
+    #[test]
+    fn does_not_match_the_shell_that_actually_got_killed() {
+        // The real false positive: a bash process whose full command line
+        // mentions "vectorhawk", "daemon" and "/run/user/1000/bus" as
+        // separate, unrelated substrings — none of them in argv[0..3]
+        // position.
+        let cmdline = b"bash\0-c\0echo vectorhawk daemon status > /run/user/1000/bus\0".to_vec();
+        assert!(!cmdline_is_daemon_run(&cmdline));
+    }
+
+    #[test]
+    fn matches_absolute_path_daemon_run_with_foreground_flag() {
+        let cmdline =
+            b"/home/linuxbrew/.linuxbrew/bin/vectorhawk\0daemon\0run\0--foreground\0".to_vec();
+        assert!(cmdline_is_daemon_run(&cmdline));
+    }
+
+    #[test]
+    fn matches_bare_name_daemon_run_with_no_trailing_args() {
+        let cmdline = b"vectorhawk\0daemon\0run\0".to_vec();
+        assert!(cmdline_is_daemon_run(&cmdline));
+    }
+
+    #[test]
+    fn does_not_match_daemon_install_the_installing_process_itself() {
+        let cmdline = b"vectorhawk\0daemon\0install\0".to_vec();
+        assert!(!cmdline_is_daemon_run(&cmdline));
+    }
+
+    #[test]
+    fn does_not_match_daemon_restart() {
+        let cmdline = b"vectorhawk\0daemon\0restart\0".to_vec();
+        assert!(!cmdline_is_daemon_run(&cmdline));
+    }
+
+    #[test]
+    fn does_not_match_similarly_named_binaries() {
+        for argv0 in ["not-vectorhawk", "vectorhawkd", "vectorhawk-old"] {
+            let cmdline = format!("{argv0}\0daemon\0run\0").into_bytes();
+            assert!(
+                !cmdline_is_daemon_run(&cmdline),
+                "argv0={argv0} must not match"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_malformed_or_short_cmdlines_do_not_match_and_do_not_panic() {
+        let cases: &[&[u8]] = &[
+            b"",
+            b"vectorhawk\0",
+            b"vectorhawk\0daemon\0",
+            b"\0\0\0",
+            b"vectorhawk",
+        ];
+        for raw in cases {
+            assert!(!cmdline_is_daemon_run(raw), "raw={raw:?}");
+        }
     }
 
     // ── unit_is_healthy ────────────────────────────────────────────────────
