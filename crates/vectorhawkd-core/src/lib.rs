@@ -20,6 +20,7 @@
 
 pub mod app;
 pub mod audit;
+pub mod binary_path;
 pub mod managed;
 pub mod model;
 pub mod policy;

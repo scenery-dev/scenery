@@ -53,6 +53,9 @@
 //!   `managed_path_markers` SQLite lookup — all sync I/O. Only the final
 //!   HTTP POST stays on the async executor (native `reqwest`, non-blocking).
 //! - Final audit flush on shutdown: wrapped in `spawn_blocking`.
+//! - Binary-replacement watch (`binary_watch` module): wraps its periodic
+//!   `stat()` of the watch path in `spawn_blocking`. See `binary_watch`'s
+//!   module docs for why the watch exists and which path it stats.
 //!
 //! ## Startup (before accept loop)
 //!
@@ -62,6 +65,7 @@
 //!   loop or per-connection handlers without adding `spawn_blocking`.
 
 mod auth_dispatch;
+mod binary_watch;
 pub mod managed_paths;
 mod oauth_listener;
 mod oauth_state;
@@ -712,6 +716,90 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
 
     info!(path = %socket_path, "listening on Unix socket");
 
+    // ── Binary-replacement watch ─────────────────────────────────────────────
+    //
+    // See `binary_watch` module docs for the full why (upgrade invisibility on
+    // Linux, `post_install` being sandboxed on both platforms, `brew upgrade`
+    // not restarting services). Record the watch path's identity now, then
+    // notify `binary_watch_notify` from a periodic background task the moment
+    // it changes; the accept loop below breaks out of its `select!` on that
+    // notification and falls through the same drain/flush/socket-cleanup path
+    // used for SIGTERM/SIGINT, so `acquire_socket`'s singleton guard never
+    // blocks the replacement binary from starting.
+    //
+    // Resolving or stat'ing the watch path can fail (no writable exe path,
+    // odd sandbox, race at the exact instant of startup); either failure
+    // disables the watch for this run rather than failing daemon startup —
+    // a daemon that can't self-detect upgrades should still run normally.
+    let binary_watch_notify = Arc::new(Notify::new());
+    if binary_watch::watch_disabled() {
+        info!("VH_NO_BINARY_WATCH set — binary-replacement watch disabled");
+    } else {
+        match binary_watch::resolve_watch_path() {
+            Ok(watch_path) => match binary_watch::stat_identity(&watch_path) {
+                Some(recorded) => {
+                    info!(
+                        watch_path = %watch_path.display(),
+                        dev = recorded.dev,
+                        ino = recorded.ino,
+                        "binary-replacement watch armed"
+                    );
+                    let notify = Arc::clone(&binary_watch_notify);
+                    tokio::spawn(async move {
+                        let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                            binary_watch::BINARY_WATCH_INTERVAL_SECS,
+                        ));
+                        // Skip the immediate first tick — let the accept loop start first.
+                        interval.tick().await;
+
+                        loop {
+                            interval.tick().await;
+
+                            let stat_path = watch_path.clone();
+                            let current = tokio::task::spawn_blocking(move || {
+                                binary_watch::stat_identity(&stat_path)
+                            })
+                            .await
+                            .unwrap_or(None);
+
+                            if binary_watch::binary_changed(recorded, current) {
+                                // `binary_changed` only returns true for `Some`, so this
+                                // unwrap is safe by construction.
+                                let new_id = current.expect("binary_changed implies Some");
+                                warn!(
+                                    watch_path = %watch_path.display(),
+                                    old_dev = recorded.dev,
+                                    old_ino = recorded.ino,
+                                    new_dev = new_id.dev,
+                                    new_ino = new_id.ino,
+                                    "binary at watch path was replaced (upgrade) — \
+                                     exiting cleanly so the service manager restarts \
+                                     the daemon on the new version"
+                                );
+                                notify.notify_one();
+                                return;
+                            }
+                        }
+                    });
+                }
+                None => {
+                    warn!(
+                        watch_path = %watch_path.display(),
+                        "binary-replacement watch: could not stat watch path at \
+                         startup — watch disabled for this run"
+                    );
+                }
+            },
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "binary-replacement watch: failed to resolve watch path — \
+                     watch disabled for this run"
+                );
+            }
+        }
+    }
+
     let mut sigterm =
         signal(SignalKind::terminate()).context("failed to register SIGTERM handler")?;
     let mut sigint =
@@ -748,6 +836,10 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
             }
             _ = sigint.recv() => {
                 info!("received SIGINT — shutting down");
+                break;
+            }
+            _ = binary_watch_notify.notified() => {
+                info!("binary-replacement watch fired — shutting down");
                 break;
             }
         }
