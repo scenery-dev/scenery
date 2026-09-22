@@ -172,16 +172,18 @@ async fn ensure_started_reconnects_sse_when_saved_token_changes() {
     let mut server = mockito::Server::new_async().await;
     let registry_url = server.url();
 
-    // `register_device` short-circuits once `sync_state["device_id"]` is
-    // set (see lib.rs), so this must be hit at most once even though
-    // `ensure_started` is called twice below — the credential-change restart
-    // must not re-register the device over the network.
+    // `register_device` posts on every call as of 1.0.90 (it no longer
+    // short-circuits on a cached `sync_state["device_id"]`), so the
+    // credential-change restart below re-registers: two `ensure_started`
+    // calls, two registrations. That re-registration is the point — it is
+    // what refreshes the backend's `agent_version`/`hostname` for this
+    // device, and the endpoint is idempotent on `device_uuid`.
     let register_mock = server
         .mock("POST", "/api/devices/register")
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(r#"{"device_id":"dev-1"}"#)
-        .expect(1)
+        .expect(2)
         .create_async()
         .await;
 
@@ -523,4 +525,99 @@ async fn boot_time_sync_start_does_not_block_socket_accept() {
     // Clean up the still-hanging background sync attempt rather than leaving
     // it to be dropped implicitly at test end.
     sync_task.abort();
+}
+
+/// The 1.0.90 fix: a device that already has a cached `device_id` must STILL
+/// post to `/api/devices/register` on daemon start. Before this, the function
+/// returned the cached id without a network call, so the backend's
+/// `agent_version` for that device froze at whatever version first paired it
+/// — a box six releases newer still advertised its original version in the
+/// portal's fleet view, while liveness kept updating from the SSE connect so
+/// nothing looked broken.
+#[tokio::test]
+async fn register_device_reregisters_when_device_id_is_already_cached() {
+    let _guard = KeychainOff::enable();
+    let (state, _tmp) = bootstrap_state();
+
+    // Simulate a device that registered on an earlier run.
+    state.set_sync_state("device_uuid", "uuid-cached").unwrap();
+    state.set_sync_state("device_id", "dev-cached").unwrap();
+
+    let mut server = mockito::Server::new_async().await;
+    let registry_url = server.url();
+
+    let mock = server
+        .mock("POST", "/api/devices/register")
+        .match_body(mockito::Matcher::PartialJson(
+            serde_json::json!({ "device_uuid": "uuid-cached" }),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"device_id":"dev-cached"}"#)
+        .expect(1)
+        .create_async()
+        .await;
+
+    let id = crate::register_device(&registry_url, "tok", Arc::clone(&state))
+        .await
+        .expect("register_device");
+
+    assert_eq!(id, "dev-cached");
+    mock.assert_async().await;
+}
+
+/// A registry that is down must not stop an already-registered daemon from
+/// booting: the cached `device_id` is the fallback, so the daemon keeps its
+/// identity and carries on rather than failing startup.
+#[tokio::test]
+async fn register_device_falls_back_to_cached_id_when_the_call_fails() {
+    let _guard = KeychainOff::enable();
+    let (state, _tmp) = bootstrap_state();
+
+    state.set_sync_state("device_uuid", "uuid-cached").unwrap();
+    state.set_sync_state("device_id", "dev-cached").unwrap();
+
+    let mut server = mockito::Server::new_async().await;
+    let registry_url = server.url();
+
+    let mock = server
+        .mock("POST", "/api/devices/register")
+        .with_status(503)
+        .expect(1)
+        .create_async()
+        .await;
+
+    let id = crate::register_device(&registry_url, "tok", Arc::clone(&state))
+        .await
+        .expect("must fall back to the cached device_id rather than erroring");
+
+    assert_eq!(id, "dev-cached");
+    mock.assert_async().await;
+}
+
+/// With no cached id there is nothing to fall back to, so a failed
+/// registration must surface as an error rather than inventing an identity.
+#[tokio::test]
+async fn register_device_errors_when_the_call_fails_and_nothing_is_cached() {
+    let _guard = KeychainOff::enable();
+    let (state, _tmp) = bootstrap_state();
+
+    let mut server = mockito::Server::new_async().await;
+    let registry_url = server.url();
+
+    let _mock = server
+        .mock("POST", "/api/devices/register")
+        .with_status(503)
+        .expect(1)
+        .create_async()
+        .await;
+
+    let err = crate::register_device(&registry_url, "tok", Arc::clone(&state))
+        .await
+        .expect_err("no cached device_id means the failure must propagate");
+
+    assert!(
+        format!("{err:#}").contains("device registration failed"),
+        "unexpected error: {err:#}"
+    );
 }

@@ -1280,10 +1280,21 @@ async fn try_start_sync(
     }
 }
 
-/// Register this device with the backend.
+/// Register this device with the backend, on every daemon start.
 ///
 /// Calls `POST /api/devices/register` with a stable device UUID and system
 /// info.  The backend returns a `device_id` which we persist in `sync_state`.
+///
+/// A `device_id` cached from a previous run is a FALLBACK for when the call
+/// fails — never a reason to skip the call. `POST /devices/register` is
+/// idempotent on `device_uuid`, and its existing-device branch is what
+/// refreshes the backend's view of this machine's `agent_version` and
+/// `hostname`. Returning early on a cached id (as this did until 1.0.90)
+/// froze `agent_version` at whatever version first paired the device: a box
+/// upgraded six releases still advertised its original version, and the
+/// portal's per-device agent column — a fleet-governance surface IT reads to
+/// know what is actually deployed — silently went stale. Liveness kept
+/// updating from the SSE connect, so nothing looked broken.
 ///
 /// On success, returns the `device_id` to use for SSE connections.
 async fn register_device(registry_url: &str, token: &str, state: Arc<AppState>) -> Result<String> {
@@ -1297,11 +1308,32 @@ async fn register_device(registry_url: &str, token: &str, state: Arc<AppState>) 
         }
     };
 
-    // Check if we already have a device_id from a previous registration.
-    if let Some(existing_id) = state.get_sync_state("device_id")? {
-        return Ok(existing_id);
-    }
+    let cached_id = state.get_sync_state("device_id")?;
 
+    match register_with_backend(registry_url, token, &device_uuid, Arc::clone(&state)).await {
+        Ok(id) => Ok(id),
+        // A registry that is down, unreachable, or holding an expired token
+        // must not stop an already-registered daemon from booting — it still
+        // has work to do offline. Only a device that has never registered has
+        // nothing to fall back to.
+        Err(e) => match cached_id {
+            Some(id) => {
+                warn!(error = %e, device_id = %id, "device re-registration failed; continuing with cached device_id");
+                Ok(id)
+            }
+            None => Err(e),
+        },
+    }
+}
+
+/// The network half of [`register_device`]: one `POST /api/devices/register`
+/// round trip, persisting the returned `device_id`.
+async fn register_with_backend(
+    registry_url: &str,
+    token: &str,
+    device_uuid: &str,
+    state: Arc<AppState>,
+) -> Result<String> {
     let url = format!(
         "{}/api/devices/register",
         registry_url.trim_end_matches('/')

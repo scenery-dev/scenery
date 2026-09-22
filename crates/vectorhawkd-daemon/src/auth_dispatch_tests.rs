@@ -87,12 +87,17 @@ async fn reload_reports_active_after_credential_change_on_running_daemon() {
     let mut server = mockito::Server::new_async().await;
     let registry_url = server.url();
 
+    // Two registrations, not one: as of 1.0.90 `register_device` posts on
+    // every call instead of short-circuiting on a cached device_id, so the
+    // credential-change restart re-registers. That is the point — it is what
+    // refreshes the backend's agent_version for this device — and the
+    // endpoint is idempotent on device_uuid.
     let register_mock = server
         .mock("POST", "/api/devices/register")
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(r#"{"device_id":"dev-1"}"#)
-        .expect(1)
+        .expect(2)
         .create_async()
         .await;
 
