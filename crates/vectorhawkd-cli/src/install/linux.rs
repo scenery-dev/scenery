@@ -36,9 +36,9 @@ use anyhow::{Context, Result};
 use std::{fs, process::Command};
 
 use super::{
-    cgroup_is_service, cmdline_is_daemon_run, daemon_socket_path, resolve_daemon_bin_path,
-    should_direct_spawn, socket_is_reachable, unit_is_healthy, wait_for_socket, InstallStatus,
-    SystemdState,
+    cgroup_is_service, cmdline_is_daemon_run, daemon_socket_path, exe_is_stale,
+    resolve_daemon_bin_path, should_direct_spawn, socket_is_reachable, unit_is_healthy,
+    wait_for_socket, InstallStatus, SystemdState,
 };
 
 const SERVICE_NAME: &str = "vectorhawk-agent.service";
@@ -347,6 +347,86 @@ fn parse_active_sub_state(output: &str) -> Option<SystemdState> {
     }
 }
 
+/// Read the unit's `MainPID` via `systemctl --user show <unit> -p MainPID
+/// --value`, using the same explicit `XDG_RUNTIME_DIR`/
+/// `DBUS_SESSION_BUS_ADDRESS` plumbing as [`unit_state`] and for the same
+/// reason (no D-Bus session bus in the Homebrew `post_install` context
+/// otherwise).
+///
+/// Returns `None` whenever a running process can't be pinned down:
+/// `systemctl` failed or is unreachable, the value didn't parse, or
+/// `MainPID=0` — which systemd reports when the unit has no running process
+/// (not active, or between crash-loop restarts). Callers feed this into the
+/// stale-exe check, where `None` here means "nothing running to check" and
+/// falls through to the existing state/socket checks rather than being
+/// treated as stale.
+fn unit_main_pid() -> Option<u32> {
+    let xdg = xdg_runtime_dir();
+    let bus = format!("unix:path={xdg}/bus");
+
+    let output = Command::new("systemctl")
+        .args(["--user", "show", SERVICE_NAME, "-p", "MainPID", "--value"])
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .env("DBUS_SESSION_BUS_ADDRESS", &bus)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let pid: u32 = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .ok()?;
+    if pid == 0 {
+        return None;
+    }
+    Some(pid)
+}
+
+/// Is the unit's currently-running process (per `MainPID`) executing a
+/// stale binary? This is the `brew upgrade` bug this module fixes: on Linux
+/// a running process keeps executing its binary's inode after the file
+/// backing it is replaced or removed by `brew upgrade`, so the unit can be
+/// genuinely `Active` with a live socket while still serving last release's
+/// code — see [`exe_is_stale`] in `mod.rs` for the live incident and the
+/// decision logic.
+///
+/// Every failure path here — no `MainPID`, an unreadable
+/// `/proc/<pid>/exe`, a `bin_path` that doesn't canonicalize — returns
+/// `false`. "Cannot determine" must never force a restart; see
+/// `exe_is_stale`'s conservative-fallback policy, which this mirrors on the
+/// I/O side.
+fn running_exe_is_stale(bin_path: &std::path::Path) -> bool {
+    let Some(pid) = unit_main_pid() else {
+        return false;
+    };
+
+    let Ok(exe_link) = fs::read_link(format!("/proc/{pid}/exe")) else {
+        return false;
+    };
+    let Some(exe_target) = exe_link.to_str() else {
+        return false;
+    };
+
+    // `bin_path` is `resolve_daemon_bin_path()`'s result — the *unversioned*
+    // Homebrew symlink when Homebrew-installed (same value written into
+    // `ExecStart`) — while `/proc/<pid>/exe` is a magic symlink the kernel
+    // always resolves through to the *real* Cellar target. Canonicalizing
+    // here is what makes the comparison apples-to-apples: comparing the raw
+    // symlink text against `exe_target` would mismatch on every healthy
+    // install and turn this into a restart loop on every `daemon install`
+    // (see `exe_is_stale`'s doc comment for the full trap). A failed
+    // canonicalize (e.g. the symlink target vanished entirely) yields
+    // `None`, which `exe_is_stale` also treats conservatively as not stale.
+    let canonical_expected = fs::canonicalize(bin_path)
+        .ok()
+        .and_then(|p| p.to_str().map(str::to_string));
+
+    exe_is_stale(exe_target, canonical_expected.as_deref())
+}
+
 /// Human-readable label for a [`SystemdState`], for status/diagnostic
 /// messages printed to the user.
 fn describe_state(state: Option<SystemdState>) -> &'static str {
@@ -481,17 +561,38 @@ fn install_systemd(bin_path: &std::path::Path) -> Result<()> {
     let needs_restart = if unit_exists_and_enabled {
         if unit_has_current_binary {
             let pre_check_state = unit_state();
-            let healthy = unit_is_healthy(pre_check_state, socket_is_reachable(&xdg_sock, 200));
+            let pre_check_socket_up = socket_is_reachable(&xdg_sock, 200);
+            // Catches the case `state`/`socket_up` alone can't: systemd
+            // reports Active, MainPID unchanged, NRestarts=0 — genuinely
+            // healthy by every check above — but `brew upgrade` replaced the
+            // binary on disk out from under the still-running process, which
+            // keeps executing the old (possibly now-deleted) inode
+            // indefinitely on Linux. See `exe_is_stale` in `mod.rs` for the
+            // live incident this fixes.
+            let exe_stale = running_exe_is_stale(bin_path);
+            let healthy = unit_is_healthy(pre_check_state, pre_check_socket_up, exe_stale);
             if healthy {
                 println!(
                     "VectorHawk daemon is already installed and up to date — no changes made."
                 );
                 return Ok(());
             }
-            println!(
-                "VectorHawk daemon unit is installed but not running ({}) — repairing.",
-                describe_state(pre_check_state)
-            );
+            if exe_stale && pre_check_state == Some(SystemdState::Active) && pre_check_socket_up {
+                // Distinct from the generic "not running" message below:
+                // this box's unit is genuinely up and healthy by
+                // state/socket — the *only* thing wrong is that the running
+                // process predates the on-disk binary. Reusing the
+                // auto-restart wording here would mislead a user checking
+                // why an install that used to be a no-op now restarts.
+                println!(
+                    "VectorHawk daemon is running an outdated binary (upgraded on disk) — restarting."
+                );
+            } else {
+                println!(
+                    "VectorHawk daemon unit is installed but not running ({}) — repairing.",
+                    describe_state(pre_check_state)
+                );
+            }
             true
         } else {
             // Binary path changed (upgrade): fall through to rewrite + restart.

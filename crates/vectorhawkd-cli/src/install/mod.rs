@@ -344,25 +344,87 @@ pub(crate) fn cmdline_is_daemon_run(raw: &[u8]) -> bool {
     basename == b"vectorhawk" && argv1 == b"daemon" && argv2 == b"run"
 }
 
+/// Pure decision: is a running daemon process executing a stale binary?
+///
+/// This is the `brew upgrade` follow-on to the `auto-restart` bug above: on
+/// Linux a running process keeps executing its binary's inode after the file
+/// backing it is replaced or removed, so `systemctl --user show` can report
+/// `MainPID` unchanged and `NRestarts=0` — genuinely `Active`, genuinely
+/// healthy by every check that came before this one — while the process is
+/// still serving last release's code. Verified live going 1.0.91 → 1.0.92:
+/// `MainPID` never changed, but `readlink /proc/<pid>/exe` still showed the
+/// 1.0.91 Cellar path marked `(deleted)`.
+///
+/// `exe_target` is the raw `readlink /proc/<pid>/exe` result (may carry the
+/// kernel's `" (deleted)"` suffix). `canonical_expected` is the canonical
+/// form of the binary path the unit *should* be running, or `None` when the
+/// caller could not determine it.
+///
+/// - `exe_target` ends with `" (deleted)"` → stale, unconditionally. This is
+///   the common case: Homebrew has already removed the old Cellar directory,
+///   so the kernel appends this marker to the magic-symlink target.
+/// - Otherwise, stale when `canonical_expected` is `Some` and differs from
+///   `exe_target`. This catches the case where Homebrew hasn't cleaned up
+///   the old Cellar directory yet — the link carries no `(deleted)` marker,
+///   but still resolves to the *previous* version's still-present path.
+/// - `canonical_expected` is `None` → **never** stale. Be conservative: when
+///   we can't determine what "current" should be, we must not force a
+///   restart on a guess.
+///
+/// **Caller trap, pinned by test below:** the rendered unit's `ExecStart`
+/// holds the *unversioned* Homebrew symlink (`resolve_daemon_bin_path`'s
+/// rewrite target, e.g. `/home/linuxbrew/.linuxbrew/bin/vectorhawk`), while
+/// `/proc/<pid>/exe` is a magic symlink the kernel always resolves through
+/// to the *real* target (e.g.
+/// `…/Cellar/vectorhawk/1.0.92/bin/vectorhawk`). Comparing `ExecStart`'s raw
+/// text against `exe_target` would therefore mismatch on **every** healthy
+/// install — the unversioned symlink text is never equal to what
+/// `/proc/.../exe` reports, healthy or not — and turn this into a restart
+/// loop on every single `daemon install`. The caller MUST
+/// `std::fs::canonicalize()` the resolved binary path first and pass that
+/// canonical form as `canonical_expected`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn exe_is_stale(exe_target: &str, canonical_expected: Option<&str>) -> bool {
+    if exe_target.ends_with(" (deleted)") {
+        return true;
+    }
+    match canonical_expected {
+        Some(expected) => exe_target != expected,
+        None => false,
+    }
+}
+
 /// Pure decision: is the systemd-managed daemon actually healthy, i.e. is it
 /// safe to treat `daemon install` as a no-op ("already installed and up to
 /// date")?
 ///
-/// This is deliberately strict — `Active` and a reachable socket, nothing
-/// looser. An earlier version of the installer's idempotency guard only
-/// checked "unit exists, is enabled, ExecStart matches the current binary"
-/// and returned early on that alone, without ever asking whether the unit
-/// was actually running. That let a box stuck in `SubState=auto-restart`
-/// (e.g. because a stray direct-spawned daemon — see `should_direct_spawn`'s
-/// docs — is holding the socket) report "no changes made" on every
-/// subsequent `daemon install`, forever, because the early return fired
-/// *before* the stray-reaping and restart logic ever ran. `Activating` is
-/// deliberately excluded too: an in-progress start is not yet a settled
-/// "healthy," and treating it as good enough would risk the same silent
-/// no-op if it never actually finishes.
+/// This is deliberately strict — `Active`, a reachable socket, and *not*
+/// running a stale binary (see [`exe_is_stale`]), nothing looser. An earlier
+/// version of the installer's idempotency guard only checked "unit exists,
+/// is enabled, ExecStart matches the current binary" and returned early on
+/// that alone, without ever asking whether the unit was actually running.
+/// That let a box stuck in `SubState=auto-restart` (e.g. because a stray
+/// direct-spawned daemon — see `should_direct_spawn`'s docs — is holding the
+/// socket) report "no changes made" on every subsequent `daemon install`,
+/// forever, because the early return fired *before* the stray-reaping and
+/// restart logic ever ran. `Activating` is deliberately excluded too: an
+/// in-progress start is not yet a settled "healthy," and treating it as good
+/// enough would risk the same silent no-op if it never actually finishes.
+///
+/// `exe_stale` folds in the `brew upgrade` case: a unit can be genuinely
+/// `Active` with a live socket while the running process is still executing
+/// last release's binary from a deleted inode (see [`exe_is_stale`]'s doc
+/// for the live incident). That is a form of unhealthy too — it must fall
+/// through to the same repair path as `auto-restart`, not early-return "no
+/// changes made," or every release's fixes silently fail to take effect on
+/// upgrade until something else restarts the service.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub(crate) fn unit_is_healthy(state: Option<SystemdState>, socket_up: bool) -> bool {
-    state == Some(SystemdState::Active) && socket_up
+pub(crate) fn unit_is_healthy(
+    state: Option<SystemdState>,
+    socket_up: bool,
+    exe_stale: bool,
+) -> bool {
+    state == Some(SystemdState::Active) && socket_up && !exe_stale
 }
 
 /// Resolve the platform socket path without bootstrapping AppState (avoids
@@ -393,7 +455,7 @@ pub(crate) fn daemon_socket_path() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        cgroup_is_service, cmdline_is_daemon_run, rewrite_homebrew_cellar_to_symlink,
+        cgroup_is_service, cmdline_is_daemon_run, exe_is_stale, rewrite_homebrew_cellar_to_symlink,
         should_direct_spawn, unit_is_healthy, SystemdState,
     };
     use std::path::Path;
@@ -573,13 +635,13 @@ mod tests {
     // even though it "exists, is enabled, and has the right ExecStart."
 
     #[test]
-    fn healthy_only_when_active_and_socket_up() {
-        assert!(unit_is_healthy(Some(SystemdState::Active), true));
+    fn healthy_only_when_active_and_socket_up_and_exe_not_stale() {
+        assert!(unit_is_healthy(Some(SystemdState::Active), true, false));
     }
 
     #[test]
     fn not_healthy_when_active_but_socket_down() {
-        assert!(!unit_is_healthy(Some(SystemdState::Active), false));
+        assert!(!unit_is_healthy(Some(SystemdState::Active), false, false));
     }
 
     #[test]
@@ -587,13 +649,21 @@ mod tests {
         // This is the exact bad state from the live repro: MainPID=0,
         // SubState=auto-restart. A momentarily-reachable socket (e.g. a
         // stray about to be reaped) must not paper over it.
-        assert!(!unit_is_healthy(Some(SystemdState::AutoRestart), true));
+        assert!(!unit_is_healthy(
+            Some(SystemdState::AutoRestart),
+            true,
+            false
+        ));
     }
 
     #[test]
     fn not_healthy_when_activating() {
         // In-progress start is not yet a settled "healthy."
-        assert!(!unit_is_healthy(Some(SystemdState::Activating), true));
+        assert!(!unit_is_healthy(
+            Some(SystemdState::Activating),
+            true,
+            false
+        ));
     }
 
     #[test]
@@ -604,9 +674,89 @@ mod tests {
             Some(SystemdState::Unknown),
             None,
         ] {
-            assert!(!unit_is_healthy(state, true), "state={state:?}");
-            assert!(!unit_is_healthy(state, false), "state={state:?}");
+            assert!(!unit_is_healthy(state, true, false), "state={state:?}");
+            assert!(!unit_is_healthy(state, false, false), "state={state:?}");
         }
+    }
+
+    #[test]
+    fn not_healthy_when_active_and_socket_up_but_exe_is_stale() {
+        // The `brew upgrade` bug this module fixes: Active, socket up,
+        // MainPID unchanged, NRestarts=0 — every prior check says "healthy"
+        // — but the running process is still executing last release's
+        // binary from a deleted inode. Must fall through to repair, not
+        // early-return "no changes made."
+        assert!(!unit_is_healthy(Some(SystemdState::Active), true, true));
+    }
+
+    // ── exe_is_stale ────────────────────────────────────────────────────────
+    //
+    // Regression coverage for the `brew upgrade` stale-exe bug: verified live
+    // on Linux immediately after 1.0.91 -> 1.0.92, where `MainPID` never
+    // changed and `NRestarts=0`, but `readlink /proc/<pid>/exe` still showed
+    // the 1.0.91 Cellar path marked "(deleted)".
+
+    #[test]
+    fn deleted_marker_is_always_stale_regardless_of_canonical_expected() {
+        let exe_target =
+            "/home/linuxbrew/.linuxbrew/Cellar/vectorhawk/1.0.91/bin/vectorhawk (deleted)";
+        assert!(exe_is_stale(exe_target, None));
+        assert!(exe_is_stale(
+            exe_target,
+            Some("/home/linuxbrew/.linuxbrew/Cellar/vectorhawk/1.0.92/bin/vectorhawk")
+        ));
+    }
+
+    #[test]
+    fn healthy_install_canonical_expected_equals_exe_target_is_not_stale() {
+        let path = "/home/linuxbrew/.linuxbrew/Cellar/vectorhawk/1.0.92/bin/vectorhawk";
+        assert!(!exe_is_stale(path, Some(path)));
+    }
+
+    #[test]
+    fn old_cellar_dir_still_present_differing_paths_no_deleted_marker_is_stale() {
+        // Homebrew does not always clean up the old Cellar directory
+        // immediately, so the link can point at a still-present old-version
+        // path with no "(deleted)" marker at all.
+        let exe_target = "/home/linuxbrew/.linuxbrew/Cellar/vectorhawk/1.0.91/bin/vectorhawk";
+        let canonical_expected =
+            "/home/linuxbrew/.linuxbrew/Cellar/vectorhawk/1.0.92/bin/vectorhawk";
+        assert!(exe_is_stale(exe_target, Some(canonical_expected)));
+    }
+
+    #[test]
+    fn none_expected_is_never_stale_conservative_fallback() {
+        // Cannot determine the expected path (e.g. canonicalize failed) —
+        // must not force a restart on a guess, even though exe_target here
+        // looks like an old version.
+        let exe_target = "/home/linuxbrew/.linuxbrew/Cellar/vectorhawk/1.0.91/bin/vectorhawk";
+        assert!(!exe_is_stale(exe_target, None));
+    }
+
+    #[test]
+    fn symlink_trap_raw_execstart_would_mismatch_but_canonical_form_matches() {
+        // ExecStart in the rendered unit holds the *unversioned* Homebrew
+        // symlink; /proc/<pid>/exe (a magic symlink) always resolves through
+        // to the *real* Cellar target. Comparing the raw ExecStart text
+        // against exe_target — the bug this test pins against — would
+        // incorrectly report every healthy install as stale:
+        let raw_exec_start = "/home/linuxbrew/.linuxbrew/bin/vectorhawk";
+        let exe_target = "/home/linuxbrew/.linuxbrew/Cellar/vectorhawk/1.0.92/bin/vectorhawk";
+        assert!(
+            exe_is_stale(exe_target, Some(raw_exec_start)),
+            "sanity check: the raw ExecStart symlink text does not equal the \
+             resolved exe target, so comparing it raw would (wrongly) read \
+             as stale"
+        );
+
+        // The fix: canonicalize the resolved binary path first — what
+        // `std::fs::canonicalize(bin_path)` produces at the real call site
+        // in linux.rs. For a healthy install that canonical form equals
+        // exe_target exactly (canonicalizing the symlink resolves to the
+        // same real Cellar path the kernel reports), so it must NOT be
+        // reported stale.
+        let canonical_expected = exe_target;
+        assert!(!exe_is_stale(exe_target, Some(canonical_expected)));
     }
 
     #[test]
