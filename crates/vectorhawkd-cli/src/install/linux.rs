@@ -52,6 +52,100 @@ fn desktop_path() -> Result<std::path::PathBuf> {
     Ok(config.join("autostart").join(DESKTOP_FILENAME))
 }
 
+/// The env line's key, as it appears (unquoted) inside the systemd
+/// `Environment="KEY=value"` assignment.
+const REGISTRY_URL_ENV_KEY: &str = "VECTORHAWK_REGISTRY_URL";
+
+/// Resolve the `VECTORHAWK_REGISTRY_URL` value to carry into a
+/// (re)rendered unit, so that installing/upgrading never silently re-homes
+/// a daemon that was pointed at a private registry.
+///
+/// Resolution order:
+/// 1. `VECTORHAWK_REGISTRY_URL` from the process environment at install
+///    time, if set and non-empty — an explicit override always wins.
+/// 2. Otherwise, whatever value is already present in the unit file at
+///    `existing_unit_path` — carried forward rather than dropped.
+/// 3. Otherwise `None` (today's behavior: no such line is emitted).
+///
+/// Step 2 is tolerant by design: a missing file, an unreadable file, or a
+/// unit with no such line all mean "nothing to preserve" — never an error
+/// that would fail the install.
+fn resolve_registry_url_env(existing_unit_path: &std::path::Path) -> Option<String> {
+    if let Ok(v) = std::env::var("VECTORHAWK_REGISTRY_URL") {
+        if !v.is_empty() {
+            return Some(v);
+        }
+    }
+    parse_registry_url_from_unit(existing_unit_path)
+}
+
+/// Tolerantly parse an `Environment="VECTORHAWK_REGISTRY_URL=<value>"` line
+/// out of an existing unit file. Returns `None` on any failure to read the
+/// file, or if no such line (with a non-empty value) is present.
+///
+/// `value` here is the raw quoted-value text as it appears in the unit
+/// (possibly containing systemd's `\"`/`\\` escapes — see
+/// [`systemd_unescape`]) and is unescaped before being returned, so the
+/// caller gets the original value back, not escaped text that would get
+/// double-escaped on the next render.
+fn parse_registry_url_from_unit(path: &std::path::Path) -> Option<String> {
+    let content = fs::read_to_string(path).ok()?;
+    let prefix = format!(r#"Environment="{REGISTRY_URL_ENV_KEY}="#);
+    for line in content.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix(&prefix) {
+            if let Some(value) = rest.strip_suffix('"') {
+                let value = systemd_unescape(value);
+                if !value.is_empty() {
+                    return Some(value);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Escape a value for safe interpolation into a double-quoted systemd unit
+/// assignment (`Environment="KEY=<value>"`). systemd unit files use
+/// C-style backslash escaping inside quoted strings (systemd.syntax(7)): an
+/// unescaped `"` inside the value would terminate the quoted string early,
+/// silently corrupting the directive (and everything after it on the line)
+/// rather than raising an error.
+///
+/// `\` is escaped FIRST: escaping `"` afterward introduces new `\` chars
+/// (`\"`), and escaping `\` after that would double-escape them.
+fn systemd_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Inverse of [`systemd_escape`]. Single left-to-right scan (rather than
+/// sequential global replaces, which are ambiguous to get right for
+/// adjacent `\`/`\"` sequences) — a bare `\` is followed by `"` or `\` to
+/// decode one escaped character, or kept as-is if not (defensive; today's
+/// encoder never produces a stray trailing backslash).
+fn systemd_unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.peek() {
+                Some('"') => {
+                    out.push('"');
+                    chars.next();
+                }
+                Some('\\') => {
+                    out.push('\\');
+                    chars.next();
+                }
+                _ => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Generate the systemd user unit content.
 ///
 /// `RUST_LOG=info` turns on INFO-level daemon logging by default (D1 board
@@ -61,10 +155,25 @@ fn desktop_path() -> Result<std::path::PathBuf> {
 /// `logging.rs`), not systemd's journal — `LogRateLimitIntervalSec`/
 /// `LogRateLimitBurst` bound the (crash-only) stderr stream journald
 /// receives, as a per-unit backstop on top of journald's own vacuum cap.
-fn render_unit(bin_path: &std::path::Path) -> Result<String> {
+///
+/// `registry_url`, when `Some`, is emitted as a quoted
+/// `Environment="VECTORHAWK_REGISTRY_URL=<value>"` line — see
+/// [`resolve_registry_url_env`] for how the caller resolves it. Regenerating
+/// the unit without this would silently drop a private-registry pin on every
+/// install/upgrade (the Homebrew formula's `post_install` calls `daemon
+/// install` on every upgrade too).
+fn render_unit(bin_path: &std::path::Path, registry_url: Option<&str>) -> Result<String> {
     let bin_str = bin_path
         .to_str()
         .context("binary path is not valid UTF-8")?;
+
+    let registry_env_line = match registry_url {
+        Some(url) => {
+            let url = systemd_escape(url);
+            format!("Environment=\"{REGISTRY_URL_ENV_KEY}={url}\"\n")
+        }
+        None => String::new(),
+    };
 
     Ok(format!(
         r#"[Unit]
@@ -75,7 +184,7 @@ After=network.target
 Type=simple
 Environment="PATH=/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin"
 Environment="RUST_LOG=info"
-ExecStart={bin_str} daemon run --foreground
+{registry_env_line}ExecStart={bin_str} daemon run --foreground
 Restart=on-failure
 RestartSec=2
 LogRateLimitIntervalSec=30
@@ -209,7 +318,11 @@ fn install_systemd(bin_path: &std::path::Path) -> Result<()> {
     }
 
     // ── 2. Write unit file ────────────────────────────────────────────────────
-    let content = render_unit(bin_path).context("failed to render systemd unit")?;
+    // Resolve VECTORHAWK_REGISTRY_URL from the env or, failing that, from
+    // whatever the unit already had — before we overwrite it below.
+    let registry_url = resolve_registry_url_env(&unit);
+    let content =
+        render_unit(bin_path, registry_url.as_deref()).context("failed to render systemd unit")?;
     fs::write(&unit, &content)
         .with_context(|| format!("failed to write unit file: {}", unit.display()))?;
 
@@ -476,7 +589,7 @@ pub fn status() -> Result<InstallStatus> {
 
 #[cfg(test)]
 mod tests {
-    use super::render_unit;
+    use super::{render_unit, resolve_registry_url_env};
     use std::path::Path;
 
     // D1 board card: INFO logging on by default via the unit file, plus a
@@ -484,7 +597,8 @@ mod tests {
     // still reaches journald.
     #[test]
     fn unit_sets_rust_log_info() {
-        let unit = render_unit(Path::new("/home/linuxbrew/.linuxbrew/bin/vectorhawk")).unwrap();
+        let unit =
+            render_unit(Path::new("/home/linuxbrew/.linuxbrew/bin/vectorhawk"), None).unwrap();
         assert!(
             unit.contains(r#"Environment="RUST_LOG=info""#),
             "expected RUST_LOG=info in the unit, got:\n{unit}"
@@ -493,10 +607,197 @@ mod tests {
 
     #[test]
     fn unit_sets_log_rate_limit() {
-        let unit = render_unit(Path::new("/home/linuxbrew/.linuxbrew/bin/vectorhawk")).unwrap();
+        let unit =
+            render_unit(Path::new("/home/linuxbrew/.linuxbrew/bin/vectorhawk"), None).unwrap();
         assert!(
             unit.contains("LogRateLimitIntervalSec=") && unit.contains("LogRateLimitBurst="),
             "expected a journald rate-limit backstop in the unit, got:\n{unit}"
         );
+    }
+
+    // ── Registry URL preservation (regression coverage) ───────────────────────
+    //
+    // `render_unit` used to emit a fixed template carrying only PATH and
+    // RUST_LOG, so regenerating the unit on every install/upgrade silently
+    // dropped any VECTORHAWK_REGISTRY_URL the unit previously had.
+
+    #[test]
+    fn render_unit_emits_registry_url_when_given() {
+        let unit = render_unit(
+            Path::new("/home/linuxbrew/.linuxbrew/bin/vectorhawk"),
+            Some("https://dev.vectorhawk.ai"),
+        )
+        .unwrap();
+        assert!(
+            unit.contains(r#"Environment="VECTORHAWK_REGISTRY_URL=https://dev.vectorhawk.ai""#),
+            "expected registry URL env line in the unit, got:\n{unit}"
+        );
+    }
+
+    #[test]
+    fn render_unit_omits_registry_url_when_none() {
+        let unit =
+            render_unit(Path::new("/home/linuxbrew/.linuxbrew/bin/vectorhawk"), None).unwrap();
+        assert!(
+            !unit.contains("VECTORHAWK_REGISTRY_URL"),
+            "expected no registry URL line, got:\n{unit}"
+        );
+    }
+
+    // ── systemd Environment= escaping (fix-round-1 should-fix) ─────────────────
+    //
+    // `render_unit` used to interpolate the registry URL straight into the
+    // double-quoted `Environment="…"` assignment. A value containing `"`
+    // terminates the quoted string early, silently corrupting the directive
+    // (and whatever follows it on the line) instead of erroring.
+    //
+    // These tests fail against the pre-fix code (no `systemd_escape` call
+    // at all — the raw `"` would appear verbatim, closing the string early).
+
+    #[test]
+    fn render_unit_escapes_quote_in_registry_url_and_does_not_break_the_next_directive() {
+        let unit = render_unit(
+            Path::new("/home/linuxbrew/.linuxbrew/bin/vectorhawk"),
+            Some(r#"https://registry.example.com/"injected"#),
+        )
+        .unwrap();
+        assert!(
+            unit.contains(
+                r#"Environment="VECTORHAWK_REGISTRY_URL=https://registry.example.com/\"injected""#
+            ),
+            "expected the '\"' to be escaped as '\\\"', got:\n{unit}"
+        );
+        // The line immediately following the (would-be-corrupted) directive
+        // must still be intact, on its own line, with ExecStart still
+        // pointing at the real binary — i.e. nothing "leaked" out of the
+        // quoted value into the rest of the unit.
+        assert!(
+            unit.contains(
+                "ExecStart=/home/linuxbrew/.linuxbrew/bin/vectorhawk daemon run --foreground\n"
+            ),
+            "ExecStart must be untouched and on its own line, got:\n{unit}"
+        );
+    }
+
+    /// A value containing `"` must round-trip: written escaped, then read
+    /// back (and carried forward on the next install) as the ORIGINAL raw
+    /// value — not the escaped text, which would otherwise get re-escaped a
+    /// little further on every subsequent install/upgrade.
+    #[test]
+    fn resolve_round_trips_a_value_containing_special_characters() {
+        let _env = RegistryUrlEnv::unset();
+        let original = r#"https://registry.example.com/"injected\path"#;
+        let rendered = render_unit(
+            Path::new("/home/linuxbrew/.linuxbrew/bin/vectorhawk"),
+            Some(original),
+        )
+        .unwrap();
+
+        let unit_path = temp_unit_path("roundtrip");
+        std::fs::write(&unit_path, &rendered).unwrap();
+
+        let resolved = resolve_registry_url_env(&unit_path);
+        assert_eq!(
+            resolved.as_deref(),
+            Some(original),
+            "expected the raw original value back, not the escaped unit text"
+        );
+
+        let _ = std::fs::remove_file(&unit_path);
+    }
+
+    /// Serializes tests below that mutate `VECTORHAWK_REGISTRY_URL` in the
+    /// process environment — `cargo test` runs tests in the same process by
+    /// default, so unguarded env mutation here would race other tests in
+    /// this module (mirrors the `KeychainOff` pattern used elsewhere in this
+    /// workspace for the same reason).
+    static REGISTRY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct RegistryUrlEnv {
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+    impl RegistryUrlEnv {
+        fn set(value: &str) -> Self {
+            let guard = REGISTRY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            std::env::set_var("VECTORHAWK_REGISTRY_URL", value);
+            RegistryUrlEnv { _guard: guard }
+        }
+        fn unset() -> Self {
+            let guard = REGISTRY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            std::env::remove_var("VECTORHAWK_REGISTRY_URL");
+            RegistryUrlEnv { _guard: guard }
+        }
+    }
+    impl Drop for RegistryUrlEnv {
+        fn drop(&mut self) {
+            std::env::remove_var("VECTORHAWK_REGISTRY_URL");
+        }
+    }
+
+    fn temp_unit_path(label: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("vh-install-linux-test-{label}-{nanos}.service"))
+    }
+
+    #[test]
+    fn resolve_prefers_env_var_over_existing_unit() {
+        let _env = RegistryUrlEnv::set("https://env.example.com");
+        let unit_path = temp_unit_path("env-wins");
+        std::fs::write(
+            &unit_path,
+            "Environment=\"VECTORHAWK_REGISTRY_URL=https://old.example.com\"\n",
+        )
+        .unwrap();
+
+        let resolved = resolve_registry_url_env(&unit_path);
+        assert_eq!(resolved.as_deref(), Some("https://env.example.com"));
+
+        let _ = std::fs::remove_file(&unit_path);
+    }
+
+    /// The actual regression case: env var unset at install time, but the
+    /// existing unit on disk has one — it must be carried forward, not
+    /// dropped.
+    #[test]
+    fn resolve_falls_back_to_existing_unit_when_env_unset() {
+        let _env = RegistryUrlEnv::unset();
+        let unit_path = temp_unit_path("fallback");
+        std::fs::write(
+            &unit_path,
+            "[Service]\nEnvironment=\"VECTORHAWK_REGISTRY_URL=https://dev.vectorhawk.ai\"\nExecStart=/x daemon run\n",
+        )
+        .unwrap();
+
+        let resolved = resolve_registry_url_env(&unit_path);
+        assert_eq!(resolved.as_deref(), Some("https://dev.vectorhawk.ai"));
+
+        let _ = std::fs::remove_file(&unit_path);
+    }
+
+    #[test]
+    fn resolve_returns_none_when_env_unset_and_no_existing_unit() {
+        let _env = RegistryUrlEnv::unset();
+        let unit_path = temp_unit_path("absent");
+        assert!(!unit_path.exists(), "precondition: no existing unit file");
+
+        let resolved = resolve_registry_url_env(&unit_path);
+        assert_eq!(resolved, None);
+    }
+
+    /// Existing unit unreadable (here: a directory instead of a file) must
+    /// not error — it means "nothing to preserve", same as absent.
+    #[test]
+    fn resolve_is_tolerant_of_unreadable_existing_unit() {
+        let _env = RegistryUrlEnv::unset();
+        let dir_path = temp_unit_path("unreadable-dir");
+        std::fs::create_dir_all(&dir_path).unwrap();
+
+        let resolved = resolve_registry_url_env(&dir_path);
+        assert_eq!(resolved, None);
+
+        let _ = std::fs::remove_dir_all(&dir_path);
     }
 }
