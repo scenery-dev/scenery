@@ -704,14 +704,7 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
             .with_context(|| format!("failed to create socket parent dir: {parent}"))?;
     }
 
-    if socket_path.exists() {
-        warn!(path = %socket_path, "removing stale socket file from previous run");
-        std::fs::remove_file(&socket_path)
-            .with_context(|| format!("failed to remove stale socket: {socket_path}"))?;
-    }
-
-    let listener = UnixListener::bind(&socket_path)
-        .with_context(|| format!("failed to bind socket at {socket_path}"))?;
+    let listener = acquire_socket(&socket_path).await?;
 
     let perms = std::fs::Permissions::from_mode(0o600);
     std::fs::set_permissions(&socket_path, perms)
@@ -797,6 +790,103 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
 
     info!("vectorhawkd shut down cleanly");
     Ok(())
+}
+
+/// Acquire the daemon's Unix socket at `path`, refusing to steal it from a
+/// live daemon.
+///
+/// A socket *file* existing on disk does not mean a daemon is listening —
+/// the previous process may have crashed without cleaning up. So before
+/// treating the file as stale, probe it with a real connect:
+///
+/// - Connect succeeds → another daemon owns this socket right now. Do NOT
+///   remove the file and do NOT bind; return an error naming the socket path
+///   so the caller can tell the operator how to resolve it.
+/// - Connect fails with a *definitive* "nobody is listening" signal
+///   (`ECONNREFUSED`, `ENOENT`, ...) → the file (if any) is genuinely stale.
+///   Remove it and bind, exactly as before.
+/// - Anything else (probe timeout, `EACCES`/`EPERM` permission-denied, ...)
+///   does NOT disprove a live listener — e.g. a daemon running as another
+///   user, or a permission change on the socket. Refuse, the same as a live
+///   connect, rather than guess.
+///
+/// The governing rule: reclaim the socket ONLY on a definitive "nobody is
+/// listening" signal; refuse whenever liveness cannot be disproven. Guessing
+/// wrong in the reclaim direction is exactly the silent-corruption bug this
+/// function exists to prevent, so every ambiguous outcome fails safe.
+///
+/// The probe is a local Unix-domain connect, so it stays cheap and bounded
+/// (a short timeout) — this runs before `UnixListener::bind` and must not
+/// meaningfully delay it; see the boot-time sync ordering note above.
+async fn acquire_socket(path: &camino::Utf8Path) -> Result<UnixListener> {
+    const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
+
+    if path.exists() {
+        let probe =
+            tokio::time::timeout(PROBE_TIMEOUT, tokio::net::UnixStream::connect(path)).await;
+        match probe {
+            Ok(Ok(_stream)) => {
+                anyhow::bail!(
+                    "another vectorhawkd is already running and listening on {path} — \
+                     stop it first (`vectorhawk daemon restart` if it's the managed \
+                     instance, or `lsof {path}` to find and kill the process holding \
+                     the socket) before starting a new one"
+                );
+            }
+            Err(_elapsed) => {
+                // The probe timed out. A Unix-domain connect completes as
+                // soon as a listener accepts it into its backlog, so this is
+                // rare — but "slow" is not "absent", and the one outcome we
+                // must never produce is stealing a live daemon's socket.
+                // Refusing is recoverable: the operator reads the message.
+                // Guessing wrong the other way is the silent corruption this
+                // whole function exists to prevent, so fail safe.
+                anyhow::bail!(
+                    "timed out probing the existing socket at {path} — refusing to \
+                     assume it is stale. Another vectorhawkd may be running; check \
+                     with `lsof {path}` and remove the file only if nothing holds it"
+                );
+            }
+            Ok(Err(e)) if connect_error_is_definitively_stale(&e) => {
+                // ECONNREFUSED / ENOENT / etc: nothing is listening. Genuinely stale.
+                warn!(path = %path, "removing stale socket file from previous run");
+                std::fs::remove_file(path)
+                    .with_context(|| format!("failed to remove stale socket: {path}"))?;
+            }
+            Ok(Err(e)) => {
+                // Most commonly EACCES/EPERM: we were not allowed to probe
+                // the socket. That does not disprove a live listener (e.g. a
+                // daemon running as another user, or a permission change on
+                // the socket) — refuse rather than assume stale.
+                anyhow::bail!(
+                    "the socket at {path} exists but could not be probed due to a \
+                     permission error ({e}) — refusing to assume it is stale. If no \
+                     daemon actually owns it, fix the socket's permissions or remove \
+                     it manually, then retry"
+                );
+            }
+        }
+    }
+
+    UnixListener::bind(path).with_context(|| format!("failed to bind socket at {path}"))
+}
+
+/// Classify a `UnixStream::connect` failure as a *definitive* "nobody is
+/// listening" signal (safe to reclaim the socket file) versus something
+/// ambiguous that must not be reclaimed — see [`acquire_socket`]'s doc
+/// comment for the governing rule.
+///
+/// Only `PermissionDenied` (`EACCES`/`EPERM` — verified on this toolchain to
+/// be how both raw errno values surface via `io::Error::kind()`, so no
+/// separate `raw_os_error()` match is needed) is treated as ambiguous: being
+/// refused permission to even attempt the connection says nothing about
+/// whether a listener is present, e.g. a daemon running as another user, or
+/// a permission change on the socket. Every other connect error — most
+/// commonly `ConnectionRefused` (`ECONNREFUSED`, a stale socket nothing is
+/// bound to) or `NotFound` (`ENOENT`) — is treated as definitively stale,
+/// matching the original behaviour for all non-permission errors.
+fn connect_error_is_definitively_stale(e: &std::io::Error) -> bool {
+    !matches!(e.kind(), std::io::ErrorKind::PermissionDenied)
 }
 
 /// One tick of the token refresh loop.
@@ -2100,6 +2190,10 @@ mod sync_tick_tests;
 #[cfg(test)]
 #[path = "sync_controller_hook_tests.rs"]
 mod sync_controller_hook_tests;
+
+#[cfg(test)]
+#[path = "acquire_socket_tests.rs"]
+mod acquire_socket_tests;
 
 #[cfg(test)]
 mod slug_tests {
