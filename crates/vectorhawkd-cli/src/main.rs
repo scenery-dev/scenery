@@ -4303,6 +4303,13 @@ async fn cmd_auth_logout(registry_url: &str) -> Result<()> {
 
 // ── auth status ───────────────────────────────────────────────────────────────
 
+/// Exit code is the machine-readable answer: 0 only when a stored token
+/// exists AND validates. Anything else — no token, or a token the registry
+/// rejects — exits non-zero, so a script can branch on `auth status` without
+/// parsing human-readable output. scripts/install.sh depends on this to
+/// decide whether to offer pairing; before this contract existed it had to
+/// grep stdout for "Logged in as", which silently breaks whenever that
+/// wording changes.
 async fn cmd_auth_status(registry_url: &str) -> Result<()> {
     use vectorhawkd_core::{
         auth::{load_tokens, AuthClient},
@@ -4316,6 +4323,7 @@ async fn cmd_auth_status(registry_url: &str) -> Result<()> {
     match tokens {
         None => {
             println!("Not logged in to {registry_url}.");
+            anyhow::bail!("not logged in to {registry_url}");
         }
         Some(stored) => {
             let client = AuthClient::new(registry_url);
@@ -4325,16 +4333,16 @@ async fn cmd_auth_status(registry_url: &str) -> Result<()> {
                     println!("Logged in as {} ({}).", user.display_name, user.email);
                     println!("Publisher ID: {slug}");
                     println!("Registry: {registry_url}");
+                    Ok(())
                 }
                 Err(e) => {
                     println!("Token present for {registry_url} but validation failed: {e:#}");
                     println!("Try `vectorhawk auth login` to refresh.");
+                    anyhow::bail!("stored token for {registry_url} failed validation")
                 }
             }
         }
     }
-
-    Ok(())
 }
 
 // ── auth token ────────────────────────────────────────────────────────────────
