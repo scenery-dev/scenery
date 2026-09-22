@@ -166,6 +166,15 @@ fn systemd_unescape(s: &str) -> String {
 /// the unit without this would silently drop a private-registry pin on every
 /// install/upgrade (the Homebrew formula's `post_install` calls `daemon
 /// install` on every upgrade too).
+///
+/// `Restart=always` (not `on-failure`): a daemon should always be running,
+/// and the binary-replacement watch (see `vectorhawkd_daemon::binary_watch`)
+/// deliberately exits 0 when it detects its own binary was replaced by an
+/// upgrade, trusting systemd to bring it straight back up on the new build.
+/// `on-failure` only restarts on a non-zero exit, so it would never restart
+/// after that clean exit — silently turning "the daemon notices the
+/// upgrade" back into "the daemon stops and stays stopped," the exact
+/// failure mode this whole mechanism exists to fix.
 fn render_unit(bin_path: &std::path::Path, registry_url: Option<&str>) -> Result<String> {
     let bin_str = bin_path
         .to_str()
@@ -189,7 +198,7 @@ Type=simple
 Environment="PATH=/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin"
 Environment="RUST_LOG=info"
 {registry_env_line}ExecStart={bin_str} daemon run --foreground
-Restart=on-failure
+Restart=always
 RestartSec=2
 LogRateLimitIntervalSec=30
 LogRateLimitBurst=1000
@@ -319,9 +328,10 @@ fn unit_state() -> Option<SystemdState> {
 ///
 /// `SubState=auto-restart` is checked first and wins over `ActiveState`:
 /// systemd reports `ActiveState=activating` while a unit is between
-/// crash-loop restarts, which reads as "starting up" but actually means
-/// `Restart=on-failure` is cycling it — a materially different situation for
-/// the decision made in `should_direct_spawn`.
+/// restarts, which reads as "starting up" but actually means `Restart=`
+/// (`always`, as of this unit — previously `on-failure`) is cycling it — a
+/// materially different situation for the decision made in
+/// `should_direct_spawn`.
 fn parse_active_sub_state(output: &str) -> Option<SystemdState> {
     let mut active_state = None;
     let mut sub_state = None;

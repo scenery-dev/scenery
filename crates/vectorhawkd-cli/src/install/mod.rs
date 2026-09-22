@@ -291,29 +291,7 @@ fn check_home_not_overridden() -> Result<()> {
 /// `std::env::current_exe()` result is returned unchanged.
 pub(crate) fn resolve_daemon_bin_path() -> Result<std::path::PathBuf> {
     let exe = std::env::current_exe().context("failed to resolve current binary path")?;
-    Ok(rewrite_homebrew_cellar_to_symlink(&exe))
-}
-
-/// Rewrite a Homebrew Cellar path (`<prefix>/Cellar/<formula>/<version>/bin/<name>`)
-/// to the unversioned symlink (`<prefix>/bin/<name>`). Any non-Cellar path is
-/// returned unchanged. Extracted so unit tests can hit it without spawning a
-/// real exe.
-pub(crate) fn rewrite_homebrew_cellar_to_symlink(exe: &std::path::Path) -> std::path::PathBuf {
-    let Some(bin_name) = exe.file_name() else {
-        return exe.to_path_buf();
-    };
-
-    let components: Vec<_> = exe.components().collect();
-    for (idx, component) in components.iter().enumerate() {
-        // OsStr literal comparison via `==` works because OsStr implements
-        // PartialEq<str>.
-        if component.as_os_str() == std::ffi::OsStr::new("Cellar") && idx >= 1 {
-            let prefix: std::path::PathBuf = components[..idx].iter().collect();
-            return prefix.join("bin").join(bin_name);
-        }
-    }
-
-    exe.to_path_buf()
+    Ok(vectorhawkd_core::binary_path::rewrite_homebrew_cellar_to_symlink(&exe))
 }
 
 /// Probe, **instantaneously**, whether the daemon Unix socket at
@@ -439,7 +417,7 @@ pub(crate) fn cgroup_is_service(cgroup_file_contents: &str, service_name: &str) 
 ///   `AutoRestart` matters most: spawning a competitor while the unit is
 ///   crash-looping is exactly how a transient failure becomes permanent —
 ///   the stray wins `acquire_socket`'s race, the managed unit's restart
-///   attempts keep losing it, and `Restart=on-failure` leaves the unit stuck
+///   attempts keep losing it, and `Restart=always` leaves the unit stuck
 ///   in `auto-restart` forever with no managed daemon ever coming up.
 /// - Otherwise (`Failed`, `Inactive`, `Unknown`, or no systemd session at
 ///   all) → direct spawn is the correct fallback.
@@ -609,9 +587,8 @@ pub(crate) fn daemon_socket_path() -> String {
 mod tests {
     use super::{
         cgroup_is_service, cmdline_is_daemon_run, exe_is_stale, home_is_overridden,
-        rewrite_homebrew_cellar_to_symlink, should_direct_spawn, unit_is_healthy, SystemdState,
+        should_direct_spawn, unit_is_healthy, SystemdState,
     };
-    use std::path::Path;
 
     // ── home_is_overridden ─────────────────────────────────────────────────
 
@@ -967,30 +944,6 @@ mod tests {
         assert!(!exe_is_stale(exe_target, Some(canonical_expected)));
     }
 
-    #[test]
-    fn rewrites_arm_homebrew_cellar_to_symlink() {
-        let got = rewrite_homebrew_cellar_to_symlink(Path::new(
-            "/opt/homebrew/Cellar/vectorhawk/1.0.45/bin/vectorhawk",
-        ));
-        assert_eq!(got, Path::new("/opt/homebrew/bin/vectorhawk"));
-    }
-
-    #[test]
-    fn rewrites_linuxbrew_cellar_to_symlink() {
-        let got = rewrite_homebrew_cellar_to_symlink(Path::new(
-            "/home/linuxbrew/.linuxbrew/Cellar/vectorhawk/1.0.45/bin/vectorhawk",
-        ));
-        assert_eq!(got, Path::new("/home/linuxbrew/.linuxbrew/bin/vectorhawk"));
-    }
-
-    #[test]
-    fn leaves_non_cellar_paths_alone() {
-        let got = rewrite_homebrew_cellar_to_symlink(Path::new(
-            "/Users/dev/code/vectorhawk/target/release/vectorhawk",
-        ));
-        assert_eq!(
-            got,
-            Path::new("/Users/dev/code/vectorhawk/target/release/vectorhawk")
-        );
-    }
+    // `rewrite_homebrew_cellar_to_symlink`'s own unit tests moved with it to
+    // `vectorhawkd_core::binary_path` — see that module.
 }

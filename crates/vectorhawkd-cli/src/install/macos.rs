@@ -168,6 +168,18 @@ fn parse_registry_url_from_plist(path: &std::path::Path) -> Option<String> {
 /// `registry_url`, when `Some`, is emitted as an extra
 /// `VECTORHAWK_REGISTRY_URL` key/string pair in `EnvironmentVariables` —
 /// see [`resolve_registry_url_env`] for how the caller resolves it.
+///
+/// `KeepAlive` is the plain boolean `true`, not the
+/// `{"SuccessfulExit": false}` dictionary form this plist used to carry.
+/// Per `launchd.plist(5)`, `SuccessfulExit: false` restarts the job only
+/// "in the inverse condition" of a successful exit — i.e. only on a
+/// non-zero exit, the macOS analog of systemd's `Restart=on-failure`. That
+/// silently defeated the binary-replacement watch (see
+/// `vectorhawkd_daemon::binary_watch`), which deliberately exits 0 when it
+/// detects an upgrade: launchd would see the clean exit and just leave the
+/// daemon stopped. Plain `KeepAlive: true` restarts unconditionally on any
+/// exit, so both a crash and the watch's deliberate clean exit bring the
+/// daemon back — matching the Linux unit's `Restart=always`.
 fn render_plist(
     bin_path: &std::path::Path,
     log_dir: &std::path::Path,
@@ -219,10 +231,7 @@ fn render_plist(
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
-    <dict>
-        <key>SuccessfulExit</key>
-        <false/>
-    </dict>
+    <true/>
     <key>StandardErrorPath</key>
     <string>{stderr_log}</string>
     <key>ProcessType</key>
