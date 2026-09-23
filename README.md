@@ -83,8 +83,17 @@ v1.0.0. See [`../context/IMPLEMENTATION_PLAN_v3.md`](../context/IMPLEMENTATION_P
 ### Homebrew (macOS)
 
 ```bash
-brew install vectorhawk/tap/vectorhawk
+brew tap vectorhawk/tap
+brew trust vectorhawk/tap
+brew install vectorhawk
+brew services start vectorhawk
+vectorhawk mcp setup
 ```
+
+`brew trust` is required by Homebrew 7+ for any third-party tap; without it
+`brew install` refuses to load the formula. `brew services start` and
+`mcp setup` are separate steps because Homebrew's install sandbox cannot write
+to your home directory during `brew install`.
 
 Supports macOS arm64 (Apple Silicon) and macOS x86_64 (Intel). The Homebrew formula
 selects the correct binary for your architecture automatically.
