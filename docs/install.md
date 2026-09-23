@@ -86,8 +86,21 @@ A Homebrew tap is available as an alternative install path (D1.3):
 
 ```sh
 brew tap vectorhawk/tap
+brew trust vectorhawk/tap
 brew install vectorhawk
+brew services start vectorhawk
+vectorhawk mcp setup
 ```
 
-The tap formula downloads the same release artifacts as the curl installer. `brew upgrade vectorhawk`
-picks up new releases automatically.
+`brew trust` is required by Homebrew 7 and later before it will load a formula from a
+third-party tap; without it `brew install` fails with "Refusing to load formula ... from
+untrusted tap".
+
+`brew services start` and `vectorhawk mcp setup` are separate, manual steps. Homebrew runs
+`post_install` inside a sandbox that denies writes to the user's real home directory (macOS
+seatbelt, Linux Landlock), so the LaunchAgent/unit and the AI-client config cannot be written
+during `brew install`.
+
+The tap formula downloads the same release artifacts as the curl installer. `brew upgrade
+vectorhawk` picks up new releases automatically; the running agent notices its binary changed
+and restarts itself onto the new version.

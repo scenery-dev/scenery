@@ -181,7 +181,7 @@ fi
 
 _ACTUAL="$(sha256_of "${TMPDIR}/${TARBALL}" | tr '[:upper:]' '[:lower:]')" || {
     log_error "No SHA-256 tool (sha256sum, shasum, or openssl) found — cannot verify the download."
-    log_error "Install one and retry, or use Homebrew: brew install vectorhawk/tap/vectorhawk"
+    log_error "Install one and retry, or use Homebrew: brew tap vectorhawk/tap && brew trust vectorhawk/tap && brew install vectorhawk"
     exit 1
 }
 
