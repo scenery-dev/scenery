@@ -26,7 +26,7 @@
 
 use std::{
     os::unix::net::UnixStream,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
     time::{Duration, Instant},
 };
@@ -74,7 +74,7 @@ fn systemctl_user_available() -> bool {
 
 /// Poll until the path exists (or doesn't, when `expect_present` is false).
 /// Returns true if the condition was met before the timeout.
-fn wait_for_path(path: &PathBuf, expect_present: bool, timeout: Duration) -> bool {
+fn wait_for_path(path: &Path, expect_present: bool, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if path.exists() == expect_present {
@@ -86,7 +86,7 @@ fn wait_for_path(path: &PathBuf, expect_present: bool, timeout: Duration) -> boo
 }
 
 /// Run `vectorhawk <args>` and return the exit status.
-fn run_cli(cli_bin: &PathBuf, args: &[&str]) -> std::process::ExitStatus {
+fn run_cli(cli_bin: &Path, args: &[&str]) -> std::process::ExitStatus {
     Command::new(cli_bin)
         .args(args)
         .status()
