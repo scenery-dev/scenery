@@ -27,7 +27,7 @@ use std::{
     io::{Read, Write},
     net::TcpStream,
     os::unix::net::UnixStream,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     time::{Duration, Instant},
 };
@@ -106,7 +106,7 @@ struct FramedSocket {
 }
 
 impl FramedSocket {
-    fn connect(path: &PathBuf) -> Self {
+    fn connect(path: &Path) -> Self {
         let stream = UnixStream::connect(path).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(15)))
