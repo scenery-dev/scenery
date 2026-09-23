@@ -25,7 +25,7 @@
 
 use std::{
     os::unix::net::UnixStream,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
     time::{Duration, Instant},
 };
@@ -72,7 +72,7 @@ fn wait_for_path(path: &std::path::Path, expect_present: bool, timeout: Duration
 }
 
 /// Run `vectorhawk <args>` and return the exit status code.
-fn run_cli(cli_bin: &PathBuf, args: &[&str]) -> std::process::ExitStatus {
+fn run_cli(cli_bin: &Path, args: &[&str]) -> std::process::ExitStatus {
     Command::new(cli_bin)
         .args(args)
         .status()
