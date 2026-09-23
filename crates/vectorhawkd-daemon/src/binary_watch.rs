@@ -47,6 +47,25 @@ pub const NO_BINARY_WATCH_ENV: &str = "VH_NO_BINARY_WATCH";
 /// see the spawn_blocking discipline note at the top of `lib.rs`.
 pub const BINARY_WATCH_INTERVAL_SECS: u64 = 60;
 
+/// Exit code used when the watch fires and the daemon is standing down so the
+/// service manager can start the replacement binary.
+///
+/// **This is deliberately non-zero, and that is load-bearing.** A clean
+/// `exit(0)` is only restarted by service definitions we control *today*
+/// (`Restart=always`, `KeepAlive: true`). Units and plists written by earlier
+/// versions carry `Restart=on-failure` and `KeepAlive: {SuccessfulExit: false}`,
+/// both of which restart a job **only on a non-zero exit** — and those are
+/// precisely the installs we can no longer reach, since auto-start moved to
+/// `brew services` and `daemon install` no longer runs from Homebrew's
+/// (sandboxed) `post_install`. Exiting 0 there would stop the daemon and leave
+/// it stopped.
+///
+/// A non-zero exit is restarted by *all four* of those settings, so it is the
+/// only value that is correct on both legacy and current installs.
+/// 75 is `EX_TEMPFAIL` from `sysexits(3)` — "temporary failure, retry" — which
+/// is exactly the situation.
+pub const BINARY_REPLACED_EXIT_CODE: i32 = 75;
+
 /// `(device, inode)` identity of a resolved binary on disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExeIdentity {
@@ -124,6 +143,24 @@ pub fn watch_disabled() -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// The exit code MUST stay non-zero. A clean `exit(0)` is honoured only by
+    /// service definitions we control today (`Restart=always`,
+    /// `KeepAlive: true`); installs predating those carry
+    /// `Restart=on-failure` / `KeepAlive: {SuccessfulExit: false}`, which
+    /// restart only on a non-zero exit — and those are exactly the installs we
+    /// can no longer rewrite, since auto-start moved to `brew services` and
+    /// `daemon install` no longer runs from Homebrew's sandboxed
+    /// `post_install`. Flipping this to 0 would silently strand every such
+    /// daemon, stopped, on its next upgrade.
+    #[test]
+    fn binary_replaced_exit_code_is_nonzero() {
+        assert_ne!(
+            BINARY_REPLACED_EXIT_CODE, 0,
+            "a zero exit is ignored by Restart=on-failure and \
+             KeepAlive={{SuccessfulExit: false}}, stranding legacy installs"
+        );
+    }
+
     use super::*;
 
     fn id(dev: u64, ino: u64) -> ExeIdentity {

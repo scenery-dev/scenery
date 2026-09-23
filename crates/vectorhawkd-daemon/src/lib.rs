@@ -731,6 +731,9 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     // odd sandbox, race at the exact instant of startup); either failure
     // disables the watch for this run rather than failing daemon startup —
     // a daemon that can't self-detect upgrades should still run normally.
+    // Set when the watch fires, so the shutdown tail below can stand down with
+    // a non-zero code (see `binary_watch::BINARY_REPLACED_EXIT_CODE`).
+    let mut binary_replaced = false;
     let binary_watch_notify = Arc::new(Notify::new());
     if binary_watch::watch_disabled() {
         info!("VH_NO_BINARY_WATCH set — binary-replacement watch disabled");
@@ -840,6 +843,7 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
             }
             _ = binary_watch_notify.notified() => {
                 info!("binary-replacement watch fired — shutting down");
+                binary_replaced = true;
                 break;
             }
         }
@@ -881,6 +885,22 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     }
 
     info!("vectorhawkd shut down cleanly");
+
+    // Stand down with a non-zero code when the binary was replaced, so *every*
+    // service definition restarts us onto it — including the legacy
+    // `Restart=on-failure` / `KeepAlive: {SuccessfulExit: false}` ones that
+    // ignore a clean exit and that we can no longer rewrite. See
+    // `binary_watch::BINARY_REPLACED_EXIT_CODE`. All shutdown work above has
+    // already run, so exiting the process directly here is safe.
+    if binary_replaced {
+        warn!(
+            code = binary_watch::BINARY_REPLACED_EXIT_CODE,
+            "binary was replaced — exiting non-zero so the service manager \
+             starts the new build"
+        );
+        std::process::exit(binary_watch::BINARY_REPLACED_EXIT_CODE);
+    }
+
     Ok(())
 }
 
