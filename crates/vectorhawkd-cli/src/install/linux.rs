@@ -37,8 +37,8 @@ use std::{fs, process::Command};
 
 use super::{
     cgroup_is_service, cmdline_is_daemon_run, daemon_socket_path, exe_is_stale,
-    resolve_daemon_bin_path, should_direct_spawn, socket_is_reachable, unit_is_healthy,
-    wait_for_socket, InstallStatus, SystemdState,
+    resolve_daemon_bin_path, socket_is_reachable, unit_is_healthy, wait_for_socket, InstallStatus,
+    SystemdState,
 };
 
 const SERVICE_NAME: &str = "vectorhawk-agent.service";
@@ -291,12 +291,17 @@ fn unit_is_enabled() -> bool {
 /// and classify it into [`SystemdState`].
 ///
 /// Returns `None` whenever the state genuinely can't be determined — no
-/// systemd user session (e.g. the Homebrew `post_install` context, which has
-/// no D-Bus session bus: this same failure is why `systemctl_user` needs an
-/// explicit `DBUS_SESSION_BUS_ADDRESS`), `systemctl` missing, or unparseable
-/// output. Callers that feed this into `should_direct_spawn` want exactly
-/// that: "we couldn't ask systemd" and "systemd isn't managing this" are the
-/// same answer — direct spawn is the fallback either way.
+/// systemd user session at all, `systemctl` missing, or unparseable output.
+///
+/// Homebrew's `post_install` does NOT lack a D-Bus session bus — a real log
+/// from a live `brew upgrade` shows `systemctl --user daemon-reload` and
+/// `systemctl --user enable --now` both succeeding there (they print
+/// "Systemd user unit enabled and started," which cannot happen without a
+/// session bus), verified on both macOS and Linux with 1.0.96. What
+/// `post_install` doesn't reliably inherit is the login session's
+/// `XDG_RUNTIME_DIR`/`DBUS_SESSION_BUS_ADDRESS` *environment variables* —
+/// which is the actual reason `systemctl_user` (and this function) set them
+/// explicitly rather than relying on the process environment.
 fn unit_state() -> Option<SystemdState> {
     let xdg = xdg_runtime_dir();
     let bus = format!("unix:path={xdg}/bus");
@@ -330,8 +335,8 @@ fn unit_state() -> Option<SystemdState> {
 /// systemd reports `ActiveState=activating` while a unit is between
 /// restarts, which reads as "starting up" but actually means `Restart=`
 /// (`always`, as of this unit — previously `on-failure`) is cycling it — a
-/// materially different situation for the decision made in
-/// `should_direct_spawn`.
+/// materially different situation for the diagnostic message
+/// `install_systemd` prints when the unit never comes up.
 fn parse_active_sub_state(output: &str) -> Option<SystemdState> {
     let mut active_state = None;
     let mut sub_state = None;
@@ -360,8 +365,9 @@ fn parse_active_sub_state(output: &str) -> Option<SystemdState> {
 /// Read the unit's `MainPID` via `systemctl --user show <unit> -p MainPID
 /// --value`, using the same explicit `XDG_RUNTIME_DIR`/
 /// `DBUS_SESSION_BUS_ADDRESS` plumbing as [`unit_state`] and for the same
-/// reason (no D-Bus session bus in the Homebrew `post_install` context
-/// otherwise).
+/// reason — the bus is present in the Homebrew `post_install` context, but
+/// the env vars pointing at it aren't reliably inherited there; see
+/// [`unit_state`]'s doc comment for the live evidence.
 ///
 /// Returns `None` whenever a running process can't be pinned down:
 /// `systemctl` failed or is unreachable, the value didn't parse, or
@@ -631,7 +637,17 @@ fn install_systemd(bin_path: &std::path::Path) -> Result<()> {
     println!("Wrote systemd user unit: {}", unit.display());
 
     // ── 3. daemon-reload ──────────────────────────────────────────────────────
-    systemctl_user(&["daemon-reload"]).context("systemctl daemon-reload failed")?;
+    // If this fails, the likely cause is no systemd user session at all (no
+    // D-Bus session bus for this user) — most commonly a headless/server box
+    // that hasn't logged in graphically since boot. Say so explicitly rather
+    // than surfacing only the bare systemctl stderr.
+    systemctl_user(&["daemon-reload"]).context(
+        "systemctl --user daemon-reload failed — most likely there is no \
+         systemd user session for this user (no D-Bus session bus). On a \
+         headless/server box, run `sudo loginctl enable-linger $USER` once \
+         to start one at boot without a graphical login, then re-run \
+         `vectorhawk daemon install`",
+    )?;
 
     // `xdg` / `xdg_sock` were already computed above, before the idempotency
     // health check.
@@ -659,30 +675,18 @@ fn install_systemd(bin_path: &std::path::Path) -> Result<()> {
     // unit is already enabled, so `restart` (not `enable --now`) is correct.
     let started_via_systemd = if needs_restart {
         // `restart` atomically stops the old process and starts the new one.
-        // Works when a D-Bus user session is present (interactive login).
-        // In Homebrew post_install the D-Bus session is absent so restart will
-        // fail — we handle that below by killing the old PID directly.
+        // `systemctl_user` supplies its own explicit XDG_RUNTIME_DIR/
+        // DBUS_SESSION_BUS_ADDRESS (see its doc comment), so this works fine
+        // inside Homebrew's `post_install` sandbox too — a real D-Bus
+        // session bus is present there on both platforms (see `unit_state`'s
+        // doc comment for the live evidence). A failure here is a genuine
+        // problem, not an absent bus, and is surfaced by the diagnostics
+        // branch below.
         systemctl_user(&["restart", SERVICE_NAME]).is_ok()
     } else {
         // Fresh install: enable the unit for auto-start and start it now.
-        // Same D-Bus caveat applies; fall back to direct spawn below.
         systemctl_user(&["enable", "--now", SERVICE_NAME]).is_ok()
     };
-
-    // On an upgrade/repair where systemctl restart failed (no D-Bus), the old
-    // process is still running from a deleted inode (upgrade) or is simply
-    // unreachable via systemctl at all (no session). Kill it so the socket
-    // goes away, then let the direct-spawn path start the new binary. This
-    // is the genuine no-D-Bus Homebrew `post_install` case and is unrelated
-    // to the cgroup-based reaper above (that one targets *stray*,
-    // non-systemd processes found by scanning all of `/proc`; this one is
-    // specifically "the process this same install/repair attempt is
-    // superseding").
-    if needs_restart && !started_via_systemd {
-        kill_daemon_process();
-        // Brief pause for the socket to close after SIGTERM.
-        std::thread::sleep(std::time::Duration::from_millis(300));
-    }
 
     // ── 5. Verify the daemon actually came up, and decide what (if anything)
     //      to do about it ───────────────────────────────────────────────────
@@ -696,116 +700,42 @@ fn install_systemd(bin_path: &std::path::Path) -> Result<()> {
     // polls for up to 5 s, which comfortably covers that startup window.
     let socket_up = wait_for_socket(&xdg_sock, std::time::Duration::from_secs(5));
 
-    // Ask systemd what it actually thinks the unit's state is, so the spawn
-    // decision is based on ground truth rather than "the socket probe failed
-    // once." `unit_state()` naturally returns `None` when there's no D-Bus
-    // session to ask (Homebrew `post_install`) — which is exactly the one
-    // case `should_direct_spawn` should treat as "go ahead and spawn."
+    // Ask systemd what it actually thinks the unit's state is, so a failure
+    // message below is grounded in ground truth rather than just "the socket
+    // probe failed once."
     let state = unit_state();
 
-    if should_direct_spawn(socket_up, state) {
-        // systemd is genuinely not managing this (no session, or the unit is
-        // failed/inactive) — spawn the daemon directly, detached from the
-        // current session (setsid) so it survives post_install exit. Note
-        // `setsid()` only detaches the POSIX *session*; it does not move the
-        // process into a systemd cgroup, which is exactly why a later
-        // `daemon install` needs `reap_stray_daemons()` above to clean this
-        // back up once a real systemd session becomes available.
-        use std::os::unix::process::CommandExt;
-        let xdg_clone = xdg.clone();
-        let _ = unsafe {
-            std::process::Command::new(bin_path)
-                .args(["daemon", "run", "--foreground"])
-                .env("XDG_RUNTIME_DIR", &xdg_clone)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .pre_exec(|| {
-                    // Create a new session so SIGHUP on parent exit doesn't
-                    // reach the daemon.
-                    libc::setsid();
-                    Ok(())
-                })
-                .spawn()
-        };
-
-        if wait_for_socket(&xdg_sock, std::time::Duration::from_secs(2)) {
-            println!("VectorHawk daemon started (direct spawn fallback).");
-            if !needs_restart {
-                println!(
-                    "Note: the daemon is managed by systemd on next login. For \
-                     permanent auto-start without a graphical session, run:\n  \
-                     sudo loginctl enable-linger $USER"
-                );
-            }
-        } else {
-            println!(
-                "VectorHawk daemon unit installed. Start it now with:\n  \
-                 XDG_RUNTIME_DIR={xdg} systemctl --user start {SERVICE_NAME}\n  \
-                 or: {bin_str} daemon run --foreground &",
-                bin_str = bin_path.display(),
-            );
-        }
-    } else if socket_up {
+    if socket_up {
         if started_via_systemd {
             println!("Systemd user unit enabled and started ({SERVICE_NAME}).");
         } else {
             println!("VectorHawk daemon is running.");
         }
     } else {
-        // systemd is managing the unit (Active/Activating/AutoRestart) but
-        // the socket never came up within the wait budget. Spawning a
-        // competitor here would be exactly the bug this fix removes — most
-        // sharply in the AutoRestart case, where it would make the crash
-        // loop permanent (the stray wins `acquire_socket`'s race forever).
-        // Surface the real state and point at the tools to diagnose it
-        // instead.
+        // systemd did not bring the daemon up within the wait budget — surface
+        // the real unit state and the tools to diagnose it. This module used
+        // to fall back to spawning a daemon directly, detached from systemd,
+        // on the theory that Homebrew's `post_install` sandbox has no D-Bus
+        // session bus. That premise is false (see `unit_state`'s doc comment
+        // for the live evidence), and the fallback was actively harmful: a
+        // process spawned this way is `setsid()`-detached from the invoking
+        // session but never joins the unit's systemd cgroup, so it becomes
+        // exactly the kind of stray `reap_stray_daemons()` above exists to
+        // clean up — and if spawned while the unit is crash-looping
+        // (`AutoRestart`), it wins `acquire_socket`'s race and makes the
+        // crash loop permanent. Never spawn a competitor; just report.
         println!(
             "VectorHawk daemon unit is installed and systemd reports it as \
              {}, but the daemon socket did not come up within 5s.\n\
-             Refusing to start a second daemon outside systemd — diagnose with:\n  \
+             Diagnose with:\n  \
              XDG_RUNTIME_DIR={xdg} systemctl --user status {SERVICE_NAME}\n  \
-             XDG_RUNTIME_DIR={xdg} journalctl --user -u {SERVICE_NAME}",
+             XDG_RUNTIME_DIR={xdg} journalctl --user -u {SERVICE_NAME}\n\
+             Start it manually with:\n  \
+             XDG_RUNTIME_DIR={xdg} systemctl --user start {SERVICE_NAME}",
             describe_state(state)
         );
     }
     Ok(())
-}
-
-/// Send SIGTERM to any running `vectorhawk daemon run` process (with or
-/// without `--foreground`).
-///
-/// Used during upgrades when `systemctl --user restart` fails (no D-Bus
-/// session in Homebrew post_install). On Linux a process keeps running after
-/// its binary is deleted, so we must explicitly kill it before spawning the
-/// replacement. Non-fatal: errors are silently ignored.
-///
-/// Uses the same positional-argv [`cmdline_is_daemon_run`] matcher as
-/// `reap_stray_daemons` — this function used to match by substring
-/// (`contains("vectorhawk") && contains("daemon") && contains("foreground")`),
-/// which is the same class of bug that made `reap_stray_daemons` kill an
-/// innocent process; see that function's call site for the live incident.
-fn kill_daemon_process() {
-    let Ok(proc_entries) = fs::read_dir("/proc") else {
-        return;
-    };
-    for entry in proc_entries.flatten() {
-        let name = entry.file_name();
-        let pid_str = name.to_string_lossy();
-        if !pid_str.chars().all(|c| c.is_ascii_digit()) {
-            continue;
-        }
-        let cmdline_path = entry.path().join("cmdline");
-        let Ok(raw) = fs::read(&cmdline_path) else {
-            continue;
-        };
-        if !cmdline_is_daemon_run(&raw) {
-            continue;
-        }
-        if let Ok(pid) = pid_str.parse::<i32>() {
-            unsafe { libc::kill(pid, libc::SIGTERM) };
-        }
-    }
 }
 
 /// XDG autostart fallback when systemd is not available.

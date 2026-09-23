@@ -360,10 +360,9 @@ pub(crate) fn wait_for_socket(socket_path: &str, timeout: std::time::Duration) -
 /// `AutoRestart` is its own variant (not folded into `Activating`) because it
 /// is the state that matters most here: `SubState=auto-restart` is reported
 /// with `ActiveState=activating`, but it means systemd is mid-crash-loop on
-/// the unit, not freshly starting it. Direct-spawning a competitor while the
-/// unit is in `auto-restart` is exactly what turns a transient failure into a
-/// permanent one (see `should_direct_spawn`), so callers need to be able to
-/// tell the two apart.
+/// the unit, not freshly starting it — a materially different situation for
+/// [`unit_is_healthy`] and for the diagnostic message `install_systemd`
+/// prints when the unit never comes up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) enum SystemdState {
@@ -398,43 +397,6 @@ pub(crate) fn cgroup_is_service(cgroup_file_contents: &str, service_name: &str) 
     cgroup_file_contents
         .lines()
         .any(|line| line.split('/').any(|segment| segment == service_name))
-}
-
-/// Pure decision: should the installer direct-spawn a daemon process outside
-/// systemd?
-///
-/// `socket_up` — is the daemon socket already accepting connections (from
-/// [`wait_for_socket`])? `systemd_state` — the unit's state, or `None` when
-/// there is no systemd user session to ask (the genuine Homebrew
-/// `post_install`, no-D-Bus case) or unit-tracking simply isn't in play.
-///
-/// The rule is deliberately conservative: direct-spawn is for the case where
-/// systemd is not managing the daemon at all, never a way to "help" systemd
-/// along.
-///
-/// - Socket already up → never spawn; there is nothing to fix.
-/// - Systemd reports `Active`, `Activating`, or `AutoRestart` → never spawn.
-///   `AutoRestart` matters most: spawning a competitor while the unit is
-///   crash-looping is exactly how a transient failure becomes permanent —
-///   the stray wins `acquire_socket`'s race, the managed unit's restart
-///   attempts keep losing it, and `Restart=always` leaves the unit stuck
-///   in `auto-restart` forever with no managed daemon ever coming up.
-/// - Otherwise (`Failed`, `Inactive`, `Unknown`, or no systemd session at
-///   all) → direct spawn is the correct fallback.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub(crate) fn should_direct_spawn(socket_up: bool, systemd_state: Option<SystemdState>) -> bool {
-    if socket_up {
-        return false;
-    }
-    match systemd_state {
-        Some(SystemdState::Active)
-        | Some(SystemdState::Activating)
-        | Some(SystemdState::AutoRestart) => false,
-        Some(SystemdState::Failed)
-        | Some(SystemdState::Inactive)
-        | Some(SystemdState::Unknown)
-        | None => true,
-    }
 }
 
 /// Given the raw, NUL-separated `/proc/<pid>/cmdline` bytes of a process,
@@ -535,8 +497,9 @@ pub(crate) fn exe_is_stale(exe_target: &str, canonical_expected: Option<&str>) -
 /// is enabled, ExecStart matches the current binary" and returned early on
 /// that alone, without ever asking whether the unit was actually running.
 /// That let a box stuck in `SubState=auto-restart` (e.g. because a stray
-/// direct-spawned daemon — see `should_direct_spawn`'s docs — is holding the
-/// socket) report "no changes made" on every subsequent `daemon install`,
+/// daemon left over from an older, buggy install — see
+/// `reap_stray_daemons`'s docs — is holding the socket) report "no changes
+/// made" on every subsequent `daemon install`,
 /// forever, because the early return fired *before* the stray-reaping and
 /// restart logic ever ran. `Activating` is deliberately excluded too: an
 /// in-progress start is not yet a settled "healthy," and treating it as good
@@ -587,7 +550,7 @@ pub(crate) fn daemon_socket_path() -> String {
 mod tests {
     use super::{
         cgroup_is_service, cmdline_is_daemon_run, exe_is_stale, home_is_overridden,
-        should_direct_spawn, unit_is_healthy, SystemdState,
+        unit_is_healthy, SystemdState,
     };
 
     // ── home_is_overridden ─────────────────────────────────────────────────
@@ -685,65 +648,6 @@ mod tests {
         // path segment — must not be treated as a match.
         let contents = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/not-vectorhawk-agent.service-backup.scope\n";
         assert!(!cgroup_is_service(contents, "vectorhawk-agent.service"));
-    }
-
-    // ── should_direct_spawn ────────────────────────────────────────────────
-
-    #[test]
-    fn never_spawns_when_socket_already_up() {
-        for state in [
-            None,
-            Some(SystemdState::Active),
-            Some(SystemdState::Activating),
-            Some(SystemdState::AutoRestart),
-            Some(SystemdState::Failed),
-            Some(SystemdState::Inactive),
-            Some(SystemdState::Unknown),
-        ] {
-            assert!(
-                !should_direct_spawn(true, state),
-                "must never spawn when socket_up=true, state={state:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn never_spawns_while_systemd_is_active() {
-        assert!(!should_direct_spawn(false, Some(SystemdState::Active)));
-    }
-
-    #[test]
-    fn never_spawns_while_systemd_is_activating() {
-        assert!(!should_direct_spawn(false, Some(SystemdState::Activating)));
-    }
-
-    #[test]
-    fn never_spawns_while_systemd_is_auto_restarting() {
-        // This is the case that made the fail loop permanent: spawning a
-        // stray while the unit is crash-looping steals the socket out from
-        // under every future restart attempt.
-        assert!(!should_direct_spawn(false, Some(SystemdState::AutoRestart)));
-    }
-
-    #[test]
-    fn spawns_when_systemd_failed() {
-        assert!(should_direct_spawn(false, Some(SystemdState::Failed)));
-    }
-
-    #[test]
-    fn spawns_when_systemd_inactive() {
-        assert!(should_direct_spawn(false, Some(SystemdState::Inactive)));
-    }
-
-    #[test]
-    fn spawns_when_systemd_state_unknown() {
-        assert!(should_direct_spawn(false, Some(SystemdState::Unknown)));
-    }
-
-    #[test]
-    fn spawns_when_no_systemd_session_at_all() {
-        // Genuine Homebrew post_install / no-D-Bus case.
-        assert!(should_direct_spawn(false, None));
     }
 
     // ── cmdline_is_daemon_run ───────────────────────────────────────────────
