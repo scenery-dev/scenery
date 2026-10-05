@@ -67,3 +67,7 @@ rusqlite.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 mockito = "1"
 base64.workspace = true
+# See `refresh_loop_tests::disable_real_keychain_for_tests` — runs before any
+# `#[test]` in this crate's binary so the suite can never touch the real OS
+# keychain.
+ctor = "0.8"

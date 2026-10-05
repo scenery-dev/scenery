@@ -1043,15 +1043,48 @@ mod tests {
     // ── Token storage tests ───────────────────────────────────────────────────
     //
     // These tests run with VECTORHAWK_DISABLE_KEYCHAIN=1 so they exercise the
-    // SQLite fallback path without polluting the real macOS Keychain. The
-    // keychain code paths are also reachable via the env-var probe — flipping
-    // the var off (manually) verifies the secure path on a desktop box.
+    // SQLite fallback path without touching the real macOS Keychain.
+    //
+    // `load_tokens` calls `keychain_get` unconditionally on *every* call —
+    // not just when a caller happens to have saved something — so this is
+    // not an opt-in nicety: any test anywhere in this crate's test binary
+    // that reaches `load_tokens`/`save_tokens`/`clear_tokens` touches the
+    // real OS keychain unless the flag is set first. A past incident (a
+    // keychain access popup firing on a developer's actual Mac during `cargo
+    // test`) showed that per-test opt-in guards are not sufficient — it's
+    // too easy to add a new test that forgets one. `disable_real_keychain_for_tests`
+    // below is the actual backstop: it runs once, automatically, before any
+    // `#[test]` in this binary even starts, via `ctor`. The per-test
+    // `KeychainOff` guard below is kept for local clarity/documentation at
+    // each call site and because it's still useful for the mutex-serialized
+    // "concurrent set/clear" story if `ctor` is ever dropped, but the ctor
+    // function is what actually provides the guarantee.
+    #[ctor::ctor]
+    fn disable_real_keychain_for_tests() {
+        std::env::set_var("VECTORHAWK_DISABLE_KEYCHAIN", "1");
+    }
 
-    /// RAII guard that sets VECTORHAWK_DISABLE_KEYCHAIN=1 for the duration
-    /// of a test and clears it on drop. Tests share process env vars and
-    /// cargo runs them concurrently, so the guard also holds a global mutex
-    /// to serialize keychain-touching tests — otherwise one test's drop
-    /// races another test's set and we get sporadic failures.
+    /// Regression guard for the safety net itself: if `#[ctor]` support
+    /// ever breaks (stripped by a linker config, crate removed, etc.) this
+    /// fails loudly instead of silently letting every other test fall back
+    /// to touching the real keychain.
+    #[test]
+    fn real_keychain_is_disabled_for_this_test_binary() {
+        assert_eq!(
+            std::env::var("VECTORHAWK_DISABLE_KEYCHAIN").as_deref(),
+            Ok("1"),
+            "disable_real_keychain_for_tests' #[ctor] must run before any test in this binary"
+        );
+    }
+
+    /// RAII guard that (re-)asserts `VECTORHAWK_DISABLE_KEYCHAIN=1` for the
+    /// duration of a test. Holds a global mutex so concurrent tests can't
+    /// interleave their set/clear of the process-global env var.
+    ///
+    /// Drop deliberately re-sets the flag rather than removing it:
+    /// `disable_real_keychain_for_tests` above sets it once for the whole
+    /// process and nothing in this binary should ever be allowed to turn it
+    /// back off, even transiently, while other threads may be mid-test.
     struct KeychainOff {
         _g: std::sync::MutexGuard<'static, ()>,
     }
@@ -1065,7 +1098,7 @@ mod tests {
     }
     impl Drop for KeychainOff {
         fn drop(&mut self) {
-            std::env::remove_var("VECTORHAWK_DISABLE_KEYCHAIN");
+            std::env::set_var("VECTORHAWK_DISABLE_KEYCHAIN", "1");
         }
     }
 

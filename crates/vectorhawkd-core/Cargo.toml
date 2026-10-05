@@ -60,3 +60,10 @@ keyring = { version = "3", default-features = false, features = ["windows-native
 
 [dev-dependencies]
 mockito = "1"
+# Runs a safe, body-only-safe-code `#[ctor]` function before any `#[test]`
+# in this crate's test binary to permanently force `VECTORHAWK_DISABLE_KEYCHAIN=1`
+# — see `auth::tests::disable_real_keychain_for_tests`. This is what actually
+# keeps the test suite from ever touching the real OS keychain; it must run
+# before literally every test, including ones added later that forget to
+# guard themselves, which per-test opt-in guards cannot guarantee.
+ctor = "0.8"

@@ -402,7 +402,10 @@ impl KeychainOff {
 }
 impl Drop for KeychainOff {
     fn drop(&mut self) {
-        std::env::remove_var("VECTORHAWK_DISABLE_KEYCHAIN");
+        // Re-assert rather than remove: `refresh_loop_tests`' `#[ctor]`
+        // (`disable_real_keychain_for_tests`) sets this once for the whole
+        // process; nothing in this binary should ever turn it back off.
+        std::env::set_var("VECTORHAWK_DISABLE_KEYCHAIN", "1");
     }
 }
 

@@ -26,6 +26,29 @@ fn temp_root(label: &str) -> Utf8PathBuf {
     .expect("temp path should be utf-8")
 }
 
+/// Runs once, automatically, before any `#[test]` in this crate's binary —
+/// see `vectorhawkd_core::auth::tests::disable_real_keychain_for_tests` for
+/// the full rationale (in short: `load_tokens` touches the real OS keychain
+/// on *every* call, not just when something was saved, so per-test opt-in
+/// guards alone are not a reliable backstop; a prior incident — a real
+/// macOS Keychain-access popup firing during `cargo test` — is why this is
+/// now a `#[ctor]` rather than something each test has to remember).
+#[ctor::ctor]
+fn disable_real_keychain_for_tests() {
+    std::env::set_var("VECTORHAWK_DISABLE_KEYCHAIN", "1");
+}
+
+/// Regression guard for the safety net itself — see the identical test in
+/// `vectorhawkd_core::auth::tests`.
+#[test]
+fn real_keychain_is_disabled_for_this_test_binary() {
+    assert_eq!(
+        std::env::var("VECTORHAWK_DISABLE_KEYCHAIN").as_deref(),
+        Ok("1"),
+        "disable_real_keychain_for_tests' #[ctor] must run before any test in this binary"
+    );
+}
+
 /// Force the SQLite fallback so refresh-loop tests don't pollute the real
 /// macOS keychain. Holds a global mutex so concurrent tests can't race
 /// each other's env-var set/clear (cargo test runs in parallel by default).
@@ -42,7 +65,11 @@ impl KeychainOff {
 }
 impl Drop for KeychainOff {
     fn drop(&mut self) {
-        std::env::remove_var("VECTORHAWK_DISABLE_KEYCHAIN");
+        // Re-assert rather than remove: `disable_real_keychain_for_tests`
+        // sets this once for the whole process and nothing in this binary
+        // should ever turn it back off, even transiently, while other
+        // threads may be mid-test.
+        std::env::set_var("VECTORHAWK_DISABLE_KEYCHAIN", "1");
     }
 }
 
