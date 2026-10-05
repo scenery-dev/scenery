@@ -2870,6 +2870,43 @@ mod tests {
         fs::write(root.join("prompts/system.txt"), "Do the thing.").unwrap();
     }
 
+    /// `vectorhawkd_core::auth::save_tokens`/`load_tokens`/`clear_tokens`
+    /// touch the real OS keychain by default — `load_tokens` calls
+    /// `keychain_get` on *every* call, not only when something was actually
+    /// saved there, so this isn't limited to the handful of tests that call
+    /// `fake_login` below. Any test here that exercises `handle_login`,
+    /// `handle_logout`, `handle_import`, `ensure_auth`, etc. reaches it too.
+    /// Several tests also share the literal registry URL
+    /// `"http://localhost:8000"`, so without disabling the keychain,
+    /// concurrent tests (cargo runs `#[test]`s on different threads of the
+    /// same process by default) would race on the very same real keychain
+    /// entry — e.g. `handle_logout_clears_tokens` deleting it out from under
+    /// another test's in-flight "am I logged in" check. That's the
+    /// auth/login nondeterminism this eliminates.
+    ///
+    /// `disable_real_keychain_for_tests` (via `#[ctor]`, see
+    /// `vectorhawkd_core::auth`'s own copy of this pattern for the full
+    /// rationale) runs once, automatically, before any `#[test]` in this
+    /// binary even starts — a per-test opt-in guard can't give that
+    /// guarantee, and a prior incident (a real macOS Keychain-access popup
+    /// firing during `cargo test`) showed per-test guards aren't reliably
+    /// applied to every test that needs them.
+    #[ctor::ctor]
+    fn disable_real_keychain_for_tests() {
+        std::env::set_var("VECTORHAWK_DISABLE_KEYCHAIN", "1");
+    }
+
+    /// Regression guard for the safety net itself — see the identical test
+    /// in `vectorhawkd_core::auth::tests`.
+    #[test]
+    fn real_keychain_is_disabled_for_this_test_binary() {
+        assert_eq!(
+            std::env::var("VECTORHAWK_DISABLE_KEYCHAIN").as_deref(),
+            Ok("1"),
+            "disable_real_keychain_for_tests' #[ctor] must run before any test in this binary"
+        );
+    }
+
     fn fake_login(state: &AppState, url: &str) {
         vectorhawkd_core::auth::save_tokens(state, url, "fake-access", "fake-refresh").unwrap();
     }

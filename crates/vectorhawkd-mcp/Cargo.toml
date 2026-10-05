@@ -75,3 +75,7 @@ sha2 = "0.10"
 tar = "0.4"
 hex = "0.4"
 tempfile = "3"
+# See `tools::tests::disable_real_keychain_for_tests` — runs before any
+# `#[test]` in this crate's binary so the suite can never touch the real OS
+# keychain.
+ctor = "0.8"
