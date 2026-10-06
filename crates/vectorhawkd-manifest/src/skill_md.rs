@@ -238,10 +238,28 @@ fn vh(fm: &SkillMdFrontmatter) -> Option<&VhExtensions> {
 /// fences are absent or malformed.
 fn split_frontmatter(content: &str) -> Option<(&str, &str)> {
     let after_open = content.strip_prefix("---\n")?;
-    let close = after_open.find("\n---\n")?;
-    let yaml_str = &after_open[..close];
-    let body = &after_open[close + 5..]; // skip "\n---\n"
-    Some((yaml_str, body))
+
+    // Common case: a closing "---" followed by a newline (and, usually, a
+    // Markdown body after it).
+    if let Some(close) = after_open.find("\n---\n") {
+        let yaml_str = &after_open[..close];
+        let body = &after_open[close + 5..]; // skip "\n---\n"
+        return Some((yaml_str, body));
+    }
+
+    // Be liberal in what we accept: a frontmatter-only SKILL.md (no
+    // Markdown body — e.g. the prompt lives inline in
+    // metadata.vectorhawk.workflow) is legitimately valid even when the
+    // file ends immediately at EOF right after the closing fence, with no
+    // trailing newline. This is exactly the byte shape python-frontmatter
+    // (registry-side) produces when re-serializing an empty-body SKILL.md,
+    // and there is no reason to reject a file that is otherwise
+    // well-formed just because it lacks a final "\n".
+    if let Some(yaml_str) = after_open.strip_suffix("\n---") {
+        return Some((yaml_str, ""));
+    }
+
+    None
 }
 
 /// Validate the raw YAML for namespace compliance:
@@ -634,5 +652,44 @@ mod tests {
             msg.contains("metadata.vectorhawk"),
             "error should mention metadata.vectorhawk migration path, got: {msg}"
         );
+    }
+
+    // ── Frontmatter-only SKILL.md (no Markdown body) ─────────────────────────
+    //
+    // Regression test for the install-bug acceptance run on spaceghost
+    // (2026-10-06, runner 1.0.97): a SKILL.md whose entire content is the
+    // frontmatter block — the prompt lives inline in
+    // `metadata.vectorhawk.workflow[*].prompt`, not in a trailing Markdown
+    // body — ending in the closing `---` with NO trailing newline must still
+    // load successfully. This is exactly the byte shape the registry's
+    // compile pipeline produces for such skills (python-frontmatter's
+    // serializer drops the final newline when the body is empty), and it is
+    // also a legitimate, spec-conformant file in its own right: EOF
+    // immediately after the closing fence is not malformed frontmatter.
+
+    #[test]
+    fn test_frontmatter_only_skill_md_with_no_trailing_newline_loads() {
+        // No body at all, and critically: no "\n" after the closing "---".
+        let content = "---\nname: acc-killtest-min\ndescription: Bare-minimum test skill.\n---";
+        let pkg = load_skill_md(content).unwrap();
+        assert_eq!(pkg.manifest.name, "acc-killtest-min");
+    }
+
+    #[test]
+    fn test_frontmatter_only_skill_md_with_trailing_newline_loads() {
+        // Same as above but with the trailing newline a well-behaved writer
+        // would include — must keep working (no regression).
+        let content = "---\nname: acc-killtest-min\ndescription: Bare-minimum test skill.\n---\n";
+        let pkg = load_skill_md(content).unwrap();
+        assert_eq!(pkg.manifest.name, "acc-killtest-min");
+    }
+
+    #[test]
+    fn test_missing_closing_fence_entirely_is_still_rejected() {
+        // Parser leniency at EOF must not swallow genuinely malformed files:
+        // no closing fence anywhere is still an error.
+        let content = "---\nname: broken\ndescription: no closing fence\n";
+        let err = load_skill_md(content).unwrap_err();
+        assert!(err.to_string().contains("frontmatter"));
     }
 }
