@@ -22,6 +22,27 @@ fn spawn_dummy_child() -> Child {
         .expect("failed to spawn dummy `sleep` child for test")
 }
 
+/// What the platform actually reported when `argv` came back `None`, so a
+/// failure on a CI box we can't reproduce on explains itself.
+fn argv_diagnostics(pid: u32, child: &mut Child) -> String {
+    let exited = format!("try_wait={:?}", child.try_wait());
+    #[cfg(target_os = "linux")]
+    {
+        let cmdline = match std::fs::read(format!("/proc/{pid}/cmdline")) {
+            Ok(b) => format!("cmdline read ok, {} bytes", b.len()),
+            Err(e) => format!("cmdline read err: {e}"),
+        };
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .unwrap_or_else(|e| format!("stat read err: {e}"));
+        format!("{exited}; {cmdline}; stat={}", stat.trim())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        exited
+    }
+}
+
 #[test]
 fn same_uid_alive_true_for_our_own_child() {
     let mut child = spawn_dummy_child();
@@ -56,7 +77,8 @@ fn real_argv_of_dummy_child_is_rejected_by_the_production_matcher() {
     let argv = SystemProcessOps.argv(pid);
     assert!(
         argv.is_some(),
-        "expected to read back argv for our own child"
+        "expected to read back argv for our own child; {}",
+        argv_diagnostics(pid, &mut child)
     );
     let argv = argv.unwrap();
     assert!(
