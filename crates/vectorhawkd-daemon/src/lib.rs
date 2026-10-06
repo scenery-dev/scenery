@@ -1270,11 +1270,18 @@ struct RunningSync {
     /// (alongside `reconciler.abort()`) is how `ensure_started` tears down a
     /// stale connection before starting a fresh one with new credentials.
     sse_abort: tokio::task::AbortHandle,
-    /// `device_id` this subsystem was started with. Unlike the access token,
-    /// device_id is not rewritten by token refresh — only a fresh device
-    /// registration changes `sync_state["device_id"]`, which does not happen
-    /// while this subsystem is running — so this half of the fingerprint is
-    /// captured once and compared as-is.
+    /// `device_id` this subsystem was started with, for the fingerprint
+    /// comparison below — captured once and compared as-is against a fresh
+    /// read of `sync_state["device_id"]` on each `ensure_started` call,
+    /// which is exactly what is needed to detect a changed value regardless
+    /// of when it changed. This field is NOT what the running SSE task
+    /// itself uses for its own reconnect attempts after the initial
+    /// connect — `sse_client::run` re-reads `sync_state["device_id"]`
+    /// directly on every retry, so a `device_id` written by `auth
+    /// pair`/`auth login` while this subsystem is already running (the
+    /// normal case: pairing again does not require the daemon to be down)
+    /// is picked up even before `ensure_started` gets a chance to tear this
+    /// task down and replace it.
     device_id: String,
     /// The SSE client's *current* access token — the same
     /// `Arc<tokio::sync::RwLock<String>>` handed to the running task via
