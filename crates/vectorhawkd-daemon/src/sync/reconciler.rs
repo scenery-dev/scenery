@@ -497,13 +497,21 @@ async fn dispatch_event(
 
             // ── MCP reconciliation ───────────────────────────────────────────
             //
-            // An empty `mcp_installations` vec means the backend did not emit
-            // the key (old backend, backwards compat).  Do NOT treat it as
-            // "desired state is zero servers" — that would wipe existing installs.
-            // Only reconcile when the vec is non-empty.
-            if !mcp_installations.is_empty() {
-                let mcp_derived =
-                    build_derived_mcp_events(mcp_installations, Arc::clone(state)).await;
+            // `None` means the backend did not emit the `mcp_installations`
+            // key at all (old backend, backwards compat) — do NOT treat that
+            // as "desired state is zero servers", which would wipe existing
+            // installs. `Some(records)` is real desired state from a backend
+            // that does emit the key, even when `records` is empty (a device
+            // with zero MCP installs) — reconcile against it, including
+            // removing every local install as orphans.
+            if let Some(records) = mcp_installations {
+                let mcp_derived = build_derived_mcp_events(
+                    records,
+                    Arc::clone(state),
+                    Arc::clone(backend_registry),
+                    pusher.as_ref().map(Arc::clone),
+                )
+                .await;
                 for d in mcp_derived {
                     match d {
                         SyncEvent::InstallMcp {
@@ -784,7 +792,7 @@ fn spawn_deactivate_mcp(
             &reg_url,
             &stats_clone,
             &br,
-            pusher.as_deref(),
+            pusher,
         )
         .await
     });
@@ -1280,9 +1288,99 @@ async fn handle_install_mcp(
     }
 }
 
+// ── Shared MCP teardown ───────────────────────────────────────────────────────
+
+/// Stop the running stdio backend for `mcp_server_id` (if any), remove its
+/// `~/.claude.json` per-server entry (if a pusher is configured), delete its
+/// `mcp_installations` row, and regenerate `managed-mcp.json`. Returns
+/// `Ok(true)` if a backend was actually removed from the live aggregator.
+///
+/// Resolves the aggregator slug from the **local row's** `mcp_server_name`
+/// before deleting that row — the row is the only place that maps
+/// `mcp_server_id` (a UUID) to the display name `remove_backend`/
+/// `remove_mcp` need to compute their key. This also means the lookup is
+/// correct even when the *incoming* snapshot record is a tombstone (deleted
+/// catalog row, `mcp_server_name == ""`) — this function never reads the
+/// incoming record, only local state.
+///
+/// Idempotent: calling this again for an already-torn-down `mcp_server_id`
+/// is a no-op (`delete_mcp_install` no-ops on a missing row) that returns
+/// `Ok(false)` and logs a WARN that the aggregator key could not be
+/// resolved.
+///
+/// Shared by every path that learns an MCP install is gone:
+/// - the live `deactivate_mcp` SSE event and a snapshot record in
+///   `"deactivated"` state, both via [`handle_deactivate_mcp`];
+/// - orphan removal in [`build_derived_mcp_events_blocking`] (installed
+///   locally, missing from the snapshot entirely).
+///
+/// This function itself is synchronous (plain SQLite + filesystem I/O, and
+/// `BackendRegistry::remove_backend`/`ManagedPathsPusher::remove_mcp` are
+/// both plain `&self` methods) — callers already running on a blocking
+/// thread (the snapshot diff) call it directly; `handle_deactivate_mcp`
+/// wraps it in `spawn_blocking`.
+fn teardown_mcp_server_locally(
+    mcp_server_id: &str,
+    state: &AppState,
+    backend_registry: &BackendRegistry,
+    pusher: Option<&ManagedPathsPusher>,
+) -> Result<bool> {
+    let aggregator_key = state
+        .list_mcp_installs()
+        .context("failed to read mcp_installations for teardown lookup")?
+        .into_iter()
+        .find(|r| r.mcp_server_id == mcp_server_id)
+        .map(|r| crate::mcp_server_slug(&r.mcp_server_name));
+
+    state
+        .delete_mcp_install(mcp_server_id)
+        .context("failed to delete mcp_installations row")?;
+    write_managed_mcp_json(state)?;
+
+    let Some(key) = aggregator_key else {
+        warn!(
+            mcp_server_id,
+            "reconciler: could not resolve aggregator key for teardown \
+             (local row already gone) — stdio backend, if any, will remain \
+             visible until daemon restart"
+        );
+        return Ok(false);
+    };
+
+    // F2: remove the per-server entry from ~/.claude.json.
+    if let Some(p) = pusher {
+        if let Err(e) = p.remove_mcp(&key) {
+            warn!(
+                mcp_server_id,
+                slug = %key,
+                error = %e,
+                "reconciler: F2 remove_mcp failed (non-fatal)"
+            );
+        }
+    }
+
+    // Remove the backend from the live aggregator so the AI client stops
+    // seeing its tools immediately without a daemon restart. `remove_backend`
+    // shuts down any spawned stdio child process.
+    let removed = backend_registry.remove_backend(&key);
+    if removed {
+        info!(
+            mcp_server_id,
+            aggregator_key = %key,
+            "reconciler: removed MCP backend from aggregator"
+        );
+    }
+    Ok(removed)
+}
+
 // ── MCP deactivate handler ────────────────────────────────────────────────────
 
 /// Handle one `DeactivateMcp` event.  Returns `true` if the tool list changed.
+///
+/// Used for both the live `deactivate_mcp` SSE event and a snapshot record
+/// in `"deactivated"` state (the latter via `spawn_deactivate_mcp`) — the
+/// exact same teardown runs either way, through the shared
+/// [`teardown_mcp_server_locally`].
 async fn handle_deactivate_mcp(
     installation_id: Uuid,
     mcp_server_id: Uuid,
@@ -1290,39 +1388,29 @@ async fn handle_deactivate_mcp(
     registry_url: &str,
     stats: &Arc<Mutex<ReconcilerStats>>,
     backend_registry: &Arc<BackendRegistry>,
-    pusher: Option<&ManagedPathsPusher>,
+    pusher: Option<Arc<ManagedPathsPusher>>,
 ) -> bool {
     let state_clone = Arc::clone(state);
     let server_id_str = mcp_server_id.to_string();
-    // Clone before the move closure so we can use the string again after await.
-    let server_id_for_closure = server_id_str.clone();
+    let backend_registry_clone = Arc::clone(backend_registry);
 
-    // Look up the server name BEFORE deletion so we can compute the
-    // aggregator slug — the SQLite row holds the only mapping from
-    // mcp_server_id (UUID) → display name needed for `remove_backend`.
-    let state_for_lookup = Arc::clone(state);
-    let id_for_lookup = server_id_str.clone();
-    let aggregator_key = tokio::task::spawn_blocking(move || {
-        state_for_lookup.list_mcp_installs().ok().and_then(|rows| {
-            rows.into_iter()
-                .find(|r| r.mcp_server_id == id_for_lookup)
-                .map(|r| crate::mcp_server_slug(&r.mcp_server_name))
-        })
-    })
-    .await
-    .ok()
-    .flatten();
-
+    // The whole teardown — resolve the aggregator key from the LOCAL row,
+    // stop the stdio child, drop the ~/.claude.json entry, delete the row,
+    // rewrite managed-mcp.json — runs as one unit on a blocking thread, in
+    // that order, so the row can never be deleted before the key that only
+    // it can resolve has been read.
     let result = tokio::task::spawn_blocking(move || {
-        state_clone
-            .delete_mcp_install(&server_id_for_closure)
-            .context("failed to delete mcp_installations row")?;
-        write_managed_mcp_json(&state_clone)
+        teardown_mcp_server_locally(
+            &server_id_str,
+            &state_clone,
+            &backend_registry_clone,
+            pusher.as_deref(),
+        )
     })
     .await;
 
     match result {
-        Ok(Ok(())) => {
+        Ok(Ok(_removed)) => {
             info!(mcp_server_id = %mcp_server_id, "reconciler: MCP server deactivated");
             report_mcp_installation_status(
                 installation_id,
@@ -1333,42 +1421,6 @@ async fn handle_deactivate_mcp(
             )
             .await;
             increment_mcp_deactivates(stats);
-
-            // F2: Remove the per-server entry from ~/.claude.json.
-            if let Some(ref key) = aggregator_key {
-                if let Some(p) = pusher {
-                    if let Err(e) = p.remove_mcp(key) {
-                        warn!(
-                            mcp_server_id = %mcp_server_id,
-                            slug = %key,
-                            error = %e,
-                            "reconciler: F2 remove_mcp failed (non-fatal)"
-                        );
-                    }
-                }
-            }
-
-            // Remove the backend from the live aggregator so the AI client
-            // stops seeing its tools immediately without a daemon restart.
-            // `remove_backend` shuts down any spawned stdio child process.
-            // Look up keyed by the slug we registered under (not the UUID).
-            if let Some(ref key) = aggregator_key {
-                let removed = backend_registry.remove_backend(key);
-                if removed {
-                    info!(
-                        mcp_server_id = %mcp_server_id,
-                        aggregator_key = %key,
-                        "reconciler: removed MCP backend from aggregator"
-                    );
-                }
-            } else {
-                warn!(
-                    mcp_server_id = %mcp_server_id,
-                    "reconciler: could not resolve aggregator key for deactivate \
-                     — backend will remain visible until daemon restart"
-                );
-            }
-
             true
         }
         Ok(Err(e)) => {
@@ -2635,46 +2687,59 @@ fn build_derived_events_blocking(
 
 // ── MCP snapshot diff ─────────────────────────────────────────────────────────
 
-/// Async wrapper: diff MCP snapshot records vs local SQLite and return derived events.
+/// Async wrapper: diff MCP snapshot records vs local SQLite and return derived
+/// events, tearing down orphans (see [`teardown_mcp_server_locally`]) along
+/// the way.
 ///
-/// An empty `records` vec means "old backend — no MCP key in snapshot"; callers
-/// must guard against calling this with an empty slice (they would get no events,
-/// which is correct, but also a wasted blocking spawn).
+/// `records` is the `Some(...)` payload already unwrapped by the caller
+/// (`dispatch_event`'s `SyncEvent::Snapshot` arm) — an empty vec here is a
+/// legitimate "this device desires zero MCP servers" and must still run
+/// orphan detection against every local row. The `None` ("old backend, no
+/// key") case is handled one level up and never reaches this function.
 async fn build_derived_mcp_events(
     records: Vec<McpInstallationRecord>,
     state: Arc<AppState>,
+    backend_registry: Arc<BackendRegistry>,
+    pusher: Option<Arc<ManagedPathsPusher>>,
 ) -> Vec<SyncEvent> {
-    tokio::task::spawn_blocking(move || build_derived_mcp_events_blocking(records, &state))
-        .await
-        .unwrap_or_else(|e| {
-            warn!(error = %e, "reconciler: MCP snapshot diff task panicked");
-            vec![]
-        })
+    tokio::task::spawn_blocking(move || {
+        build_derived_mcp_events_blocking(records, &state, &backend_registry, pusher.as_deref())
+    })
+    .await
+    .unwrap_or_else(|e| {
+        warn!(error = %e, "reconciler: MCP snapshot diff task panicked");
+        vec![]
+    })
 }
 
 /// Diff a slice of MCP snapshot records against the local `mcp_installations`
 /// SQLite table and return the minimal set of `InstallMcp`/`DeactivateMcp`
 /// events needed to converge state.
 ///
-/// Additionally removes any local SQLite rows whose `mcp_server_id` is **not**
-/// in the snapshot (orphan detection: the catalog row was deleted while the
-/// daemon was offline).
+/// Orphans — local rows whose `mcp_server_id` is **not** in the snapshot at
+/// all (the catalog row was deleted from the backend while the daemon was
+/// offline) — are torn down directly here via
+/// [`teardown_mcp_server_locally`], the same shared teardown
+/// [`handle_deactivate_mcp`] uses for the live `deactivate_mcp` SSE event and
+/// for a snapshot record in `"deactivated"` state. There is no
+/// `installation_id` left to usefully PATCH for an orphan (the row is gone
+/// from the catalog entirely — mirrors how the sibling plugin-snapshot diff
+/// silently purges its own orphans with no backend callback), so this calls
+/// the teardown directly instead of going through the event→PATCH path.
 ///
-/// A single `write_managed_mcp_json` call at the end of all mutations keeps the
-/// managed-mcp.json file consistent without N per-event writes.
+/// A `"deactivated"` record is **not** torn down here — only a
+/// `DeactivateMcp` event is emitted. Deleting the row in this function
+/// before that event reaches `handle_deactivate_mcp` would make the
+/// aggregator key (which only the local row can resolve, via
+/// `mcp_server_name`) unresolvable by the time the handler runs, leaving the
+/// stdio child running until the daemon restarts — this was the kill-switch
+/// bug the Option<Vec<_>>/teardown-ordering fix addresses.
 pub(crate) fn build_derived_mcp_events_blocking(
     records: Vec<McpInstallationRecord>,
     state: &AppState,
+    backend_registry: &BackendRegistry,
+    pusher: Option<&ManagedPathsPusher>,
 ) -> Vec<SyncEvent> {
-    // An empty records slice means "old backend — no mcp_installations key".
-    // Treat as a no-op: do not remove existing installs.  The caller in
-    // dispatch_event already guards `if !mcp_installations.is_empty()` before
-    // calling the async wrapper, but this guard makes the function safe to
-    // call directly from tests with an empty slice.
-    if records.is_empty() {
-        return vec![];
-    }
-
     // Load current local state: mcp_server_id → installation_id (string).
     let local_rows = match state.list_mcp_installs() {
         Ok(r) => r,
@@ -2690,28 +2755,34 @@ pub(crate) fn build_derived_mcp_events_blocking(
         .map(|r| r.mcp_server_id.to_string())
         .collect();
 
-    // Remove orphans (local rows absent from the snapshot).
-    // These represent servers deleted from the backend catalog while offline.
-    let mut any_orphan_removed = false;
+    // Remove orphans (local rows absent from the snapshot): stop any running
+    // stdio child, drop the ~/.claude.json entry, delete the row, rewrite
+    // managed-mcp.json — the full shared teardown, not just a row delete.
     for local in &local_rows {
         if !snapshot_ids.contains(&local.mcp_server_id) {
-            if let Err(e) = state.delete_mcp_install(&local.mcp_server_id) {
-                warn!(
-                    mcp_server_id = %local.mcp_server_id,
-                    error = %e,
-                    "reconciler: failed to remove orphan mcp_installations row"
-                );
-            } else {
-                info!(
-                    mcp_server_id = %local.mcp_server_id,
-                    "reconciler: removed orphan MCP install (not in snapshot)"
-                );
-                any_orphan_removed = true;
+            match teardown_mcp_server_locally(&local.mcp_server_id, state, backend_registry, pusher)
+            {
+                Ok(_) => {
+                    info!(
+                        mcp_server_id = %local.mcp_server_id,
+                        "reconciler: removed orphan MCP install (not in snapshot)"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        mcp_server_id = %local.mcp_server_id,
+                        error = %e,
+                        "reconciler: failed to tear down orphan mcp_installations row"
+                    );
+                }
             }
         }
     }
 
     // Build a set of currently-installed mcp_server_ids for fast lookup.
+    // Computed from `local_rows`, captured before the orphan teardown loop
+    // above ran — that is fine: orphans are by definition absent from
+    // `records`, so they can never match an arm in the loop below.
     let installed_ids: std::collections::HashSet<String> =
         local_rows.iter().map(|r| r.mcp_server_id.clone()).collect();
 
@@ -2739,25 +2810,14 @@ pub(crate) fn build_derived_mcp_events_blocking(
                 // Already installed: no event needed.
             }
             "deactivated" => {
-                // Should be removed locally.  If it's still in the local table, deactivate.
+                // Teardown is deferred to `handle_deactivate_mcp` (shared
+                // with the live SSE event) — do NOT delete the row here.
+                // See this function's doc comment.
                 if installed_ids.contains(&server_id_str) {
-                    if let Err(e) = state.delete_mcp_install(&server_id_str) {
-                        warn!(
-                            mcp_server_id = %server_id_str,
-                            error = %e,
-                            "reconciler: failed to remove deactivated mcp_installations row in snapshot"
-                        );
-                    } else {
-                        info!(
-                            mcp_server_id = %server_id_str,
-                            "reconciler: deactivated MCP server removed from local state (snapshot)"
-                        );
-                        any_deactivation = true;
-                        events.push(SyncEvent::DeactivateMcp {
-                            installation_id: record.installation_id,
-                            mcp_server_id: record.mcp_server_id,
-                        });
-                    }
+                    events.push(SyncEvent::DeactivateMcp {
+                        installation_id: record.installation_id,
+                        mcp_server_id: record.mcp_server_id,
+                    });
                 }
             }
             "removed" => {
@@ -2789,10 +2849,11 @@ pub(crate) fn build_derived_mcp_events_blocking(
         }
     }
 
-    // Regenerate managed-mcp.json once for all mutations (orphan removals +
-    // deactivations) rather than once per event.  Install events will each
-    // call write_managed_mcp_json themselves via handle_install_mcp.
-    if any_orphan_removed || any_deactivation {
+    // Regenerate managed-mcp.json for the `"removed"` branch's direct
+    // mutations above. Orphan teardowns already rewrote it themselves
+    // (inside `teardown_mcp_server_locally`); `"deactivated"` makes no
+    // mutation here at all (deferred to `handle_deactivate_mcp`).
+    if any_deactivation {
         if let Err(e) = write_managed_mcp_json(state) {
             warn!(error = %e, "reconciler: failed to write managed-mcp.json after snapshot MCP diff");
         }
@@ -3121,8 +3182,9 @@ pub(crate) fn write_managed_mcp_json_for_test(state: &AppState) -> anyhow::Resul
 pub(crate) fn build_derived_mcp_events_blocking_for_test(
     records: Vec<crate::sync::sse_client::McpInstallationRecord>,
     state: &AppState,
+    backend_registry: &BackendRegistry,
 ) -> Vec<SyncEvent> {
-    build_derived_mcp_events_blocking(records, state)
+    build_derived_mcp_events_blocking(records, state, backend_registry, None)
 }
 
 #[cfg(test)]

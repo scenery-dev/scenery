@@ -350,7 +350,8 @@ fn snapshot_mcp_two_desired_rows_produce_two_install_events_and_write_json() {
         make_mcp_snapshot_record(sid2, iid2, "Slack MCP", "desired"),
     ];
 
-    let events = super::build_derived_mcp_events_blocking_for_test(records, &state);
+    let registry = fresh_registry();
+    let events = super::build_derived_mcp_events_blocking_for_test(records, &state, &registry);
 
     assert_eq!(events.len(), 2, "two desired rows → two InstallMcp events");
 
@@ -405,7 +406,8 @@ fn snapshot_mcp_orphan_removed_from_sqlite_and_managed_json() {
         "installed",
     )];
 
-    let events = super::build_derived_mcp_events_blocking_for_test(records, &state);
+    let registry = fresh_registry();
+    let events = super::build_derived_mcp_events_blocking_for_test(records, &state, &registry);
 
     // No new install events — server A is already present.
     assert!(events.is_empty(), "server A already installed → no events");
@@ -429,11 +431,21 @@ fn snapshot_mcp_orphan_removed_from_sqlite_and_managed_json() {
 }
 
 #[test]
-fn snapshot_mcp_deactivated_state_removes_local_row_and_rewrites_json() {
+fn snapshot_mcp_deactivated_state_defers_teardown_and_emits_event() {
     // Scenario: server was installed; portal admin deactivates it. Daemon
-    // reconnects and receives a snapshot with state=deactivated for that server.
-    // Expect: row deleted from SQLite, managed-mcp.json is empty, DeactivateMcp
-    // event emitted so the backend PATCH callback fires.
+    // reconnects and receives a snapshot with state=deactivated for that
+    // server.
+    //
+    // Regression for the kill-switch bug: the diff function used to delete
+    // the local row itself, which made the aggregator key (resolvable only
+    // from that row) unresolvable by the time the derived `DeactivateMcp`
+    // event reached `handle_deactivate_mcp` — so `remove_backend` never ran
+    // and the stdio child kept running until the daemon restarted. The fix
+    // is to defer ALL teardown (row delete, json rewrite, aggregator
+    // removal) to `handle_deactivate_mcp` — the diff function must only
+    // emit the event and leave local state untouched. See
+    // `snapshot_mcp_deactivated_event_stops_running_backend` below for the
+    // full pipeline proving teardown still happens, correctly, downstream.
     let root = temp_root("snapshot-mcp-deactivated");
     let state = AppState::bootstrap_in(root.clone()).unwrap();
 
@@ -457,9 +469,11 @@ fn snapshot_mcp_deactivated_state_removes_local_row_and_rewrites_json() {
         "deactivated",
     )];
 
-    let events = super::build_derived_mcp_events_blocking_for_test(records, &state);
+    let registry = fresh_registry();
+    let events = super::build_derived_mcp_events_blocking_for_test(records, &state, &registry);
 
-    // One DeactivateMcp event so the reconciler can PATCH the backend.
+    // One DeactivateMcp event so the reconciler can PATCH the backend and
+    // run the real teardown.
     assert_eq!(events.len(), 1);
     match &events[0] {
         crate::sync::sse_client::SyncEvent::DeactivateMcp { mcp_server_id, .. } => {
@@ -468,48 +482,277 @@ fn snapshot_mcp_deactivated_state_removes_local_row_and_rewrites_json() {
         other => panic!("expected DeactivateMcp, got {other:?}"),
     }
 
-    // Row removed from SQLite.
-    assert!(state.list_mcp_installs().unwrap().is_empty());
+    // The row must NOT be removed by the diff itself — deleting it here
+    // would make the aggregator key unresolvable downstream (the bug).
+    let remaining = state.list_mcp_installs().unwrap();
+    assert_eq!(
+        remaining.len(),
+        1,
+        "diff must not delete the row — teardown is deferred to handle_deactivate_mcp"
+    );
 
-    // managed-mcp.json rewritten with zero servers.
+    // managed-mcp.json must be untouched by the diff for this arm.
     let json = read_managed_mcp_json(&state);
     assert_eq!(
         json["servers"].as_array().unwrap().len(),
-        0,
-        "managed-mcp.json must be empty after deactivation"
+        1,
+        "diff must not rewrite managed-mcp.json for a deactivated record — deferred"
     );
 
     cleanup(&root);
 }
 
 #[test]
-fn snapshot_mcp_empty_array_is_noop_for_existing_installs() {
-    // Backwards-compat scenario: old backend does not emit `mcp_installations`
-    // key. The SSE parser defaults it to an empty vec.  The reconciler must
-    // treat an empty slice as "old backend, no data" — NOT as "desired state is
-    // zero servers".  Existing local installs must be left untouched.
-    let root = temp_root("snapshot-mcp-empty-compat");
+fn snapshot_mcp_some_empty_reconciles_away_existing_installs() {
+    // `Some(vec![])` (a present-but-empty `mcp_installations` array — what
+    // the current backend sends for a device with zero desired MCP
+    // installs) is real desired state, not "old backend, no data". The
+    // low-level diff function only ever receives the already-unwrapped
+    // `Some(...)` payload (the `None` case is handled one level up in
+    // `dispatch_event` and never reaches this function — see
+    // `sse_client_tests::parses_snapshot_event` and
+    // `parses_snapshot_event_with_empty_mcp_installations_as_some_empty`
+    // for the parsing-level distinction). An empty `records` vec here must
+    // therefore reconcile every local install away as an orphan, including
+    // tearing down its running stdio backend.
+    let root = temp_root("snapshot-mcp-some-empty");
     let state = AppState::bootstrap_in(root.clone()).unwrap();
 
     let sid = server_id();
-    seed_mcp_row(&state, sid, "GitHub MCP");
+    seed_mcp_row_with_config(&state, sid, "GitHub MCP", Some(stdio_server_config()));
     super::write_managed_mcp_json_for_test(&state).unwrap();
 
-    // Caller guards against empty vec (as done in dispatch_event).
-    // To test the function directly we call it with an empty vec and confirm
-    // it is a no-op (no events, no SQLite changes, no JSON rewrite).
-    let events = super::build_derived_mcp_events_blocking_for_test(vec![], &state);
+    let registry = fresh_registry();
+    let (list_changed_tx, _rx) = tokio::sync::broadcast::channel(16);
+    crate::load_managed_mcp_into_registry(&state, &registry, list_changed_tx);
+    assert!(
+        registry.has_backend("github-mcp"),
+        "backend must be registered before reconciling against Some(empty)"
+    );
 
-    assert!(events.is_empty(), "empty snapshot → no events");
+    let events = super::build_derived_mcp_events_blocking_for_test(vec![], &state, &registry);
 
-    // Existing row must still be present.
+    assert!(
+        events.is_empty(),
+        "Some(empty) orphans every local row silently — no events to report, \
+         mirroring the plugin orphan diff's own silent-purge precedent"
+    );
+
+    // Row removed from SQLite.
+    let remaining = state.list_mcp_installs().unwrap();
+    assert!(
+        remaining.is_empty(),
+        "Some(empty) must reconcile away every existing install"
+    );
+
+    // managed-mcp.json rewritten empty.
+    let json = read_managed_mcp_json(&state);
+    assert_eq!(
+        json["servers"].as_array().unwrap().len(),
+        0,
+        "managed-mcp.json must be empty after Some(empty) reconcile"
+    );
+
+    // Running stdio backend stopped.
+    assert!(
+        !registry.has_backend("github-mcp"),
+        "Some(empty) must stop the running backend, not just delete the row"
+    );
+
+    cleanup(&root);
+}
+
+#[tokio::test]
+async fn snapshot_mcp_deactivated_event_stops_running_backend() {
+    // Full pipeline for the kill-switch bug: diff a "deactivated" snapshot
+    // record (emits DeactivateMcp, leaves local state untouched — see
+    // `snapshot_mcp_deactivated_state_defers_teardown_and_emits_event`
+    // above), then feed that event through the exact handler the
+    // reconciler's event loop would (`handle_deactivate_mcp`). The
+    // aggregator key must resolve from the still-present local row and the
+    // stdio backend must actually stop.
+    let root = temp_root("snapshot-mcp-deactivated-e2e");
+    let state = AppState::bootstrap_in(root.clone()).unwrap();
+    let state_arc = Arc::new(state.clone());
+
+    let sid = server_id();
+    let iid = install_id();
+    seed_mcp_row_with_config(&state, sid, "GitHub MCP", Some(stdio_server_config()));
+
+    let registry = fresh_registry();
+    let (list_changed_tx, _rx) = tokio::sync::broadcast::channel(16);
+    crate::load_managed_mcp_into_registry(&state, &registry, list_changed_tx);
+    assert!(
+        registry.has_backend("github-mcp"),
+        "backend must be registered before deactivation"
+    );
+
+    let records = vec![make_mcp_snapshot_record(
+        sid,
+        iid,
+        "GitHub MCP",
+        "deactivated",
+    )];
+    let events = super::build_derived_mcp_events_blocking_for_test(records, &state, &registry);
+    assert_eq!(events.len(), 1, "deactivated record must emit one event");
+
+    let (event_iid, event_sid) = match &events[0] {
+        crate::sync::sse_client::SyncEvent::DeactivateMcp {
+            installation_id,
+            mcp_server_id,
+        } => (*installation_id, *mcp_server_id),
+        other => panic!("expected DeactivateMcp, got {other:?}"),
+    };
+
+    let stats = Arc::new(std::sync::Mutex::new(super::ReconcilerStats::default()));
+    let mut mock_server = mockito::Server::new_async().await;
+    let _m = mock_server
+        .mock(
+            "PATCH",
+            format!("/api/mcp-installations/{event_iid}").as_str(),
+        )
+        .with_status(200)
+        .with_body("{}")
+        .create_async()
+        .await;
+
+    let changed = super::handle_deactivate_mcp_for_test(
+        event_iid,
+        event_sid,
+        &state_arc,
+        &mock_server.url(),
+        &stats,
+        &registry,
+    )
+    .await;
+
+    assert!(changed, "handle_deactivate_mcp must report success");
+    assert!(
+        !registry.has_backend("github-mcp"),
+        "the stdio backend must be stopped once the derived DeactivateMcp \
+         event reaches handle_deactivate_mcp — this is the regression test \
+         for the kill-switch bug"
+    );
+    assert!(
+        state.list_mcp_installs().unwrap().is_empty(),
+        "row must be removed by handle_deactivate_mcp"
+    );
+
+    cleanup(&root);
+}
+
+#[tokio::test]
+async fn snapshot_mcp_orphan_removal_stops_running_backend() {
+    // Regression for the other half of the kill-switch bug: orphan removal
+    // (a server installed locally but missing from the snapshot entirely —
+    // its catalog row was deleted while offline) used to delete the local
+    // row directly with no call into the aggregator, so the stdio child
+    // kept running until the daemon restarted.
+    let root = temp_root("snapshot-mcp-orphan-aggregator");
+    let state = AppState::bootstrap_in(root.clone()).unwrap();
+
+    let sid_a = server_id();
+    let sid_b = server_id();
+    let iid_a = install_id();
+
+    seed_mcp_row_with_config(&state, sid_a, "GitHub MCP", Some(stdio_server_config()));
+    seed_mcp_row_with_config(&state, sid_b, "Slack MCP", Some(stdio_server_config()));
+
+    let registry = fresh_registry();
+    let (list_changed_tx, _rx) = tokio::sync::broadcast::channel(16);
+    crate::load_managed_mcp_into_registry(&state, &registry, list_changed_tx);
+    assert!(registry.has_backend("github-mcp"));
+    assert!(registry.has_backend("slack-mcp"));
+
+    // Snapshot only contains server A — server B is an orphan.
+    let records = vec![make_mcp_snapshot_record(
+        sid_a,
+        iid_a,
+        "GitHub MCP",
+        "installed",
+    )];
+    let events = super::build_derived_mcp_events_blocking_for_test(records, &state, &registry);
+    assert!(events.is_empty(), "server A already installed → no events");
+
+    // Server B's row is gone...
+    let remaining = state.list_mcp_installs().unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].mcp_server_id, sid_a.to_string());
+
+    // ...and, unlike before the fix, so is its running backend.
+    assert!(
+        registry.has_backend("github-mcp"),
+        "surviving server A must stay registered"
+    );
+    assert!(
+        !registry.has_backend("slack-mcp"),
+        "orphaned server B's stdio backend must be stopped by the diff itself"
+    );
+
+    cleanup(&root);
+}
+
+#[tokio::test]
+async fn dispatch_event_mcp_none_leaves_existing_installs_and_backend_untouched() {
+    // `mcp_installations: None` means an old backend omitted the key
+    // entirely — distinct from `Some(vec![])`, which is real desired state
+    // of zero servers (see `snapshot_mcp_some_empty_reconciles_away_existing_installs`
+    // above). Exercised at the `dispatch_event` level (not the lower-level
+    // diff function, which never sees `None` — that case is handled here,
+    // one level up) to prove the full reconcile is skipped end to end: the
+    // existing row AND its running backend must be left alone.
+    let root = temp_root("dispatch-mcp-none");
+    let state = Arc::new(AppState::bootstrap_in(root.clone()).unwrap());
+
+    let sid = server_id();
+    seed_mcp_row_with_config(&state, sid, "GitHub MCP", Some(stdio_server_config()));
+    super::write_managed_mcp_json_for_test(&state).unwrap();
+
+    let registry = fresh_registry();
+    let (list_changed_tx, _rx) = tokio::sync::broadcast::channel(16);
+    crate::load_managed_mcp_into_registry(&state, &registry, list_changed_tx.clone());
+    assert!(registry.has_backend("github-mcp"));
+
+    let registry_url = "https://example.invalid".to_string();
+    let sem = Arc::new(tokio::sync::Semaphore::new(4));
+    let skill_locks: super::SkillLockMap =
+        Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let stats = Arc::new(std::sync::Mutex::new(super::ReconcilerStats::default()));
+    let mut install_tasks: tokio::task::JoinSet<bool> = tokio::task::JoinSet::new();
+
+    let snapshot_event = crate::sync::sse_client::SyncEvent::Snapshot {
+        installations: vec![],
+        mcp_installations: None,
+        plugin_installations: vec![],
+    };
+
+    super::dispatch_event(
+        snapshot_event,
+        &state,
+        &registry_url,
+        &sem,
+        &skill_locks,
+        &stats,
+        &mut install_tasks,
+        &registry,
+        list_changed_tx,
+        None,
+    )
+    .await;
+
+    // Drain any spawned tasks — there should be none for a None snapshot.
+    while install_tasks.join_next().await.is_some() {}
+
+    assert!(
+        registry.has_backend("github-mcp"),
+        "None must leave the running backend untouched"
+    );
     let remaining = state.list_mcp_installs().unwrap();
     assert_eq!(
         remaining.len(),
         1,
-        "empty snapshot must not wipe existing installs"
+        "None must leave the existing install row untouched"
     );
-    assert_eq!(remaining[0].mcp_server_id, sid.to_string());
 
     cleanup(&root);
 }
