@@ -37,8 +37,8 @@ use std::{fs, process::Command};
 
 use super::{
     cgroup_is_service, cmdline_is_daemon_run, daemon_socket_path, exe_is_stale,
-    resolve_daemon_bin_path, socket_is_reachable, unit_is_healthy, wait_for_socket, InstallStatus,
-    SystemdState,
+    resolve_daemon_bin_path, socket_is_reachable, take_over_verified_pid, unit_is_healthy,
+    wait_for_socket, InstallStatus, SystemdState,
 };
 
 const SERVICE_NAME: &str = "vectorhawk-agent.service";
@@ -457,7 +457,10 @@ fn describe_state(state: Option<SystemdState>) -> &'static str {
 }
 
 /// Scan `/proc` for VectorHawk daemon processes running **outside** the
-/// `vectorhawk-agent.service` cgroup, and SIGTERM them.
+/// `vectorhawk-agent.service` cgroup, verify each one with the exact same
+/// rules as daemon startup's automatic takeover
+/// (`vectorhawkd_daemon::daemon_takeover::verify_pid`), and take over only
+/// the ones verified stale.
 ///
 /// This is the repair step for boxes already stuck in the bug this module
 /// fixes: a previous buggy install direct-spawned a daemon that `setsid()`
@@ -472,18 +475,44 @@ fn describe_state(state: Option<SystemdState>) -> &'static str {
 /// unit on every subsequent `daemon-reload`/`start` unless something reaps
 /// it first. This is that something.
 ///
-/// Called only from the systemctl path, before (re)starting the unit — the
-/// XDG-autostart fallback has no cgroups to compare against and no stray
-/// problem (it never direct-spawns a competitor).
+/// Called from the systemctl path both before (re)starting the unit, and
+/// (as of the automatic-takeover feature) on the healthy-unit early-return
+/// path too — a box can be genuinely healthy by every systemd/socket check
+/// while a *separate* stray from this same historical bug is still running
+/// alongside it. The XDG-autostart fallback has no cgroups to compare
+/// against and no stray problem (it never direct-spawns a competitor), so
+/// it never calls this.
 ///
 /// Every step here is best-effort and non-fatal: a `/proc` we can't fully
-/// enumerate, a `cmdline`/`cgroup` file we can't read, or a `kill` that
-/// fails (already exited, no permission) must never fail the install.
+/// enumerate, a `cmdline`/`cgroup` file we can't read, a verification that
+/// comes back ambiguous, or a signal that fails (already exited, no
+/// permission) must never fail the install — see `verify_pid`'s "never
+/// kill on uncertainty" rule, which this now enforces identically to daemon
+/// startup instead of the unconditional kill this function used to do.
 fn reap_stray_daemons() {
     let Ok(proc_entries) = fs::read_dir("/proc") else {
         return;
     };
     let our_pid = std::process::id();
+    let Ok(our_version) = semver::Version::parse(env!("CARGO_PKG_VERSION")) else {
+        return;
+    };
+
+    // Only the pid currently bound to the socket (if any) has a version
+    // signal available at all — any other matching `/proc` pid can only be
+    // verified stale via its on-disk executable (`exe_replaced_or_deleted`).
+    let xdg = xdg_runtime_dir();
+    let xdg_sock = format!("{xdg}/vectorhawk/agent.sock");
+    let (socket_peer, socket_version) =
+        camino::Utf8PathBuf::from_path_buf(std::path::PathBuf::from(&xdg_sock))
+            .ok()
+            .map(|path| {
+                vectorhawkd_daemon::peer_handshake::connect_and_probe(
+                    &path,
+                    std::time::Duration::from_millis(500),
+                )
+            })
+            .unwrap_or_default();
 
     for entry in proc_entries.flatten() {
         let pid_str = entry.file_name().to_string_lossy().into_owned();
@@ -520,11 +549,33 @@ fn reap_stray_daemons() {
             continue;
         }
 
-        println!(
-            "Stopping a VectorHawk daemon running outside systemd (pid {pid}) so \
-             the service can take ownership."
+        let version_hint = if socket_peer.pid == Some(pid) {
+            socket_version.clone()
+        } else {
+            None
+        };
+
+        let verdict = vectorhawkd_daemon::daemon_takeover::verify_pid(
+            &vectorhawkd_daemon::process_probe::SystemProcessOps,
+            pid,
+            our_pid,
+            &our_version,
+            version_hint,
         );
-        unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+
+        match verdict {
+            vectorhawkd_daemon::daemon_takeover::Verdict::Refuse(reason) => {
+                println!("Leaving pid {pid} alone: {reason}.");
+            }
+            vectorhawkd_daemon::daemon_takeover::Verdict::TakeOver { pid, reason } => {
+                println!(
+                    "Stopping a VectorHawk daemon running outside systemd (pid {pid}, \
+                     {reason:?}) so the service can take ownership."
+                );
+                let result = take_over_verified_pid(pid);
+                println!("Takeover sequence for pid {pid} finished: {result:?}");
+            }
+        }
     }
 }
 
@@ -588,6 +639,14 @@ fn install_systemd(bin_path: &std::path::Path) -> Result<()> {
             let exe_stale = running_exe_is_stale(bin_path);
             let healthy = unit_is_healthy(pre_check_state, pre_check_socket_up, exe_stale);
             if healthy {
+                // The managed unit itself is fine, but a *separate* stray
+                // from the historical direct-spawn bug this module fixes
+                // can still be running alongside it (outside the unit's
+                // cgroup, not bound to the socket the healthy unit already
+                // owns) — reap it opportunistically even though nothing
+                // else about this install needs repairing. Best-effort;
+                // never turns a healthy no-op into a failure.
+                reap_stray_daemons();
                 println!(
                     "VectorHawk daemon is already installed and up to date — no changes made."
                 );

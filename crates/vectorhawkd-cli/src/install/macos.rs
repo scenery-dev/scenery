@@ -27,7 +27,7 @@
 use anyhow::{Context, Result};
 use std::{fs, process::Command};
 
-use super::{daemon_socket_path, socket_is_reachable, InstallStatus};
+use super::{daemon_socket_path, reap_stray_daemon_via_socket, socket_is_reachable, InstallStatus};
 
 const LABEL: &str = "com.vectorhawk.agent";
 const PLIST_FILENAME: &str = "com.vectorhawk.agent.plist";
@@ -321,6 +321,20 @@ pub fn install() -> Result<()> {
         .with_context(|| format!("failed to write plist: {}", plist.display()))?;
 
     println!("Wrote LaunchAgent plist: {}", plist.display());
+
+    // ── 3b. Reap a verified-stale daemon holding the socket outside launchd ──
+    //
+    // Mirrors Linux's `reap_stray_daemons` repair step (see that module's
+    // doc comment for the historical bug): an install predating LaunchAgent
+    // packaging — or a daemon run by hand — can be sitting on the socket
+    // without launchd ever knowing about it. `bootout`/`kickstart -k` below
+    // only ever touch a process launchd itself started under this label;
+    // they cannot reach an unmanaged process. Verify-and-take-over first so
+    // the bootstrap below isn't shut out of the socket it needs. Best
+    // effort: if nothing is listening, or the holder can't be verified
+    // stale, this changes nothing and bootstrap below proceeds (and simply
+    // fails to bind the socket if something still legitimately owns it).
+    reap_stray_daemon_via_socket(&daemon_socket_path());
 
     // ── 4. If currently loaded (stale state), boot it out first ───────────────
     if service_is_loaded(uid) {
