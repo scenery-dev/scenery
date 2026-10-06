@@ -974,6 +974,57 @@ fn push_missing_active_skills_repushes_only_absent() {
     );
 }
 
+/// Regression test for the reported "CLI local install doesn't create
+/// active/ symlink" bug: drive the exact same entry point
+/// `vectorhawk skill install /path/to/skill-dir/` uses
+/// (`vectorhawkd_core::installer::install_unpacked_skill` with
+/// `InstallMode::Copy`, called on a `SkillPackage` loaded straight from a
+/// local directory — the `cli-local` branch of `cmd_skill_install`), then
+/// run the heal pass and confirm it can read `active/SKILL.md` and re-push
+/// the skill. If the `active/` symlink were missing, this would surface as
+/// `healed == 0` and a "cannot read SKILL.md from installed copy" warning.
+#[test]
+fn local_dir_install_produces_readable_active_symlink_for_heal() {
+    use vectorhawkd_core::installer::{install_unpacked_skill, InstallMode};
+    use vectorhawkd_manifest::SkillPackage;
+
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let fake_home = tempfile::tempdir().unwrap();
+    let prev_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", fake_home.path());
+
+    let state_root = tempfile::tempdir().unwrap();
+    let state = vectorhawkd_core::state::AppState::bootstrap_in(
+        camino::Utf8PathBuf::from_path_buf(state_root.path().to_path_buf()).unwrap(),
+    )
+    .expect("state bootstrap should succeed");
+
+    // Same example skill directory used by the installer's own local-install
+    // test, loaded exactly as `cmd_skill_install`'s cli-local branch does.
+    let skill_path = camino::Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/skills/contract-compare");
+    let pkg = SkillPackage::load_from_dir(&skill_path).expect("example skill should load");
+
+    install_unpacked_skill(&state, &pkg, InstallMode::Copy).expect("local install should succeed");
+
+    let pusher = ManagedPathsPusher::new(&state);
+    let healed = push_missing_active_skills(&state, &pusher);
+
+    if let Some(v) = prev_home {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+
+    let healed = healed.expect("heal pass should not error");
+    assert_eq!(
+        healed, 1,
+        "heal must successfully read active/SKILL.md and re-push the \
+         locally-installed skill; 0 means the active/ symlink was missing \
+         or unreadable"
+    );
+}
+
 // ── Restore journal (F2 pushes) ─────────────────────────────────────────────
 //
 // push_skill/push_mcp both write into $HOME-derived paths, so
