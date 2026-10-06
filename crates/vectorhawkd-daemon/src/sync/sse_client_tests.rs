@@ -18,13 +18,84 @@ fn parses_snapshot_event() {
             assert_eq!(installations[0].version, "1.0.0");
             assert_eq!(installations[0].state, "desired");
             assert!(
-                mcp_installations.is_empty(),
-                "old-format snapshot has no mcp_installations key → default empty vec"
+                mcp_installations.is_none(),
+                "old-format snapshot has no mcp_installations key → None, not Some(empty)"
             );
             assert!(
                 plugin_installations.is_empty(),
                 "old-format snapshot has no plugin_installations key → default empty vec"
             );
+        }
+        other => panic!("expected Snapshot, got {other:?}"),
+    }
+}
+
+#[test]
+fn parses_snapshot_event_with_empty_mcp_installations_as_some_empty() {
+    // A present-but-empty "mcp_installations": [] (what the current backend
+    // sends for a device with zero MCP installs — see
+    // vectorhawk-backend/backend/app/routers/portal_sync.py _get_mcp_snapshot,
+    // which always includes the key) must parse to `Some(vec![])`, not
+    // `None`. The two have different meanings to the reconciler: `None`
+    // means "old backend, no data, leave existing installs alone"; `Some(
+    // vec![])` means "this device desires zero MCP servers, reconcile
+    // everything away."
+    let data = r#"{"installations":[],"mcp_installations":[]}"#;
+    let event = parse_sync_event("snapshot", data).unwrap();
+    match event {
+        super::SyncEvent::Snapshot {
+            mcp_installations, ..
+        } => {
+            let records = mcp_installations
+                .expect("a present empty mcp_installations array must parse to Some, not None");
+            assert!(
+                records.is_empty(),
+                "the inner vec must be empty — Some(vec![]) means zero desired MCP servers"
+            );
+        }
+        other => panic!("expected Snapshot, got {other:?}"),
+    }
+}
+
+#[test]
+fn parses_snapshot_event_with_deleted_server_tombstone() {
+    // Wire shape the backend sends for an MCP server whose catalog row was
+    // hard-deleted (admin delete): mcp_server_name/package_source are
+    // empty strings, auth_type is "none", gateway fields are null, and
+    // state is "deactivated" — see _get_mcp_snapshot's tombstone branch in
+    // vectorhawk-backend/backend/app/routers/portal_sync.py. The runner must
+    // parse this without erroring; the reconciler resolves the real
+    // aggregator key from its OWN local row (not from this tombstone's
+    // empty name) before tearing the server down.
+    let data = r#"{
+        "installations": [],
+        "mcp_installations": [
+            {
+                "installation_id": "550e8400-e29b-41d4-a716-446655440030",
+                "mcp_server_id": "550e8400-e29b-41d4-a716-446655440031",
+                "mcp_server_name": "",
+                "package_source": "",
+                "version_pin": null,
+                "server_config": null,
+                "auth_type": "none",
+                "gateway_server_id": null,
+                "gateway_url": null,
+                "state": "deactivated"
+            }
+        ]
+    }"#;
+    let event = parse_sync_event("snapshot", data).unwrap();
+    match event {
+        super::SyncEvent::Snapshot {
+            mcp_installations, ..
+        } => {
+            let records = mcp_installations.expect("tombstone snapshot must parse to Some");
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].mcp_server_name, "");
+            assert_eq!(records[0].package_source, "");
+            assert_eq!(records[0].auth_type, "none");
+            assert_eq!(records[0].state, "deactivated");
+            assert!(records[0].gateway_url.is_none());
         }
         other => panic!("expected Snapshot, got {other:?}"),
     }

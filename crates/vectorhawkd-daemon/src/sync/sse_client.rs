@@ -606,8 +606,14 @@ pub enum SyncEvent {
     Snapshot {
         installations: Vec<InstallationRecord>,
         /// MCP installation desired-state from the snapshot payload.
-        /// Empty when the backend is older and does not emit the key.
-        mcp_installations: Vec<McpInstallationRecord>,
+        /// `None` when the backend is older and omits the key entirely —
+        /// the reconciler must leave existing installs untouched.
+        /// `Some(vec![])` is a real desired state of zero MCP servers —
+        /// the reconciler must reconcile existing installs away. These two
+        /// cases were conflated as a plain `Vec` (both collapsed to empty)
+        /// until the fix for the kill-switch bug where an `Option<Vec<_>>`
+        /// was introduced to tell them apart.
+        mcp_installations: Option<Vec<McpInstallationRecord>>,
         /// Plugin installation desired-state from the snapshot payload
         /// (backend `plugin_installations` key — RB1). Delivers plugins
         /// durably to a device that wasn't connected when the live
@@ -746,11 +752,14 @@ pub struct McpInstallationRecord {
 #[derive(Debug, serde::Deserialize)]
 struct WireSnapshot {
     installations: Vec<InstallationRecord>,
-    /// MCP installation desired-state list.  `#[serde(default)]` so snapshots
-    /// from older backends (which do not emit the key) parse successfully with
-    /// an empty vec rather than failing deserialization.
+    /// MCP installation desired-state list.  `#[serde(default)]` so a
+    /// snapshot from an older backend that omits the key entirely parses
+    /// to `None` rather than failing deserialization. A present-but-empty
+    /// `"mcp_installations": []` parses to `Some(vec![])` — distinct from
+    /// `None`, since the two mean different things to the reconciler (see
+    /// `SyncEvent::Snapshot::mcp_installations`).
     #[serde(default)]
-    mcp_installations: Vec<McpInstallationRecord>,
+    mcp_installations: Option<Vec<McpInstallationRecord>>,
     /// Plugin installation desired-state list (RB1).  `#[serde(default)]` so
     /// snapshots from older backends (which do not emit the key) parse
     /// successfully with an empty vec rather than failing deserialization.
@@ -927,13 +936,13 @@ fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
             let kind = wire.kind.as_deref().unwrap_or("unknown");
             debug!("SSE: received state event (kind={kind}) — no-op");
             // Return a no-op Snapshot with empty lists so the reconciler ignores
-            // this without special-casing it. The reconciler drops empty snapshot
-            // diffs with zero derived events and does not wipe existing MCP state
-            // because an empty `mcp_installations` vec is treated as "old backend
-            // with no MCP key" rather than "zero desired servers".
+            // this without special-casing it. `mcp_installations: None` tells
+            // the reconciler "no data in this event" (same meaning as an old
+            // backend omitting the key) rather than "zero desired servers",
+            // which would wipe existing MCP installs.
             Ok(SyncEvent::Snapshot {
                 installations: vec![],
-                mcp_installations: vec![],
+                mcp_installations: None,
                 plugin_installations: vec![],
             })
         }
@@ -969,7 +978,7 @@ fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
             // it has access to AppState; parse_sync_event is a pure parser.
             Ok(SyncEvent::Snapshot {
                 installations: vec![],
-                mcp_installations: vec![],
+                mcp_installations: None,
                 plugin_installations: vec![],
             })
         }
@@ -979,7 +988,7 @@ fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
             // the reconciler produces no diff actions.
             Ok(SyncEvent::Snapshot {
                 installations: vec![],
-                mcp_installations: vec![],
+                mcp_installations: None,
                 plugin_installations: vec![],
             })
         }
@@ -989,7 +998,7 @@ fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
             // reconciler produces no diff actions.
             Ok(SyncEvent::Snapshot {
                 installations: vec![],
-                mcp_installations: vec![],
+                mcp_installations: None,
                 plugin_installations: vec![],
             })
         }
@@ -1000,7 +1009,7 @@ fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
             // reconciler produces no diff actions.
             Ok(SyncEvent::Snapshot {
                 installations: vec![],
-                mcp_installations: vec![],
+                mcp_installations: None,
                 plugin_installations: vec![],
             })
         }

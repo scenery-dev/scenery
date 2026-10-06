@@ -474,7 +474,7 @@ async fn concurrent_live_and_snapshot_install_for_same_slug_are_serialized() {
     // snapshot poll converging on the same plugin concurrently).
     let snapshot_event = SyncEvent::Snapshot {
         installations: vec![],
-        mcp_installations: vec![],
+        mcp_installations: None,
         plugin_installations: vec![make_record(slug, install_id(), "desired")],
     };
     dispatch_event(
@@ -630,7 +630,7 @@ async fn concurrent_live_install_and_snapshot_derived_orphan_purge_for_same_slug
     // return and skip orphan detection).
     let snapshot_event = SyncEvent::Snapshot {
         installations: vec![],
-        mcp_installations: vec![],
+        mcp_installations: None,
         plugin_installations: vec![make_record("decoy", install_id(), "installed")],
     };
     dispatch_event(
@@ -731,7 +731,7 @@ async fn dispatch_event_snapshot_converges_deactivated_and_orphan_and_removed_pl
 
     let snapshot_event = SyncEvent::Snapshot {
         installations: vec![],
-        mcp_installations: vec![],
+        mcp_installations: None,
         plugin_installations: vec![
             make_record("to-deactivate", install_id(), "deactivated"),
             make_record("to-remove", install_id(), "removed"),
