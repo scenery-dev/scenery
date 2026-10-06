@@ -664,6 +664,44 @@ async fn register_device_reregisters_when_device_id_is_already_cached() {
     mock.assert_async().await;
 }
 
+/// Direct regression test for the portal-facing symptom the 1.0.90 fix
+/// targets: the `agent_version` field posted on a re-registration (cached
+/// `device_id` present) must be the binary's CURRENT version
+/// (`CARGO_PKG_VERSION`), not something frozen at first pairing. Pairs with
+/// `register_device_reregisters_when_device_id_is_already_cached` above,
+/// which proves the call happens at all; this proves what it actually
+/// reports.
+#[tokio::test]
+async fn register_device_reports_current_agent_version_even_with_cached_id() {
+    let _guard = KeychainOff::enable();
+    let (state, _tmp) = bootstrap_state();
+
+    state.set_sync_state("device_uuid", "uuid-cached").unwrap();
+    state.set_sync_state("device_id", "dev-cached").unwrap();
+
+    let mut server = mockito::Server::new_async().await;
+    let registry_url = server.url();
+
+    let mock = server
+        .mock("POST", "/api/devices/register")
+        .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+            "device_uuid": "uuid-cached",
+            "agent_version": env!("CARGO_PKG_VERSION"),
+        })))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"device_id":"dev-cached"}"#)
+        .expect(1)
+        .create_async()
+        .await;
+
+    crate::register_device(&registry_url, "tok", Arc::clone(&state))
+        .await
+        .expect("register_device");
+
+    mock.assert_async().await;
+}
+
 /// A registry that is down must not stop an already-registered daemon from
 /// booting: the cached `device_id` is the fallback, so the daemon keeps its
 /// identity and carries on rather than failing startup.
