@@ -74,7 +74,16 @@ fn real_argv_of_dummy_child_is_rejected_by_the_production_matcher() {
     let mut child = spawn_dummy_child();
     let pid = child.id();
 
-    let argv = SystemProcessOps.argv(pid);
+    // `spawn` (posix_spawn / CLONE_VFORK) resumes us as soon as the kernel
+    // swaps in the child's new mm — before exec has finished, so on a slow
+    // box /proc/<pid>/cmdline can still read back empty. Poll (bounded) for
+    // exec to complete rather than reading once.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut argv = SystemProcessOps.argv(pid);
+    while argv.is_none() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        argv = SystemProcessOps.argv(pid);
+    }
     assert!(
         argv.is_some(),
         "expected to read back argv for our own child; {}",
