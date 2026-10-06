@@ -574,7 +574,7 @@ pub(crate) fn take_over_verified_pid(
 /// no side effects when nothing is listening or the holder can't be
 /// verified as stale (the normal "refuse, name the pid" diagnostics at each
 /// call site are unaffected either way).
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn reap_stray_daemon_via_socket(socket_path: &str) -> bool {
     let Some(path) = camino::Utf8PathBuf::from_path_buf(std::path::PathBuf::from(socket_path)).ok()
     else {
