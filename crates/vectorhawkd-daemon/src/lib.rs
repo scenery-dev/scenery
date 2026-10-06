@@ -66,6 +66,7 @@
 
 mod auth_dispatch;
 mod binary_watch;
+mod instance_lock;
 pub mod managed_paths;
 mod oauth_listener;
 mod oauth_state;
@@ -195,6 +196,19 @@ const REFRESH_INTERVAL_SECS: u64 = 60;
 pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     let state = AppState::bootstrap().context("failed to bootstrap application state")?;
     info!(root = %state.root_dir, "application state bootstrapped");
+
+    // Single-instance guard on `state.db` — independent of, and in addition
+    // to, the socket singleton guard (`acquire_socket`) further down. See
+    // `instance_lock`'s module docs for why the socket alone cannot catch an
+    // already-displaced daemon that keeps ticking its sync loop against
+    // shared state. Acquired first, before any other startup work, so a
+    // collision fails fast without having spawned background tasks or
+    // touched the registry.
+    let _instance_lock = instance_lock::acquire(&state.root_dir).context(
+        "failed to acquire the daemon's single-instance lock — another \
+         vectorhawkd process is already running against this state directory",
+    )?;
+
     state.seed_block_third_party_from_sync_state();
 
     let registry_url = opts
