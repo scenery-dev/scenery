@@ -693,3 +693,302 @@ async fn marker_present_returns_true_when_f2_marker_exists() {
 
     cleanup(&root);
 }
+
+// ── Bug A regression: F2 (`~/.claude/skills/<id>`) projection cleanup on
+// Purge / per-device kill-switch Deactivate ───────────────────────────────────
+//
+// `purge_skill_blocking` and `handle_deactivate` already invoke
+// `ManagedPathsPusher::remove_skill` (wired in since v1.0.51, commit
+// 896dafb) — but until now nothing exercised that wiring above the
+// pusher-unit level (`managed_paths/pusher_tests.rs` tests `remove_skill`
+// directly, never through the reconciler handlers that are the documented
+// call site). These tests close that gap end-to-end and pin the required
+// invariant: the F2 projection comes down on Purge/Deactivate regardless of
+// `managed_paths_mode` — that KV only gates F3's drift scanner
+// (`managed_paths/drift.rs`), never F2's `remove_skill`, so "warn" must not
+// suppress removal.
+
+/// Set `HOME` to a fresh temp dir for the duration of `f`, holding the
+/// crate-wide `ENV_MUTEX` so parallel tests never race on the env var, and
+/// always restoring the previous value afterward even if `f` panics.
+fn with_fake_home<T>(f: impl FnOnce(&std::path::Path) -> T) -> T {
+    let _guard = crate::managed_paths::ENV_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let fake_home = tempfile::tempdir().unwrap();
+    let prev_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", fake_home.path());
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(fake_home.path())));
+
+    if let Some(v) = prev_home {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+
+    match result {
+        Ok(v) => v,
+        Err(e) => std::panic::resume_unwind(e),
+    }
+}
+
+#[test]
+fn purge_skill_blocking_removes_f2_claude_skills_projection() {
+    let root = temp_root("purge-f2-removes");
+    let state = AppState::bootstrap_in(root.clone()).unwrap();
+    {
+        let conn = Connection::open(&state.db_path).unwrap();
+        seed_skill(&conn, "demo", "1.0.0", false);
+    }
+
+    with_fake_home(|home| {
+        let pusher = crate::managed_paths::ManagedPathsPusher::new(&state);
+        pusher
+            .push_skill("demo", Some("inst-1"), b"---\nname: demo\n---\n", &[])
+            .unwrap();
+
+        let canonical = home.join(".agents/skills/demo");
+        let link = home.join(".claude/skills/demo");
+        assert!(
+            canonical.is_dir(),
+            "precondition: F2 projection must exist before purge"
+        );
+        assert!(
+            link.is_symlink(),
+            "precondition: Claude Code link must exist before purge"
+        );
+
+        super::purge_skill_blocking(&state, "demo").expect("purge_skill_blocking should succeed");
+
+        assert!(
+            !canonical.exists(),
+            "BUG: Purge left the F2 skill dir orphaned at ~/.agents/skills/demo"
+        );
+        assert!(
+            !link.exists() && !link.is_symlink(),
+            "BUG: Purge left the ~/.claude/skills/demo link orphaned"
+        );
+    });
+
+    cleanup(&root);
+}
+
+#[test]
+fn purge_skill_blocking_removes_f2_projection_even_when_mode_is_warn() {
+    let root = temp_root("purge-f2-warn-mode");
+    let state = AppState::bootstrap_in(root.clone()).unwrap();
+    {
+        let conn = Connection::open(&state.db_path).unwrap();
+        seed_skill(&conn, "demo", "1.0.0", false);
+    }
+    // F4's org-level policy mode — must not gate F2 removal on an explicit
+    // security action (Purge). Only F3's drift scanner reads this key.
+    state.set_sync_state("managed_paths_mode", "warn").unwrap();
+
+    with_fake_home(|home| {
+        let pusher = crate::managed_paths::ManagedPathsPusher::new(&state);
+        pusher
+            .push_skill("demo", Some("inst-1"), b"---\nname: demo\n---\n", &[])
+            .unwrap();
+
+        let canonical = home.join(".agents/skills/demo");
+        let link = home.join(".claude/skills/demo");
+
+        super::purge_skill_blocking(&state, "demo").expect("purge_skill_blocking should succeed");
+
+        assert!(
+            !canonical.exists(),
+            "BUG: managed_paths_mode=warn suppressed F2 removal during Purge"
+        );
+        assert!(
+            !link.exists() && !link.is_symlink(),
+            "BUG: managed_paths_mode=warn left the Claude Code link in place after Purge"
+        );
+    });
+
+    cleanup(&root);
+}
+
+#[test]
+fn purge_skill_blocking_does_not_touch_foreign_unmanaged_projection() {
+    let root = temp_root("purge-f2-foreign-untouched");
+    let state = AppState::bootstrap_in(root.clone()).unwrap();
+
+    with_fake_home(|home| {
+        // A real, unmanaged directory at the canonical path — e.g. left by
+        // `npx skills`, Cursor, or Codex — never carrying VectorHawk's
+        // `.vectorhawk-managed.json` marker. Purge must never touch it.
+        let agents_skills = home.join(".agents").join("skills");
+        std::fs::create_dir_all(&agents_skills).unwrap();
+        let foreign = agents_skills.join("demo");
+        std::fs::create_dir_all(&foreign).unwrap();
+        std::fs::write(foreign.join("SKILL.md"), b"the user's own SKILL.md").unwrap();
+
+        super::purge_skill_blocking(&state, "demo").expect(
+            "purge_skill_blocking must not fail just because F2 refused to remove a foreign dir",
+        );
+
+        assert!(
+            foreign.is_dir(),
+            "BUG: Purge deleted a directory VectorHawk never marked as managed"
+        );
+        assert_eq!(
+            std::fs::read(foreign.join("SKILL.md")).ok().as_deref(),
+            Some(b"the user's own SKILL.md".as_ref()),
+            "BUG: Purge modified content inside a foreign, unmanaged directory"
+        );
+    });
+
+    cleanup(&root);
+}
+
+/// `handle_deactivate` is async and must hold `HOME` steady across its one
+/// `.await` (the blocking `deactivate_skill_blocking` task plus the PATCH
+/// status report), so — unlike the sync Purge tests above — this can't go
+/// through the sync `with_fake_home` helper. `#[tokio::test]` defaults to a
+/// current-thread runtime and this test has no other concurrent task, so
+/// holding the std `ENV_MUTEX` across the single `.await` below cannot
+/// deadlock or block a worker pool; same justification already used in
+/// `managed_paths/adopt_publish_tests.rs`.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn handle_deactivate_removes_f2_claude_skills_projection() {
+    use std::sync::Arc;
+
+    let _guard = crate::managed_paths::ENV_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let fake_home = tempfile::tempdir().unwrap();
+    let prev_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", fake_home.path());
+
+    let root = temp_root("deactivate-f2-removes");
+    let state = AppState::bootstrap_in(root.clone()).unwrap();
+    {
+        let conn = Connection::open(&state.db_path).unwrap();
+        seed_skill(&conn, "demo", "1.0.0", false);
+    }
+    let state_arc = Arc::new(state.clone());
+
+    let pusher = crate::managed_paths::ManagedPathsPusher::new(&state);
+    pusher
+        .push_skill("demo", Some("inst-1"), b"---\nname: demo\n---\n", &[])
+        .unwrap();
+
+    let canonical = fake_home.path().join(".agents/skills/demo");
+    let link = fake_home.path().join(".claude/skills/demo");
+    assert!(
+        canonical.is_dir(),
+        "precondition: F2 projection must exist before deactivate"
+    );
+
+    let mut mock_server = mockito::Server::new_async().await;
+    let iid = install_id();
+    let url_path = format!("/api/installations/{iid}");
+    let _m = mock_server
+        .mock("PATCH", url_path.as_str())
+        .with_status(200)
+        .with_body("{}")
+        .create_async()
+        .await;
+
+    let changed =
+        super::handle_deactivate(iid, "demo", &state_arc, &mock_server.url(), Some(&pusher)).await;
+
+    let canonical_gone = !canonical.exists();
+    let link_gone = !link.exists() && !link.is_symlink();
+
+    if let Some(v) = prev_home {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+
+    assert!(
+        changed,
+        "handle_deactivate should report a tool-list change on success"
+    );
+    assert!(
+        canonical_gone,
+        "BUG: per-device kill-switch Deactivate left the F2 skill dir orphaned"
+    );
+    assert!(
+        link_gone,
+        "BUG: per-device kill-switch Deactivate left the Claude Code link orphaned"
+    );
+
+    cleanup(&root);
+}
+
+/// See `handle_deactivate_removes_f2_claude_skills_projection` above for the
+/// `await_holding_lock` justification.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn handle_deactivate_removes_f2_projection_even_when_mode_is_warn() {
+    use std::sync::Arc;
+
+    let _guard = crate::managed_paths::ENV_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let fake_home = tempfile::tempdir().unwrap();
+    let prev_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", fake_home.path());
+
+    let root = temp_root("deactivate-f2-warn-mode");
+    let state = AppState::bootstrap_in(root.clone()).unwrap();
+    {
+        let conn = Connection::open(&state.db_path).unwrap();
+        seed_skill(&conn, "demo", "1.0.0", false);
+    }
+    // F4's org-level policy mode — must not gate F2 removal on an explicit
+    // security action (the per-device kill switch). Only F3's drift scanner
+    // reads this key.
+    state.set_sync_state("managed_paths_mode", "warn").unwrap();
+    let state_arc = Arc::new(state.clone());
+
+    let pusher = crate::managed_paths::ManagedPathsPusher::new(&state);
+    pusher
+        .push_skill("demo", Some("inst-1"), b"---\nname: demo\n---\n", &[])
+        .unwrap();
+
+    let canonical = fake_home.path().join(".agents/skills/demo");
+    let link = fake_home.path().join(".claude/skills/demo");
+
+    let mut mock_server = mockito::Server::new_async().await;
+    let iid = install_id();
+    let url_path = format!("/api/installations/{iid}");
+    let _m = mock_server
+        .mock("PATCH", url_path.as_str())
+        .with_status(200)
+        .with_body("{}")
+        .create_async()
+        .await;
+
+    let changed =
+        super::handle_deactivate(iid, "demo", &state_arc, &mock_server.url(), Some(&pusher)).await;
+
+    let canonical_gone = !canonical.exists();
+    let link_gone = !link.exists() && !link.is_symlink();
+
+    if let Some(v) = prev_home {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+
+    assert!(
+        changed,
+        "handle_deactivate should report a tool-list change on success"
+    );
+    assert!(
+        canonical_gone,
+        "BUG: managed_paths_mode=warn suppressed F2 removal during the per-device kill-switch Deactivate"
+    );
+    assert!(
+        link_gone,
+        "BUG: managed_paths_mode=warn left the Claude Code link in place after Deactivate"
+    );
+
+    cleanup(&root);
+}
