@@ -637,6 +637,10 @@ impl RegistryClient {
     }
 
     /// Search the registry for skills matching `query`.
+    ///
+    /// Requires a Bearer token ([`set_auth`](Self::set_auth)) — the backend's
+    /// `GET /portal/skills` requires an authenticated portal user and 401s
+    /// without one.
     pub fn search_skills(&self, query: &str) -> Result<Vec<SearchResult>> {
         let url = format!(
             "{}/portal/skills?search={}",
@@ -645,9 +649,14 @@ impl RegistryClient {
         );
         debug!(url, "searching skills");
 
+        let token = self
+            .get_auth_token()
+            .context("no auth token set — cannot search skills")?;
+
         let resp = self
             .http
             .get(&url)
+            .bearer_auth(token)
             .send()
             .with_context(|| format!("failed to reach registry at {url}"))?;
 
@@ -1886,16 +1895,32 @@ mod tests {
         let mut server = Server::new();
         let mock = server
             .mock("GET", mockito::Matcher::Regex(r"/portal/skills".to_string()))
+            .match_header("authorization", "Bearer tok")
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"items":[{"skill_id":"contract-compare","name":"Contract Compare","latest_version":"0.2.0","publisher_name":null,"description":null}]}"#)
             .create();
 
-        let client = RegistryClient::new(server.url());
+        let client = RegistryClient::new(server.url()).with_auth("tok");
         let results = client.search_skills("contract").unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].skill_id, "contract-compare");
         mock.assert();
+    }
+
+    /// No auth token set — should fail fast without making an HTTP call,
+    /// rather than sending an unauthenticated request that the backend's
+    /// `GET /portal/skills` (which requires a portal user) would 401.
+    #[test]
+    fn search_skills_requires_auth_token() {
+        let client = RegistryClient::new("http://127.0.0.1:1");
+        let result = client.search_skills("contract");
+        assert!(result.is_err(), "should require an auth token");
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            msg.contains("auth token"),
+            "error should mention the missing auth token; got: {msg}"
+        );
     }
 
     // ── HttpPolicyClient: 7-day offline grace ─────────────────────────────────

@@ -1491,10 +1491,20 @@ async fn fetch_update_hints_for_list(
 // ── skill search ─────────────────────────────────────────────────────────────
 
 async fn cmd_skill_search(query: &str, registry_url: Option<&str>) -> Result<()> {
-    use vectorhawkd_core::registry::RegistryClient;
+    use vectorhawkd_core::{auth::load_tokens, registry::RegistryClient, state::AppState};
 
     let url = registry_url.unwrap_or("https://app.vectorhawk.ai");
-    let registry = RegistryClient::new(url);
+
+    let state = AppState::bootstrap().context("failed to bootstrap state")?;
+    let tokens = load_tokens(&state, url)
+        .context("failed to load auth tokens")?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "not authenticated — run 'vectorhawk auth login' first, then retry search"
+            )
+        })?;
+
+    let registry = RegistryClient::new(url).with_auth(tokens.access_token);
     let q = query.to_string();
 
     let results = tokio::task::spawn_blocking(move || registry.search_skills(&q))
