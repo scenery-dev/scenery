@@ -530,6 +530,101 @@ async fn boot_time_sync_start_does_not_block_socket_accept() {
     sync_task.abort();
 }
 
+/// Reproduces the spaceghost reconnect-storm trace: `auth pair` writes a new
+/// `device_id` to `sync_state` while an already-running SSE client task is
+/// mid-backoff after a failed attempt with the OLD id. Unlike the access
+/// token (`live_token`, refreshed in place by the SSE client's own internal
+/// 401 handling), `device_id` used to be captured once into `SyncConfig` at
+/// spawn time and never re-read — so every reconnect attempt inside that
+/// *same* task kept sending the stale `X-Device-ID`, the backend 404s
+/// ("Device not found or not owned by this user") every time, and the
+/// exponential backoff (1s -> 60s) never resets because it never sees a
+/// clean connect.
+///
+/// This drives `sse_client::run` directly (not through `SyncController`) so
+/// it isolates the task's *own* reconnect loop from `ensure_started`'s
+/// separate (and already-correct) teardown-and-respawn path: the fix must
+/// hold even if nothing ever calls `ensure_started` again after the
+/// `device_id` changes underneath a connection that is still alive.
+#[tokio::test]
+async fn sse_client_reconnects_with_fresh_device_id_after_sync_state_change() {
+    let _guard = KeychainOff::enable();
+    let (state, _tmp) = bootstrap_state();
+    state
+        .set_sync_state("device_id", "dev-old")
+        .expect("seed dev-old");
+
+    let mut server = mockito::Server::new_async().await;
+    let registry_url = server.url();
+
+    // First attempt: still carries the stale id from spawn time. The
+    // backend's per-user device check 404s it — exactly the trace's symptom.
+    let stale_attempt = server
+        .mock("GET", "/api/sync/events")
+        .match_header("x-device-id", "dev-old")
+        .with_status(404)
+        .expect(1)
+        .create_async()
+        .await;
+
+    // Second attempt (after the 1s backoff): must carry the NEW id written
+    // to `sync_state` while the task was sleeping, not the one it was
+    // spawned with.
+    let fresh_attempt = server
+        .mock("GET", "/api/sync/events")
+        .match_header("x-device-id", "dev-new")
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body("")
+        .expect_at_least(1)
+        .create_async()
+        .await;
+
+    let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
+    let (connected_tx, mut connected_rx) = tokio::sync::watch::channel(false);
+    let live_token = Arc::new(tokio::sync::RwLock::new("tok".to_string()));
+    let config = crate::sync::SyncConfig {
+        registry_url: registry_url.clone(),
+        token: "tok".to_string(),
+        device_id: "dev-old".to_string(),
+        last_event_id: None,
+        pusher: None,
+        live_token,
+    };
+
+    let task = tokio::spawn(crate::sync::sse_client::run(
+        config,
+        Arc::clone(&state),
+        event_tx,
+        connected_tx,
+    ));
+
+    // Let the first (stale-id) attempt land and fail.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    stale_attempt.assert_async().await;
+
+    // Simulate `auth pair` writing the new device_id while this task is
+    // mid-backoff (1s sleep) after the failed first attempt.
+    state
+        .set_sync_state("device_id", "dev-new")
+        .expect("write dev-new mid-backoff");
+
+    // Wait past the 1s backoff so the retry fires, then confirm it used the
+    // fresh id and actually connected.
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        connected_rx
+            .wait_for(|&connected| connected)
+            .await
+            .expect("connected_tx sender should not be dropped")
+    })
+    .await
+    .expect("SSE client should connect with the fresh device_id within 3s");
+
+    fresh_attempt.assert_async().await;
+
+    task.abort();
+}
+
 /// The 1.0.90 fix: a device that already has a cached `device_id` must STILL
 /// post to `/api/devices/register` on daemon start. Before this, the function
 /// returned the cached id without a network call, so the backend's

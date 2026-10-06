@@ -80,12 +80,33 @@ pub async fn run(
     let mut backoff_secs = BACKOFF_INIT_SECS;
     let mut last_event_id = config.last_event_id.clone();
     let mut current_token = config.token.clone();
+    let mut current_device_id = config.device_id.clone();
 
     loop {
+        // Re-read `device_id` from the on-disk source of truth before every
+        // connection attempt, instead of trusting the value this task was
+        // spawned with. `auth pair`/`auth login` can write a fresh
+        // `device_id` to `sync_state` at any time, including while this
+        // very task is sleeping out a backoff after a failed attempt with
+        // the OLD id. `SyncController::ensure_started` normally reacts to
+        // that by tearing this task down and spawning a replacement with
+        // the new credentials — but that is a separate, external path; it
+        // must not be the *only* way a live connection recovers. Without
+        // this re-read, a stale `X-Device-ID` 404s ("Device not found or
+        // not owned by this user") on every retry, and since a 404 is never
+        // a clean connect, the exponential backoff (1s -> 60s) never resets
+        // — a self-inflicted reconnect storm that persists until something
+        // external restarts the daemon. Falling back to the last-known
+        // value on a read error keeps this a pure improvement over the
+        // frozen `config.device_id` it replaces.
+        if let Ok(Some(id)) = state.get_sync_state("device_id") {
+            current_device_id = id;
+        }
+
         let result = connect_and_stream(
             &config.registry_url,
             &current_token,
-            &config.device_id,
+            &current_device_id,
             last_event_id.clone(),
             Arc::clone(&state),
             &tx,
