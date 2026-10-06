@@ -66,10 +66,15 @@
 
 mod auth_dispatch;
 mod binary_watch;
+pub mod daemon_takeover;
+pub mod daemon_takeover_signal;
 mod instance_lock;
 pub mod managed_paths;
 mod oauth_listener;
 mod oauth_state;
+pub mod peer_handshake;
+pub mod process_probe;
+mod protocol_frame;
 mod socket_dispatch;
 pub mod sync;
 use sync::SyncEvent;
@@ -196,6 +201,27 @@ const REFRESH_INTERVAL_SECS: u64 = 60;
 pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     let state = AppState::bootstrap().context("failed to bootstrap application state")?;
     info!(root = %state.root_dir, "application state bootstrapped");
+
+    // Resolved early (it's a pure path computation — see
+    // `AppState::socket_path`) so both the takeover attempt below and the
+    // real `acquire_socket` call further down use the exact same path.
+    let socket_path = opts
+        .socket_path_override
+        .clone()
+        .unwrap_or_else(|| state.socket_path());
+
+    // ── Automatic takeover of a verified stale daemon ────────────────────
+    //
+    // If an older `vectorhawk daemon run` process (or one whose on-disk
+    // binary has been replaced/deleted) is holding the instance lock
+    // and/or the socket, verify it and take it over *before* the real
+    // acquire calls below run — see `daemon_takeover`'s module docs for why
+    // this gap exists (a daemon too old to hold the lock or watch its own
+    // binary otherwise sits on the socket forever) and the exact rules
+    // this enforces. Best-effort: if nothing is blocking us, or the holder
+    // can't be verified as stale, this changes nothing and the normal
+    // acquire calls below run exactly as they did before this existed.
+    attempt_daemon_takeover(&state.root_dir, &socket_path);
 
     // Single-instance guard on `state.db` — independent of, and in addition
     // to, the socket singleton guard (`acquire_socket`) further down. See
@@ -713,10 +739,8 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
         vh_registry.backend_count()
     );
 
-    let socket_path = opts
-        .socket_path_override
-        .unwrap_or_else(|| state.socket_path());
-
+    // `socket_path` was already resolved above (before `attempt_daemon_takeover`),
+    // from the same `opts.socket_path_override` / `state.socket_path()` logic.
     if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create socket parent dir: {parent}"))?;
@@ -1013,6 +1037,86 @@ async fn acquire_socket(path: &camino::Utf8Path) -> Result<UnixListener> {
 /// matching the original behaviour for all non-permission errors.
 fn connect_error_is_definitively_stale(e: &std::io::Error) -> bool {
     !matches!(e.kind(), std::io::ErrorKind::PermissionDenied)
+}
+
+/// Best-effort: verify and take over a stale `vectorhawk daemon run`
+/// process blocking the instance lock and/or the socket. See this
+/// function's call site in `run_daemon` and `daemon_takeover`'s module
+/// docs for the rules this enforces. Never panics, never blocks longer than
+/// the bounded timeouts below, and changes nothing when nothing is
+/// blocking us or the holder can't be verified as stale.
+fn attempt_daemon_takeover(root_dir: &camino::Utf8Path, socket_path: &camino::Utf8Path) {
+    use process_probe::ProcessInspector;
+
+    let our_pid = std::process::id();
+    let Ok(our_version) = semver::Version::parse(env!("CARGO_PKG_VERSION")) else {
+        // Should be unreachable (our own crate version is always valid
+        // semver), but never guess about staleness without it.
+        return;
+    };
+
+    let probe_timeout = std::time::Duration::from_millis(500);
+    let (socket_peer, socket_version) =
+        peer_handshake::connect_and_probe(socket_path, probe_timeout);
+
+    // Independent of the socket — see `instance_lock`'s module docs for
+    // why a pre-`instance_lock` daemon can hold the socket without this,
+    // and a post-`instance_lock` daemon can (in principle) hold this
+    // without yet having bound the socket. Acquiring and immediately
+    // dropping is a pure probe: the guard releases the flock before this
+    // statement ends, well before the real `instance_lock::acquire` call
+    // that follows this function's return in `run_daemon`.
+    let lock_held_by_other = instance_lock::acquire(root_dir).is_err();
+
+    let candidate_pid = match (socket_peer.pid, lock_held_by_other) {
+        (Some(pid), _) => Some(pid),
+        (None, true) => daemon_takeover::resolve_unique_daemon_run_pid(
+            &process_probe::SystemProcessOps,
+            our_pid,
+        ),
+        (None, false) => None,
+    };
+
+    let Some(pid) = candidate_pid else {
+        return; // nothing is blocking us — the normal acquire path proceeds untouched
+    };
+
+    let verdict = daemon_takeover::verify_pid(
+        &process_probe::SystemProcessOps,
+        pid,
+        our_pid,
+        &our_version,
+        socket_version,
+    );
+
+    match verdict {
+        daemon_takeover::Verdict::Refuse(reason) => {
+            warn!(pid, %reason, "daemon takeover: leaving the existing process alone");
+        }
+        daemon_takeover::Verdict::TakeOver { pid, reason } => {
+            info!(
+                pid,
+                ?reason,
+                "daemon takeover: verified stale — taking over"
+            );
+            let fingerprint = process_probe::SystemProcessOps
+                .argv(pid)
+                .unwrap_or_default();
+            let mut io = daemon_takeover_signal::SystemTakeoverIo::new(
+                pid,
+                fingerprint,
+                &process_probe::SystemProcessOps,
+                &process_probe::SystemProcessOps,
+            );
+            let result = daemon_takeover_signal::execute_takeover(
+                &mut io,
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_millis(200),
+            );
+            info!(pid, ?result, "daemon takeover: sequence finished");
+        }
+    }
 }
 
 /// One tick of the token refresh loop.

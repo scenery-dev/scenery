@@ -420,22 +420,13 @@ pub(crate) fn cgroup_is_service(cgroup_file_contents: &str, service_name: &str) 
 /// naturally excludes `vectorhawk daemon install`/`restart` (the CLI
 /// invocation doing the reaping/killing itself), since `argv[2]` there is
 /// `install`/`restart`, not `run`.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub(crate) fn cmdline_is_daemon_run(raw: &[u8]) -> bool {
-    let mut argv = raw.split(|&b| b == 0);
-    let Some(argv0) = argv.next() else {
-        return false;
-    };
-    let Some(argv1) = argv.next() else {
-        return false;
-    };
-    let Some(argv2) = argv.next() else {
-        return false;
-    };
-
-    let basename = argv0.rsplit(|&b| b == b'/').next().unwrap_or(argv0);
-    basename == b"vectorhawk" && argv1 == b"daemon" && argv2 == b"run"
-}
+///
+/// Canonical implementation now lives in `vectorhawkd_daemon::daemon_takeover`
+/// (this CLI already depends on that crate for `daemon run` itself) so
+/// daemon startup's automatic-takeover verification and this installer's
+/// stray-reaping use the exact same matcher — not two copies.
+#[cfg_attr(not(target_os = "linux"), allow(unused_imports))]
+pub(crate) use vectorhawkd_daemon::daemon_takeover::cmdline_is_daemon_run;
 
 /// Pure decision: is a running daemon process executing a stale binary?
 ///
@@ -544,6 +535,87 @@ pub(crate) fn daemon_socket_path() -> String {
 
     // Last resort (will not work, but is a valid path string).
     "~/.local/share/VectorHawk/agent.sock".to_string()
+}
+
+/// Execute a [`vectorhawkd_daemon::daemon_takeover::Verdict::TakeOver`]
+/// against `pid`: SIGTERM, bounded wait, guarded SIGKILL — the exact same
+/// sequence and timeouts daemon startup uses (see
+/// `vectorhawkd_daemon::daemon_takeover_signal`'s module docs), shared here
+/// so both platform installers (`linux.rs`'s `reap_stray_daemons`,
+/// `macos.rs`'s pre-bootstrap reap) execute a takeover identically rather
+/// than each hand-rolling their own SIGTERM/SIGKILL dance.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn take_over_verified_pid(
+    pid: u32,
+) -> vectorhawkd_daemon::daemon_takeover_signal::TakeoverResult {
+    use vectorhawkd_daemon::process_probe::ProcessInspector;
+
+    let fingerprint = vectorhawkd_daemon::process_probe::SystemProcessOps
+        .argv(pid)
+        .unwrap_or_default();
+    let mut io = vectorhawkd_daemon::daemon_takeover_signal::SystemTakeoverIo::new(
+        pid,
+        fingerprint,
+        &vectorhawkd_daemon::process_probe::SystemProcessOps,
+        &vectorhawkd_daemon::process_probe::SystemProcessOps,
+    );
+    vectorhawkd_daemon::daemon_takeover_signal::execute_takeover(
+        &mut io,
+        std::time::Duration::from_secs(5),
+        std::time::Duration::from_secs(2),
+        std::time::Duration::from_millis(200),
+    )
+}
+
+/// Probe `socket_path` for a live peer, verify it with the exact same rules
+/// as daemon startup's automatic takeover
+/// (`vectorhawkd_daemon::daemon_takeover::verify_pid`), and take over only a
+/// verified-stale holder. Best-effort and silent-safe: returns `false` with
+/// no side effects when nothing is listening or the holder can't be
+/// verified as stale (the normal "refuse, name the pid" diagnostics at each
+/// call site are unaffected either way).
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn reap_stray_daemon_via_socket(socket_path: &str) -> bool {
+    let Some(path) = camino::Utf8PathBuf::from_path_buf(std::path::PathBuf::from(socket_path)).ok()
+    else {
+        return false;
+    };
+    let our_pid = std::process::id();
+    let Ok(our_version) = semver::Version::parse(env!("CARGO_PKG_VERSION")) else {
+        return false;
+    };
+
+    let (peer, version) = vectorhawkd_daemon::peer_handshake::connect_and_probe(
+        &path,
+        std::time::Duration::from_millis(500),
+    );
+    let Some(pid) = peer.pid else {
+        return false; // nothing listening — nothing to reap
+    };
+
+    let verdict = vectorhawkd_daemon::daemon_takeover::verify_pid(
+        &vectorhawkd_daemon::process_probe::SystemProcessOps,
+        pid,
+        our_pid,
+        &our_version,
+        version,
+    );
+
+    match verdict {
+        vectorhawkd_daemon::daemon_takeover::Verdict::Refuse(reason) => {
+            println!("Not touching the process holding the VectorHawk daemon socket: {reason}.");
+            false
+        }
+        vectorhawkd_daemon::daemon_takeover::Verdict::TakeOver { pid, reason } => {
+            println!(
+                "Stopping a verified stale VectorHawk daemon (pid {pid}, {reason:?}) so \
+                 this install can take ownership of the socket."
+            );
+            let result = take_over_verified_pid(pid);
+            println!("Takeover sequence for pid {pid} finished: {result:?}");
+            true
+        }
+    }
 }
 
 #[cfg(test)]
