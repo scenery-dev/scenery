@@ -427,3 +427,54 @@ async fn revoked_device_stops_the_sse_loop_instead_of_retrying() {
     revoked_attempt.assert_async().await;
     would_retry.assert_async().await;
 }
+
+/// Beyond just stopping the loop (above), a revoked-device 403 must clear
+/// the local device identity and stamp `device_revoked_at` — see
+/// `AppState::mark_device_revoked`'s doc comment for why this matters:
+/// without it, the daemon's own unattended register-on-startup path would
+/// have a stale (now-dead) `device_uuid`/`device_id` sitting in
+/// `sync_state` forever, and `auth status`/`doctor` would have nothing to
+/// tell the user.
+#[tokio::test]
+async fn revoked_device_clears_local_identity_and_stamps_marker() {
+    let (state, _tmp) = bootstrap_state();
+    state.set_sync_state("device_uuid", "uuid-revoked").unwrap();
+    state.set_sync_state("device_id", "dev-revoked").unwrap();
+    let state = Arc::new(state);
+
+    let mut server = mockito::Server::new_async().await;
+    let registry_url = server.url();
+
+    server
+        .mock("GET", "/api/sync/events")
+        .with_status(403)
+        .with_body(r#"{"detail":{"code":"device_revoked","detail":"Device has been revoked"}}"#)
+        .create_async()
+        .await;
+
+    let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
+    let (connected_tx, _connected_rx) = tokio::sync::watch::channel(false);
+    let live_token = Arc::new(tokio::sync::RwLock::new("tok".to_string()));
+    let config = crate::sync::SyncConfig {
+        registry_url: registry_url.clone(),
+        token: "tok".to_string(),
+        device_id: "dev-revoked".to_string(),
+        last_event_id: None,
+        pusher: None,
+        live_token,
+    };
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        crate::sync::sse_client::run(config, Arc::clone(&state), event_tx, connected_tx),
+    )
+    .await
+    .expect("run() must return promptly on a revoked-device 403");
+
+    assert_eq!(state.get_sync_state("device_uuid").unwrap(), None);
+    assert_eq!(state.get_sync_state("device_id").unwrap(), None);
+    assert!(
+        state.get_sync_state("device_revoked_at").unwrap().is_some(),
+        "device_revoked_at must be stamped"
+    );
+}
