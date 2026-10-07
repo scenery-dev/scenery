@@ -1847,7 +1847,14 @@ pub fn run_sync_tick(
     match audit.flush(&state_view) {
         Ok(n) if n > 0 => info!(count = n, "sync: audit flush uploaded events"),
         Ok(_) => {}
-        Err(e) => warn!(error = %e, "sync: audit flush failed"),
+        Err(e) => {
+            // `%e` (Display) only prints the outermost `.context(...)` message
+            // ("failed to upload audit batch to registry") — it drops the HTTP
+            // status and response body that `upload_audit_batch` bails! with
+            // deeper in the chain. `{:#}` (alternate Display) walks the full
+            // anyhow chain so the status/body actually reach the log.
+            warn!(error = format!("{e:#}"), "sync: audit flush failed");
+        }
     }
 
     // ── 3. Approved-server list refresh ──────────────────────────────────────

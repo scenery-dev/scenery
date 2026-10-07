@@ -427,6 +427,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Regression guard for the swallowed-error-context bug: the daemon's
+    /// `run_sync_tick` logs `audit.flush()` failures with `warn!(error =
+    /// format!("{e:#}"), ...)` so the HTTP status and response body excerpt
+    /// from `upload_audit_batch` reach the log instead of being hidden
+    /// behind the outer "failed to upload audit batch to registry" context
+    /// message (which is all plain `%e` / `Display` would show). This test
+    /// asserts the error produced by `flush()` still carries that detail
+    /// through the full `anyhow` chain when formatted with `{:#}`.
+    #[test]
+    fn sqlite_buffer_flush_error_chain_includes_http_status_and_body() {
+        use mockito::Server;
+
+        let (state, root) = temp_state("sqlite-401-body");
+        let mut server = Server::new();
+        let mock = server
+            .mock("POST", "/api/runner/audit")
+            .with_status(401)
+            .with_body("Runner authentication required")
+            .create();
+
+        let registry = Arc::new(RegistryClient::new(server.url()));
+        let buf = SqliteAuditBuffer::new(Arc::clone(&registry), &state);
+
+        buf.record(&AuditEvent {
+            event_type: "tool_called".to_string(),
+            payload: serde_json::json!({}),
+        })
+        .unwrap();
+
+        let err = buf
+            .flush(&state)
+            .expect_err("401 should surface as an error");
+        let full_chain = format!("{err:#}");
+        assert!(
+            full_chain.contains("401"),
+            "chain should include the HTTP status, got: {full_chain}"
+        );
+        assert!(
+            full_chain.contains("Runner authentication required"),
+            "chain should include the response body excerpt, got: {full_chain}"
+        );
+
+        mock.assert();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn sqlite_buffer_flush_returns_zero_when_empty() {
         use mockito::Server;
