@@ -14,6 +14,7 @@ fn parses_snapshot_event() {
             installations,
             mcp_installations,
             plugin_installations,
+            revocations,
         } => {
             assert_eq!(installations.len(), 1);
             assert_eq!(installations[0].skill_id, "my-skill");
@@ -26,6 +27,11 @@ fn parses_snapshot_event() {
             assert!(
                 plugin_installations.is_empty(),
                 "old-format snapshot has no plugin_installations key → default empty vec"
+            );
+            assert!(
+                revocations.is_none(),
+                "old-format snapshot has no revocations key → None, so the local \
+                 revocation cache must be left untouched, not wiped"
             );
         }
         other => panic!("expected Snapshot, got {other:?}"),
@@ -218,6 +224,84 @@ fn parses_purge_event() {
 }
 
 #[test]
+fn parses_revoke_event_whole_artifact() {
+    let data = r#"{"artifact_type":"skill","artifact_key":"code-review"}"#;
+    let event = parse_sync_event("revoke", data).unwrap();
+    match event {
+        super::SyncEvent::Revoke {
+            artifact_type,
+            artifact_key,
+            version,
+        } => {
+            assert_eq!(artifact_type, "skill");
+            assert_eq!(artifact_key, "code-review");
+            assert!(
+                version.is_none(),
+                "an omitted version means the whole artifact, every version"
+            );
+        }
+        other => panic!("expected Revoke, got {other:?}"),
+    }
+}
+
+#[test]
+fn parses_revoke_event_scoped_to_one_version() {
+    let data = r#"{"artifact_type":"skill","artifact_key":"code-review","version":"1.2.3","revoked_at":"2026-10-06T12:00:00Z"}"#;
+    let event = parse_sync_event("revoke", data).unwrap();
+    match event {
+        super::SyncEvent::Revoke {
+            artifact_type,
+            artifact_key,
+            version,
+        } => {
+            assert_eq!(artifact_type, "skill");
+            assert_eq!(artifact_key, "code-review");
+            assert_eq!(version, Some("1.2.3".to_string()));
+        }
+        other => panic!("expected Revoke, got {other:?}"),
+    }
+}
+
+#[test]
+fn parses_revoke_event_for_mcp_server_and_plugin_artifact_types() {
+    for (artifact_type, key) in [
+        ("mcp_server", "550e8400-e29b-41d4-a716-446655440099"),
+        ("plugin", "release-notes-bundle"),
+    ] {
+        let data = format!(r#"{{"artifact_type":"{artifact_type}","artifact_key":"{key}"}}"#);
+        let event = parse_sync_event("revoke", &data).unwrap();
+        match event {
+            super::SyncEvent::Revoke {
+                artifact_type: at,
+                artifact_key: ak,
+                ..
+            } => {
+                assert_eq!(at, artifact_type);
+                assert_eq!(ak, key);
+            }
+            other => panic!("expected Revoke, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn parses_snapshot_event_with_revocations_list() {
+    let data = r#"{"installations":[],"revocations":[{"artifact_type":"skill","artifact_key":"blocked-skill"},{"artifact_type":"mcp_server","artifact_key":"srv-1","version":"0.2.0"}]}"#;
+    let event = parse_sync_event("snapshot", data).unwrap();
+    match event {
+        super::SyncEvent::Snapshot { revocations, .. } => {
+            let revs = revocations.expect("present key must parse to Some(..)");
+            assert_eq!(revs.len(), 2);
+            assert_eq!(revs[0].artifact_type, "skill");
+            assert_eq!(revs[0].artifact_key, "blocked-skill");
+            assert!(revs[0].version.is_none());
+            assert_eq!(revs[1].version, Some("0.2.0".to_string()));
+        }
+        other => panic!("expected Snapshot, got {other:?}"),
+    }
+}
+
+#[test]
 fn rejects_unknown_event_type() {
     let result = parse_sync_event("unknown_type", r#"{"foo":"bar"}"#);
     assert!(result.is_err(), "unknown event type should return an error");
@@ -248,6 +332,7 @@ fn snapshot_with_multiple_records() {
             installations,
             mcp_installations: _,
             plugin_installations: _,
+            revocations: _,
         } => {
             assert_eq!(installations.len(), 2);
             assert_eq!(installations[0].skill_id, "skill-a");
