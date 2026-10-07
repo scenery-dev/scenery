@@ -1,7 +1,9 @@
 //! Unit tests for the SSE event parser.
 #![allow(clippy::unwrap_used)]
 
-use super::{dispatch_event, parse_sync_event};
+use std::sync::Arc;
+
+use super::{dispatch_event, is_device_revoked_body, parse_sync_event};
 
 #[test]
 fn parses_snapshot_event() {
@@ -336,4 +338,92 @@ async fn inference_policy_update_flips_flag_and_persists() {
         Some("false"),
         "sync_state must persist the flip back to false"
     );
+}
+
+// ── device revocation (kill switch) ─────────────────────────────────────────
+
+#[test]
+fn device_revoked_body_detected_in_fastapi_http_exception_shape() {
+    // FastAPI's HTTPException(detail={"code": "device_revoked", ...}) wire
+    // shape: the dict passed to `detail` lands nested one level under the
+    // top-level "detail" key.
+    assert!(is_device_revoked_body(
+        r#"{"detail":{"code":"device_revoked","detail":"Device has been revoked"}}"#
+    ));
+}
+
+#[test]
+fn device_revoked_body_also_detected_in_flat_shape() {
+    // Tolerate a hypothetical future flatter error shape too — this is a
+    // best-effort optional fast path, not a hard contract with one route.
+    assert!(is_device_revoked_body(r#"{"code":"device_revoked"}"#));
+}
+
+#[test]
+fn ordinary_403_body_is_not_mistaken_for_revocation() {
+    assert!(!is_device_revoked_body(
+        r#"{"detail":"Admin access required"}"#
+    ));
+    assert!(!is_device_revoked_body(""));
+    assert!(!is_device_revoked_body("not json at all"));
+}
+
+/// End-to-end: a 403 carrying the device-revoked signal must stop the SSE
+/// client's `run()` loop outright — no retry, no backoff sleep — rather
+/// than treating it like any other transient error. Modeled on
+/// `sync_controller_hook_tests::sse_client_reconnects_with_fresh_device_id_
+/// after_sync_state_change`, which drives `sse_client::run` directly against
+/// a mockito server for the same reason: this must hold independent of
+/// `SyncController`.
+#[tokio::test]
+async fn revoked_device_stops_the_sse_loop_instead_of_retrying() {
+    let (state, _tmp) = bootstrap_state();
+    let state = Arc::new(state);
+
+    let mut server = mockito::Server::new_async().await;
+    let registry_url = server.url();
+
+    let revoked_attempt = server
+        .mock("GET", "/api/sync/events")
+        .with_status(403)
+        .with_body(r#"{"detail":{"code":"device_revoked","detail":"Device has been revoked"}}"#)
+        .expect(1)
+        .create_async()
+        .await;
+
+    // If the fix regresses to "retry like any other error", this second
+    // mock would start getting hit after the 1s backoff — `expect(0)`
+    // below would then fail the test.
+    let would_retry = server
+        .mock("GET", "/api/sync/events")
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body("")
+        .expect(0)
+        .create_async()
+        .await;
+
+    let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
+    let (connected_tx, _connected_rx) = tokio::sync::watch::channel(false);
+    let live_token = Arc::new(tokio::sync::RwLock::new("tok".to_string()));
+    let config = crate::sync::SyncConfig {
+        registry_url: registry_url.clone(),
+        token: "tok".to_string(),
+        device_id: "dev-revoked".to_string(),
+        last_event_id: None,
+        pusher: None,
+        live_token,
+    };
+
+    // `run()` must return on its own — no abort needed — because a
+    // revocation is terminal for this task, not a thing to sleep through.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        crate::sync::sse_client::run(config, state, event_tx, connected_tx),
+    )
+    .await
+    .expect("run() must return promptly on a revoked-device 403, not loop forever");
+
+    revoked_attempt.assert_async().await;
+    would_retry.assert_async().await;
 }

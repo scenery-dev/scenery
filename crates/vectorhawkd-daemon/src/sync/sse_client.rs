@@ -147,6 +147,20 @@ pub async fn run(
                 info!("SSE: reconciler channel closed — stopping SSE client");
                 return;
             }
+            ConnectResult::Revoked => {
+                // Admin revoked this device (backend 403 + {"code":
+                // "device_revoked"}). Unlike a bare 404/other error, this
+                // is not transient — retrying can never succeed until an
+                // admin explicitly restores the device, and the daemon
+                // has no way to detect that short of polling. Stop this
+                // task outright rather than backing off forever: nothing
+                // is lost, because `SyncController::ensure_started` tears
+                // this task down and spawns a fresh one whenever
+                // `device_id` changes in `sync_state` — exactly what a
+                // real re-pair (the only sanctioned way back) does.
+                info!("SSE: device revoked by admin — stopping sync until re-paired");
+                return;
+            }
             ConnectResult::Error(e) => {
                 warn!(error = %e, backoff_secs, "SSE: connection error — backing off");
             }
@@ -167,8 +181,27 @@ enum ConnectResult {
     Unauthorized,
     /// Downstream channel closed — caller should stop the loop.
     ChannelClosed,
+    /// Server returned 403 with `{"code": "device_revoked"}` — caller
+    /// should stop the loop permanently (see the `run()` match arm).
+    Revoked,
     /// Any other connection or I/O error.
     Error(anyhow::Error),
+}
+
+/// Best-effort sniff of a 403 response body for the backend's device-
+/// revocation signal (`portal_sync._reject_if_revoked` /
+/// `portal_devices.register_device`): `{"detail": {"code":
+/// "device_revoked", ...}, ...}`. Any other shape (older backend, a
+/// generic 403, a body that isn't JSON at all) returns false and the
+/// caller falls back to treating it like any other non-success status —
+/// this is purely an optional fast path, never a correctness requirement.
+fn is_device_revoked_body(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("detail").cloned().or(Some(v)))
+        .and_then(|d| d.get("code").cloned())
+        .and_then(|c| c.as_str().map(|s| s == "device_revoked"))
+        .unwrap_or(false)
 }
 
 // ── SSE stream ────────────────────────────────────────────────────────────────
@@ -217,6 +250,18 @@ async fn connect_and_stream(
 
     if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
         return ConnectResult::Unauthorized;
+    }
+
+    if resp.status() == reqwest::StatusCode::FORBIDDEN {
+        // Read the body (best-effort) before falling through to the
+        // generic error path, so a device-revocation 403 gets the clean
+        // "stop retrying" signal instead of backing off forever against a
+        // backend that will never let this device_id back in.
+        let body = resp.text().await.unwrap_or_default();
+        if is_device_revoked_body(&body) {
+            return ConnectResult::Revoked;
+        }
+        return ConnectResult::Error(anyhow::anyhow!("SSE: server returned HTTP 403"));
     }
 
     if !resp.status().is_success() {
