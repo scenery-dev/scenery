@@ -149,16 +149,31 @@ pub async fn run(
             }
             ConnectResult::Revoked => {
                 // Admin revoked this device (backend 403 + {"code":
-                // "device_revoked"}). Unlike a bare 404/other error, this
-                // is not transient — retrying can never succeed until an
-                // admin explicitly restores the device, and the daemon
-                // has no way to detect that short of polling. Stop this
-                // task outright rather than backing off forever: nothing
-                // is lost, because `SyncController::ensure_started` tears
-                // this task down and spawns a fresh one whenever
-                // `device_id` changes in `sync_state` — exactly what a
-                // real re-pair (the only sanctioned way back) does.
-                info!("SSE: device revoked by admin — stopping sync until re-paired");
+                // "device_revoked"}) — permanent for this device_uuid/id,
+                // per revocation-model-decisions (2026-10-06). Retrying
+                // can never succeed again; there is no admin "restore"
+                // any more, only a deliberate `vectorhawk auth pair` that
+                // mints a brand-new device identity. Clear the local
+                // device_uuid/device_id now so: (a) `vectorhawk auth
+                // status`/`doctor` can tell the user plainly what
+                // happened and what to do, and (b) the daemon's own
+                // unattended register-on-startup path never again
+                // presents this (now known-dead) identity — see
+                // `AppState::mark_device_revoked`'s doc comment for why
+                // that's safe and doesn't itself silently self-repair.
+                //
+                // Stop this task outright rather than backing off
+                // forever: nothing is lost, because
+                // `SyncController::ensure_started` tears this task down
+                // and spawns a fresh one whenever `device_id` changes in
+                // `sync_state` — exactly what a real re-pair does.
+                if let Err(e) = state.mark_device_revoked() {
+                    warn!(error = %e, "SSE: failed to persist device-revoked state locally");
+                }
+                info!(
+                    "SSE: device revoked by admin — stopping sync. \
+                     Run `vectorhawk auth pair` to re-pair as a new device."
+                );
                 return;
             }
             ConnectResult::Error(e) => {
@@ -195,7 +210,7 @@ enum ConnectResult {
 /// generic 403, a body that isn't JSON at all) returns false and the
 /// caller falls back to treating it like any other non-success status —
 /// this is purely an optional fast path, never a correctness requirement.
-fn is_device_revoked_body(body: &str) -> bool {
+pub(crate) fn is_device_revoked_body(body: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(body)
         .ok()
         .and_then(|v| v.get("detail").cloned().or(Some(v)))

@@ -757,3 +757,89 @@ async fn register_device_errors_when_the_call_fails_and_nothing_is_cached() {
         "unexpected error: {err:#}"
     );
 }
+
+// ── device revocation (device-revocation-v2) ────────────────────────────────
+
+/// A 403 `{"code": "device_revoked"}` from `POST /devices/register` must
+/// NOT fall back to the cached `device_id` the way a 503 does above — that
+/// identity is dead and will never be accepted again. It must also clear
+/// the local device_uuid/device_id and stamp `device_revoked_at`, so the
+/// daemon's own next unattended register attempt (see the test below) has
+/// nothing to resend and refuses outright, rather than quietly minting and
+/// registering a fresh identity on its own.
+#[tokio::test]
+async fn register_device_on_revoked_403_clears_identity_and_does_not_fall_back() {
+    let _guard = KeychainOff::enable();
+    let (state, _tmp) = bootstrap_state();
+
+    state.set_sync_state("device_uuid", "uuid-revoked").unwrap();
+    state.set_sync_state("device_id", "dev-revoked").unwrap();
+
+    let mut server = mockito::Server::new_async().await;
+    let registry_url = server.url();
+
+    let mock = server
+        .mock("POST", "/api/devices/register")
+        .with_status(403)
+        .with_body(r#"{"detail":{"code":"device_revoked","detail":"Device has been revoked"}}"#)
+        .expect(1)
+        .create_async()
+        .await;
+
+    let err = crate::register_device(&registry_url, "tok", Arc::clone(&state))
+        .await
+        .expect_err("a device-revoked 403 must propagate, never fall back to the dead cached id");
+    assert!(
+        format!("{err:#}").contains("revoked"),
+        "unexpected error: {err:#}"
+    );
+    mock.assert_async().await;
+
+    assert_eq!(
+        state.get_sync_state("device_uuid").unwrap(),
+        None,
+        "device_uuid must be cleared"
+    );
+    assert_eq!(
+        state.get_sync_state("device_id").unwrap(),
+        None,
+        "device_id must be cleared"
+    );
+    assert!(
+        state.get_sync_state("device_revoked_at").unwrap().is_some(),
+        "device_revoked_at must be stamped"
+    );
+}
+
+/// Once `device_revoked_at` is set, `register_device` must refuse to even
+/// attempt a network call — no generating a fresh `device_uuid` and
+/// silently registering it with the still-valid user bearer token. That
+/// would resurrect the device through an unattended daemon restart rather
+/// than the deliberate `vectorhawk auth pair` the revocation model
+/// requires.
+#[tokio::test]
+async fn register_device_refuses_to_auto_register_once_marked_revoked() {
+    let _guard = KeychainOff::enable();
+    let (state, _tmp) = bootstrap_state();
+
+    state.mark_device_revoked().unwrap();
+
+    let mut server = mockito::Server::new_async().await;
+    let registry_url = server.url();
+
+    // expect(0): no network call of any kind.
+    let mock = server
+        .mock("POST", "/api/devices/register")
+        .expect(0)
+        .create_async()
+        .await;
+
+    let err = crate::register_device(&registry_url, "tok", Arc::clone(&state))
+        .await
+        .expect_err("a revoked device must refuse to auto-register");
+    assert!(
+        format!("{err:#}").contains("auth pair"),
+        "unexpected error: {err:#}"
+    );
+    mock.assert_async().await;
+}

@@ -879,6 +879,8 @@ async fn cmd_doctor(registry_url: Option<&str>) -> Result<()> {
 
             let reconcile_status = query_reconcile_status(&app.state.db_path);
             println!("Reconcile:       {reconcile_status}");
+
+            print_device_revoked_notice(&app.state);
         }
         Err(e) => {
             eprintln!("warning: could not bootstrap state directory: {e:#}");
@@ -4343,6 +4345,7 @@ async fn cmd_auth_status(registry_url: &str) -> Result<()> {
                     println!("Logged in as {} ({}).", user.display_name, user.email);
                     println!("Publisher ID: {slug}");
                     println!("Registry: {registry_url}");
+                    print_device_revoked_notice(&state);
                     Ok(())
                 }
                 Err(e) => {
@@ -4352,6 +4355,21 @@ async fn cmd_auth_status(registry_url: &str) -> Result<()> {
                 }
             }
         }
+    }
+}
+
+/// Print a clear, human-readable notice when THIS device was revoked by an
+/// admin (`sync_state["device_revoked_at"]` set by
+/// `AppState::mark_device_revoked`, via a device-revoked 403 on register or
+/// SSE connect — see `vectorhawkd_daemon::sync::sse_client` and
+/// `register_with_backend`). Shared by `auth status` and `doctor` so both
+/// surfaces say the same thing. A no-op when the marker isn't set (the
+/// common case) or can't be read (never fails the caller over this).
+fn print_device_revoked_notice(state: &vectorhawkd_core::state::AppState) {
+    if let Ok(Some(revoked_at)) = state.get_sync_state("device_revoked_at") {
+        println!();
+        println!("⚠ This device was revoked by an admin (at {revoked_at}).");
+        println!("  Run `vectorhawk auth pair` to re-pair it as a new device.");
     }
 }
 
@@ -4401,12 +4419,20 @@ async fn cmd_auth_pair(code: Option<&str>, registry_url: &str) -> Result<()> {
 
     let state = AppState::bootstrap().context("failed to bootstrap application state")?;
 
-    // Retrieve or generate a stable device UUID. SQLite calls go directly on
-    // this thread — AppState wraps a non-Send Connection, so no spawn_blocking.
-    let device_uuid = state
-        .get_sync_state("device_uuid")
+    // Device-revocation-v2: `auth pair` is THE deliberate pairing action —
+    // revocation-model-decisions (2026-10-06) requires it to always mint a
+    // brand-new device identity, never reuse whatever happens to be cached
+    // in sync_state. This is what makes "re-pairing as a new device" true
+    // even when the previous identity was revoked (the stale device_uuid
+    // would otherwise be the one on disk right up until this call), and it
+    // costs nothing on a genuinely first-ever pairing, where there was
+    // nothing cached to reuse anyway. SQLite calls go directly on this
+    // thread — AppState wraps a non-Send Connection, so no spawn_blocking.
+    let was_revoked = state
+        .get_sync_state("device_revoked_at")
         .context("failed to read sync_state")?
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        .is_some();
+    let device_uuid = uuid::Uuid::new_v4().to_string();
 
     let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| {
         #[cfg(unix)]
@@ -4491,8 +4517,16 @@ async fn cmd_auth_pair(code: Option<&str>, registry_url: &str) -> Result<()> {
     state
         .set_sync_state("device_id", &pair.device_id)
         .context("failed to save device_id")?;
+    // This pairing succeeded with a brand-new identity — any previous
+    // "this device was revoked" marker no longer applies to it.
+    state
+        .clear_device_revoked()
+        .context("failed to clear device-revoked marker")?;
 
     println!("Paired successfully.");
+    if was_revoked {
+        println!("(Previous device on this machine was revoked — this is a new device.)");
+    }
     println!("Device ID : {}", pair.device_id);
     println!("Registry  : {registry_url}");
     println!();

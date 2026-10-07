@@ -257,6 +257,47 @@ impl AppState {
         Ok(())
     }
 
+    /// Remove a key from the `sync_state` table. No-op (not an error) if
+    /// the key doesn't exist.
+    pub fn delete_sync_state(&self, key: &str) -> Result<()> {
+        let conn = Connection::open(&self.db_path).context("failed to open state DB")?;
+        conn.execute("DELETE FROM sync_state WHERE key = ?1", [key])
+            .context("failed to delete sync_state key")?;
+        Ok(())
+    }
+
+    /// Record that the backend revoked THIS device (device-revocation-v2):
+    /// clears the local `device_uuid`/`device_id` identity and stamps
+    /// `device_revoked_at` for `vectorhawk auth status`/`doctor` to
+    /// surface to the user.
+    ///
+    /// Deliberately does NOT itself trigger a new registration. Clearing
+    /// `device_uuid` means the daemon's own unattended register-on-startup
+    /// path (`register_device` in vectorhawkd-daemon) has nothing cached
+    /// to resend — callers of THAT function are responsible for refusing
+    /// to auto-generate and register a fresh identity on their own once
+    /// `device_revoked_at` is set (see its doc comment), so a revoked
+    /// device can only come back through a deliberate `vectorhawk auth
+    /// pair`, which is the only code path that both generates a new
+    /// `device_uuid` AND calls [`AppState::clear_device_revoked`].
+    ///
+    /// Idempotent — calling this repeatedly (e.g. a 403 on every sync tick
+    /// before the task notices it should stop) is harmless.
+    pub fn mark_device_revoked(&self) -> Result<()> {
+        self.delete_sync_state("device_uuid")?;
+        self.delete_sync_state("device_id")?;
+        self.set_sync_state("device_revoked_at", &chrono::Utc::now().to_rfc3339())?;
+        Ok(())
+    }
+
+    /// Clear the `device_revoked_at` marker set by [`AppState::mark_device_revoked`].
+    /// Called once a fresh `vectorhawk auth pair` has established a new
+    /// device identity, so `auth status`/`doctor` stop reporting the old
+    /// revocation against the (now different) device.
+    pub fn clear_device_revoked(&self) -> Result<()> {
+        self.delete_sync_state("device_revoked_at")
+    }
+
     /// Return a clone of the shared handle for the "block third-party
     /// inference" kill switch. Cheap (`Arc` clone) — safe to call per
     /// request/session; all clones observe flips made through any handle.
@@ -800,6 +841,67 @@ mod tests {
         state
             .clear_pending_adopt_takeover("never-recorded")
             .expect("clearing an absent record should be a no-op, not an error");
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn delete_sync_state_removes_the_key_and_is_idempotent() {
+        let root = temp_root("delete-sync-state");
+        let state = AppState::bootstrap_in(root.clone()).expect("bootstrap");
+
+        state.set_sync_state("foo", "bar").expect("set");
+        assert_eq!(
+            state.get_sync_state("foo").unwrap(),
+            Some("bar".to_string())
+        );
+
+        state.delete_sync_state("foo").expect("first delete");
+        assert_eq!(state.get_sync_state("foo").unwrap(), None);
+
+        // Deleting an already-absent key must not error.
+        state
+            .delete_sync_state("foo")
+            .expect("second delete (no-op)");
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn mark_device_revoked_clears_identity_and_stamps_marker() {
+        let root = temp_root("mark-device-revoked");
+        let state = AppState::bootstrap_in(root.clone()).expect("bootstrap");
+
+        state
+            .set_sync_state("device_uuid", "uuid-1")
+            .expect("set uuid");
+        state.set_sync_state("device_id", "id-1").expect("set id");
+
+        state.mark_device_revoked().expect("mark revoked");
+
+        assert_eq!(state.get_sync_state("device_uuid").unwrap(), None);
+        assert_eq!(state.get_sync_state("device_id").unwrap(), None);
+        assert!(
+            state.get_sync_state("device_revoked_at").unwrap().is_some(),
+            "device_revoked_at must be stamped"
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn clear_device_revoked_removes_the_marker() {
+        let root = temp_root("clear-device-revoked");
+        let state = AppState::bootstrap_in(root.clone()).expect("bootstrap");
+
+        state.mark_device_revoked().expect("mark revoked");
+        assert!(state.get_sync_state("device_revoked_at").unwrap().is_some());
+
+        state.clear_device_revoked().expect("clear");
+        assert_eq!(state.get_sync_state("device_revoked_at").unwrap(), None);
+
+        // Clearing when nothing is set must not error.
+        state.clear_device_revoked().expect("clear again (no-op)");
 
         cleanup(&root);
     }

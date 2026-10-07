@@ -1624,7 +1624,25 @@ async fn try_start_sync(
 /// updating from the SSE connect, so nothing looked broken.
 ///
 /// On success, returns the `device_id` to use for SSE connections.
+///
+/// Device-revocation-v2: if this device was revoked (`device_revoked_at` set
+/// in `sync_state` by [`AppState::mark_device_revoked`]), this refuses to
+/// even attempt a network call — it must never auto-generate a fresh
+/// `device_uuid` and silently register it on its own. That would resurrect
+/// access through an unattended daemon restart rather than the deliberate
+/// `vectorhawk auth pair` the revocation model requires (revocation-model-
+/// decisions, 2026-10-06: "every device, new or existing, must get in only
+/// through the pairing flow with a logged-in user"). Only `auth pair` clears
+/// `device_revoked_at` (see its implementation), so this stays a no-op until
+/// the user deliberately re-pairs.
 async fn register_device(registry_url: &str, token: &str, state: Arc<AppState>) -> Result<String> {
+    if state.get_sync_state("device_revoked_at")?.is_some() {
+        anyhow::bail!(
+            "this device was revoked by an admin — run `vectorhawk auth pair` \
+             to re-pair as a new device"
+        );
+    }
+
     // Retrieve or generate a stable device UUID.
     let device_uuid = match state.get_sync_state("device_uuid")? {
         Some(u) => u,
@@ -1639,6 +1657,12 @@ async fn register_device(registry_url: &str, token: &str, state: Arc<AppState>) 
 
     match register_with_backend(registry_url, token, &device_uuid, Arc::clone(&state)).await {
         Ok(id) => Ok(id),
+        // A device-revoked 403 already cleared device_uuid/device_id and
+        // stamped device_revoked_at inside register_with_backend — the
+        // cached_id above is now for a dead identity, so never fall back
+        // to it here (unlike the generic "registry unreachable" case
+        // below).
+        Err(e) if e.downcast_ref::<DeviceRevokedError>().is_some() => Err(e),
         // A registry that is down, unreachable, or holding an expired token
         // must not stop an already-registered daemon from booting — it still
         // has work to do offline. Only a device that has never registered has
@@ -1652,6 +1676,21 @@ async fn register_device(registry_url: &str, token: &str, state: Arc<AppState>) 
         },
     }
 }
+
+/// Marker error distinguishing "the backend told us this device is
+/// revoked" from an ordinary network/registry failure — downcast-matched in
+/// [`register_device`] so it never falls back to a cached `device_id` for
+/// an identity the backend will never accept again.
+#[derive(Debug)]
+struct DeviceRevokedError;
+
+impl std::fmt::Display for DeviceRevokedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "device revoked by admin")
+    }
+}
+
+impl std::error::Error for DeviceRevokedError {}
 
 /// The network half of [`register_device`]: one `POST /api/devices/register`
 /// round trip, persisting the returned `device_id`.
@@ -1704,6 +1743,21 @@ async fn register_with_backend(
 
     if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
         anyhow::bail!("device registration returned 401 — token expired");
+    }
+
+    if resp.status() == reqwest::StatusCode::FORBIDDEN {
+        let body = resp.text().await.unwrap_or_default();
+        if crate::sync::sse_client::is_device_revoked_body(&body) {
+            if let Err(e) = state.mark_device_revoked() {
+                warn!(error = %e, "failed to persist device-revoked state locally");
+            }
+            warn!(
+                "device registration rejected — this device was revoked by an admin. \
+                 Run `vectorhawk auth pair` to re-pair as a new device."
+            );
+            return Err(anyhow::Error::new(DeviceRevokedError));
+        }
+        anyhow::bail!("device registration failed (HTTP 403): {body}");
     }
 
     if !resp.status().is_success() {
