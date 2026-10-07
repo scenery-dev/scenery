@@ -702,6 +702,22 @@ pub enum SyncEvent {
         /// device reconnecting after a dropped delta). Empty when the
         /// backend is older and does not emit the key.
         plugin_installations: Vec<PluginInstallationRecord>,
+        /// Durable artifact-revocation list (broadcast-model revoke).
+        /// `None` when the backend omits the `revocations` key entirely
+        /// (older backend) — the reconciler must leave the local revocation
+        /// cache untouched in that case, exactly like `mcp_installations:
+        /// None` above. `Some(vec![])` is a real "nothing is revoked right
+        /// now" and must clear the local cache — that's how an admin
+        /// "unblock" propagates: the entry just drops out of the list.
+        revocations: Option<Vec<RevocationRecord>>,
+    },
+    /// Immediately remove a revoked artifact (broadcast-model kill switch).
+    /// `version: None` means "the whole artifact, every version" — the
+    /// default scope when an admin revokes without pinning a version.
+    Revoke {
+        artifact_type: String,
+        artifact_key: String,
+        version: Option<String>,
     },
     /// Install (or re-activate) a specific skill version.
     Install {
@@ -828,6 +844,20 @@ pub struct McpInstallationRecord {
     pub state: String,
 }
 
+/// One entry in a [`SyncEvent::Snapshot`] / live `revoke` revocation list.
+///
+/// `artifact_key` is the skill slug, the MCP server's UUID (as a string), or
+/// the plugin slug — whatever `artifact_type` says it is. There is no FK or
+/// typed union on the wire; the reconciler dispatches on `artifact_type`.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct RevocationRecord {
+    pub artifact_type: String,
+    pub artifact_key: String,
+    /// `None` (or an absent field) means "the whole artifact, every version".
+    #[serde(default)]
+    pub version: Option<String>,
+}
+
 // ── Wire types (SSE JSON payloads) ────────────────────────────────────────────
 
 #[derive(Debug, serde::Deserialize)]
@@ -846,6 +876,28 @@ struct WireSnapshot {
     /// successfully with an empty vec rather than failing deserialization.
     #[serde(default)]
     plugin_installations: Vec<PluginInstallationRecord>,
+    /// Durable artifact-revocation list (broadcast-model revoke).
+    /// `#[serde(default)]` so a backend that doesn't yet emit this key
+    /// parses to `None`, not `Some(vec![])` — see
+    /// `SyncEvent::Snapshot::revocations`'s doc comment for why that
+    /// distinction matters (it's the exact same `None` vs `Some(vec![])`
+    /// pattern as `mcp_installations` above).
+    #[serde(default)]
+    revocations: Option<Vec<RevocationRecord>>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct WireRevoke {
+    artifact_type: String,
+    artifact_key: String,
+    #[serde(default)]
+    version: Option<String>,
+    /// Not currently consumed — the daemon stamps its own local
+    /// `revoked_at` on write. Present on the wire for forward-compat /
+    /// future audit enrichment.
+    #[allow(dead_code)]
+    #[serde(default)]
+    revoked_at: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -933,6 +985,7 @@ pub fn snapshot_event_from_json(data: &str) -> Result<SyncEvent> {
         installations: wire.installations,
         mcp_installations: wire.mcp_installations,
         plugin_installations: wire.plugin_installations,
+        revocations: wire.revocations,
     })
 }
 
@@ -1009,6 +1062,19 @@ fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
                 plugin_slug: wire.plugin_slug,
             })
         }
+        "revoke" => {
+            // Broadcast-model kill switch: one event, fanned out to every
+            // connected daemon in the org, for an admin revoking a skill,
+            // MCP server, or plugin (whole-artifact or one version). See
+            // `reconciler::spawn_revoke` for the teardown this triggers.
+            let wire: WireRevoke = serde_json::from_str(data)
+                .with_context(|| format!("failed to parse revoke event: {data}"))?;
+            Ok(SyncEvent::Revoke {
+                artifact_type: wire.artifact_type,
+                artifact_key: wire.artifact_key,
+                version: wire.version,
+            })
+        }
         "state" => {
             // The backend sends `state` events after PATCH-backs. Parse the `kind`
             // field and skip — reconciler state transitions are handled via PATCH
@@ -1025,6 +1091,7 @@ fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
                 installations: vec![],
                 mcp_installations: None,
                 plugin_installations: vec![],
+                revocations: None,
             })
         }
         "managed_paths_policy_update" => {
@@ -1061,6 +1128,7 @@ fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
                 installations: vec![],
                 mcp_installations: None,
                 plugin_installations: vec![],
+                revocations: None,
             })
         }
         "discovery_adopted" => {
@@ -1071,6 +1139,7 @@ fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
                 installations: vec![],
                 mcp_installations: None,
                 plugin_installations: vec![],
+                revocations: None,
             })
         }
         "discovery_publish_requested" => {
@@ -1081,6 +1150,7 @@ fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
                 installations: vec![],
                 mcp_installations: None,
                 plugin_installations: vec![],
+                revocations: None,
             })
         }
         "inference_policy_update" => {
@@ -1092,6 +1162,7 @@ fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
                 installations: vec![],
                 mcp_installations: None,
                 plugin_installations: vec![],
+                revocations: None,
             })
         }
         other => {

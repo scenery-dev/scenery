@@ -137,6 +137,11 @@ impl AppState {
         conn.execute_batch(SCHEMA_ADOPT_SQL)
             .context("failed to apply adopt-takeover schema additions")?;
 
+        // Broadcast-model artifact revocation: durable local cache of the
+        // backend's revocation list, reconciled on every snapshot/connect.
+        conn.execute_batch(SCHEMA_REVOKE_SQL)
+            .context("failed to apply artifact-revocation schema additions")?;
+
         Ok(Self {
             root_dir,
             db_path,
@@ -649,6 +654,33 @@ CREATE TABLE IF NOT EXISTS adopt_pending_takeovers (
 );
 "#;
 
+/// Broadcast-model artifact revocation cache (see `crate::revocation`).
+///
+/// One row per revoked artifact (or artifact+version). `version` is the
+/// empty string `''` as the sentinel for "whole artifact, every version" —
+/// never NULL, so the `(artifact_type, artifact_key, version)` primary key
+/// stays a clean idempotency target for upserts (NULL would never collide
+/// with NULL in a unique index the way we need for "revoke again is a
+/// no-op").
+///
+/// Populated two ways, both converging on the same table:
+/// - the live `revoke` SSE event (`revocation::upsert_revocation`) — fast
+///   path for an online daemon;
+/// - a full-replace from the `revocations` key of a `snapshot` event or the
+///   `GET /sync/snapshot` poll (`revocation::replace_all`) — the durable
+///   path for a daemon that was offline when the live event fired, and the
+///   same mechanism that lets an admin "unblock" clear the row (an entry
+///   dropped from the snapshot's list is dropped here too).
+const SCHEMA_REVOKE_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS artifact_revocations (
+    artifact_type TEXT NOT NULL,
+    artifact_key  TEXT NOT NULL,
+    version       TEXT NOT NULL DEFAULT '',
+    revoked_at    TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (artifact_type, artifact_key, version)
+);
+"#;
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -690,14 +722,14 @@ mod tests {
                  ('installed_skills','skill_versions','auth_tokens',\
                   'audit_events','skill_ratings','skill_execution_counts',\
                   'sync_state','mcp_installations','managed_path_markers',\
-                  'adopt_pending_takeovers')",
+                  'adopt_pending_takeovers','artifact_revocations')",
                 [],
                 |row| row.get(0),
             )
             .expect("should query sqlite_master");
         assert_eq!(
-            table_count, 10,
-            "all ten tables should exist (execution_history + policy_cache were retired)"
+            table_count, 11,
+            "all eleven tables should exist (execution_history + policy_cache were retired)"
         );
 
         cleanup(&state.root_dir);

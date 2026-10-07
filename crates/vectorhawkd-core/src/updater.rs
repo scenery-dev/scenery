@@ -80,6 +80,19 @@ pub fn install_from_registry(
         }
     };
 
+    // Revoke overrides desired state everywhere a skill can be installed —
+    // this is the single choke point `vectorhawk skill install`, the
+    // auto-updater (`auto_update_if_needed` below), and the governance
+    // install paths (`mcp_governance`, `tools.rs`) all funnel through, so
+    // one check here covers all of them. The SSE/snapshot-driven reconciler
+    // paths (which never call this function) have their own check in
+    // `reconciler.rs`.
+    if crate::revocation::is_revoked(state, "skill", skill_id, Some(&version))? {
+        anyhow::bail!(
+            "'{skill_id}' version {version} has been revoked by an administrator and cannot be installed"
+        );
+    }
+
     info!(skill_id, version, "installing from registry");
     download_and_install(state, registry, skill_id, &version)?;
     Ok(version)
@@ -1141,5 +1154,51 @@ mod tests {
         status_mock.assert();
         let _ = fs::remove_dir_all(&state_root);
         let _ = fs::remove_dir_all(&skill_root);
+    }
+
+    #[test]
+    fn install_from_registry_blocks_a_revoked_skill() {
+        let state_root = temp_root("revoked-install");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+        crate::revocation::upsert_revocation(&state, "skill", "blocked-skill", None).unwrap();
+
+        // No mock set up — a real HTTP call here would fail the test by
+        // panicking on an unmocked endpoint, proving the gate short-circuits
+        // before any registry/network access.
+        let registry = RegistryClient::new("http://localhost:0");
+        let result = install_from_registry(&state, &registry, "blocked-skill", Some("1.0.0"));
+
+        let err = result.expect_err("revoked skill must not install");
+        assert!(
+            err.to_string().contains("revoked"),
+            "error should mention revocation: {err}"
+        );
+
+        let _ = fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn install_from_registry_blocks_only_the_revoked_version() {
+        let state_root = temp_root("revoked-version-install");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+        crate::revocation::upsert_revocation(&state, "skill", "partial-skill", Some("1.0.0"))
+            .unwrap();
+
+        let registry = RegistryClient::new("http://localhost:0");
+
+        let blocked = install_from_registry(&state, &registry, "partial-skill", Some("1.0.0"));
+        assert!(blocked.is_err(), "the revoked version must be blocked");
+
+        // A different version isn't revoked, so it proceeds past the gate
+        // (and then fails on the network call, which proves the gate wasn't
+        // what stopped it — the revocation check is version-scoped).
+        let other = install_from_registry(&state, &registry, "partial-skill", Some("2.0.0"));
+        assert!(other.is_err(), "unmocked network call should fail");
+        assert!(
+            !other.unwrap_err().to_string().contains("revoked"),
+            "version 2.0.0 was never revoked, so this must fail for a different reason"
+        );
+
+        let _ = fs::remove_dir_all(&state_root);
     }
 }

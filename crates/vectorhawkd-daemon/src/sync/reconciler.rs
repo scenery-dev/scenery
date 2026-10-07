@@ -39,6 +39,7 @@ use crate::sync::sse_client::{
 use vectorhawkd_core::{
     auth::load_all_tokens,
     registry::RegistryClient,
+    revocation::{self, RevocationEntry},
     state::{AppState, McpInstallRow},
 };
 use vectorhawkd_mcp::aggregator::BackendRegistry;
@@ -429,11 +430,77 @@ async fn dispatch_event(
                 install_tasks,
             );
         }
+        SyncEvent::Revoke {
+            artifact_type,
+            artifact_key,
+            version,
+        } => {
+            spawn_revoke(
+                artifact_type,
+                artifact_key,
+                version,
+                state,
+                skill_locks,
+                install_tasks,
+                backend_registry,
+                pusher.as_ref().map(Arc::clone),
+            );
+        }
         SyncEvent::Snapshot {
             installations,
             mcp_installations,
             plugin_installations,
+            revocations,
         } => {
+            // ── Revocation list reconcile (broadcast model) ──────────────────
+            //
+            // `None` means the backend omitted the `revocations` key
+            // (older backend, before this feature shipped) — leave the
+            // local cache untouched. `Some(list)` — even `Some(vec![])` —
+            // is the backend's current authoritative set: replace the
+            // local cache wholesale (this is how an admin "unblock"
+            // propagates — the entry just drops out of the next
+            // snapshot), then converge anything still installed locally
+            // that is now revoked. Do this FIRST, before the install
+            // reconciliation below, so a revoked artifact can never be
+            // (re)installed by the same snapshot that is supposed to be
+            // removing it.
+            if let Some(ref revs) = revocations {
+                let state_for_replace = Arc::clone(state);
+                let entries: Vec<RevocationEntry> = revs
+                    .iter()
+                    .map(|r| RevocationEntry {
+                        artifact_type: r.artifact_type.clone(),
+                        artifact_key: r.artifact_key.clone(),
+                        version: r.version.clone(),
+                    })
+                    .collect();
+                let replace_result = tokio::task::spawn_blocking(move || {
+                    revocation::replace_all(&state_for_replace, &entries)
+                })
+                .await;
+                match replace_result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        warn!(error = %e, "reconciler: failed to persist revocation snapshot")
+                    }
+                    Err(e) => warn!(error = %e, "reconciler: revocation snapshot task panicked"),
+                }
+
+                for rec in revs {
+                    spawn_revoke(
+                        rec.artifact_type.clone(),
+                        rec.artifact_key.clone(),
+                        rec.version.clone(),
+                        state,
+                        skill_locks,
+                        install_tasks,
+                        backend_registry,
+                        pusher.as_ref().map(Arc::clone),
+                    );
+                }
+            }
+
             // ── Skill reconciliation (unchanged) ─────────────────────────────
             let derived = build_derived_events(installations, Arc::clone(state)).await;
             for d in derived {
@@ -491,7 +558,8 @@ async fn dispatch_event(
                     SyncEvent::InstallMcp { .. }
                     | SyncEvent::DeactivateMcp { .. }
                     | SyncEvent::InstallPlugin { .. }
-                    | SyncEvent::DeactivatePlugin { .. } => {}
+                    | SyncEvent::DeactivatePlugin { .. }
+                    | SyncEvent::Revoke { .. } => {}
                 }
             }
 
@@ -871,6 +939,36 @@ async fn handle_install_plugin(
     registry_url: &str,
     stats: &Arc<Mutex<ReconcilerStats>>,
 ) -> bool {
+    // Revoke overrides desired state — see the matching check in
+    // `handle_install_mcp` for why this must also live at the live-event
+    // choke point, not just in the Snapshot arm's pre-dispatch reconcile.
+    {
+        let state_check = Arc::clone(state);
+        let slug_check = plugin_slug.to_string();
+        let revoked = tokio::task::spawn_blocking(move || {
+            revocation::is_revoked(&state_check, "plugin", &slug_check, None)
+        })
+        .await
+        .unwrap_or(Ok(false))
+        .unwrap_or(false);
+        if revoked {
+            warn!(
+                plugin_slug,
+                "reconciler: install blocked — plugin is revoked"
+            );
+            report_plugin_installation_status(
+                installation_id,
+                "error",
+                Some("blocked: plugin revoked by administrator"),
+                registry_url,
+                state,
+            )
+            .await;
+            decrement_pending_inc_errors(stats);
+            return false;
+        }
+    }
+
     match do_install_plugin(
         installation_id,
         plugin_slug,
@@ -1139,6 +1237,166 @@ fn spawn_purge_plugin(
     });
 }
 
+// ── Revoke handler (broadcast model) ──────────────────────────────────────────
+
+/// Handle one `Revoke` event, or one entry of a snapshot's revocation list.
+///
+/// Spawns a task that:
+/// 1. persists the revocation locally (idempotent upsert — redundant but
+///    harmless for a snapshot-derived entry, which already went through
+///    `revocation::replace_all` in the `Snapshot` arm above; load-bearing
+///    for the live `revoke` SSE event, which never goes through
+///    `replace_all`);
+/// 2. tears the artifact down immediately if present, reusing the exact
+///    same local-removal primitives purge/deactivate already use
+///    (`purge_skill_blocking`, `teardown_mcp_server_locally`,
+///    `uninstall_plugin_bundle`) — all three are already no-ops when
+///    nothing is installed, which is what makes this idempotent and
+///    race-safe against a concurrent install;
+/// 3. emits a `<artifact_type>_revoked` audit event through the runner
+///    audit pipeline (`audit_events` table → `POST /api/runner/audit`),
+///    unconditionally — the backend wants to see every daemon converge,
+///    not just the ones that had something locally to remove.
+///
+/// Locked on the same key an install/deactivate for this artifact would
+/// use, so a revoke can never interleave with — and lose to — a concurrent
+/// install of the very thing it's removing.
+#[allow(clippy::too_many_arguments)]
+fn spawn_revoke(
+    artifact_type: String,
+    artifact_key: String,
+    version: Option<String>,
+    state: &Arc<AppState>,
+    skill_locks: &SkillLockMap,
+    install_tasks: &mut tokio::task::JoinSet<bool>,
+    backend_registry: &Arc<BackendRegistry>,
+    pusher: Option<Arc<ManagedPathsPusher>>,
+) {
+    let lock_key = match artifact_type.as_str() {
+        "plugin" => format!("plugin:{artifact_key}"),
+        _ => artifact_key.clone(),
+    };
+    let lock = skill_lock(skill_locks, &lock_key);
+    let state = Arc::clone(state);
+    let backend_registry = Arc::clone(backend_registry);
+
+    install_tasks.spawn(async move {
+        let _guard = lock.lock_owned().await;
+
+        // Persist durably first — a crash mid-teardown still leaves the
+        // artifact blocked locally on restart (the next snapshot will also
+        // re-assert it, but this makes the block effective immediately).
+        {
+            let persist_state = Arc::clone(&state);
+            let at = artifact_type.clone();
+            let ak = artifact_key.clone();
+            let ver = version.clone();
+            match tokio::task::spawn_blocking(move || {
+                revocation::upsert_revocation(&persist_state, &at, &ak, ver.as_deref())
+            })
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => warn!(
+                    error = %e, artifact_type = %artifact_type, artifact_key = %artifact_key,
+                    "reconciler: failed to persist revocation"
+                ),
+                Err(e) => warn!(error = %e, "reconciler: revoke persist task panicked"),
+            }
+        }
+
+        let changed = match artifact_type.as_str() {
+            "skill" => {
+                let state2 = Arc::clone(&state);
+                let skill_id = artifact_key.clone();
+                match tokio::task::spawn_blocking(move || purge_skill_blocking(&state2, &skill_id))
+                    .await
+                {
+                    Ok(Ok(())) => true,
+                    Ok(Err(e)) => {
+                        warn!(error = %e, skill_id = %artifact_key, "reconciler: revoke purge failed");
+                        false
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "reconciler: revoke purge task panicked");
+                        false
+                    }
+                }
+            }
+            "mcp_server" => {
+                let state2 = Arc::clone(&state);
+                let backend_registry2 = Arc::clone(&backend_registry);
+                let server_id = artifact_key.clone();
+                let pusher2 = pusher.clone();
+                match tokio::task::spawn_blocking(move || {
+                    teardown_mcp_server_locally(&server_id, &state2, &backend_registry2, pusher2.as_deref())
+                })
+                .await
+                {
+                    Ok(Ok(removed)) => removed,
+                    Ok(Err(e)) => {
+                        warn!(error = %e, mcp_server_id = %artifact_key, "reconciler: revoke teardown failed");
+                        false
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "reconciler: revoke teardown task panicked");
+                        false
+                    }
+                }
+            }
+            "plugin" => {
+                let slug = artifact_key.clone();
+                match tokio::task::spawn_blocking(move || {
+                    crate::managed_paths::uninstall_plugin_bundle(&slug)
+                })
+                .await
+                {
+                    Ok(Ok(())) => true,
+                    Ok(Err(e)) => {
+                        warn!(error = %e, plugin_slug = %artifact_key, "reconciler: revoke plugin purge failed");
+                        false
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "reconciler: revoke plugin purge task panicked");
+                        false
+                    }
+                }
+            }
+            other => {
+                // Forward-compat: a future artifact_type (e.g. "agent")
+                // this daemon build doesn't know how to tear down yet.
+                // The revocation is still persisted above (blocks future
+                // installs); just no local removal action to take.
+                warn!(artifact_type = other, "reconciler: revoke for an unrecognized artifact_type — persisted the block, no local teardown performed");
+                false
+            }
+        };
+
+        info!(
+            artifact_type = %artifact_type,
+            artifact_key = %artifact_key,
+            version = ?version,
+            removed_locally = changed,
+            "reconciler: artifact revoked"
+        );
+
+        vectorhawkd_core::audit::write_audit_event_direct(
+            &state.db_path,
+            &vectorhawkd_core::audit::AuditEvent {
+                event_type: format!("{artifact_type}_revoked"),
+                payload: serde_json::json!({
+                    "artifact_type": artifact_type,
+                    "artifact_key": artifact_key,
+                    "version": version,
+                    "removed_locally": changed,
+                }),
+            },
+        );
+
+        changed
+    });
+}
+
 // ── MCP install handler ───────────────────────────────────────────────────────
 
 /// Handle one `InstallMcp` event.  Returns `true` if the tool list changed.
@@ -1160,6 +1418,38 @@ async fn handle_install_mcp(
     list_changed_tx: broadcast::Sender<()>,
     pusher: Option<&ManagedPathsPusher>,
 ) -> bool {
+    // Revoke overrides desired state: a revoked server must never be
+    // (re)installed, even by a stale `install_mcp` event or a snapshot
+    // delivered after the revoke (the Snapshot arm already reconciles the
+    // revocation list before dispatching installs, but this is the same
+    // check at the other choke point — the live SSE event — so neither
+    // path depends on event ordering).
+    {
+        let state_check = Arc::clone(state);
+        let server_id_check = mcp_server_id.to_string();
+        let revoked = tokio::task::spawn_blocking(move || {
+            revocation::is_revoked(&state_check, "mcp_server", &server_id_check, None)
+        })
+        .await
+        .unwrap_or(Ok(false))
+        .unwrap_or(false);
+        if revoked {
+            warn!(
+                mcp_server_id = %mcp_server_id,
+                "reconciler: install blocked — MCP server is revoked"
+            );
+            report_mcp_installation_status(
+                installation_id,
+                "error",
+                Some("blocked: server revoked by administrator"),
+                registry_url,
+                state,
+            )
+            .await;
+            return false;
+        }
+    }
+
     report_mcp_installation_status(installation_id, "installing", None, registry_url, state).await;
 
     let server_config_str = server_config
@@ -1652,6 +1942,39 @@ async fn handle_install(
     stats: &Arc<Mutex<ReconcilerStats>>,
     pusher: Option<&ManagedPathsPusher>,
 ) -> bool {
+    // Revoke overrides desired state — same check, same reasoning, as
+    // `handle_install_mcp` / `handle_install_plugin`. `install_from_registry`
+    // (vectorhawkd-core::updater) carries the equivalent gate for the CLI
+    // `skill install` command and the auto-updater, which never go through
+    // this SSE/snapshot-driven handler.
+    {
+        let state_check = Arc::clone(state);
+        let skill_id_check = skill_id.to_string();
+        let version_check = version.to_string();
+        let revoked = tokio::task::spawn_blocking(move || {
+            revocation::is_revoked(&state_check, "skill", &skill_id_check, Some(&version_check))
+        })
+        .await
+        .unwrap_or(Ok(false))
+        .unwrap_or(false);
+        if revoked {
+            warn!(
+                skill_id,
+                version, "reconciler: install blocked — skill is revoked"
+            );
+            report_installation_status(
+                installation_id,
+                "error",
+                Some("blocked: skill revoked by administrator"),
+                registry_url,
+                state,
+            )
+            .await;
+            decrement_pending_inc_errors(stats);
+            return false;
+        }
+    }
+
     let result = do_install(
         installation_id,
         skill_id,
@@ -3278,3 +3601,7 @@ mod mcp_tests;
 #[cfg(test)]
 #[path = "plugin_reconciler_tests.rs"]
 mod plugin_tests;
+
+#[cfg(test)]
+#[path = "revoke_reconciler_tests.rs"]
+mod revoke_tests;
