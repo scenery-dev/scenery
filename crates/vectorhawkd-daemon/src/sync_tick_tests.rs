@@ -172,6 +172,100 @@ fn gap04_update_cache_empty_when_no_installed_skills() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+// ── bug-revoke-loop: revocation snapshot reconcile with NO reconciler ────────
+
+/// `vectorhawk mcp sync` (`cmd_mcp_sync`) is a one-shot CLI invocation with
+/// no reconciler running — it always calls `run_sync_tick` with
+/// `snapshot_tx = None` (there is no `SyncController`/event channel to feed
+/// outside the long-running daemon). Before this fix, the entire snapshot
+/// fetch — including the durable `revocations` list — was skipped whenever
+/// `snapshot_tx` was `None`, so this command could never lift a stale local
+/// revocation gate from an admin "unblock"; only a daemon restart (which
+/// re-fetches a snapshot on SSE connect) or waiting out the next 5-minute
+/// in-daemon tick would. This proves the revocation half of the snapshot is
+/// now applied unconditionally, independent of whether a reconciler exists
+/// to hand the rest of the snapshot to.
+#[test]
+fn revocation_snapshot_applied_even_with_no_reconciler_present() {
+    let root = temp_root("revloop-mcp-sync-unrevoke");
+    let state = AppState::bootstrap_in(root.clone()).unwrap();
+
+    // A device_id must be on disk for `run_sync_tick` to even attempt the
+    // snapshot fetch (mirrors a real paired device; `vectorhawk mcp sync`
+    // on an unpaired box has nothing to reconcile).
+    state
+        .set_sync_state("device_id", "mcp-sync-device")
+        .unwrap();
+
+    let mut server = Server::new();
+    let registry_url = server.url();
+
+    // `fetch_sync_snapshot` requires an auth token to be set on the
+    // RegistryClient — step 0 of `run_sync_tick` does that FROM the stored
+    // tokens row, so one must exist for this path to even reach the fetch.
+    vectorhawkd_core::auth::save_tokens(
+        &state,
+        &registry_url,
+        "fake-access-tok",
+        "fake-refresh-tok",
+    )
+    .unwrap();
+
+    let _approved_mock = server
+        .mock("GET", "/api/runner/approved-servers")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"servers":[]}"#)
+        .create();
+
+    // The backend's current, authoritative state: nothing is revoked right
+    // now (the admin already unrevoked it — this is exactly what
+    // `GET /api/sync/snapshot` returns per the bug report: `revocations: []`).
+    let _snapshot_mock = server
+        .mock("GET", "/api/sync/snapshot")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"installations":[],"mcp_installations":[],"plugin_installations":[],"revocations":[]}"#,
+        )
+        .create();
+
+    // Simulate the STALE local state: this device revoked "ghost-skill"
+    // earlier (e.g. via a live `revoke` SSE event while the daemon was
+    // running) and never got the news that it was lifted.
+    vectorhawkd_core::revocation::upsert_revocation(&state, "skill", "ghost-skill", None).unwrap();
+    assert!(
+        vectorhawkd_core::revocation::is_revoked(&state, "skill", "ghost-skill", Some("1.0.0"))
+            .unwrap(),
+        "precondition: locally revoked before the tick"
+    );
+
+    let registry = RegistryClient::new(&registry_url);
+    let audit_buf = SqliteAuditBuffer::new(Arc::new(RegistryClient::new(&registry_url)), &state);
+    let cache = empty_cache();
+
+    // The exact call `cmd_mcp_sync` makes: no reconciler, so `snapshot_tx`
+    // is `None`.
+    run_sync_tick(
+        &registry,
+        &audit_buf,
+        &state.db_path,
+        &state.root_dir,
+        &cache,
+        None,
+    )
+    .unwrap();
+
+    assert!(
+        !vectorhawkd_core::revocation::is_revoked(&state, "skill", "ghost-skill", Some("1.0.0"))
+            .unwrap(),
+        "a `vectorhawk mcp sync` tick with no reconciler must still apply \
+         the durable revocation list and lift the stale local gate"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 // ── GAP-05: Ratings flush ─────────────────────────────────────────────────────
 
 /// An unsynced rating stored in SQLite is uploaded on `run_sync_tick` and the

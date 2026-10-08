@@ -217,6 +217,122 @@ async fn revoke_event_is_idempotent_when_sent_twice() {
     cleanup(&root);
 }
 
+// ── Live `unrevoke` event (Bug 2 fix) ──────────────────────────────────────────
+
+#[tokio::test]
+async fn unrevoke_event_clears_the_local_gate_immediately() {
+    let root = temp_root("unrevoke-skill-live");
+    let state = Arc::new(AppState::bootstrap_in(root.clone()).unwrap());
+
+    dispatch(
+        SyncEvent::Revoke {
+            artifact_type: "skill".to_string(),
+            artifact_key: "temp-blocked".to_string(),
+            version: None,
+        },
+        &state,
+        &Arc::new(BackendRegistry::new()),
+    )
+    .await;
+    assert!(
+        revocation_row_exists(&state, "skill", "temp-blocked"),
+        "precondition: revoke must persist the block"
+    );
+
+    // Before this fix, only the periodic snapshot reconcile (or an SSE
+    // reconnect) could ever clear this — the admin's unrevoke sent nothing
+    // live at all. This live `Unrevoke` event must lift the gate
+    // immediately, with no snapshot/reconnect involved.
+    dispatch(
+        SyncEvent::Unrevoke {
+            artifact_type: "skill".to_string(),
+            artifact_key: "temp-blocked".to_string(),
+            version: None,
+        },
+        &state,
+        &Arc::new(BackendRegistry::new()),
+    )
+    .await;
+
+    assert!(
+        !revocation_row_exists(&state, "skill", "temp-blocked"),
+        "a live unrevoke must clear the local revocation-cache row"
+    );
+
+    cleanup(&root);
+}
+
+#[tokio::test]
+async fn unrevoke_event_for_a_never_revoked_key_is_a_harmless_no_op() {
+    let root = temp_root("unrevoke-skill-noop");
+    let state = Arc::new(AppState::bootstrap_in(root.clone()).unwrap());
+
+    dispatch(
+        SyncEvent::Unrevoke {
+            artifact_type: "skill".to_string(),
+            artifact_key: "never-blocked".to_string(),
+            version: None,
+        },
+        &state,
+        &Arc::new(BackendRegistry::new()),
+    )
+    .await;
+
+    assert!(!revocation_row_exists(&state, "skill", "never-blocked"));
+
+    cleanup(&root);
+}
+
+#[tokio::test]
+async fn install_event_succeeds_after_a_live_unrevoke() {
+    let root = temp_root("unrevoke-then-install");
+    let state = Arc::new(AppState::bootstrap_in(root.clone()).unwrap());
+
+    dispatch(
+        SyncEvent::Revoke {
+            artifact_type: "skill".to_string(),
+            artifact_key: "revoked-then-unrevoked".to_string(),
+            version: None,
+        },
+        &state,
+        &Arc::new(BackendRegistry::new()),
+    )
+    .await;
+
+    dispatch(
+        SyncEvent::Unrevoke {
+            artifact_type: "skill".to_string(),
+            artifact_key: "revoked-then-unrevoked".to_string(),
+            version: None,
+        },
+        &state,
+        &Arc::new(BackendRegistry::new()),
+    )
+    .await;
+
+    // `handle_install`'s gate (`revocation::is_revoked`) must now say "no"
+    // — proving the live unrevoke is not merely cosmetic (clearing the row)
+    // but actually unblocks the real install-time check every install path
+    // consults. The install itself will fail for an unrelated reason (no
+    // real registry at `https://example.invalid` to fetch artifact
+    // metadata from) — that's fine, this test only needs to prove the
+    // revocation gate itself was lifted, not exercise a full install.
+    assert!(
+        !vectorhawkd_core::revocation::is_revoked(
+            &state,
+            "skill",
+            "revoked-then-unrevoked",
+            Some("1.0.0")
+        )
+        .unwrap(),
+        "is_revoked must return false after a live unrevoke, which is what \
+         lets handle_install proceed past its revoke-overrides-desired-state \
+         gate"
+    );
+
+    cleanup(&root);
+}
+
 // ── Live `revoke` event: MCP server ────────────────────────────────────────────
 
 #[tokio::test]

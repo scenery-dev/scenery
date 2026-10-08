@@ -1873,23 +1873,66 @@ pub fn run_sync_tick(
     // swallow, etc.) — the SSE client otherwise only re-converges by fetching
     // a fresh snapshot on *reconnect*, which may not happen for a long time.
     //
-    // `snapshot_tx` is `None` until the SSE sync subsystem has started (device
-    // not yet paired) — nothing to reconcile against, so skip cleanly.
-    // Fetch + parse failures are logged and never fail the tick: this is a
-    // best-effort top-up, and the SSE stream remains the primary path.
-    if let Some(tx) = snapshot_tx {
+    // The revocation list is applied UNCONDITIONALLY whenever a snapshot can
+    // be fetched — a direct, reconciler-independent SQLite write (bug-
+    // revoke-loop fix) — not gated on `snapshot_tx`. `vectorhawk mcp sync`
+    // (`cmd_mcp_sync`) is a one-shot CLI invocation with no reconciler
+    // running at all (`snapshot_tx` is always `None` there), and before this
+    // fix the entire fetch was skipped in that case, so that command could
+    // never lift a stale local revocation gate from an admin "unblock" — the
+    // one thing an impatient user reaches for instead of waiting out the
+    // next periodic tick. Forwarding the REST of the snapshot
+    // (installs/mcp/plugins) to the reconciler for a full diff still
+    // requires `snapshot_tx`: that dedup/concurrency machinery
+    // (`skill_locks`, `install_tasks`) only exists inside the long-running
+    // daemon.
+    //
+    // `snapshot_tx` is `None` until the SSE sync subsystem has started
+    // (device not yet paired); guard the fetch on having a device_id at all
+    // (set above in step 0) so an unpaired tick doesn't spam a doomed
+    // request. Fetch + parse failures are logged and never fail the tick:
+    // this is a best-effort top-up, and the SSE stream remains the primary
+    // path.
+    let have_device_id = matches!(state_view.get_sync_state("device_id"), Ok(Some(_)));
+    if have_device_id {
         match registry.fetch_sync_snapshot() {
             Ok(body) => {
                 match sync::sse_client::snapshot_event_from_json(&body) {
-                    Ok(event) => match tx.try_send(event) {
-                        Ok(()) => debug!("sync: snapshot reconcile tick delivered to reconciler"),
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            warn!("sync: reconciler channel full — snapshot reconcile skipped this tick");
+                    Ok(event) => {
+                        if let SyncEvent::Snapshot {
+                            revocations: Some(ref revs),
+                            ..
+                        } = event
+                        {
+                            let entries: Vec<vectorhawkd_core::revocation::RevocationEntry> = revs
+                                .iter()
+                                .map(|r| vectorhawkd_core::revocation::RevocationEntry {
+                                    artifact_type: r.artifact_type.clone(),
+                                    artifact_key: r.artifact_key.clone(),
+                                    version: r.version.clone(),
+                                })
+                                .collect();
+                            if let Err(e) =
+                                vectorhawkd_core::revocation::replace_all(&state_view, &entries)
+                            {
+                                warn!(error = %e, "sync: failed to persist revocation snapshot");
+                            }
                         }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                            warn!("sync: reconciler channel closed — snapshot reconcile skipped");
+
+                        if let Some(tx) = snapshot_tx {
+                            match tx.try_send(event) {
+                                Ok(()) => {
+                                    debug!("sync: snapshot reconcile tick delivered to reconciler")
+                                }
+                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                    warn!("sync: reconciler channel full — snapshot reconcile skipped this tick");
+                                }
+                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    warn!("sync: reconciler channel closed — snapshot reconcile skipped");
+                                }
+                            }
                         }
-                    },
+                    }
                     Err(e) => warn!(error = %e, "sync: failed to parse snapshot reconcile payload"),
                 }
             }
