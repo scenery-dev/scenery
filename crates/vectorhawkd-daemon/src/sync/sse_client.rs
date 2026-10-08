@@ -33,7 +33,7 @@ use uuid::Uuid;
 
 use crate::sync::SyncConfig;
 use vectorhawkd_core::{
-    auth::{load_all_tokens, save_tokens, AuthClient},
+    auth::{load_tokens, record_refresh_failure, save_tokens, AuthClient},
     state::AppState,
 };
 
@@ -47,6 +47,17 @@ const BACKOFF_INIT_SECS: u64 = 1;
 
 /// Maximum reconnect delay.
 const BACKOFF_MAX_SECS: u64 = 60;
+
+/// How many consecutive "refresh, then retry, still 401" cycles to tolerate
+/// before giving up and treating this as "re-authentication needed" rather
+/// than a transiently stale token. A single stale-token blip (the common
+/// case: the access token merely expired) resolves on the very next retry,
+/// so this is deliberately small — it exists to bound the revoked-user
+/// case (refresh "succeeds" — the backend hands back a technically valid
+/// token — but the very next request 401s again because the *account*,
+/// not the token, is the problem) to a handful of attempts instead of
+/// forever.
+const MAX_CONSECUTIVE_POST_REFRESH_UNAUTHORIZED: u32 = 3;
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -82,6 +93,18 @@ pub async fn run(
     let mut current_token = config.token.clone();
     let mut current_device_id = config.device_id.clone();
 
+    // Bug 1 (revoke-loop) state: tracks "refresh succeeded, but the very
+    // next connect attempt STILL got a 401" across loop iterations, so a
+    // revoked/deactivated account's refresh token — which keeps minting
+    // technically-valid-but-useless access tokens — can't loop forever.
+    // `post_refresh_unauthorized_streak` counts consecutive occurrences;
+    // `awaiting_post_refresh_check` is true only for the one iteration
+    // immediately following a successful refresh, so an UNRELATED 401 much
+    // later (after a real, successful reconnect in between) never gets
+    // misattributed to the same streak.
+    let mut post_refresh_unauthorized_streak: u32 = 0;
+    let mut awaiting_post_refresh_check = false;
+
     loop {
         // Re-read `device_id` from the on-disk source of truth before every
         // connection attempt, instead of trusting the value this task was
@@ -116,13 +139,47 @@ pub async fn run(
 
         match result {
             ConnectResult::Reconnect { new_last_id } => {
-                // Clean reconnect (EOF or watchdog).  Reset backoff.
+                // Clean reconnect (EOF or watchdog) — proof the credentials
+                // are good. Reset backoff AND the post-refresh-401 streak:
+                // a real connection in between means a LATER 401 is a fresh
+                // problem, not a continuation of an old one.
                 backoff_secs = BACKOFF_INIT_SECS;
+                post_refresh_unauthorized_streak = 0;
+                awaiting_post_refresh_check = false;
                 if let Some(id) = new_last_id {
                     last_event_id = Some(id);
                 }
             }
             ConnectResult::Unauthorized => {
+                // Count this 401 toward the post-refresh streak ONLY if it
+                // immediately follows a refresh this same loop attempted —
+                // otherwise (first 401 ever, or one after an unrelated
+                // generic-error retry) it starts a fresh streak at 1.
+                if awaiting_post_refresh_check {
+                    post_refresh_unauthorized_streak += 1;
+                } else {
+                    post_refresh_unauthorized_streak = 1;
+                }
+                awaiting_post_refresh_check = false;
+
+                if post_refresh_unauthorized_streak > MAX_CONSECUTIVE_POST_REFRESH_UNAUTHORIZED {
+                    // Refresh keeps "succeeding" (the backend hands back a
+                    // token) but the account itself is rejected on every
+                    // subsequent request — a revoked/deactivated user, not
+                    // a merely-stale token. Retrying can't fix this; only a
+                    // human re-authenticating can. Stop outright rather
+                    // than keep refreshing forever with no backoff — see
+                    // the revoke-loop bug this guards against.
+                    warn!(
+                        streak = post_refresh_unauthorized_streak,
+                        "SSE: repeated 401s immediately after a successful token \
+                         refresh — treating as revoked/invalid account, not an \
+                         expired token. Run `vectorhawk auth login` to \
+                         re-authenticate."
+                    );
+                    return;
+                }
+
                 // 401: try to refresh the JWT before reconnecting.
                 info!("SSE: received 401 — attempting token refresh");
                 match try_refresh_token(
@@ -134,9 +191,19 @@ pub async fn run(
                 {
                     Ok(new_token) => {
                         current_token = new_token;
-                        info!("SSE: token refreshed — reconnecting immediately");
-                        backoff_secs = BACKOFF_INIT_SECS;
-                        continue; // no delay
+                        info!(
+                            backoff_secs,
+                            "SSE: token refreshed — will retry after backoff"
+                        );
+                        awaiting_post_refresh_check = true;
+                        // Deliberately NOT resetting `backoff_secs` and NOT
+                        // skipping the sleep at the bottom of the loop — a
+                        // 401/refresh cycle must never retry without
+                        // backing off, even on an apparently-successful
+                        // refresh. A revoked account's refresh "succeeds"
+                        // every time, so skipping the delay here is exactly
+                        // what turned this into an unbounded ~120ms-interval
+                        // request storm before this fix.
                     }
                     Err(e) => {
                         warn!(error = %e, "SSE: token refresh failed — backing off");
@@ -719,6 +786,19 @@ pub enum SyncEvent {
         artifact_key: String,
         version: Option<String>,
     },
+    /// Live "unblock" push (Bug 2 fix, broadcast-model revoke's mirror
+    /// image). Before this, `unrevoke_artifact` sent nothing live — a
+    /// connected daemon only converged on its next periodic
+    /// `GET /api/sync/snapshot` poll or SSE reconnect (up to
+    /// `SYNC_INTERVAL_SECS`, ~5 minutes). This clears the local revocation
+    /// gate immediately. Does NOT reinstall anything — same "unblock
+    /// doesn't resurrect state" rule every other revoke/unrevoke path in
+    /// this codebase follows; the user reinstalls explicitly.
+    Unrevoke {
+        artifact_type: String,
+        artifact_key: String,
+        version: Option<String>,
+    },
     /// Install (or re-activate) a specific skill version.
     Install {
         installation_id: Uuid,
@@ -901,6 +981,14 @@ struct WireRevoke {
 }
 
 #[derive(Debug, serde::Deserialize)]
+struct WireUnrevoke {
+    artifact_type: String,
+    artifact_key: String,
+    #[serde(default)]
+    version: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
 struct WireInstall {
     installation_id: Uuid,
     skill_id: String,
@@ -1075,6 +1163,20 @@ fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
                 version: wire.version,
             })
         }
+        "unrevoke" => {
+            // Live "unblock" push (Bug 2 fix) — see `SyncEvent::Unrevoke`'s
+            // doc comment. A brand-new event name is safe for runners that
+            // predate it: the `other => anyhow::bail!(...)` arm below is
+            // caught by `dispatch_event`, logged, and skipped, never
+            // retried or crashed on.
+            let wire: WireUnrevoke = serde_json::from_str(data)
+                .with_context(|| format!("failed to parse unrevoke event: {data}"))?;
+            Ok(SyncEvent::Unrevoke {
+                artifact_type: wire.artifact_type,
+                artifact_key: wire.artifact_key,
+                version: wire.version,
+            })
+        }
         "state" => {
             // The backend sends `state` events after PATCH-backs. Parse the `kind`
             // field and skip — reconciler state transitions are handled via PATCH
@@ -1175,12 +1277,33 @@ fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
 
 /// Attempt to refresh the stored JWT for `registry_url`.
 ///
-/// Uses the existing token store (SQLite `auth_tokens`).  On success, saves the
-/// new tokens back, publishes the new access token to `live_token` — so
-/// `SyncController::ensure_started`'s credential-fingerprint comparison sees
-/// the token this connection is actually using now, not a value frozen at
-/// spawn time (see the doc comment on `SyncConfig::live_token`) — and returns
-/// the new access token.
+/// Uses the existing token store (SQLite `auth_tokens`) and the SAME
+/// persisted-backoff mechanism the daemon's periodic 60s token-refresh loop
+/// (`refresh_one_tick` / `classify_refresh_failure` in
+/// `vectorhawkd-daemon::lib`) already uses — `auth_tokens.
+/// next_refresh_attempt_at` / `refresh_failures` / `last_refresh_status` are
+/// one shared piece of state, not duplicated per call site. This matters for
+/// bug-revoke-loop: before this, the SSE client called the bare, undetailed
+/// `AuthClient::refresh` and tracked nothing durable, so a daemon RESTART
+/// wiped out any notion of "this refresh token is dead" and re-entered the
+/// tight loop from scratch. Now:
+///   - a refresh attempt made while a prior failure's backoff window
+///     (`next_refresh_attempt_at`) hasn't elapsed yet is skipped outright —
+///     no network call — and this survives a restart, since the window is
+///     read fresh from SQLite every time;
+///   - a 401/403 from `/portal/auth/refresh` itself (the backend now
+///     returns this for a revoked/inactive user, closing the loophole that
+///     let refresh "succeed" forever) is classified via
+///     `crate::classify_refresh_failure` and recorded via
+///     `record_refresh_failure`, the exact exponential schedule (60s up to
+///     1h) `refresh_one_tick` already uses for a dead refresh token.
+///
+/// On success, saves the new tokens back (which also clears the backoff
+/// counters — see `save_tokens`), publishes the new access token to
+/// `live_token` — so `SyncController::ensure_started`'s credential-
+/// fingerprint comparison sees the token this connection is actually using
+/// now, not a value frozen at spawn time (see the doc comment on
+/// `SyncConfig::live_token`) — and returns the new access token.
 async fn try_refresh_token(
     registry_url: &str,
     state: Arc<AppState>,
@@ -1190,28 +1313,57 @@ async fn try_refresh_token(
     let state_clone = Arc::clone(&state);
 
     let new_access_token = tokio::task::spawn_blocking(move || {
-        let rows =
-            load_all_tokens(&state_clone).context("failed to load auth tokens for refresh")?;
-
-        let row = rows
-            .into_iter()
-            .find(|r| r.registry_url == reg_url)
+        let row = load_tokens(&state_clone, &reg_url)
+            .context("failed to load auth tokens for refresh")?
             .ok_or_else(|| anyhow::anyhow!("no stored token for {reg_url}"))?;
 
+        // Honor the persisted backoff window set by a prior auth failure —
+        // same guard `refresh_one_tick` applies, so the SSE path can't
+        // hammer a refresh token the periodic loop already knows is dead
+        // (or vice versa), and this holds across a daemon restart since the
+        // window lives in SQLite, not in-process state.
+        if let Some(next_at) = row.next_refresh_attempt_at {
+            let now_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            if next_at > now_unix {
+                anyhow::bail!(
+                    "refresh skipped — in backoff window after a prior auth failure \
+                     ({} s remaining)",
+                    next_at - now_unix
+                );
+            }
+        }
+
         let client = AuthClient::new(&reg_url);
-        let new_tokens = client
-            .refresh(&row.refresh_token)
-            .context("token refresh HTTP call failed")?;
-
-        save_tokens(
-            &state_clone,
-            &reg_url,
-            &new_tokens.access_token,
-            &new_tokens.refresh_token,
-        )
-        .context("failed to save refreshed tokens")?;
-
-        Ok::<String, anyhow::Error>(new_tokens.access_token)
+        match client.refresh_detailed(&row.refresh_token) {
+            Ok(new_tokens) => {
+                save_tokens(
+                    &state_clone,
+                    &reg_url,
+                    &new_tokens.access_token,
+                    &new_tokens.refresh_token,
+                )
+                .context("failed to save refreshed tokens")?;
+                Ok(new_tokens.access_token)
+            }
+            Err(err) => {
+                let now_unix = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                let (status_label, backoff) =
+                    crate::classify_refresh_failure(&err, row.refresh_failures);
+                let next_attempt_at = backoff.map(|secs| now_unix + secs as i64);
+                if let Err(e) =
+                    record_refresh_failure(&state_clone, &reg_url, status_label, next_attempt_at)
+                {
+                    warn!(error = %e, "SSE: failed to record refresh failure state");
+                }
+                Err(anyhow::Error::new(err).context("token refresh HTTP call failed"))
+            }
+        }
     })
     .await
     .context("token refresh task panicked")??;

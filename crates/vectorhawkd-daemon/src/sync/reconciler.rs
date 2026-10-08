@@ -446,6 +446,13 @@ async fn dispatch_event(
                 pusher.as_ref().map(Arc::clone),
             );
         }
+        SyncEvent::Unrevoke {
+            artifact_type,
+            artifact_key,
+            version,
+        } => {
+            spawn_unrevoke(artifact_type, artifact_key, version, state, install_tasks);
+        }
         SyncEvent::Snapshot {
             installations,
             mcp_installations,
@@ -559,7 +566,8 @@ async fn dispatch_event(
                     | SyncEvent::DeactivateMcp { .. }
                     | SyncEvent::InstallPlugin { .. }
                     | SyncEvent::DeactivatePlugin { .. }
-                    | SyncEvent::Revoke { .. } => {}
+                    | SyncEvent::Revoke { .. }
+                    | SyncEvent::Unrevoke { .. } => {}
                 }
             }
 
@@ -1394,6 +1402,53 @@ fn spawn_revoke(
         );
 
         changed
+    });
+}
+
+/// Handle one live `Unrevoke` event (Bug 2 fix — live "unblock" push).
+///
+/// Just clears the local revocation-cache row via
+/// [`revocation::clear_revocation`] — the exact same primitive the
+/// periodic snapshot reconcile already relies on indirectly through
+/// `replace_all`. Deliberately does NOT reinstall or reactivate anything:
+/// same "unblock doesn't resurrect state" rule every other revoke/unrevoke
+/// path in this codebase follows (see `uninstall-restore-invariant`) — the
+/// user reinstalls explicitly. Never changes the local tool list, so this
+/// always resolves to `false`.
+fn spawn_unrevoke(
+    artifact_type: String,
+    artifact_key: String,
+    version: Option<String>,
+    state: &Arc<AppState>,
+    install_tasks: &mut tokio::task::JoinSet<bool>,
+) {
+    let state = Arc::clone(state);
+    install_tasks.spawn(async move {
+        let at = artifact_type.clone();
+        let ak = artifact_key.clone();
+        let ver = version.clone();
+        match tokio::task::spawn_blocking(move || {
+            revocation::clear_revocation(&state, &at, &ak, ver.as_deref())
+        })
+        .await
+        {
+            Ok(Ok(())) => {
+                info!(
+                    artifact_type = %artifact_type,
+                    artifact_key = %artifact_key,
+                    version = ?version,
+                    "reconciler: artifact unrevoked — local gate lifted"
+                );
+            }
+            Ok(Err(e)) => {
+                warn!(
+                    error = %e, artifact_type = %artifact_type, artifact_key = %artifact_key,
+                    "reconciler: failed to clear local revocation on unrevoke"
+                );
+            }
+            Err(e) => warn!(error = %e, "reconciler: unrevoke task panicked"),
+        }
+        false
     });
 }
 

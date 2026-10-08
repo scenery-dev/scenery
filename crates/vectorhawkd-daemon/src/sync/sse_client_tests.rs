@@ -245,6 +245,34 @@ fn parses_revoke_event_whole_artifact() {
 }
 
 #[test]
+fn parses_unrevoke_event() {
+    // Bug 2 fix: live "unblock" push, mirroring the `revoke` event shape.
+    let data = r#"{"artifact_type":"skill","artifact_key":"code-review","version":null}"#;
+    let event = parse_sync_event("unrevoke", data).unwrap();
+    match event {
+        super::SyncEvent::Unrevoke {
+            artifact_type,
+            artifact_key,
+            version,
+        } => {
+            assert_eq!(artifact_type, "skill");
+            assert_eq!(artifact_key, "code-review");
+            assert!(version.is_none());
+        }
+        other => panic!("expected Unrevoke, got {other:?}"),
+    }
+}
+
+#[test]
+fn unknown_event_type_is_logged_and_skipped_not_fatal() {
+    // Precondition for both `revoke` and `unrevoke` being safely additive:
+    // a runner that predates them must treat the unrecognized event name as
+    // a no-op, not a crash or a reason to drop the connection. Confirmed
+    // identical in the shipped v1.0.99 tag (same `other => bail!` arm).
+    assert!(parse_sync_event("some_future_event_type", "{}").is_err());
+}
+
+#[test]
 fn parses_revoke_event_scoped_to_one_version() {
     let data = r#"{"artifact_type":"skill","artifact_key":"code-review","version":"1.2.3","revoked_at":"2026-10-06T12:00:00Z"}"#;
     let event = parse_sync_event("revoke", data).unwrap();
@@ -562,4 +590,112 @@ async fn revoked_device_clears_local_identity_and_stamps_marker() {
         state.get_sync_state("device_revoked_at").unwrap().is_some(),
         "device_revoked_at must be stamped"
     );
+}
+
+// ── bug-revoke-loop: bounded retry on a 401/refresh/401 cycle ─────────────────
+
+/// Bug 1 (revoke-loop) regression — THE headline test.
+///
+/// A revoked/deactivated user is the exact failure mode where
+/// `/api/sync/events` always 401s and `/portal/auth/refresh` keeps
+/// returning HTTP 200 with a technically-valid (but useless) fresh token
+/// pair — before this fix, every 401→refresh→retry cycle reset the
+/// in-process backoff to its minimum and skipped the sleep entirely
+/// (`continue;` with no delay), producing an unbounded ~every-poll-tick
+/// request storm (observed ~120ms / ~8 req/s in the field). This proves
+/// the fixed loop instead:
+///   1. never skips the backoff sleep on a 401, even when the refresh
+///      call itself reports success;
+///   2. stops outright — `run()` returns — once a bounded number of
+///      consecutive "refresh succeeded, very next request still 401"
+///      cycles have happened, rather than retrying forever.
+///
+/// Runs real time (not a paused clock — mockito's async server does real
+/// socket I/O, which doesn't play well with Tokio's paused-time
+/// auto-advance) through the real 1s → 2s → 4s backoff schedule before
+/// `run()` gives up on its own; the generous outer timeout below is a
+/// correctness bound ("it does eventually stop"), not a tight race.
+#[tokio::test]
+async fn bounded_retry_stops_after_repeated_401s_following_successful_refresh() {
+    use vectorhawkd_core::auth::save_tokens;
+
+    let (state, _tmp) = bootstrap_state();
+    let state = Arc::new(state);
+
+    let mut server = mockito::Server::new_async().await;
+    let registry_url = server.url();
+
+    // Seed a stored refresh token for this registry so `try_refresh_token`
+    // has something to send — mirrors what `auth login`/`auth pair` would
+    // have written.
+    save_tokens(
+        &state,
+        &registry_url,
+        "stale-access-tok",
+        "some-refresh-tok",
+    )
+    .expect("seed stored tokens");
+
+    // Every GET /api/sync/events attempt is rejected — same as a revoked
+    // user, where the account (not the token) is the problem. Exact count:
+    // with MAX_CONSECUTIVE_POST_REFRESH_UNAUTHORIZED = 3, the streak goes
+    // 1, 2, 3 (each still <= max, so a refresh is attempted) then 4 (>
+    // max, loop stops) — four connect attempts total.
+    let events_mock = server
+        .mock("GET", "/api/sync/events")
+        .with_status(401)
+        .expect(4)
+        .create_async()
+        .await;
+
+    // Every refresh call "succeeds" — the backend hands back a fresh,
+    // technically-valid token pair every time, exactly like a revoked
+    // user's refresh endpoint did before the backend-side fix (and exactly
+    // what this runner-side fix must independently bound against, since a
+    // backend without that fix is one of the explicit scenarios this bug
+    // covers). Exact count: one refresh per streak count that didn't
+    // exceed the max (3), not one for the 4th (terminal) attempt.
+    let refresh_mock = server
+        .mock("POST", "/portal/auth/refresh")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"access_token":"new-tok","refresh_token":"new-refresh-tok"}"#)
+        .expect(3)
+        .create_async()
+        .await;
+
+    let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
+    let (connected_tx, _connected_rx) = tokio::sync::watch::channel(false);
+    let live_token = Arc::new(tokio::sync::RwLock::new("stale-access-tok".to_string()));
+    let config = crate::sync::SyncConfig {
+        registry_url: registry_url.clone(),
+        token: "stale-access-tok".to_string(),
+        device_id: "dev-1".to_string(),
+        last_event_id: None,
+        pusher: None,
+        live_token,
+    };
+
+    // Bounded: `run()` must return on its own well within this window.
+    // The real schedule is 1s + 2s + 4s =~ 7s of sleeping before the loop
+    // gives up on the 4th connect attempt; 20s leaves ample headroom for
+    // test-runner scheduling jitter without masking an actual regression
+    // to "loops forever".
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        crate::sync::sse_client::run(config, Arc::clone(&state), event_tx, connected_tx),
+    )
+    .await
+    .expect(
+        "run() must stop on its own after bounded 401/refresh retries, \
+         not loop forever",
+    );
+
+    // Bounded, not unbounded: a tight pre-fix loop would have hit these
+    // endpoints hundreds of times within this same logical window
+    // (observed ~8 req/s in the field with no cap at all). Asserting the
+    // EXACT counts above is what proves this loop is bounded rather than
+    // merely "eventually gave up after a while".
+    events_mock.assert_async().await;
+    refresh_mock.assert_async().await;
 }
