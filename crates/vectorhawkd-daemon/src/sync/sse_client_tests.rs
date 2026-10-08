@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use super::{dispatch_event, is_device_revoked_body, parse_sync_event};
+use super::{dispatch_event, is_device_revoked_body, is_user_revoked_body, parse_sync_event};
 
 #[test]
 fn parses_snapshot_event() {
@@ -590,6 +590,68 @@ async fn revoked_device_clears_local_identity_and_stamps_marker() {
         state.get_sync_state("device_revoked_at").unwrap().is_some(),
         "device_revoked_at must be stamped"
     );
+}
+
+/// An admin revoking the USER is terminal too. The backend checks the user
+/// before the device on `/sync/events`, so a revoked user's daemon gets
+/// 403 `{"code":"user_revoked"}` rather than `device_revoked`. That must
+/// stop the loop the same way (user revoke cascades to every device), not
+/// fall into the generic 403 backoff and retry every 60s forever.
+#[tokio::test]
+async fn revoked_user_stops_the_sse_loop_and_clears_local_identity() {
+    let (state, _tmp) = bootstrap_state();
+    state
+        .set_sync_state("device_uuid", "uuid-user-revoked")
+        .unwrap();
+    state
+        .set_sync_state("device_id", "dev-user-revoked")
+        .unwrap();
+    let state = Arc::new(state);
+
+    let mut server = mockito::Server::new_async().await;
+    let registry_url = server.url();
+
+    let revoked_attempt = server
+        .mock("GET", "/api/sync/events")
+        .with_status(403)
+        .with_body(r#"{"detail":{"code":"user_revoked","detail":"User has been revoked"}}"#)
+        .expect(1)
+        .create_async()
+        .await;
+
+    let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
+    let (connected_tx, _connected_rx) = tokio::sync::watch::channel(false);
+    let live_token = Arc::new(tokio::sync::RwLock::new("tok".to_string()));
+    let config = crate::sync::SyncConfig {
+        registry_url: registry_url.clone(),
+        token: "tok".to_string(),
+        device_id: "dev-user-revoked".to_string(),
+        last_event_id: None,
+        pusher: None,
+        live_token,
+    };
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        crate::sync::sse_client::run(config, Arc::clone(&state), event_tx, connected_tx),
+    )
+    .await
+    .expect("run() must return promptly on a revoked-user 403, not back off forever");
+
+    revoked_attempt.assert_async().await;
+    assert_eq!(state.get_sync_state("device_uuid").unwrap(), None);
+    assert_eq!(state.get_sync_state("device_id").unwrap(), None);
+}
+
+#[test]
+fn user_revoked_body_detected() {
+    assert!(is_user_revoked_body(
+        r#"{"detail":{"code":"user_revoked","detail":"User has been revoked"}}"#
+    ));
+    assert!(!is_user_revoked_body(
+        r#"{"detail":{"code":"device_revoked"}}"#
+    ));
+    assert!(!is_user_revoked_body("not json"));
 }
 
 // ── bug-revoke-loop: bounded retry on a 401/refresh/401 cycle ─────────────────
