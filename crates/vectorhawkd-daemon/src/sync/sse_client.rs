@@ -243,6 +243,21 @@ pub async fn run(
                 );
                 return;
             }
+            ConnectResult::UserRevoked => {
+                // An admin revoked this user, which also revoked every one
+                // of their devices — so this device identity is dead too.
+                // Clear it like a device revoke; the way back is an admin
+                // reinstating the user, then `auth login` + `auth pair`.
+                if let Err(e) = state.mark_device_revoked() {
+                    warn!(error = %e, "SSE: failed to persist device-revoked state locally");
+                }
+                info!(
+                    "SSE: your VectorHawk account was revoked by an admin — stopping sync. \
+                     After an admin reinstates it, run `vectorhawk auth login` then \
+                     `vectorhawk auth pair`."
+                );
+                return;
+            }
             ConnectResult::Error(e) => {
                 warn!(error = %e, backoff_secs, "SSE: connection error — backing off");
             }
@@ -266,6 +281,9 @@ enum ConnectResult {
     /// Server returned 403 with `{"code": "device_revoked"}` — caller
     /// should stop the loop permanently (see the `run()` match arm).
     Revoked,
+    /// Server returned 403 with `{"code": "user_revoked"}` — the user's
+    /// account was revoked (which also revoked this device). Terminal.
+    UserRevoked,
     /// Any other connection or I/O error.
     Error(anyhow::Error),
 }
@@ -283,6 +301,19 @@ pub(crate) fn is_device_revoked_body(body: &str) -> bool {
         .and_then(|v| v.get("detail").cloned().or(Some(v)))
         .and_then(|d| d.get("code").cloned())
         .and_then(|c| c.as_str().map(|s| s == "device_revoked"))
+        .unwrap_or(false)
+}
+
+/// Same sniff for the user-revocation signal. The backend checks the user
+/// before the device on `/sync/*` (`portal_sync._reject_if_inactive`), so a
+/// revoked user's daemon gets `{"code": "user_revoked"}`, not
+/// `device_revoked`, even though user revoke also revokes every device.
+pub(crate) fn is_user_revoked_body(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("detail").cloned().or(Some(v)))
+        .and_then(|d| d.get("code").cloned())
+        .and_then(|c| c.as_str().map(|s| s == "user_revoked"))
         .unwrap_or(false)
 }
 
@@ -342,6 +373,9 @@ async fn connect_and_stream(
         let body = resp.text().await.unwrap_or_default();
         if is_device_revoked_body(&body) {
             return ConnectResult::Revoked;
+        }
+        if is_user_revoked_body(&body) {
+            return ConnectResult::UserRevoked;
         }
         return ConnectResult::Error(anyhow::anyhow!("SSE: server returned HTTP 403"));
     }
