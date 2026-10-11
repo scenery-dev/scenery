@@ -255,3 +255,65 @@ fn resolve_unique_skips_candidates_with_wrong_uid() {
         .with_pids(&[1, 100]);
     assert_eq!(resolve_unique_daemon_run_pid(&inspector, 1), None);
 }
+
+// ── decide_and_signal_takeover ──────────────────────────────────────────
+//
+// Combines `verify_pid` with (conditionally) executing a takeover.
+// `run_takeover` is a plain fake here — no real signal, no real process —
+// per this crate's hard rule that tests never touch an ambient process.
+
+use crate::daemon_takeover_signal::TakeoverResult;
+
+#[test]
+fn decide_and_signal_invokes_takeover_only_for_a_verified_stale_holder() {
+    let inspector = FakeInspector::default().daemon_run(100);
+    let mut calls: Vec<(u32, Vec<u8>)> = Vec::new();
+
+    let (verdict, result) = decide_and_signal_takeover(
+        &inspector,
+        100,
+        1,
+        &v("2.0.0"),
+        Some(v("1.0.0")),
+        |pid, argv| {
+            calls.push((pid, argv));
+            TakeoverResult::AcquiredAfterTerm
+        },
+    );
+
+    assert_eq!(
+        verdict,
+        Verdict::TakeOver {
+            pid: 100,
+            reason: StalenessReason::OlderVersion(v("1.0.0"))
+        }
+    );
+    assert_eq!(result, Some(TakeoverResult::AcquiredAfterTerm));
+    assert_eq!(calls, vec![(100, b"vectorhawk\0daemon\0run".to_vec())]);
+}
+
+#[test]
+fn decide_and_signal_never_invokes_takeover_when_refused() {
+    let inspector = FakeInspector::default().daemon_run(100);
+    let mut calls: Vec<(u32, Vec<u8>)> = Vec::new();
+
+    // Equal version — verify_pid refuses per its anti-loop rule.
+    let (verdict, result) = decide_and_signal_takeover(
+        &inspector,
+        100,
+        1,
+        &v("2.0.0"),
+        Some(v("2.0.0")),
+        |pid, argv| {
+            calls.push((pid, argv));
+            TakeoverResult::AcquiredAfterTerm
+        },
+    );
+
+    assert!(matches!(verdict, Verdict::Refuse(_)));
+    assert_eq!(result, None);
+    assert!(
+        calls.is_empty(),
+        "run_takeover must never be called on a Refuse verdict"
+    );
+}
