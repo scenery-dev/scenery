@@ -655,7 +655,25 @@ impl Backend for RealBackend {
                     })
                     .is_some()
             });
-            crate::instructions::build_instructions(self.managed.as_ref(), "daemon", logged_in)
+            // The instructions must never name a tool `list_tools` doesn't
+            // actually expose for this session — see
+            // `instructions::build_instructions`'s doc comment. Build the
+            // exact same tool list `list_tools` below returns (minus the
+            // namespaced backend tools, which instructions never names) so
+            // the two can never drift apart.
+            let exposed_tool_names: Vec<String> = match &self.state {
+                Some(state) => crate::tools::build_tool_list(state, &self.registry_url)
+                    .into_iter()
+                    .map(|t| t.name)
+                    .collect(),
+                None => Vec::new(),
+            };
+            crate::instructions::build_instructions(
+                self.managed.as_ref(),
+                "daemon",
+                logged_in,
+                &exposed_tool_names,
+            )
         };
         #[cfg(not(feature = "daemon"))]
         let instructions = "VectorHawk runner — governed AI platform.".to_string();
@@ -949,6 +967,205 @@ impl Backend for RealBackend {
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+
+    // ── Bug: `initialize.instructions` must never name a tool `list_tools`
+    //    doesn't actually expose, for every surface state ─────────────────
+    //
+    // These exercise the real `RealBackend` wiring (not just
+    // `instructions::build_instructions` in isolation) so a future change
+    // to `tools::build_tool_list` that adds/removes a built-in tool without
+    // updating `instructions.rs` fails here, not just in production.
+    #[cfg(feature = "daemon")]
+    mod instructions_match_tools_list {
+        use super::*;
+        use std::collections::HashMap;
+        use std::sync::Mutex as StdMutex;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tokio::sync::Mutex as AsyncMutex;
+        use vectorhawkd_core::{audit::NoOpAuditBuffer, policy::MockPolicyClient, state::AppState};
+
+        fn temp_root(label: &str) -> camino::Utf8PathBuf {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            camino::Utf8PathBuf::from_path_buf(
+                std::env::temp_dir().join(format!("mcp-backend-instructions-{label}-{nanos}")),
+            )
+            .unwrap()
+        }
+
+        /// Serializes every test in this module that touches
+        /// `VECTORHAWK_EXPOSE_BUILTIN_TOOLS` — it's process-global, and this
+        /// is the only module in the binary that reads/writes it, so a
+        /// single mutex around the set/assert/clear sequence is enough to
+        /// make five otherwise-parallel `#[tokio::test]`s deterministic.
+        static EXPOSE_BUILTINS_ENV_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
+
+        /// Every literal tool name `instructions::build_instructions` is
+        /// capable of mentioning — kept here, independent of
+        /// `instructions.rs`'s own source, so this test can't pass merely
+        /// because both files agree on the same (possibly wrong) list.
+        const MENTIONABLE_TOOL_NAMES: &[&str] = &[
+            "vectorhawk_login",
+            "vectorhawk_list",
+            "vectorhawk_search",
+            "vectorhawk_mcp_catalog",
+            "vectorhawk_mcp_request",
+        ];
+
+        fn make_backend(
+            registry_url: Option<String>,
+            managed: Option<vectorhawkd_core::managed::ManagedConfig>,
+            logged_in: bool,
+            state_root: &camino::Utf8PathBuf,
+        ) -> RealBackend {
+            let state = Arc::new(AppState::bootstrap_in(state_root.clone()).unwrap());
+            if logged_in {
+                let url = registry_url
+                    .as_deref()
+                    .expect("logged_in scenarios must configure a registry_url");
+                vectorhawkd_core::auth::save_tokens(&state, url, "fake-access", "fake-refresh")
+                    .unwrap();
+            }
+            RealBackend::with_full_context(
+                Arc::new(BackendRegistry::new()),
+                Arc::new(NoOpAuditBuffer),
+                managed,
+                state,
+                registry_url,
+                Arc::new(MockPolicyClient::default()),
+                None,
+                Arc::new(StdMutex::new(HashMap::new())),
+            )
+        }
+
+        /// Assert the invariant for one backend: every mentionable tool name
+        /// that appears in `initialize`'s instructions must also appear in
+        /// `list_tools`'s response.
+        async fn assert_instructions_match_tools_list(backend: &RealBackend, scenario: &str) {
+            let init = backend.initialize(serde_json::json!({})).await.unwrap();
+            let instructions = init.instructions.unwrap_or_default();
+
+            let listed = backend.list_tools(serde_json::json!({})).await.unwrap();
+            let listed_names: Vec<&str> = listed.tools.iter().map(|t| t.name.as_str()).collect();
+
+            for tool in MENTIONABLE_TOOL_NAMES {
+                if instructions.contains(tool) {
+                    assert!(
+                        listed_names.contains(tool),
+                        "[{scenario}] instructions mention '{tool}' but tools/list \
+                         does not expose it — listed: {listed_names:?}\n\
+                         instructions: {instructions}"
+                    );
+                }
+            }
+        }
+
+        /// The real production default: `VECTORHAWK_EXPOSE_BUILTIN_TOOLS`
+        /// unset, so management tools are hidden — the exact surface that
+        /// was broken (instructions always named vectorhawk_list/_search/
+        /// _mcp_catalog regardless).
+        #[tokio::test]
+        async fn default_surface_logged_out_with_registry() {
+            let _guard = EXPOSE_BUILTINS_ENV_LOCK.lock().await;
+            std::env::remove_var("VECTORHAWK_EXPOSE_BUILTIN_TOOLS");
+            let state_root = temp_root("default-logged-out");
+            let backend = make_backend(
+                Some("http://localhost:8000".to_string()),
+                None,
+                false,
+                &state_root,
+            );
+            assert_instructions_match_tools_list(&backend, "default/logged-out/registry").await;
+            let _ = std::fs::remove_dir_all(&state_root);
+        }
+
+        #[tokio::test]
+        async fn default_surface_logged_in_with_registry() {
+            let _guard = EXPOSE_BUILTINS_ENV_LOCK.lock().await;
+            std::env::remove_var("VECTORHAWK_EXPOSE_BUILTIN_TOOLS");
+            let state_root = temp_root("default-logged-in");
+            let backend = make_backend(
+                Some("http://localhost:8000".to_string()),
+                None,
+                true,
+                &state_root,
+            );
+            assert_instructions_match_tools_list(&backend, "default/logged-in/registry").await;
+            let _ = std::fs::remove_dir_all(&state_root);
+        }
+
+        /// No registry URL at all — `vectorhawk_login` must not be named
+        /// either, since there is nothing to log into.
+        #[tokio::test]
+        async fn default_surface_no_registry_configured() {
+            let _guard = EXPOSE_BUILTINS_ENV_LOCK.lock().await;
+            std::env::remove_var("VECTORHAWK_EXPOSE_BUILTIN_TOOLS");
+            let state_root = temp_root("default-no-registry");
+            let backend = make_backend(None, None, false, &state_root);
+            assert_instructions_match_tools_list(&backend, "default/no-registry").await;
+            let _ = std::fs::remove_dir_all(&state_root);
+        }
+
+        /// Managed mode, default (hidden-builtins) surface — the governance
+        /// block previously always named `vectorhawk_mcp_request`.
+        #[tokio::test]
+        async fn managed_default_surface_logged_in() {
+            let _guard = EXPOSE_BUILTINS_ENV_LOCK.lock().await;
+            std::env::remove_var("VECTORHAWK_EXPOSE_BUILTIN_TOOLS");
+            let state_root = temp_root("managed-default-logged-in");
+            let managed = vectorhawkd_core::managed::ManagedConfig {
+                managed: true,
+                org: Some("Acme Corp".to_string()),
+                registry_url: None,
+                api_key: None,
+                allow_user_installs: true,
+                governance_message: None,
+                governance_message_enabled: true,
+                ollama_url: None,
+                ollama_model: None,
+            };
+            let backend = make_backend(
+                Some("http://localhost:8000".to_string()),
+                Some(managed),
+                true,
+                &state_root,
+            );
+            assert_instructions_match_tools_list(&backend, "managed/default/logged-in").await;
+            let _ = std::fs::remove_dir_all(&state_root);
+        }
+
+        /// Opt-in surface (`VECTORHAWK_EXPOSE_BUILTIN_TOOLS=1`) — every
+        /// built-in should now be both mentioned AND listed; this guards
+        /// against the fix over-correcting into never mentioning anything.
+        #[tokio::test]
+        async fn builtins_exposed_surface_logged_in() {
+            let _guard = EXPOSE_BUILTINS_ENV_LOCK.lock().await;
+            std::env::set_var("VECTORHAWK_EXPOSE_BUILTIN_TOOLS", "1");
+            let state_root = temp_root("exposed-logged-in");
+            let backend = make_backend(
+                Some("http://localhost:8000".to_string()),
+                None,
+                true,
+                &state_root,
+            );
+            assert_instructions_match_tools_list(&backend, "exposed/logged-in").await;
+
+            let init = backend.initialize(serde_json::json!({})).await.unwrap();
+            let instructions = init.instructions.unwrap_or_default();
+            assert!(
+                instructions.contains("vectorhawk_list")
+                    && instructions.contains("vectorhawk_search")
+                    && instructions.contains("vectorhawk_mcp_catalog"),
+                "expected the fully-exposed surface to still advertise its \
+                 built-in tools; got: {instructions}"
+            );
+
+            std::env::remove_var("VECTORHAWK_EXPOSE_BUILTIN_TOOLS");
+            let _ = std::fs::remove_dir_all(&state_root);
+        }
+    }
 
     async fn make_embedded() -> EmbeddedBackend {
         EmbeddedBackend::with_stub_backend(
