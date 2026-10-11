@@ -45,6 +45,7 @@
 //! `install/macos.rs`), so the rules above are enforced exactly once, not
 //! reimplemented per call site.
 
+use crate::daemon_takeover_signal::TakeoverResult;
 use crate::process_probe::ProcessInspector;
 use semver::Version;
 
@@ -134,6 +135,45 @@ pub fn verify_pid<I: ProcessInspector>(
             "pid {pid}'s version could not be determined and its executable is not \
              detectably stale — refusing rather than guess"
         )),
+    }
+}
+
+/// Combines [`verify_pid`] with (conditionally) executing the takeover it
+/// decides on — the one place a *live*, already-running daemon decides
+/// whether to signal a process currently holding a resource it wants back
+/// (e.g. a stolen socket; see `socket_watch`'s module docs). Kept separate
+/// from `verify_pid` so a caller that only needs the pure verdict (like
+/// `run_daemon`'s one-shot startup check, `attempt_daemon_takeover`) is not
+/// forced to also supply a takeover executor.
+///
+/// `run_takeover` is invoked only for a [`Verdict::TakeOver`], with the pid
+/// and its argv fingerprint (captured at verification time, for the
+/// pid-reuse guard — see `daemon_takeover_signal`'s doc comment) as
+/// arguments. Real callers pass a closure that builds a
+/// `daemon_takeover_signal::SystemTakeoverIo` and calls `execute_takeover`;
+/// tests pass a fake that only records the call — see
+/// `daemon_takeover_tests.rs`, which is why this takes an explicit `F:
+/// FnMut` generic rather than `impl FnMut` (keeps the fake substitutable
+/// without a trait object).
+pub fn decide_and_signal_takeover<I: ProcessInspector, F>(
+    inspector: &I,
+    pid: u32,
+    our_pid: u32,
+    our_version: &Version,
+    version_hint: Option<Version>,
+    mut run_takeover: F,
+) -> (Verdict, Option<TakeoverResult>)
+where
+    F: FnMut(u32, Vec<u8>) -> TakeoverResult,
+{
+    let verdict = verify_pid(inspector, pid, our_pid, our_version, version_hint);
+    match &verdict {
+        Verdict::Refuse(_) => (verdict, None),
+        Verdict::TakeOver { pid, .. } => {
+            let argv = inspector.argv(*pid).unwrap_or_default();
+            let result = run_takeover(*pid, argv);
+            (verdict, Some(result))
+        }
     }
 }
 

@@ -76,6 +76,7 @@ pub mod peer_handshake;
 pub mod process_probe;
 mod protocol_frame;
 mod socket_dispatch;
+mod socket_watch;
 pub mod sync;
 use sync::SyncEvent;
 
@@ -746,13 +747,85 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
             .with_context(|| format!("failed to create socket parent dir: {parent}"))?;
     }
 
-    let listener = acquire_socket(&socket_path).await?;
+    let mut listener = acquire_socket(&socket_path).await?;
 
     let perms = std::fs::Permissions::from_mode(0o600);
     std::fs::set_permissions(&socket_path, perms)
         .with_context(|| format!("failed to set socket permissions: {socket_path}"))?;
 
     info!(path = %socket_path, "listening on Unix socket");
+
+    // ── Socket-identity watch ─────────────────────────────────────────────
+    //
+    // See `socket_watch`'s module docs for why: a pre-1.0.91 binary started
+    // by hand (or any binary that predates this watch) can unlink and
+    // rebind `socket_path` out from under an already-running daemon,
+    // cutting every shim/CLI connection off without this daemon noticing
+    // on its own. Record our own bound identity now, then periodically
+    // re-stat the path; on a mismatch, `attempt_socket_rebind_takeover`
+    // verifies and (only if safe) takes over and rebinds, handing the
+    // fresh listener back over `relisten_rx` below. Never kills on
+    // uncertainty — see that function's and `daemon_takeover`'s doc
+    // comments.
+    //
+    // Stat'ing our own freshly-bound socket should never fail; if it
+    // somehow does, the watch is simply skipped for this run rather than
+    // failing daemon startup over a non-critical safeguard.
+    let (relisten_tx, mut relisten_rx) = mpsc::channel::<UnixListener>(1);
+    if let Some(mut recorded) = socket_watch::stat_identity(&socket_path) {
+        let watch_path = socket_path.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                socket_watch::SOCKET_WATCH_INTERVAL_SECS,
+            ));
+            // Skip the immediate first tick — let the accept loop start first.
+            interval.tick().await;
+
+            loop {
+                interval.tick().await;
+
+                let stat_path = watch_path.clone();
+                let current =
+                    tokio::task::spawn_blocking(move || socket_watch::stat_identity(&stat_path))
+                        .await
+                        .unwrap_or(None);
+
+                if !socket_watch::socket_changed(recorded, current) {
+                    continue;
+                }
+
+                warn!(
+                    path = %watch_path,
+                    "socket watch: socket path no longer resolves to the inode we bound \
+                     — probing for a thief"
+                );
+
+                let Some(new_listener) = attempt_socket_rebind_takeover(&watch_path).await else {
+                    // Logged inside attempt_socket_rebind_takeover; nothing
+                    // more to do this tick — try again on the next one.
+                    continue;
+                };
+
+                // Rebound successfully: our baseline identity is now the
+                // fresh bind, not the stolen one, so the next tick compares
+                // against reality instead of immediately re-detecting a
+                // "change" against ourselves.
+                recorded = socket_watch::stat_identity(&watch_path).unwrap_or(recorded);
+
+                if relisten_tx.send(new_listener).await.is_err() {
+                    // The main accept loop has already shut down — nothing
+                    // left to hand the new listener to.
+                    return;
+                }
+            }
+        });
+    } else {
+        warn!(
+            path = %socket_path,
+            "socket watch: could not stat the socket we just bound — watch disabled \
+             for this run"
+        );
+    }
 
     // ── Binary-replacement watch ─────────────────────────────────────────────
     //
@@ -883,6 +956,14 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
                 info!("binary-replacement watch fired — shutting down");
                 binary_replaced = true;
                 break;
+            }
+            Some(new_listener) = relisten_rx.recv() => {
+                info!(
+                    path = %socket_path,
+                    "socket watch: swapped to a freshly rebound listener after taking \
+                     over a process that had stolen our socket"
+                );
+                listener = new_listener;
             }
         }
     }
@@ -1115,6 +1196,138 @@ fn attempt_daemon_takeover(root_dir: &camino::Utf8Path, socket_path: &camino::Ut
                 std::time::Duration::from_millis(200),
             );
             info!(pid, ?result, "daemon takeover: sequence finished");
+        }
+    }
+}
+
+/// Best-effort: react to the socket-watch task (see `socket_watch`'s module
+/// docs) noticing that `socket_path` no longer resolves to the inode this
+/// daemon bound — i.e. something else has unlinked and rebound it out from
+/// under a *running* daemon. Identifies the new holder via a live socket
+/// probe, verifies it through the exact same rules `attempt_daemon_takeover`
+/// applies at startup, and — only if verified stale — takes it over and
+/// rebinds.
+///
+/// Returns `Some(new_listener)` only after a successful takeover AND a
+/// successful rebind; the caller swaps it into the live accept loop. Every
+/// other outcome (holder's pid couldn't be learned, verification refused,
+/// the takeover didn't actually free the socket, rebind itself failed)
+/// returns `None` and is logged loudly at the call site below — never
+/// escalated into killing anything further. The blocking pieces (socket
+/// connect+probe, signal, bounded sleep) run inside `spawn_blocking`,
+/// matching this crate's documented spawn_blocking discipline; only the
+/// final rebind (`acquire_socket`, tokio-native) runs on the executor.
+async fn attempt_socket_rebind_takeover(socket_path: &camino::Utf8Path) -> Option<UnixListener> {
+    let our_pid = std::process::id();
+    let Ok(our_version) = semver::Version::parse(env!("CARGO_PKG_VERSION")) else {
+        return None;
+    };
+
+    let probe_path = socket_path.to_owned();
+    let (verdict, result) = tokio::task::spawn_blocking(move || {
+        let probe_timeout = std::time::Duration::from_millis(500);
+        let (socket_peer, socket_version) =
+            peer_handshake::connect_and_probe(&probe_path, probe_timeout);
+
+        let Some(pid) = socket_peer.pid else {
+            return (
+                daemon_takeover::Verdict::Refuse(
+                    "socket watch: path's identity changed but the new holder's pid \
+                     could not be learned via SO_PEERCRED/LOCAL_PEERPID — refusing"
+                        .to_string(),
+                ),
+                None,
+            );
+        };
+
+        daemon_takeover::decide_and_signal_takeover(
+            &process_probe::SystemProcessOps,
+            pid,
+            our_pid,
+            &our_version,
+            socket_version,
+            |pid, argv| {
+                let mut io = daemon_takeover_signal::SystemTakeoverIo::new(
+                    pid,
+                    argv,
+                    &process_probe::SystemProcessOps,
+                    &process_probe::SystemProcessOps,
+                );
+                daemon_takeover_signal::execute_takeover(
+                    &mut io,
+                    std::time::Duration::from_secs(5),
+                    std::time::Duration::from_secs(2),
+                    std::time::Duration::from_millis(200),
+                )
+            },
+        )
+    })
+    .await
+    .unwrap_or((
+        daemon_takeover::Verdict::Refuse("socket watch: background task panicked".to_string()),
+        None,
+    ));
+
+    match (verdict, result) {
+        (daemon_takeover::Verdict::Refuse(reason), _) => {
+            warn!(%reason, "socket watch: thief detected but refusing to take over");
+            None
+        }
+        (daemon_takeover::Verdict::TakeOver { pid, reason }, Some(takeover_result)) => {
+            let freed = matches!(
+                takeover_result,
+                daemon_takeover_signal::TakeoverResult::AcquiredAfterTerm
+                    | daemon_takeover_signal::TakeoverResult::AcquiredAfterKill
+            );
+            if !freed {
+                warn!(
+                    pid,
+                    ?reason,
+                    ?takeover_result,
+                    "socket watch: takeover did not free the socket — leaving it alone"
+                );
+                return None;
+            }
+            info!(
+                pid,
+                ?reason,
+                ?takeover_result,
+                "socket watch: took over the process holding our socket — rebinding"
+            );
+            match acquire_socket(socket_path).await {
+                Ok(new_listener) => {
+                    if let Err(e) = std::fs::set_permissions(
+                        socket_path.as_std_path(),
+                        std::fs::Permissions::from_mode(0o600),
+                    ) {
+                        warn!(
+                            error = %e,
+                            path = %socket_path,
+                            "socket watch: failed to set permissions on the rebound socket"
+                        );
+                    }
+                    Some(new_listener)
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        path = %socket_path,
+                        "socket watch: took over the stale holder but failed to rebind \
+                         — will retry on the next watch tick"
+                    );
+                    None
+                }
+            }
+        }
+        (daemon_takeover::Verdict::TakeOver { pid, .. }, None) => {
+            // Structurally unreachable — `decide_and_signal_takeover` always
+            // returns `Some` for a `TakeOver` verdict — but handled rather
+            // than unwrapped, per this crate's no-panics-in-glue-code rule.
+            warn!(
+                pid,
+                "socket watch: takeover decided but produced no result — leaving the socket alone"
+            );
+            None
         }
     }
 }
