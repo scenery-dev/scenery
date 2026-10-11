@@ -926,6 +926,16 @@ impl RegistryClient {
     }
 
     /// Fetch aggregated pre-install governance data for a skill.
+    ///
+    /// Deliberately sends NO `Authorization` header. The backend guards this
+    /// route with `_optional_api_key`, which treats a missing header as
+    /// "anonymous" but 401s on any Bearer token that isn't `sk_`-prefixed.
+    /// `self.auth_token` is the portal OAuth JWT (or a `vh_pat_...` PAT) set
+    /// by `auth login` — never an `sk_` key — so attaching it here always
+    /// broke this call for a logged-in user. The response itself doesn't
+    /// vary by caller identity (see backend `routers/runner.py::get_skill_preinstall`,
+    /// which never reads the resolved `api_key`), so anonymous is correct,
+    /// not just a workaround.
     pub fn fetch_preinstall_governance(&self, skill_id: &str) -> Result<PreinstallGovernance> {
         let url = format!(
             "{}/skills/{}/preinstall",
@@ -934,12 +944,9 @@ impl RegistryClient {
         );
         debug!(url, "fetching preinstall governance");
 
-        let mut req = self.http.get(&url);
-        if let Some(token) = self.get_auth_token() {
-            req = req.bearer_auth(token);
-        }
-
-        let resp = req
+        let resp = self
+            .http
+            .get(&url)
             .send()
             .with_context(|| format!("failed to reach registry at {url}"))?;
 
@@ -1723,6 +1730,79 @@ mod tests {
             Some("security vulnerability")
         );
         assert_eq!(ttl, 86400); // default TTL
+        mock.assert();
+    }
+
+    // ── RegistryClient: fetch_preinstall_governance ────────────────────────
+
+    /// Wire body shared by the preinstall tests below — mirrors
+    /// `PreinstallGovernance`'s required fields with everything else
+    /// defaulted/omitted.
+    const PREINSTALL_BODY: &str = r#"{
+        "publisher": {
+            "id": "pub-1",
+            "name": "Acme Corp",
+            "verified": true,
+            "verified_at": null
+        },
+        "policy": {
+            "status": "approved",
+            "org_id": null,
+            "message": null
+        },
+        "scopes_requested": [],
+        "scan": null,
+        "audit": null
+    }"#;
+
+    /// The backend's `/skills/{id}/preinstall` route is guarded by
+    /// `_optional_api_key`, which 401s on any Bearer token that isn't
+    /// `sk_`-prefixed. The runner's stored `auth_token` is the portal
+    /// OAuth JWT (or a `vh_pat_...` token) — never an `sk_` key — so
+    /// attaching it here must not happen; the call must be unauthenticated.
+    #[test]
+    fn fetch_preinstall_governance_sends_no_authorization_header_when_logged_in() {
+        use mockito::{Matcher, Server};
+        let mut server = Server::new();
+        let mock = server
+            .mock("GET", "/skills/my-skill/preinstall")
+            .match_header("authorization", Matcher::Missing)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(PREINSTALL_BODY)
+            .create();
+
+        let client = RegistryClient::new(server.url());
+        // Simulates a logged-in runner: a portal JWT is stored, exactly as
+        // `vectorhawk auth login` leaves it via `set_auth`.
+        client.set_auth("eyJhbGciOiJIUzI1NiJ9.portal-jwt.sig");
+
+        let governance = client.fetch_preinstall_governance("my-skill").unwrap();
+
+        assert_eq!(governance.publisher.name, "Acme Corp");
+        assert!(governance.publisher.verified);
+        assert_eq!(governance.policy.status, "approved");
+        mock.assert();
+    }
+
+    /// Same call, logged out — must keep working with no auth_token set.
+    #[test]
+    fn fetch_preinstall_governance_works_when_logged_out() {
+        use mockito::{Matcher, Server};
+        let mut server = Server::new();
+        let mock = server
+            .mock("GET", "/skills/my-skill/preinstall")
+            .match_header("authorization", Matcher::Missing)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(PREINSTALL_BODY)
+            .create();
+
+        let client = RegistryClient::new(server.url());
+
+        let governance = client.fetch_preinstall_governance("my-skill").unwrap();
+
+        assert_eq!(governance.policy.status, "approved");
         mock.assert();
     }
 
