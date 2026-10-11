@@ -2179,8 +2179,28 @@ async fn cmd_skill_run(
         let ollama_url = std::env::var("VECTORHAWK_OLLAMA_URL")
             .or_else(|_| std::env::var("OLLAMA_BASE_URL"))
             .unwrap_or_else(|_| "http://localhost:11434".to_string());
-        let ollama_model = select_model_for_skill(&ollama_url, id, &state, explicit_model);
-        let model = OllamaClient::new(ollama_url, ollama_model);
+
+        // select_model_for_skill and OllamaClient::new both build/use a
+        // blocking reqwest client; constructing one directly on the async
+        // executor thread panics in debug builds (see
+        // check_ollama_for_validate for the full explanation), so run both
+        // off-thread via spawn_blocking.
+        let state_for_model = state.clone();
+        let id_for_model = id.to_string();
+        let explicit_model_owned = explicit_model.map(str::to_string);
+        let ollama_url_for_model = ollama_url.clone();
+        let model = tokio::task::spawn_blocking(move || {
+            let ollama_model = select_model_for_skill(
+                &ollama_url_for_model,
+                &id_for_model,
+                &state_for_model,
+                explicit_model_owned.as_deref(),
+            );
+            OllamaClient::new(ollama_url_for_model, ollama_model)
+        })
+        .await
+        .context("failed to select Ollama model (background task panicked)")?;
+
         run_skill(&state, &policy, id, &input, Some(&model))
     };
 
@@ -2570,10 +2590,15 @@ async fn check_ollama_for_validate(path: &camino::Utf8Path) -> Option<String> {
         .or_else(|_| std::env::var("OLLAMA_BASE_URL"))
         .unwrap_or_else(|_| "http://localhost:11434".to_string());
 
-    let client = OllamaClient::new(&ollama_url, "");
-
-    // Run the blocking Ollama calls off the async executor.
+    // Build AND use the blocking Ollama client entirely inside spawn_blocking.
+    // `OllamaClient::new` builds a `reqwest::blocking::Client`, which — in
+    // debug builds — enters and drops a throwaway tokio runtime just to
+    // detect whether it's already inside one. Constructing it directly on
+    // the async executor thread panics with "Cannot drop a runtime in a
+    // context where blocking is not allowed"; spawn_blocking runs it on a
+    // dedicated OS thread where that's safe.
     let status = tokio::task::spawn_blocking(move || {
+        let client = OllamaClient::new(&ollama_url, "");
         if !client.health_check().reachable {
             return "not running — will use MCP sampling fallback".to_string();
         }
@@ -2844,7 +2869,10 @@ async fn cmd_skill_author(
         .or_else(|_| std::env::var("OLLAMA_BASE_URL"))
         .unwrap_or_else(|_| "http://localhost:11434".to_string());
 
-    let available_ollama: Vec<String> = {
+    // Build AND use the blocking Ollama client entirely inside spawn_blocking
+    // — constructing `reqwest::blocking::Client` directly on the async
+    // executor thread panics in debug builds (see check_ollama_for_validate).
+    let available_ollama: Vec<String> = tokio::task::spawn_blocking(move || {
         use vectorhawkd_core::ollama::OllamaClient;
         let client = OllamaClient::new(&ollama_url_for_detect, "");
         if client.health_check().reachable {
@@ -2854,9 +2882,11 @@ async fn cmd_skill_author(
                 .map(|models| models.into_iter().map(|m| m.name).collect())
                 .unwrap_or_default()
         } else {
-            vec![]
+            Vec::new()
         }
-    };
+    })
+    .await
+    .context("failed to detect local Ollama models (background task panicked)")?;
 
     if !available_ollama.is_empty() {
         // Find the first recommended model present locally (prefix match).
@@ -5632,6 +5662,10 @@ fn is_plugin_installed_locally(slug: &str) -> Result<bool> {
 #[cfg(test)]
 #[path = "commands_tests.rs"]
 mod commands_tests;
+
+#[cfg(test)]
+#[path = "skill_validate_tests.rs"]
+mod skill_validate_tests;
 
 #[cfg(all(test, unix))]
 #[path = "daemon_reload_tests.rs"]
