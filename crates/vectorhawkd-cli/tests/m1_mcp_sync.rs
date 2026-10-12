@@ -60,6 +60,7 @@ fn mcp_sync_succeeds_when_registry_unreachable() {
         &state.root_dir,
         &update_cache,
         None,
+        &Arc::new(std::sync::atomic::AtomicBool::new(false)),
     );
     assert!(
         result.is_ok(),
@@ -118,6 +119,7 @@ fn mcp_sync_calls_registry_endpoints_when_reachable() {
         &state.root_dir,
         &update_cache,
         None,
+        &Arc::new(std::sync::atomic::AtomicBool::new(false)),
     );
     assert!(result.is_ok(), "run_sync_tick must succeed: {result:?}");
 
