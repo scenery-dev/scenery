@@ -110,6 +110,7 @@ fn gap04_update_cache_populated_when_newer_version_available() {
         &state.root_dir,
         &cache,
         None,
+        &Arc::new(std::sync::atomic::AtomicBool::new(false)),
     )
     .unwrap();
 
@@ -161,6 +162,7 @@ fn gap04_update_cache_empty_when_no_installed_skills() {
         &state.root_dir,
         &cache,
         None,
+        &Arc::new(std::sync::atomic::AtomicBool::new(false)),
     )
     .unwrap();
 
@@ -253,6 +255,7 @@ fn revocation_snapshot_applied_even_with_no_reconciler_present() {
         &state.root_dir,
         &cache,
         None,
+        &Arc::new(std::sync::atomic::AtomicBool::new(false)),
     )
     .unwrap();
 
@@ -261,6 +264,154 @@ fn revocation_snapshot_applied_even_with_no_reconciler_present() {
             .unwrap(),
         "a `vectorhawk mcp sync` tick with no reconciler must still apply \
          the durable revocation list and lift the stale local gate"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// ── Card 2 / Card 3: org-policy snapshot reconcile observed through the ────
+// ── real shared block_third_party_inference handle ──────────────────────────
+
+/// Before the Card 2 fix, `run_sync_tick` built its own
+/// `Arc::new(AtomicBool::new(false))` internally — any flip the org-policy
+/// snapshot reconcile (Card 3) made was invisible to the caller, because it
+/// never touched the real shared flag the daemon's `HybridModelClient`
+/// reads. This threads a real `Arc<AtomicBool>` through the call (exactly as
+/// the daemon's periodic loop and `cmd_mcp_sync` now do) and asserts the
+/// flip is observed on that SAME handle after the tick returns — proving the
+/// plumbing, not just that some internal, disconnected copy changed.
+#[test]
+fn org_policy_snapshot_flips_the_caller_supplied_atomic() {
+    let root = temp_root("org-policy-caller-atomic");
+    let state = AppState::bootstrap_in(root.clone()).unwrap();
+    state
+        .set_sync_state("device_id", "mcp-sync-device")
+        .unwrap();
+
+    let mut server = Server::new();
+    let registry_url = server.url();
+    vectorhawkd_core::auth::save_tokens(
+        &state,
+        &registry_url,
+        "fake-access-tok",
+        "fake-refresh-tok",
+    )
+    .unwrap();
+
+    let _approved_mock = server
+        .mock("GET", "/api/runner/approved-servers")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"servers":[]}"#)
+        .create();
+
+    // The backend's current, authoritative state: Block Third-Party
+    // Inference was just toggled on by an admin, and this device missed the
+    // live SSE delta (it was offline, or the queue dropped it).
+    let _snapshot_mock = server
+        .mock("GET", "/api/sync/snapshot")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"installations":[],"mcp_installations":[],"plugin_installations":[],
+                "revocations":[],
+                "org_policy":{"block_third_party_inference":true}}"#,
+        )
+        .create();
+
+    let registry = RegistryClient::new(&registry_url);
+    let audit_buf = SqliteAuditBuffer::new(Arc::new(RegistryClient::new(&registry_url)), &state);
+    let cache = empty_cache();
+
+    // The exact handle a real caller would hand in (daemon's
+    // `state.block_third_party_handle()`, or the CLI's seeded equivalent) —
+    // NOT a fresh one constructed inside `run_sync_tick`.
+    let block_third_party = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    run_sync_tick(
+        &registry,
+        &audit_buf,
+        &state.db_path,
+        &state.root_dir,
+        &cache,
+        None,
+        &block_third_party,
+    )
+    .unwrap();
+
+    assert!(
+        block_third_party.load(std::sync::atomic::Ordering::Relaxed),
+        "the org_policy snapshot's block_third_party_inference:true must flip \
+         the caller's own atomic handle, not a disconnected internal copy"
+    );
+    assert_eq!(
+        state
+            .get_sync_state("block_third_party_inference")
+            .unwrap()
+            .as_deref(),
+        Some("true"),
+        "the snapshot reconcile must also persist to sync_state"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A snapshot that omits `org_policy` entirely (older backend, or nothing to
+/// report) must leave an already-true flag alone — "absent means no
+/// change", not "reset to false".
+#[test]
+fn org_policy_snapshot_absent_key_leaves_flag_untouched() {
+    let root = temp_root("org-policy-absent-key");
+    let state = AppState::bootstrap_in(root.clone()).unwrap();
+    state
+        .set_sync_state("device_id", "mcp-sync-device")
+        .unwrap();
+
+    let mut server = Server::new();
+    let registry_url = server.url();
+    vectorhawkd_core::auth::save_tokens(
+        &state,
+        &registry_url,
+        "fake-access-tok",
+        "fake-refresh-tok",
+    )
+    .unwrap();
+
+    let _approved_mock = server
+        .mock("GET", "/api/runner/approved-servers")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"servers":[]}"#)
+        .create();
+
+    let _snapshot_mock = server
+        .mock("GET", "/api/sync/snapshot")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"installations":[],"mcp_installations":[],"plugin_installations":[]}"#)
+        .create();
+
+    let registry = RegistryClient::new(&registry_url);
+    let audit_buf = SqliteAuditBuffer::new(Arc::new(RegistryClient::new(&registry_url)), &state);
+    let cache = empty_cache();
+
+    // Precondition: already on, from an earlier live toggle.
+    let block_third_party = Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+    run_sync_tick(
+        &registry,
+        &audit_buf,
+        &state.db_path,
+        &state.root_dir,
+        &cache,
+        None,
+        &block_third_party,
+    )
+    .unwrap();
+
+    assert!(
+        block_third_party.load(std::sync::atomic::Ordering::Relaxed),
+        "a snapshot without org_policy must not reset the flag to false"
     );
 
     let _ = std::fs::remove_dir_all(&root);
@@ -308,6 +459,7 @@ fn gap05_unsynced_rating_flushed_on_tick() {
         &state.root_dir,
         &cache,
         None,
+        &Arc::new(std::sync::atomic::AtomicBool::new(false)),
     )
     .unwrap();
 
@@ -358,6 +510,7 @@ fn gap05_no_upload_when_no_ratings() {
         &state.root_dir,
         &cache,
         None,
+        &Arc::new(std::sync::atomic::AtomicBool::new(false)),
     )
     .unwrap();
 
@@ -423,6 +576,7 @@ fn gap06_unmanaged_server_buffered_as_audit_event() {
         &state.root_dir,
         &cache,
         None,
+        &Arc::new(std::sync::atomic::AtomicBool::new(false)),
     )
     .unwrap();
 
@@ -512,6 +666,7 @@ fn gap06_no_events_when_all_servers_managed() {
         &state.root_dir,
         &cache,
         None,
+        &Arc::new(std::sync::atomic::AtomicBool::new(false)),
     )
     .unwrap();
 

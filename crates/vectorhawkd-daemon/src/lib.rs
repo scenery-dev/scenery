@@ -670,6 +670,12 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     let sync_list_changed_tx = list_changed_tx.clone();
     let sync_update_cache = Arc::clone(&update_check_cache);
     let sync_controller_for_tick = Arc::clone(&sync_controller);
+    // Card 2 fix: the daemon's real, shared block_third_party_inference
+    // handle — the same one wired into `HybridModelClient` above — not a
+    // fresh disconnected flag. Without this, a flip the periodic tick's
+    // org-policy snapshot reconcile (Card 3) makes would be invisible to
+    // every other part of the daemon that reads the live atomic.
+    let sync_block_third_party = state.block_third_party_handle();
     tokio::spawn(async move {
         let mut interval =
             tokio::time::interval(std::time::Duration::from_secs(SYNC_INTERVAL_SECS));
@@ -684,6 +690,7 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
             let db = sync_db_path.clone();
             let root = sync_root_dir.clone();
             let cache = Arc::clone(&sync_update_cache);
+            let block_third_party = Arc::clone(&sync_block_third_party);
             // `event_sender` locks a tokio Mutex, so it must be awaited here
             // in the async task — before handing off to spawn_blocking below.
             // Returns `None` until the SSE sync subsystem has started (device
@@ -692,7 +699,15 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
             let snapshot_tx = sync_controller_for_tick.event_sender().await;
 
             let result = tokio::task::spawn_blocking(move || {
-                run_sync_tick(&reg, &aud, &db, &root, &cache, snapshot_tx.as_ref())
+                run_sync_tick(
+                    &reg,
+                    &aud,
+                    &db,
+                    &root,
+                    &cache,
+                    snapshot_tx.as_ref(),
+                    &block_third_party,
+                )
             })
             .await;
 
@@ -2031,15 +2046,24 @@ pub fn run_sync_tick(
     root_dir: &camino::Utf8PathBuf,
     update_cache: &UpdateCheckCache,
     snapshot_tx: Option<&mpsc::Sender<SyncEvent>>,
+    block_third_party: &Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<bool> {
     use vectorhawkd_core::policy::MockPolicyClient;
 
     let mut changed = false;
 
+    // Card 2 fix: this used to be `Arc::new(AtomicBool::new(false))` — a
+    // fresh, disconnected flag that discarded any flip this tick made the
+    // instant the function returned. Now it's the caller's real shared
+    // handle (the daemon's long-running `AppState.block_third_party_inference`,
+    // or the standalone `vectorhawk mcp sync`/`skill update` CLI's own
+    // seeded handle), so a flip made via the org-policy snapshot reconcile
+    // below (Card 3) is actually observed by whatever reads this flag for
+    // live enforcement.
     let state_view = AppState {
         root_dir: root_dir.clone(),
         db_path: db_path.clone(),
-        block_third_party_inference: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        block_third_party_inference: Arc::clone(block_third_party),
     };
 
     // ── 0. Auth token + device ID sync ───────────────────────────────────────
@@ -2112,6 +2136,28 @@ pub fn run_sync_tick(
             Ok(body) => {
                 match sync::sse_client::snapshot_event_from_json(&body) {
                     Ok(event) => {
+                        // ── Org-policy reconcile (Card 3) ────────────────────
+                        //
+                        // Applied UNCONDITIONALLY — same reasoning as the
+                        // revocation-list reconcile just below: this tick
+                        // runs even with no reconciler at all (`snapshot_tx
+                        // == None`, e.g. standalone `vectorhawk mcp sync`),
+                        // so org policy must converge here directly rather
+                        // than relying solely on the forwarded event
+                        // reaching a reconciler that may not exist. `None`
+                        // means the backend omitted `org_policy` (older
+                        // backend) — leave sync_state/the live atomic alone.
+                        if let SyncEvent::Snapshot {
+                            org_policy: Some(ref policy),
+                            ..
+                        } = event
+                        {
+                            state_view.apply_org_policy_snapshot(
+                                policy.managed_paths_mode.as_deref(),
+                                policy.block_third_party_inference,
+                            );
+                        }
+
                         if let SyncEvent::Snapshot {
                             revocations: Some(ref revs),
                             ..
