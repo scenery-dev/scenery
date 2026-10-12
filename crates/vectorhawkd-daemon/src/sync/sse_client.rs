@@ -811,6 +811,15 @@ pub enum SyncEvent {
         /// now" and must clear the local cache — that's how an admin
         /// "unblock" propagates: the entry just drops out of the list.
         revocations: Option<Vec<RevocationRecord>>,
+        /// Org-policy flags (`managed_paths_mode`, `block_third_party_inference`)
+        /// snapshot reconcile (Card 3). `None` when the backend omits the
+        /// `org_policy` key entirely (older backend) — the reconciler must
+        /// leave both the persisted `sync_state` and any live atomic
+        /// untouched. Each field *inside* [`OrgPolicySnapshot`] carries the
+        /// same "absent means no change" semantics independently, so a
+        /// backend can report one flag without having to know the other's
+        /// current value.
+        org_policy: Option<OrgPolicySnapshot>,
     },
     /// Immediately remove a revoked artifact (broadcast-model kill switch).
     /// `version: None` means "the whole artifact, every version" — the
@@ -972,6 +981,23 @@ pub struct RevocationRecord {
     pub version: Option<String>,
 }
 
+/// Org-policy flags carried by a [`SyncEvent::Snapshot`]'s `org_policy` key
+/// (Card 3 — org-policy snapshot reconcile). Every field is independently
+/// `Option`: a `None` field means the backend didn't report a value for it
+/// in this snapshot (either an older backend that predates the field, or
+/// simply nothing to say), and must NOT overwrite the existing persisted
+/// value or live atomic. This mirrors the live SSE delta handlers
+/// (`managed_paths_policy_update`, `inference_policy_update`) field-for-field
+/// so a reconnecting/polling runner converges on exactly the state a live
+/// toggle would have produced.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct OrgPolicySnapshot {
+    #[serde(default)]
+    pub managed_paths_mode: Option<String>,
+    #[serde(default)]
+    pub block_third_party_inference: Option<bool>,
+}
+
 // ── Wire types (SSE JSON payloads) ────────────────────────────────────────────
 
 #[derive(Debug, serde::Deserialize)]
@@ -998,6 +1024,11 @@ struct WireSnapshot {
     /// pattern as `mcp_installations` above).
     #[serde(default)]
     revocations: Option<Vec<RevocationRecord>>,
+    /// Org-policy flags (Card 3). `#[serde(default)]` so a snapshot from a
+    /// backend that predates this field parses to `None` — "no change" —
+    /// rather than failing deserialization.
+    #[serde(default)]
+    org_policy: Option<OrgPolicySnapshot>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1108,6 +1139,7 @@ pub fn snapshot_event_from_json(data: &str) -> Result<SyncEvent> {
         mcp_installations: wire.mcp_installations,
         plugin_installations: wire.plugin_installations,
         revocations: wire.revocations,
+        org_policy: wire.org_policy,
     })
 }
 
@@ -1228,6 +1260,7 @@ fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
                 mcp_installations: None,
                 plugin_installations: vec![],
                 revocations: None,
+                org_policy: None,
             })
         }
         "managed_paths_policy_update" => {
@@ -1265,6 +1298,7 @@ fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
                 mcp_installations: None,
                 plugin_installations: vec![],
                 revocations: None,
+                org_policy: None,
             })
         }
         "discovery_adopted" => {
@@ -1276,6 +1310,7 @@ fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
                 mcp_installations: None,
                 plugin_installations: vec![],
                 revocations: None,
+                org_policy: None,
             })
         }
         "discovery_publish_requested" => {
@@ -1287,6 +1322,7 @@ fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
                 mcp_installations: None,
                 plugin_installations: vec![],
                 revocations: None,
+                org_policy: None,
             })
         }
         "inference_policy_update" => {
@@ -1299,6 +1335,7 @@ fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
                 mcp_installations: None,
                 plugin_installations: vec![],
                 revocations: None,
+                org_policy: None,
             })
         }
         other => {

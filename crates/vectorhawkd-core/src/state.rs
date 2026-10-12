@@ -324,6 +324,52 @@ impl AppState {
             .store(on, Ordering::Relaxed);
     }
 
+    /// Apply an org-policy snapshot fragment (as carried by the `org_policy`
+    /// key of `GET /api/sync/snapshot` / the SSE `snapshot` event) to
+    /// persisted `sync_state` and any live atomic it gates.
+    ///
+    /// Each parameter is `None` when the snapshot omits that field — an
+    /// older backend, or a policy nobody has touched yet — and "no change"
+    /// is the correct behavior: leave the existing persisted/live value
+    /// alone, don't reset it to a default. A `Some` value is applied
+    /// unconditionally, exactly like the corresponding live SSE delta
+    /// (`managed_paths_policy_update` / `inference_policy_update`) would.
+    ///
+    /// This is what lets a daemon that was offline (or a one-shot
+    /// `vectorhawk mcp sync`) during an admin toggle converge immediately on
+    /// reconnect/next tick, instead of staying stale until the next live
+    /// toggle or a restart (Card 3 — org-policy snapshot reconcile).
+    pub fn apply_org_policy_snapshot(
+        &self,
+        managed_paths_mode: Option<&str>,
+        block_third_party_inference: Option<bool>,
+    ) {
+        if let Some(mode) = managed_paths_mode {
+            if let Err(e) = self.set_sync_state("managed_paths_mode", mode) {
+                tracing::warn!(
+                    error = %e,
+                    mode,
+                    "org policy snapshot: failed to persist managed_paths_mode"
+                );
+            }
+        }
+
+        if let Some(enabled) = block_third_party_inference {
+            let v = if enabled { "true" } else { "false" };
+            if let Err(e) = self.set_sync_state("block_third_party_inference", v) {
+                tracing::warn!(
+                    error = %e,
+                    "org policy snapshot: failed to persist block_third_party_inference"
+                );
+            }
+            // Flip the live atomic directly — the snapshot must take effect
+            // immediately, not just on the next seed-from-sync_state (which
+            // today only happens at daemon startup).
+            self.block_third_party_inference
+                .store(enabled, Ordering::Relaxed);
+        }
+    }
+
     /// Return the slugs of every MCP server that has been F2-pushed to
     /// `~/.claude.json` (i.e. it has a `managed_path_markers` row with
     /// `kind='mcp'`).
@@ -778,6 +824,96 @@ mod tests {
         assert!(
             !state.block_third_party_handle().load(Ordering::Relaxed),
             "missing sync_state key should seed to off"
+        );
+
+        cleanup(&root);
+    }
+
+    // ── org-policy snapshot reconcile (Card 3) ───────────────────────────────
+
+    #[test]
+    fn apply_org_policy_snapshot_persists_and_flips_the_live_atomic() {
+        let root = temp_root("org-policy-snapshot-both-set");
+        let state = AppState::bootstrap_in(root.clone()).expect("bootstrap");
+
+        assert!(!state.block_third_party_handle().load(Ordering::Relaxed));
+
+        state.apply_org_policy_snapshot(Some("enforced"), Some(true));
+
+        assert_eq!(
+            state
+                .get_sync_state("managed_paths_mode")
+                .unwrap()
+                .as_deref(),
+            Some("enforced")
+        );
+        assert_eq!(
+            state
+                .get_sync_state("block_third_party_inference")
+                .unwrap()
+                .as_deref(),
+            Some("true")
+        );
+        assert!(
+            state.block_third_party_handle().load(Ordering::Relaxed),
+            "the live atomic must flip immediately, not just the persisted value"
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn apply_org_policy_snapshot_absent_key_means_no_change() {
+        let root = temp_root("org-policy-snapshot-absent");
+        let state = AppState::bootstrap_in(root.clone()).expect("bootstrap");
+
+        // Simulate a prior live toggle that already set the policy on.
+        state
+            .set_sync_state("block_third_party_inference", "true")
+            .unwrap();
+        state.seed_block_third_party_from_sync_state();
+        assert!(state.block_third_party_handle().load(Ordering::Relaxed));
+
+        // A snapshot that omits org_policy entirely (older backend, or simply
+        // nothing changed) must leave both the persisted value and the live
+        // atomic untouched — `None` means "no change", not "reset to false".
+        state.apply_org_policy_snapshot(None, None);
+
+        assert_eq!(
+            state
+                .get_sync_state("block_third_party_inference")
+                .unwrap()
+                .as_deref(),
+            Some("true"),
+            "absent field must not overwrite the persisted value"
+        );
+        assert!(
+            state.block_third_party_handle().load(Ordering::Relaxed),
+            "absent field must not reset the live atomic"
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn apply_org_policy_snapshot_can_flip_the_flag_back_off() {
+        let root = temp_root("org-policy-snapshot-off");
+        let state = AppState::bootstrap_in(root.clone()).expect("bootstrap");
+
+        state.apply_org_policy_snapshot(None, Some(true));
+        assert!(state.block_third_party_handle().load(Ordering::Relaxed));
+
+        state.apply_org_policy_snapshot(None, Some(false));
+        assert!(
+            !state.block_third_party_handle().load(Ordering::Relaxed),
+            "an explicit false must flip the switch back off (reversibility)"
+        );
+        assert_eq!(
+            state
+                .get_sync_state("block_third_party_inference")
+                .unwrap()
+                .as_deref(),
+            Some("false")
         );
 
         cleanup(&root);

@@ -477,6 +477,7 @@ async fn concurrent_live_and_snapshot_install_for_same_slug_are_serialized() {
         mcp_installations: None,
         plugin_installations: vec![make_record(slug, install_id(), "desired")],
         revocations: None,
+        org_policy: None,
     };
     dispatch_event(
         snapshot_event,
@@ -634,6 +635,7 @@ async fn concurrent_live_install_and_snapshot_derived_orphan_purge_for_same_slug
         mcp_installations: None,
         plugin_installations: vec![make_record("decoy", install_id(), "installed")],
         revocations: None,
+        org_policy: None,
     };
     dispatch_event(
         snapshot_event,
@@ -741,6 +743,7 @@ async fn dispatch_event_snapshot_converges_deactivated_and_orphan_and_removed_pl
             // "orphan" deliberately absent.
         ],
         revocations: None,
+        org_policy: None,
     };
     dispatch_event(
         snapshot_event,

@@ -458,7 +458,24 @@ async fn dispatch_event(
             mcp_installations,
             plugin_installations,
             revocations,
+            org_policy,
         } => {
+            // ── Org-policy reconcile (Card 3) ─────────────────────────────────
+            //
+            // `None` means the backend omitted the `org_policy` key entirely
+            // (older backend) — leave persisted sync_state and any live
+            // atomic untouched. Apply unconditionally (not gated on anything
+            // below) so a daemon that reconnects after missing a live
+            // `managed_paths_policy_update`/`inference_policy_update` delta
+            // converges immediately from this snapshot instead of staying
+            // stale until the next live toggle or a restart.
+            if let Some(policy) = org_policy {
+                state.apply_org_policy_snapshot(
+                    policy.managed_paths_mode.as_deref(),
+                    policy.block_third_party_inference,
+                );
+            }
+
             // ── Revocation list reconcile (broadcast model) ──────────────────
             //
             // `None` means the backend omitted the `revocations` key

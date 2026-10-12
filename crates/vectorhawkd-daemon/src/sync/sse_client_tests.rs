@@ -15,6 +15,7 @@ fn parses_snapshot_event() {
             mcp_installations,
             plugin_installations,
             revocations,
+            org_policy,
         } => {
             assert_eq!(installations.len(), 1);
             assert_eq!(installations[0].skill_id, "my-skill");
@@ -32,6 +33,11 @@ fn parses_snapshot_event() {
                 revocations.is_none(),
                 "old-format snapshot has no revocations key → None, so the local \
                  revocation cache must be left untouched, not wiped"
+            );
+            assert!(
+                org_policy.is_none(),
+                "old-format snapshot has no org_policy key → None, so sync_state \
+                 and the live block_third_party atomic must be left untouched"
             );
         }
         other => panic!("expected Snapshot, got {other:?}"),
@@ -361,6 +367,7 @@ fn snapshot_with_multiple_records() {
             mcp_installations: _,
             plugin_installations: _,
             revocations: _,
+            org_policy: _,
         } => {
             assert_eq!(installations.len(), 2);
             assert_eq!(installations[0].skill_id, "skill-a");
@@ -451,6 +458,63 @@ async fn inference_policy_update_flips_flag_and_persists() {
         Some("false"),
         "sync_state must persist the flip back to false"
     );
+}
+
+// ── org-policy snapshot reconcile (Card 3) ──────────────────────────────────
+
+#[test]
+fn snapshot_parses_org_policy_block() {
+    let data = r#"{
+        "installations": [],
+        "org_policy": {
+            "managed_paths_mode": "quarantine",
+            "block_third_party_inference": true
+        }
+    }"#;
+    let event = parse_sync_event("snapshot", data).unwrap();
+    match event {
+        super::SyncEvent::Snapshot { org_policy, .. } => {
+            let policy = org_policy.expect("org_policy key present must parse to Some");
+            assert_eq!(policy.managed_paths_mode.as_deref(), Some("quarantine"));
+            assert_eq!(policy.block_third_party_inference, Some(true));
+        }
+        other => panic!("expected Snapshot, got {other:?}"),
+    }
+}
+
+#[test]
+fn snapshot_without_org_policy_key_parses_to_none() {
+    // Backward compat: an older backend's snapshot (or one with nothing to
+    // report) omits `org_policy` entirely — must parse cleanly to `None`,
+    // not fail deserialization and not default to some concrete policy.
+    let data = r#"{"installations": []}"#;
+    let event = parse_sync_event("snapshot", data).unwrap();
+    match event {
+        super::SyncEvent::Snapshot { org_policy, .. } => {
+            assert!(org_policy.is_none());
+        }
+        other => panic!("expected Snapshot, got {other:?}"),
+    }
+}
+
+#[test]
+fn snapshot_org_policy_partial_fields_parse_independently() {
+    // A backend might report only one flag's current value in a given
+    // snapshot. The other field must parse to `None` ("no change"), not
+    // fail deserialization or default to `false`.
+    let data = r#"{
+        "installations": [],
+        "org_policy": { "block_third_party_inference": true }
+    }"#;
+    let event = parse_sync_event("snapshot", data).unwrap();
+    match event {
+        super::SyncEvent::Snapshot { org_policy, .. } => {
+            let policy = org_policy.unwrap();
+            assert_eq!(policy.managed_paths_mode, None);
+            assert_eq!(policy.block_third_party_inference, Some(true));
+        }
+        other => panic!("expected Snapshot, got {other:?}"),
+    }
 }
 
 // ── device revocation (kill switch) ─────────────────────────────────────────
