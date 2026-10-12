@@ -2151,6 +2151,67 @@ fn select_model_for_skill(
         .unwrap_or_else(|| recommended[0].clone())
 }
 
+/// A `ModelClient` tier representing "no cloud/sampling channel is available
+/// to this CLI process". `vectorhawk skill run`/`vectorhawk skill update` are
+/// bare-process invocations with no connected AI client to delegate MCP
+/// sampling to and no daemon-brokered gateway session — so there is no
+/// legitimate non-local tier for `HybridModelClient` to fall back to here.
+///
+/// It exists only to satisfy `HybridModelClient::with_third_party_blocking`'s
+/// required second argument. It is unreachable in practice: the Block
+/// Third-Party Inference branch in `HybridModelClient::generate` never calls
+/// the fallback tier — it either serves from Ollama or fails closed first.
+struct NoCloudChannel;
+
+impl vectorhawkd_core::model::ModelClient for NoCloudChannel {
+    fn generate(
+        &self,
+        _request: vectorhawkd_core::model::ModelRequest,
+    ) -> Result<vectorhawkd_core::model::ModelResponse> {
+        anyhow::bail!(
+            "no cloud/sampling channel is available to a direct CLI invocation \
+             (vectorhawk skill run has no connected AI client or gateway session)"
+        )
+    }
+}
+
+/// Build the model client used by direct CLI skill execution (`skill run`),
+/// enforcing the Block Third-Party Inference org policy.
+///
+/// Card 1 fix: `AppState::bootstrap()` always starts with the
+/// `block_third_party_inference` atomic defaulted to `false` — only the
+/// daemon seeds it from persisted `sync_state` at startup
+/// (`vectorhawkd_daemon::run_daemon`). The CLI's direct-execution paths
+/// never did that seeding and never consulted the flag at all, so
+/// `vectorhawk skill run` on a policy-enabled endpoint ignored governance
+/// entirely instead of failing closed.
+///
+/// The caller must call `state.seed_block_third_party_from_sync_state()`
+/// before this is invoked. When the (now-seeded) flag is `false`, this
+/// returns the bare Ollama client unchanged — byte-identical to the
+/// pre-fix behavior, so normal (non-policy) runs are unaffected. When the
+/// flag is `true`, the Ollama client is wrapped in the same
+/// `HybridModelClient::with_third_party_blocking` enforcement chokepoint the
+/// daemon uses, which forces the local tier and fails closed with the
+/// governance error for every non-compliant outcome — and never touches the
+/// `NoCloudChannel` tier.
+fn cli_inference_client(
+    ollama: vectorhawkd_core::ollama::OllamaClient,
+    block_third_party: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Box<dyn vectorhawkd_core::model::ModelClient> {
+    if block_third_party.load(std::sync::atomic::Ordering::Relaxed) {
+        Box::new(
+            vectorhawkd_mcp::sampling::HybridModelClient::with_third_party_blocking(
+                Some(Box::new(ollama)),
+                Box::new(NoCloudChannel),
+                block_third_party,
+            ),
+        )
+    } else {
+        Box::new(ollama)
+    }
+}
+
 async fn cmd_skill_run(
     id: &str,
     input_path: camino::Utf8PathBuf,
@@ -2166,6 +2227,11 @@ async fn cmd_skill_run(
     };
 
     let state = AppState::bootstrap().context("failed to bootstrap state")?;
+    // Card 1 fix: bootstrap() always starts the block_third_party_inference
+    // atomic at `false` — seed it from persisted sync_state (the same state
+    // the daemon seeds from at startup) so a policy-enabled endpoint's org
+    // policy is honored by direct CLI execution too, not just the daemon.
+    state.seed_block_third_party_from_sync_state();
     let policy = MockPolicyClient::default();
 
     let raw = std::fs::read_to_string(&input_path)
@@ -2189,7 +2255,7 @@ async fn cmd_skill_run(
         let id_for_model = id.to_string();
         let explicit_model_owned = explicit_model.map(str::to_string);
         let ollama_url_for_model = ollama_url.clone();
-        let model = tokio::task::spawn_blocking(move || {
+        let ollama = tokio::task::spawn_blocking(move || {
             let ollama_model = select_model_for_skill(
                 &ollama_url_for_model,
                 &id_for_model,
@@ -2201,7 +2267,9 @@ async fn cmd_skill_run(
         .await
         .context("failed to select Ollama model (background task panicked)")?;
 
-        run_skill(&state, &policy, id, &input, Some(&model))
+        let model = cli_inference_client(ollama, state.block_third_party_handle());
+
+        run_skill(&state, &policy, id, &input, Some(model.as_ref()))
     };
 
     // Audit and execution counter: always emit, whether the run succeeded or
@@ -5085,6 +5153,13 @@ async fn cmd_mcp_sync() -> Result<()> {
     use vectorhawkd_mcp::tools::UpdateCheckCache;
 
     let state = AppState::bootstrap().context("failed to bootstrap state")?;
+    // Card 2 fix: seed the real block_third_party_inference handle from
+    // persisted sync_state before the tick, and hand that SAME handle to
+    // `run_sync_tick` — it used to build its own fresh, disconnected
+    // `Arc::new(AtomicBool::new(false))` internally, so a flip made by the
+    // org-policy snapshot reconcile (Card 3) during this tick would have
+    // been invisible to anything else in this process.
+    state.seed_block_third_party_from_sync_state();
     let registry_url = std::env::var("VECTORHAWK_REGISTRY_URL")
         .unwrap_or_else(|_| "https://app.vectorhawk.ai".to_string());
 
@@ -5094,12 +5169,21 @@ async fn cmd_mcp_sync() -> Result<()> {
     let root_dir = state.root_dir.clone();
     let update_cache: UpdateCheckCache =
         Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let block_third_party = state.block_third_party_handle();
 
     // No reconciler is running in this standalone invocation (there's no
     // daemon, so no SSE sync subsystem/event channel to feed) — the periodic
     // snapshot-reconcile step is a daemon-only safety net and is skipped here.
     tokio::task::spawn_blocking(move || {
-        run_sync_tick(&registry, &audit, &db_path, &root_dir, &update_cache, None)
+        run_sync_tick(
+            &registry,
+            &audit,
+            &db_path,
+            &root_dir,
+            &update_cache,
+            None,
+            &block_third_party,
+        )
     })
     .await
     .context("sync task panicked")?
@@ -5670,3 +5754,7 @@ mod skill_validate_tests;
 #[cfg(all(test, unix))]
 #[path = "daemon_reload_tests.rs"]
 mod daemon_reload_tests;
+
+#[cfg(test)]
+#[path = "btpi_tests.rs"]
+mod btpi_tests;
