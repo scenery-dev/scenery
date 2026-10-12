@@ -725,6 +725,7 @@ async fn dispatch_event_mcp_none_leaves_existing_installs_and_backend_untouched(
         mcp_installations: None,
         plugin_installations: vec![],
         revocations: None,
+        org_policy: None,
     };
 
     super::dispatch_event(
