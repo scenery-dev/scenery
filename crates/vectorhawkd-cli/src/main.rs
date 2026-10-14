@@ -4949,8 +4949,58 @@ fn resolve_local_mcp_key() -> Option<String> {
 /// write when there's a key to protect it with.
 ///
 /// [wcce]: vectorhawkd_mcp::setup::write_claude_code_entry
-fn resolve_mcp_http() -> Option<(u16, String)> {
-    resolve_mcp_http_port().zip(resolve_local_mcp_key())
+async fn resolve_mcp_http() -> Option<(u16, String)> {
+    let port_and_key = resolve_mcp_http_port().zip(resolve_local_mcp_key())?;
+    // Version gate: the runner auto-updates ahead of backend deploys, so only
+    // write the HTTP+OAuth entry when this device's registry really serves the
+    // /oauth authorization server. Otherwise Authenticate could never succeed.
+    let registry_url = vectorhawkd_core::state::AppState::bootstrap()
+        .ok()?
+        .get_sync_state("registry_url")
+        .ok()
+        .flatten()?;
+    if !registry_serves_mcp_oauth(&registry_url).await {
+        return None;
+    }
+    Some(port_and_key)
+}
+
+/// `true` only if `<registry>/.well-known/oauth-authorization-server` answers
+/// 200 with metadata whose `issuer` is this registry. Any error, timeout or
+/// mismatch is `false`, so `mcp setup` falls back to the stdio entry.
+async fn registry_serves_mcp_oauth(registry_url: &str) -> bool {
+    let issuer = registry_url.trim_end_matches('/');
+    let url = format!("{issuer}/.well-known/oauth-authorization-server");
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+    else {
+        return false;
+    };
+    let Ok(resp) = client
+        .get(&url)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .send()
+        .await
+    else {
+        return false;
+    };
+    if !resp.status().is_success() {
+        return false;
+    }
+    match resp.text().await {
+        Ok(body) => oauth_metadata_matches_issuer(&body, issuer),
+        Err(_) => false,
+    }
+}
+
+/// Whether an RFC 8414 metadata document names `registry_url` as its issuer.
+fn oauth_metadata_matches_issuer(body: &str, registry_url: &str) -> bool {
+    let expected = registry_url.trim_end_matches('/');
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("issuer").and_then(|i| i.as_str()).map(str::to_owned))
+        .is_some_and(|issuer| issuer == expected)
 }
 
 /// Render a human-readable one-or-two-line message for the outcome of
@@ -5146,7 +5196,7 @@ async fn cmd_mcp_setup(client: Option<&str>, dry_run: bool, rotate_local_key: bo
         // Resolved once, outside the per-client write loop: the daemon's
         // local MCP HTTP port/local key don't vary by client, and only
         // Claude Code ever consults them.
-        let mcp_http = resolve_mcp_http();
+        let mcp_http = resolve_mcp_http().await;
         let claude_code_kind = std::cell::Cell::new(None::<ClaudeCodeEntryKind>);
 
         let outcomes = write_all_client_entries(&clients, |config| {
@@ -5306,9 +5356,10 @@ async fn cmd_mcp_setup(client: Option<&str>, dry_run: bool, rotate_local_key: bo
                     config.config_path.display()
                 );
             } else {
+                let mcp_http = resolve_mcp_http().await;
                 let kind = write_claude_code_entry(
                     &config,
-                    resolve_mcp_http(),
+                    mcp_http,
                     claude_code_supports_http_oauth,
                     pick_free_callback_port,
                 )
@@ -6094,6 +6145,10 @@ mod skill_validate_tests;
 #[cfg(all(test, unix))]
 #[path = "daemon_reload_tests.rs"]
 mod daemon_reload_tests;
+
+#[cfg(test)]
+#[path = "mcp_oauth_probe_tests.rs"]
+mod mcp_oauth_probe_tests;
 
 #[cfg(test)]
 #[path = "btpi_tests.rs"]
