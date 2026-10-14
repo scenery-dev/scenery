@@ -2796,7 +2796,7 @@ checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "vectorhawkd-cli"
-version = "1.0.102"
+version = "1.0.103"
 dependencies = [
  "anyhow",
  "camino",
@@ -2830,7 +2830,7 @@ dependencies = [
 
 [[package]]
 name = "vectorhawkd-core"
-version = "1.0.102"
+version = "1.0.103"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2867,7 +2867,7 @@ dependencies = [
 
 [[package]]
 name = "vectorhawkd-daemon"
-version = "1.0.102"
+version = "1.0.103"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2906,7 +2906,7 @@ dependencies = [
 
 [[package]]
 name = "vectorhawkd-manifest"
-version = "1.0.102"
+version = "1.0.103"
 dependencies = [
  "anyhow",
  "camino",
@@ -2920,7 +2920,7 @@ dependencies = [
 
 [[package]]
 name = "vectorhawkd-mcp"
-version = "1.0.102"
+version = "1.0.103"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2953,7 +2953,7 @@ dependencies = [
 
 [[package]]
 name = "vectorhawkd-shim"
-version = "1.0.102"
+version = "1.0.103"
 dependencies = [
  "anyhow",
  "dirs",
