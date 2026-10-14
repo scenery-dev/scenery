@@ -51,7 +51,20 @@ fs2 = "0.4"
 
 # OAuth callback HTTP listener — daemon-only dep (shim does not link axum).
 # axum 0.8 targets tokio 1.x, matching the workspace tokio version.
-axum = { version = "0.8", default-features = false, features = ["http1", "query", "tokio"] }
+# "json" is needed by the Phase 2 local MCP HTTP resource server to build
+# JSON-RPC/PRM responses the same way the rest of the daemon already does
+# (serde_json is already linked everywhere — this just enables the
+# extractor, no new transitive deps).
+axum = { version = "0.8", default-features = false, features = ["http1", "query", "tokio", "json"] }
+
+# ES256 JWT verification for the local MCP HTTP resource server (Phase 2
+# zero-CLI OAuth, §8 of the frozen interface contract). Well-maintained,
+# widely used, no heavyweight transitive deps beyond its crypto backend
+# (`ring`, already a common dependency in the Rust TLS ecosystem via
+# rustls — no new crypto library is introduced). Default features only;
+# we don't need PEM parsing since JWKS keys are built directly from their
+# base64url `x`/`y` components via `DecodingKey::from_ec_components`.
+jsonwebtoken = "9"
 
 [dev-dependencies]
 serde_json.workspace = true

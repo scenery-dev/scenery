@@ -123,6 +123,303 @@ fn mcp_entry_for(config: &ClientConfig) -> serde_json::Value {
     entry
 }
 
+// ── Zero-CLI Phase 2: Claude Code HTTP+OAuth MCP entry ──────────────────────
+//
+// Claude Code only (§3.6/§9 of
+// `context/2026-10-13-zero-cli-http-mcp-oauth-design.md`). Every other
+// client keeps the stdio entry [`build_mcp_entry`] writes unchanged.
+
+/// The only OAuth client this resource server accepts (§8 of the frozen
+/// contract) — must match `vectorhawkd-daemon::mcp_http::JWT_CLIENT_ID`.
+pub const MCP_HTTP_CLIENT_ID: &str = "vectorhawk-claude-code";
+
+/// Allowed `callbackPort` range for Claude Code's own loopback OAuth
+/// redirect listener (§8: `http://localhost:{P}/callback` for `P` in this
+/// range) — distinct from the daemon's own `mcp_http_port` range
+/// (39140–39149).
+pub const CLAUDE_CODE_CALLBACK_PORT_RANGE: std::ops::RangeInclusive<u16> = 39150..=39159;
+
+/// Minimum Claude Code version that supports the pre-registered
+/// `oauth.clientId`/`oauth.callbackPort` config shape with a `localhost`
+/// redirect (§9 Phase 0 spike / the design doc's §2 "Redirect" note).
+/// Below this, `mcp setup` must keep writing the stdio entry.
+pub const MIN_CLAUDE_CODE_HTTP_OAUTH_VERSION: (u32, u32, u32) = (2, 1, 231);
+
+/// Which shape of Claude Code MCP entry was written, for caller messaging.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaudeCodeEntryKind {
+    Http {
+        callback_port: u16,
+        /// M8: any port(s) in [`CLAUDE_CODE_CALLBACK_PORT_RANGE`] that were
+        /// tried and found busy before `callback_port` was chosen — empty on
+        /// the common case where the first port tried was free. Callers use
+        /// this to print a clear "port N was busy, used M instead" note.
+        busy_ports_skipped: Vec<u16>,
+        /// Whether `config.config_path`'s file mode was just tightened to
+        /// 0600 because it was group- or world-readable (see
+        /// `tighten_permissions_if_group_or_world_readable`).
+        permissions_tightened: bool,
+    },
+    Stdio {
+        reason: StdioReason,
+    },
+}
+
+/// Why [`write_claude_code_entry`] fell back to the stdio entry — lets the
+/// caller print a message that actually explains what happened (M8), rather
+/// than a single generic "wrote the stdio entry" for every case.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StdioReason {
+    /// `mcp_http` was `None`: the daemon's local HTTP resource server isn't
+    /// up (disabled, never bound a port yet, or M9 refused an insecure
+    /// issuer) — covers all three; see `resolve_mcp_http_port` in the CLI.
+    HttpUnavailable,
+    /// The daemon's HTTP server is up, but the installed Claude Code is
+    /// older than [`MIN_CLAUDE_CODE_HTTP_OAUTH_VERSION`].
+    ClientTooOld,
+    /// The daemon's HTTP server is up and Claude Code is new enough, but
+    /// every port in [`CLAUDE_CODE_CALLBACK_PORT_RANGE`] was busy (M8).
+    NoFreeCallbackPort { busy_ports: Vec<u16> },
+}
+
+/// Build the exact HTTP+OAuth entry from §8, plus the H3 local-key header:
+/// `{"type":"http","url":"http://127.0.0.1:<port>/mcp","oauth":{"clientId":"vectorhawk-claude-code","callbackPort":<P>},"headers":{"X-VectorHawk-Local-Key":"<local_key>"}}`.
+pub fn build_claude_code_http_entry(
+    mcp_http_port: u16,
+    callback_port: u16,
+    local_key: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "http",
+        "url": format!("http://127.0.0.1:{mcp_http_port}/mcp"),
+        "oauth": {
+            "clientId": MCP_HTTP_CLIENT_ID,
+            "callbackPort": callback_port,
+        },
+        "headers": {
+            "X-VectorHawk-Local-Key": local_key,
+        }
+    })
+}
+
+/// Result of [`pick_free_callback_port`] — which port (if any) is free,
+/// plus every port in [`CLAUDE_CODE_CALLBACK_PORT_RANGE`] that was tried and
+/// found busy first (M8). `port.is_none()` implies `busy_ports` is the
+/// entire range.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallbackPortPick {
+    pub port: Option<u16>,
+    pub busy_ports: Vec<u16>,
+}
+
+/// Find a free port in [`CLAUDE_CODE_CALLBACK_PORT_RANGE`] by actually
+/// binding and immediately releasing it — "free at setup time", a one-shot
+/// snapshot check (not reserved/held), matching how this is a one-off
+/// `vectorhawk mcp setup` decision rather than something re-verified on
+/// every daemon boot.
+///
+/// M8: also reports every port tried and found busy before (or instead of)
+/// a free one, so the caller can tell the user clearly rather than silently
+/// picking a different port or silently falling back to stdio.
+pub fn pick_free_callback_port() -> CallbackPortPick {
+    pick_free_port_in(CLAUDE_CODE_CALLBACK_PORT_RANGE, |port| {
+        std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+    })
+}
+
+/// Core scan logic behind [`pick_free_callback_port`], with the "is this
+/// port free" probe injected so the busy-ports-skipped bookkeeping (M8) is
+/// unit-testable without ever binding a real socket — tests substitute a
+/// pure closure over a fixed set of "busy" ports instead of racing real
+/// `TcpListener::bind` calls against ports this Mac's actual services (or a
+/// real `vectorhawk mcp setup` run) might be using.
+fn pick_free_port_in(
+    range: std::ops::RangeInclusive<u16>,
+    is_free: impl Fn(u16) -> bool,
+) -> CallbackPortPick {
+    let mut busy_ports = Vec::new();
+    for port in range {
+        if is_free(port) {
+            return CallbackPortPick {
+                port: Some(port),
+                busy_ports,
+            };
+        }
+        busy_ports.push(port);
+    }
+    CallbackPortPick {
+        port: None,
+        busy_ports,
+    }
+}
+
+/// Parse a `claude --version` style output string (e.g. `"2.1.238 (Claude
+/// Code)"`) into `(major, minor, patch)`. Scans whitespace-separated tokens
+/// for the first that parses as `x.y.z`, so it tolerates whatever text
+/// surrounds the version number.
+fn parse_claude_version(output: &str) -> Option<(u32, u32, u32)> {
+    output.split_whitespace().find_map(|token| {
+        let cleaned = token.trim_start_matches('v');
+        let mut parts = cleaned.split('.');
+        let major = parts.next()?.parse().ok()?;
+        let minor = parts.next()?.parse().ok()?;
+        let patch = parts.next()?.parse().ok()?;
+        if parts.next().is_some() {
+            return None; // more than 3 dot-separated segments — not a plain semver token
+        }
+        Some((major, minor, patch))
+    })
+}
+
+/// Run `claude --version` with a short timeout (no native process timeout in
+/// `std::process`, so this polls `try_wait` and kills the child if it hangs)
+/// and parse its output. Returns `None` on any failure: `claude` not on
+/// PATH, it exits non-zero, it hangs past the timeout, or its output doesn't
+/// contain a recognizable version token.
+fn detect_claude_code_version() -> Option<(u32, u32, u32)> {
+    use std::io::Read;
+
+    let mut child = std::process::Command::new("claude")
+        .arg("--version")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+
+    let timeout = std::time::Duration::from_millis(1500);
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => break,
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(_) => return None,
+        }
+    }
+
+    let mut stdout = child.stdout.take()?;
+    let mut buf = String::new();
+    stdout.read_to_string(&mut buf).ok()?;
+    parse_claude_version(&buf)
+}
+
+/// Whether the installed Claude Code binary is new enough for the
+/// HTTP+OAuth MCP entry. `false` on any detection failure (not installed,
+/// not on PATH, too old, or the version probe hung/errored) — the caller
+/// falls back to the stdio entry, never errors the whole `mcp setup` run
+/// over this.
+pub fn claude_code_supports_http_oauth() -> bool {
+    detect_claude_code_version()
+        .map(|v| v >= MIN_CLAUDE_CODE_HTTP_OAUTH_VERSION)
+        .unwrap_or(false)
+}
+
+/// Decide and write Claude Code's MCP entry.
+///
+/// Writes the HTTP+OAuth shape (§8, plus the H3 local-key header) when
+/// `mcp_http` is `Some((port, local_key))` (the daemon's local MCP HTTP
+/// resource server is up — `None` means the feature is disabled, the daemon
+/// couldn't bind it, or M9 refused an insecure issuer, so HTTP is never
+/// attempted) **and** `supports_http_oauth()` reports a new enough Claude
+/// Code. In every other case — old Claude Code, feature unavailable, no
+/// free callback port — this writes the existing stdio entry unchanged,
+/// exactly as if the caller had called [`write_mcp_entry`] directly.
+///
+/// `supports_http_oauth` and `pick_callback_port` are injected (rather than
+/// calling [`claude_code_supports_http_oauth`]/[`pick_free_callback_port`]
+/// directly) so this decision logic is unit-testable without a real
+/// `claude` binary on PATH or real port binds; production callers pass
+/// those two functions.
+///
+/// After writing the HTTP entry, best-effort tightens `config.config_path`
+/// to mode 0600 if it's group- or world-readable (Unix only) — an empirical
+/// run found `~/.claude.json` at mode 0664 on Linux, which would otherwise
+/// leak the H3 local key this call just wrote into it to every other local
+/// user, defeating H3 entirely. Reported back via
+/// `ClaudeCodeEntryKind::Http::permissions_tightened` rather than logged
+/// from this crate (which has no logging setup of its own) so the CLI
+/// caller can print it.
+pub fn write_claude_code_entry(
+    config: &ClientConfig,
+    mcp_http: Option<(u16, String)>,
+    supports_http_oauth: impl Fn() -> bool,
+    pick_callback_port: impl Fn() -> CallbackPortPick,
+) -> Result<ClaudeCodeEntryKind> {
+    if let Some((port, local_key)) = mcp_http {
+        if supports_http_oauth() {
+            let pick = pick_callback_port();
+            if let Some(callback_port) = pick.port {
+                write_mcp_entry_json_with_value(
+                    config,
+                    build_claude_code_http_entry(port, callback_port, &local_key),
+                )?;
+                let permissions_tightened =
+                    tighten_permissions_if_group_or_world_readable(&config.config_path)
+                        .unwrap_or(false);
+                return Ok(ClaudeCodeEntryKind::Http {
+                    callback_port,
+                    busy_ports_skipped: pick.busy_ports,
+                    permissions_tightened,
+                });
+            }
+            // No free callback port — fall through to stdio rather than
+            // failing the whole `mcp setup` run; the daemon's HTTP server
+            // being up doesn't help if Claude Code has nowhere to receive
+            // the OAuth redirect.
+            write_mcp_entry(config)?;
+            return Ok(ClaudeCodeEntryKind::Stdio {
+                reason: StdioReason::NoFreeCallbackPort {
+                    busy_ports: pick.busy_ports,
+                },
+            });
+        }
+        write_mcp_entry(config)?;
+        return Ok(ClaudeCodeEntryKind::Stdio {
+            reason: StdioReason::ClientTooOld,
+        });
+    }
+    write_mcp_entry(config)?;
+    Ok(ClaudeCodeEntryKind::Stdio {
+        reason: StdioReason::HttpUnavailable,
+    })
+}
+
+/// M9 spike finding: `~/.claude.json` was observed at mode 0664
+/// (group-readable) on Linux. `mcp setup` just wrote the H3 local key into
+/// this file as an OAuth header — a group/world-readable mode would hand
+/// that per-user secret to every other local user, which is exactly what
+/// H3 exists to prevent. Tightens to 0600 (owner read/write only) if, and
+/// only if, the file is currently readable/writable by group or other;
+/// leaves an already-owner-only file untouched. Returns `Ok(true)` iff it
+/// actually changed the mode, so the caller can tell the user. Unix only
+/// (Windows ACLs are a different model — returns `Ok(false)` there, a no-op,
+/// never a failure the rest of `mcp setup` needs to handle specially).
+#[cfg(unix)]
+fn tighten_permissions_if_group_or_world_readable(path: &std::path::Path) -> Result<bool> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = fs::metadata(path)?;
+    let mode = metadata.permissions().mode();
+    if mode & 0o077 == 0 {
+        return Ok(false); // already owner-only
+    }
+    let mut perms = metadata.permissions();
+    perms.set_mode(0o600);
+    fs::set_permissions(path, perms)?;
+    Ok(true)
+}
+
+#[cfg(not(unix))]
+fn tighten_permissions_if_group_or_world_readable(_path: &std::path::Path) -> Result<bool> {
+    Ok(false)
+}
+
 /// Detect Claude Code installation and return config info.
 ///
 /// Detected by `~/.claude`, `~/.claude.json`, or the presence of the app bundle
@@ -429,6 +726,18 @@ fn atomic_write(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
 }
 
 fn write_mcp_entry_json(config: &ClientConfig) -> Result<()> {
+    write_mcp_entry_json_with_value(config, mcp_entry_for(config))
+}
+
+/// Core of [`write_mcp_entry_json`], taking the entry value explicitly so
+/// [`write_claude_code_entry`] can merge in the HTTP+OAuth shape
+/// ([`build_claude_code_http_entry`]) through the exact same read/merge/
+/// journal/atomic-write path — same backup behavior, same crash safety —
+/// rather than a parallel implementation that could drift from it.
+fn write_mcp_entry_json_with_value(
+    config: &ClientConfig,
+    entry_value: serde_json::Value,
+) -> Result<()> {
     let existing: serde_json::Value = if config.config_path.exists() {
         let text = fs::read_to_string(&config.config_path)?;
         serde_json::from_str(&text).unwrap_or(serde_json::Value::Object(Default::default()))
@@ -445,7 +754,7 @@ fn write_mcp_entry_json(config: &ClientConfig) -> Result<()> {
         .entry(config.mcp_key.clone())
         .or_insert_with(|| serde_json::Value::Object(Default::default()));
     if let serde_json::Value::Object(ref mut map) = servers {
-        map.insert(MCP_SERVER_NAME.to_string(), mcp_entry_for(config));
+        map.insert(MCP_SERVER_NAME.to_string(), entry_value);
     }
 
     if let Some(parent) = config.config_path.parent() {
@@ -1048,10 +1357,54 @@ fn vscode_settings_path(home: &std::path::Path) -> Option<PathBuf> {
 /// applies the same staleness rule regardless of whether it came from JSON
 /// or TOML — see [`command_is_current`].
 fn is_vectorhawk_configured(path: &std::path::Path, mcp_key: &str, format: ConfigFormat) -> bool {
+    // An HTTP+OAuth entry (Claude Code only, `write_claude_code_entry`) has
+    // no `command` to go stale — once written it stays "configured" until
+    // the user removes it, so check for it before falling through to the
+    // command-staleness logic below (which would otherwise see no
+    // `command` field and report "not configured", making `mcp setup`
+    // rewrite — and `pick_free_callback_port` re-pick — it on every run).
+    if format == ConfigFormat::Json
+        && read_vectorhawk_entry_type(path, mcp_key).as_deref() == Some("http")
+    {
+        return true;
+    }
     match read_vectorhawk_command(path, mcp_key, format) {
         Some(command) => command_is_current(&command),
         None => false,
     }
+}
+
+/// Read the `type` string of the `vectorhawk` entry (`{mcp_key}.vectorhawk.type`)
+/// out of a JSON client config file. `None` if the file is missing,
+/// unparsable, or the entry has no `type` field at all (every stdio entry
+/// this module writes, except VS Code's `"stdio"` marker — see
+/// [`is_vectorhawk_configured`]'s caller, which only treats `"http"`
+/// specially).
+fn read_vectorhawk_entry_type(path: &std::path::Path, mcp_key: &str) -> Option<String> {
+    let text = fs::read_to_string(path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    json.get(mcp_key)?
+        .get(MCP_SERVER_NAME)?
+        .get("type")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Read the `oauth.callbackPort` of the `vectorhawk` entry out of a JSON
+/// client config file — i.e. Claude Code's HTTP+OAuth entry written by
+/// [`write_claude_code_entry`] (§8). `None` if the file is missing,
+/// unparsable, the entry has no HTTP/OAuth shape (still on stdio), or the
+/// port doesn't fit a `u16`. Used by `vectorhawk doctor` (M8) to check
+/// whether the configured callback port is currently free.
+pub fn read_claude_code_callback_port(path: &std::path::Path, mcp_key: &str) -> Option<u16> {
+    let text = fs::read_to_string(path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    json.get(mcp_key)?
+        .get(MCP_SERVER_NAME)?
+        .get("oauth")?
+        .get("callbackPort")?
+        .as_u64()
+        .and_then(|v| u16::try_from(v).ok())
 }
 
 /// Returns `true` if `command` is a `vectorhawk` MCP entry's command that's
@@ -1648,6 +2001,448 @@ mod tests {
         let block = build_mcp_servers_block();
         let entry = &block[MCP_SERVER_NAME];
         assert_eq!(entry["command"], expected_command());
+    }
+
+    // ── Claude Code HTTP+OAuth entry (Zero-CLI Phase 2) ────────────────────────
+
+    #[test]
+    fn claude_code_http_entry_matches_contract_exactly() {
+        let entry = build_claude_code_http_entry(39140, 39150, "the-local-key");
+        assert_eq!(
+            entry,
+            serde_json::json!({
+                "type": "http",
+                "url": "http://127.0.0.1:39140/mcp",
+                "oauth": {
+                    "clientId": "vectorhawk-claude-code",
+                    "callbackPort": 39150,
+                },
+                "headers": {
+                    "X-VectorHawk-Local-Key": "the-local-key",
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn parse_claude_version_extracts_semver_token() {
+        assert_eq!(
+            parse_claude_version("2.1.238 (Claude Code)"),
+            Some((2, 1, 238))
+        );
+        assert_eq!(parse_claude_version("v2.1.238"), Some((2, 1, 238)));
+        assert_eq!(
+            parse_claude_version("Claude Code 2.1.238"),
+            Some((2, 1, 238))
+        );
+    }
+
+    #[test]
+    fn parse_claude_version_returns_none_for_garbage() {
+        assert_eq!(parse_claude_version(""), None);
+        assert_eq!(parse_claude_version("not a version"), None);
+        assert_eq!(parse_claude_version("1.2"), None);
+    }
+
+    #[test]
+    fn pick_free_callback_port_returns_a_port_in_range() {
+        let pick = pick_free_callback_port();
+        let port = pick.port.expect("a port should be free in CI/dev");
+        assert!(CLAUDE_CODE_CALLBACK_PORT_RANGE.contains(&port));
+    }
+
+    #[test]
+    fn pick_free_port_in_reports_busy_ports_skipped_before_a_free_one() {
+        // Pure-function version of the scan — no real sockets involved, so
+        // it never races against this Mac's actual listeners.
+        let busy = [39150u16, 39151u16];
+        let pick = pick_free_port_in(39150..=39159, |p| !busy.contains(&p));
+        assert_eq!(pick.busy_ports, vec![39150, 39151]);
+        assert_eq!(pick.port, Some(39152));
+    }
+
+    #[test]
+    fn pick_free_port_in_reports_all_busy_when_nothing_free() {
+        let pick = pick_free_port_in(39150..=39152, |_| false);
+        assert_eq!(pick.port, None);
+        assert_eq!(pick.busy_ports, vec![39150, 39151, 39152]);
+    }
+
+    fn fake_claude_code_config(tmp: &std::path::Path) -> ClientConfig {
+        ClientConfig {
+            name: "Claude Code".to_string(),
+            config_path: tmp.join("claude.json"),
+            mcp_key: "mcpServers".to_string(),
+            already_configured: false,
+            format: ConfigFormat::Json,
+        }
+    }
+
+    /// Shorthand for an always-succeeds callback-port picker in tests that
+    /// don't care about M8's busy-ports bookkeeping.
+    fn free_port(port: u16) -> impl Fn() -> CallbackPortPick {
+        move || CallbackPortPick {
+            port: Some(port),
+            busy_ports: Vec::new(),
+        }
+    }
+
+    fn no_free_port(busy_ports: Vec<u16>) -> impl Fn() -> CallbackPortPick {
+        move || CallbackPortPick {
+            port: None,
+            busy_ports: busy_ports.clone(),
+        }
+    }
+
+    #[test]
+    fn write_claude_code_entry_writes_http_when_port_present_and_supported() {
+        let tmp = temp_root("claude-http");
+        let config = fake_claude_code_config(&tmp);
+
+        let kind = with_fake_home(&tmp, || {
+            write_claude_code_entry(
+                &config,
+                Some((39140, "the-local-key".to_string())),
+                || true,
+                free_port(39150),
+            )
+        })
+        .expect("write should succeed");
+
+        // `permissions_tightened` depends on the umask of the file
+        // `write_mcp_entry_json_with_value` just created, which this test
+        // doesn't control — the dedicated permission tests below pin that
+        // behavior deliberately. Match the fields this test actually cares
+        // about instead of asserting the whole struct.
+        match kind {
+            ClaudeCodeEntryKind::Http {
+                callback_port,
+                ref busy_ports_skipped,
+                ..
+            } => {
+                assert_eq!(callback_port, 39150);
+                assert!(busy_ports_skipped.is_empty());
+            }
+            ref other => panic!("expected Http, got {other:?}"),
+        }
+        let text = fs::read_to_string(&config.config_path).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(json["mcpServers"]["vectorhawk"]["type"], "http");
+        assert_eq!(
+            json["mcpServers"]["vectorhawk"]["url"],
+            "http://127.0.0.1:39140/mcp"
+        );
+        assert_eq!(
+            json["mcpServers"]["vectorhawk"]["oauth"]["clientId"],
+            "vectorhawk-claude-code"
+        );
+        assert_eq!(
+            json["mcpServers"]["vectorhawk"]["oauth"]["callbackPort"],
+            39150
+        );
+        assert_eq!(
+            json["mcpServers"]["vectorhawk"]["headers"]["X-VectorHawk-Local-Key"],
+            "the-local-key"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn write_claude_code_entry_reports_busy_ports_skipped_in_the_http_outcome() {
+        let tmp = temp_root("claude-http-busy-reported");
+        let config = fake_claude_code_config(&tmp);
+
+        let pick = move || CallbackPortPick {
+            port: Some(39152),
+            busy_ports: vec![39150, 39151],
+        };
+        let kind = with_fake_home(&tmp, || {
+            write_claude_code_entry(&config, Some((39140, "key".to_string())), || true, pick)
+        })
+        .expect("write should succeed");
+
+        match kind {
+            ClaudeCodeEntryKind::Http {
+                callback_port,
+                busy_ports_skipped,
+                ..
+            } => {
+                assert_eq!(callback_port, 39152);
+                assert_eq!(busy_ports_skipped, vec![39150, 39151]);
+            }
+            other => panic!("expected Http, got {other:?}"),
+        }
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn write_claude_code_entry_writes_stdio_when_version_too_old() {
+        let tmp = temp_root("claude-stdio-old-version");
+        let config = fake_claude_code_config(&tmp);
+
+        let kind = with_fake_home(&tmp, || {
+            write_claude_code_entry(
+                &config,
+                Some((39140, "the-local-key".to_string())),
+                || false,
+                free_port(39150),
+            )
+        })
+        .expect("write should succeed");
+
+        assert_eq!(
+            kind,
+            ClaudeCodeEntryKind::Stdio {
+                reason: StdioReason::ClientTooOld
+            }
+        );
+        let text = fs::read_to_string(&config.config_path).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(
+            json["mcpServers"]["vectorhawk"].get("type").is_none(),
+            "stdio entry must not carry a type field"
+        );
+        assert_eq!(
+            json["mcpServers"]["vectorhawk"]["command"],
+            expected_command()
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn write_claude_code_entry_writes_stdio_when_mcp_http_is_none() {
+        let tmp = temp_root("claude-stdio-no-port");
+        let config = fake_claude_code_config(&tmp);
+
+        // Even if the version check would say yes, no (port, local_key) pair
+        // means HTTP is off/unavailable (disabled, never bound, or M9
+        // refused an insecure issuer) — must not write an HTTP entry.
+        let kind = with_fake_home(&tmp, || {
+            write_claude_code_entry(&config, None, || true, free_port(39150))
+        })
+        .expect("write should succeed");
+
+        assert_eq!(
+            kind,
+            ClaudeCodeEntryKind::Stdio {
+                reason: StdioReason::HttpUnavailable
+            }
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn write_claude_code_entry_falls_back_to_stdio_when_no_callback_port_free() {
+        let tmp = temp_root("claude-stdio-no-callback-port");
+        let config = fake_claude_code_config(&tmp);
+
+        let busy: Vec<u16> = CLAUDE_CODE_CALLBACK_PORT_RANGE.collect();
+        let kind = with_fake_home(&tmp, || {
+            write_claude_code_entry(
+                &config,
+                Some((39140, "the-local-key".to_string())),
+                || true,
+                no_free_port(busy.clone()),
+            )
+        })
+        .expect("write should succeed");
+
+        assert_eq!(
+            kind,
+            ClaudeCodeEntryKind::Stdio {
+                reason: StdioReason::NoFreeCallbackPort { busy_ports: busy }
+            }
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // ── File permissions on the config holding the H3 local key ───────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn write_claude_code_entry_tightens_group_or_world_readable_config_to_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = temp_root("claude-http-perms-tighten");
+        let config = fake_claude_code_config(&tmp);
+
+        // Pre-create the file at a group/world-readable mode, mirroring the
+        // 0664 `~/.claude.json` observed on Linux during the H3 spike.
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(&config.config_path, "{}").unwrap();
+        fs::set_permissions(&config.config_path, fs::Permissions::from_mode(0o664)).unwrap();
+
+        let kind = with_fake_home(&tmp, || {
+            write_claude_code_entry(
+                &config,
+                Some((39140, "the-local-key".to_string())),
+                || true,
+                free_port(39150),
+            )
+        })
+        .expect("write should succeed");
+
+        match kind {
+            ClaudeCodeEntryKind::Http {
+                permissions_tightened,
+                ..
+            } => assert!(
+                permissions_tightened,
+                "a group/world-readable config holding the local key must be tightened"
+            ),
+            other => panic!("expected Http, got {other:?}"),
+        }
+
+        let mode = fs::metadata(&config.config_path)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "config file holding the H3 local key must end up owner-only"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_claude_code_entry_leaves_already_owner_only_config_unflagged() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = temp_root("claude-http-perms-already-tight");
+        let config = fake_claude_code_config(&tmp);
+
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(&config.config_path, "{}").unwrap();
+        fs::set_permissions(&config.config_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let kind = with_fake_home(&tmp, || {
+            write_claude_code_entry(
+                &config,
+                Some((39140, "the-local-key".to_string())),
+                || true,
+                free_port(39150),
+            )
+        })
+        .expect("write should succeed");
+
+        match kind {
+            ClaudeCodeEntryKind::Http {
+                permissions_tightened,
+                ..
+            } => assert!(
+                !permissions_tightened,
+                "an already owner-only config must not be reported as tightened"
+            ),
+            other => panic!("expected Http, got {other:?}"),
+        }
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tighten_permissions_if_group_or_world_readable_detects_and_fixes_world_readable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = temp_root("tighten-perms-direct");
+        fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("secret.json");
+        fs::write(&path, "{}").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let changed = tighten_permissions_if_group_or_world_readable(&path).unwrap();
+        assert!(changed);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        // Calling it again on the now-owner-only file is a no-op.
+        let changed_again = tighten_permissions_if_group_or_world_readable(&path).unwrap();
+        assert!(!changed_again);
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn is_vectorhawk_configured_recognizes_http_entry_as_configured() {
+        let tmp = temp_root("claude-http-configured");
+        fs::create_dir_all(&tmp).unwrap();
+        let config_path = tmp.join("claude.json");
+        fs::write(
+            &config_path,
+            serde_json::json!({
+                "mcpServers": {
+                    "vectorhawk": build_claude_code_http_entry(39140, 39150, "the-local-key")
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert!(is_vectorhawk_configured(
+            &config_path,
+            "mcpServers",
+            ConfigFormat::Json
+        ));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn read_claude_code_callback_port_reads_back_the_written_value() {
+        let tmp = temp_root("claude-callback-port-readback");
+        fs::create_dir_all(&tmp).unwrap();
+        let config_path = tmp.join("claude.json");
+        fs::write(
+            &config_path,
+            serde_json::json!({
+                "mcpServers": {
+                    "vectorhawk": build_claude_code_http_entry(39140, 39155, "the-local-key")
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_claude_code_callback_port(&config_path, "mcpServers"),
+            Some(39155)
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn read_claude_code_callback_port_is_none_for_a_stdio_entry() {
+        let tmp = temp_root("claude-callback-port-stdio");
+        fs::create_dir_all(&tmp).unwrap();
+        let config_path = tmp.join("claude.json");
+        fs::write(
+            &config_path,
+            serde_json::json!({
+                "mcpServers": {
+                    "vectorhawk": {"command": "vectorhawk", "args": ["mcp", "serve"]}
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_claude_code_callback_port(&config_path, "mcpServers"),
+            None
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     // ── write_mcp_entry ────────────────────────────────────────────────────────

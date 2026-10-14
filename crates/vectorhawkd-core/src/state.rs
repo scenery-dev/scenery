@@ -5,6 +5,54 @@ use std::fs;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+/// `sync_state` key the local MCP HTTP resource server's bound port
+/// (Zero-CLI Phase 2, §8) is persisted under. Shared between
+/// `vectorhawkd-daemon::mcp_http` (which writes it once, on first bind) and
+/// `vectorhawkd-cli`'s `mcp setup` (which reads it back to build Claude
+/// Code's HTTP+OAuth entry URL) so both sides read the exact same key.
+pub const MCP_HTTP_PORT_SYNC_STATE_KEY: &str = "mcp_http_port";
+
+/// `sync_state` key the local MCP HTTP resource server caches its resolved
+/// bound-user-id under (the `sub` of the MCP access token this daemon is
+/// currently bound to). Shared between `vectorhawkd-daemon::mcp_http` (which
+/// reads/writes it) and [`AppState::clear_device_session`] (M6 — which must
+/// clear it alongside `device_id`/`device_uuid` on logout/revocation so a
+/// different user logging in afterward never gets rejected as a stale
+/// `sub_mismatch`).
+pub const MCP_USER_ID_SYNC_STATE_KEY: &str = "mcp_user_id";
+
+/// `sync_state` key the per-user local key for the MCP HTTP resource
+/// server's `X-VectorHawk-Local-Key` header is persisted under (H3 — defeats
+/// another OS user on this machine from reaching `127.0.0.1:<mcp_http_port>`,
+/// which has no same-user ACL the way the Unix socket does). User-private
+/// because `sync_state` lives in `state.db` under the per-user data
+/// directory. Shared between `vectorhawkd-daemon::mcp_http` (which checks
+/// it on every request) and `vectorhawkd-cli`'s `mcp setup` (which writes it
+/// into Claude Code's HTTP entry headers) — both read/write the same
+/// `state.db`, so neither side ever needs to ask the other for the value.
+pub const LOCAL_MCP_KEY_SYNC_STATE_KEY: &str = "mcp_local_key";
+
+/// Env var that lets the local MCP HTTP resource server (and `mcp setup`'s
+/// decision to write a Claude Code HTTP+OAuth entry) accept a non-`https://`
+/// issuer/registry URL (M9). Loud, dev-only: every call site that honors
+/// this logs a warning when it does. Tests exercise the HTTP RS against a
+/// `mockito` `http://` server with this set; production registries are
+/// always `https://`.
+pub const MCP_HTTP_ALLOW_INSECURE_ISSUER_ENV: &str = "VECTORHAWK_MCP_HTTP_ALLOW_INSECURE_ISSUER";
+
+/// M9: whether the local MCP HTTP resource server may be started — or its
+/// Claude Code config entry written — against `registry_url` as the OAuth
+/// issuer. `true` for `https://`, or for anything when
+/// [`MCP_HTTP_ALLOW_INSECURE_ISSUER_ENV`] is exactly `"1"`. Pure/no I/O
+/// besides the env read, so both `vectorhawkd-daemon::mcp_http::start_listener`
+/// and `vectorhawkd-cli`'s `resolve_mcp_http_port` can call it and always
+/// agree. Callers are responsible for logging loudly when the override is
+/// what let an insecure issuer through — this function itself stays silent.
+pub fn mcp_http_issuer_allowed(registry_url: &str) -> bool {
+    registry_url.starts_with("https://")
+        || std::env::var(MCP_HTTP_ALLOW_INSECURE_ISSUER_ENV).as_deref() == Ok("1")
+}
+
 /// Bootstrapped application state: root directory and SQLite path.
 ///
 /// The root directory is `~/Library/Application Support/VectorHawk/` on macOS
@@ -271,6 +319,82 @@ impl AppState {
         Ok(())
     }
 
+    /// Whether the local MCP HTTP resource server (Zero-CLI Phase 2 — see
+    /// `context/2026-10-13-zero-cli-http-mcp-oauth-design.md`) is enabled
+    /// for this daemon.
+    ///
+    /// `VECTORHAWK_MCP_HTTP=0`/`false` (env, checked first so it always wins
+    /// for an operator debugging a specific run) or
+    /// `sync_state["mcp_http_enabled"]` set to `0`/`false` disables it.
+    /// Default: **on**. Shared by `vectorhawkd-daemon::mcp_http` (which
+    /// actually starts the listener) and `vectorhawkd-cli`'s `mcp setup`
+    /// (which reads it back, via [`Self::get_sync_state`] on
+    /// [`MCP_HTTP_PORT_SYNC_STATE_KEY`], to decide whether Claude Code gets
+    /// the HTTP+OAuth entry) so both sides of that decision can never
+    /// disagree about whether the feature is on.
+    pub fn mcp_http_enabled(&self) -> bool {
+        if let Ok(v) = std::env::var("VECTORHAWK_MCP_HTTP") {
+            return !(v == "0" || v.eq_ignore_ascii_case("false"));
+        }
+        match self.get_sync_state("mcp_http_enabled") {
+            Ok(Some(v)) => !(v == "0" || v.eq_ignore_ascii_case("false")),
+            _ => true,
+        }
+    }
+
+    /// The per-user local key for the MCP HTTP resource server's
+    /// `X-VectorHawk-Local-Key` header (H3), generating and persisting one on
+    /// first use. Stable across calls/processes — both the daemon and
+    /// `mcp setup` read the same `state.db` row, so they always agree without
+    /// an extra IPC round trip, and `mcp setup` re-running keeps the existing
+    /// key rather than silently invalidating Claude Code's config.
+    ///
+    /// 256 bits from the OS CSPRNG (`getrandom`, same source
+    /// [`generate_code_verifier`](crate::auth) already uses for PKCE
+    /// verifiers), hex-encoded so it's a plain header-safe ASCII string with
+    /// no base64 padding/URL-safety edge cases to get wrong in a header
+    /// value.
+    pub fn local_mcp_key(&self) -> Result<String> {
+        if let Some(existing) = self.get_sync_state(LOCAL_MCP_KEY_SYNC_STATE_KEY)? {
+            if !existing.is_empty() {
+                return Ok(existing);
+            }
+        }
+        self.rotate_local_mcp_key()
+    }
+
+    /// Generate a fresh local key and persist it, overwriting any existing
+    /// value — `vectorhawk mcp setup --rotate-local-key`. Any client config
+    /// written with the previous key stops working against this daemon
+    /// until it's rewritten with the new one.
+    pub fn rotate_local_mcp_key(&self) -> Result<String> {
+        let mut bytes = [0u8; 32];
+        getrandom::getrandom(&mut bytes).map_err(|e| {
+            anyhow::anyhow!("failed to generate local MCP key (OS RNG unavailable): {e}")
+        })?;
+        let key = hex::encode(bytes);
+        self.set_sync_state(LOCAL_MCP_KEY_SYNC_STATE_KEY, &key)?;
+        Ok(key)
+    }
+
+    /// Clear this daemon's device/user session identity: `device_id`,
+    /// `device_uuid`, and [`MCP_USER_ID_SYNC_STATE_KEY`] (the local MCP HTTP
+    /// resource server's cached bound-user-id).
+    ///
+    /// M6: called by both `vectorhawk auth logout` and
+    /// [`AppState::mark_device_revoked`]. Without clearing `mcp_user_id` too,
+    /// a user who logs out and a *different* user who logs in afterward
+    /// would have their valid MCP access token rejected as `sub_mismatch`
+    /// against the first user's stale cached id — the daemon never asks to
+    /// re-resolve it once cached. Idempotent: clearing an already-clear key
+    /// is a no-op, never an error.
+    pub fn clear_device_session(&self) -> Result<()> {
+        self.delete_sync_state("device_id")?;
+        self.delete_sync_state("device_uuid")?;
+        self.delete_sync_state(MCP_USER_ID_SYNC_STATE_KEY)?;
+        Ok(())
+    }
+
     /// Record that the backend revoked THIS device (device-revocation-v2):
     /// clears the local `device_uuid`/`device_id` identity and stamps
     /// `device_revoked_at` for `vectorhawk auth status`/`doctor` to
@@ -288,9 +412,12 @@ impl AppState {
     ///
     /// Idempotent — calling this repeatedly (e.g. a 403 on every sync tick
     /// before the task notices it should stop) is harmless.
+    ///
+    /// M6: also clears `mcp_user_id` via [`AppState::clear_device_session`] —
+    /// a revoked device/user must not leave a stale bound-user-id behind
+    /// that a subsequent re-pair as a *different* user could collide with.
     pub fn mark_device_revoked(&self) -> Result<()> {
-        self.delete_sync_state("device_uuid")?;
-        self.delete_sync_state("device_id")?;
+        self.clear_device_session()?;
         self.set_sync_state("device_revoked_at", &chrono::Utc::now().to_rfc3339())?;
         Ok(())
     }
@@ -1044,17 +1171,123 @@ mod tests {
             .set_sync_state("device_uuid", "uuid-1")
             .expect("set uuid");
         state.set_sync_state("device_id", "id-1").expect("set id");
+        state
+            .set_sync_state(MCP_USER_ID_SYNC_STATE_KEY, "user-1")
+            .expect("set mcp_user_id");
 
         state.mark_device_revoked().expect("mark revoked");
 
         assert_eq!(state.get_sync_state("device_uuid").unwrap(), None);
         assert_eq!(state.get_sync_state("device_id").unwrap(), None);
+        assert_eq!(
+            state.get_sync_state(MCP_USER_ID_SYNC_STATE_KEY).unwrap(),
+            None,
+            "M6: mark_device_revoked must also clear the cached mcp_user_id, \
+             or a different user re-pairing afterward could hit a stale sub_mismatch"
+        );
         assert!(
             state.get_sync_state("device_revoked_at").unwrap().is_some(),
             "device_revoked_at must be stamped"
         );
 
         cleanup(&root);
+    }
+
+    #[test]
+    fn clear_device_session_clears_all_three_keys_and_is_idempotent() {
+        let root = temp_root("clear-device-session");
+        let state = AppState::bootstrap_in(root.clone()).expect("bootstrap");
+
+        state.set_sync_state("device_id", "id-1").expect("set id");
+        state
+            .set_sync_state("device_uuid", "uuid-1")
+            .expect("set uuid");
+        state
+            .set_sync_state(MCP_USER_ID_SYNC_STATE_KEY, "user-1")
+            .expect("set mcp_user_id");
+
+        state.clear_device_session().expect("clear session");
+
+        assert_eq!(state.get_sync_state("device_id").unwrap(), None);
+        assert_eq!(state.get_sync_state("device_uuid").unwrap(), None);
+        assert_eq!(
+            state.get_sync_state(MCP_USER_ID_SYNC_STATE_KEY).unwrap(),
+            None
+        );
+
+        // Idempotent — clearing an already-clear session must not error.
+        state.clear_device_session().expect("clear again (no-op)");
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_mcp_key_is_generated_once_and_stable_across_calls() {
+        let root = temp_root("local-mcp-key-stable");
+        let state = AppState::bootstrap_in(root.clone()).expect("bootstrap");
+
+        let first = state.local_mcp_key().expect("generate key");
+        assert_eq!(first.len(), 64, "256 bits hex-encoded is 64 chars");
+        assert!(first.chars().all(|c| c.is_ascii_hexdigit()));
+
+        let second = state.local_mcp_key().expect("read back same key");
+        assert_eq!(first, second, "local_mcp_key must be stable once generated");
+
+        // A second AppState handle onto the same state.db (mirrors the
+        // daemon and `mcp setup` being separate processes against the same
+        // state.db) must observe the exact same key, with no IPC required.
+        let other_handle = AppState::bootstrap_in(root.clone()).expect("bootstrap again");
+        assert_eq!(
+            other_handle.local_mcp_key().expect("read via other handle"),
+            first
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn rotate_local_mcp_key_changes_the_persisted_value() {
+        let root = temp_root("local-mcp-key-rotate");
+        let state = AppState::bootstrap_in(root.clone()).expect("bootstrap");
+
+        let original = state.local_mcp_key().expect("generate key");
+        let rotated = state.rotate_local_mcp_key().expect("rotate key");
+
+        assert_ne!(original, rotated, "rotation must produce a new key");
+        assert_eq!(
+            state.local_mcp_key().expect("read back"),
+            rotated,
+            "local_mcp_key must read back the rotated value, not the original"
+        );
+
+        cleanup(&root);
+    }
+
+    /// Serializes tests that mutate the process-global
+    /// `VECTORHAWK_MCP_HTTP_ALLOW_INSECURE_ISSUER` env var — only one test
+    /// in this binary touches it, but the guard documents the hazard for
+    /// whoever adds the next one.
+    static MCP_HTTP_ISSUER_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn mcp_http_issuer_allowed_requires_https_unless_override_env_set() {
+        let _guard = MCP_HTTP_ISSUER_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(MCP_HTTP_ALLOW_INSECURE_ISSUER_ENV);
+
+        assert!(mcp_http_issuer_allowed("https://dev.vectorhawk.ai"));
+        assert!(!mcp_http_issuer_allowed("http://dev.vectorhawk.ai"));
+        assert!(!mcp_http_issuer_allowed("http://127.0.0.1:1234"));
+
+        std::env::set_var(MCP_HTTP_ALLOW_INSECURE_ISSUER_ENV, "1");
+        assert!(
+            mcp_http_issuer_allowed("http://127.0.0.1:1234"),
+            "the explicit dev override must allow a non-https issuer"
+        );
+
+        std::env::remove_var(MCP_HTTP_ALLOW_INSECURE_ISSUER_ENV);
+        assert!(!mcp_http_issuer_allowed("http://127.0.0.1:1234"));
     }
 
     #[test]
