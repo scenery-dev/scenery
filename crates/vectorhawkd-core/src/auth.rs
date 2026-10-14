@@ -373,11 +373,17 @@ impl AuthClient {
     }
 }
 
-/// Decode the `exp` claim from a JWT without verifying the signature.
+/// Decode the raw JSON payload (second segment) of a JWT without verifying
+/// the signature. Returns `None` on any parse error. The JWT is assumed to
+/// be three segments separated by `.`; the payload segment may be
+/// base64url-no-padding or standard-base64-padded.
 ///
-/// Returns `None` on any parse error. The JWT is assumed to be three
-/// base64url-no-padding segments separated by `.`.
-fn decode_jwt_exp(token: &str) -> Option<u64> {
+/// This is intentionally unauthenticated: callers only ever use it to read
+/// claims out of a token *this daemon itself already holds* (its own stored
+/// portal access token), never to trust claims from an untrusted caller.
+/// Untrusted bearer tokens (the MCP HTTP resource-server path) go through
+/// full ES256/JWKS verification instead — see `vectorhawkd-daemon::mcp_http`.
+fn decode_jwt_payload(token: &str) -> Option<serde_json::Value> {
     let parts: Vec<&str> = token.splitn(3, '.').collect();
     if parts.len() != 3 {
         return None;
@@ -388,8 +394,25 @@ fn decode_jwt_exp(token: &str) -> Option<u64> {
         .decode(parts[1])
         .or_else(|_| base64::engine::general_purpose::STANDARD.decode(parts[1]))
         .ok()?;
-    let claims: JwtClaims = serde_json::from_slice(&payload_bytes).ok()?;
+    serde_json::from_slice(&payload_bytes).ok()
+}
+
+/// Decode the `exp` claim from a JWT without verifying the signature.
+fn decode_jwt_exp(token: &str) -> Option<u64> {
+    let claims: JwtClaims = serde_json::from_value(decode_jwt_payload(token)?).ok()?;
     Some(claims.exp)
+}
+
+/// Decode the `sub` claim from a JWT without verifying the signature.
+///
+/// Used only to read the user id out of this daemon's own stored portal
+/// access token (an HS256 JWT this daemon trusts because it is the one that
+/// saved it via [`save_tokens`]) — not for validating untrusted input.
+pub fn decode_jwt_sub(token: &str) -> Option<String> {
+    decode_jwt_payload(token)?
+        .get("sub")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
 }
 
 // ── Token storage ────────────────────────────────────────────────────────────
@@ -861,6 +884,23 @@ mod tests {
             AuthClient::needs_refresh("only-one-segment"),
             "single-segment token should conservatively need refresh"
         );
+    }
+
+    #[test]
+    fn decode_jwt_sub_returns_sub_claim() {
+        let header = URL_SAFE_NO_PAD.encode(b"{\"alg\":\"HS256\",\"typ\":\"JWT\"}");
+        let payload = URL_SAFE_NO_PAD.encode(b"{\"sub\":\"user-123\",\"exp\":9999999999}");
+        let token = format!("{header}.{payload}.fakesig");
+        assert_eq!(decode_jwt_sub(&token), Some("user-123".to_string()));
+    }
+
+    #[test]
+    fn decode_jwt_sub_returns_none_for_malformed_or_missing() {
+        assert_eq!(decode_jwt_sub("not.a.jwt"), None);
+        let header = URL_SAFE_NO_PAD.encode(b"{\"alg\":\"HS256\"}");
+        let payload = URL_SAFE_NO_PAD.encode(b"{\"exp\":1}");
+        let token = format!("{header}.{payload}.fakesig");
+        assert_eq!(decode_jwt_sub(&token), None, "payload has no sub claim");
     }
 
     #[test]

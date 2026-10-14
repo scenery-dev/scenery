@@ -902,6 +902,64 @@ mod tests {
         }
     }
 
+    // ── M6: auth logout clears device/session state ─────────────────────────
+
+    /// Regression for M6: `auth logout` must clear `device_id`/
+    /// `device_uuid`/`mcp_user_id`, or a different user logging in
+    /// afterward would have their valid MCP access token rejected as a
+    /// stale `sub_mismatch` against this user's binding (the daemon-level
+    /// half of this is covered by
+    /// `vectorhawkd_daemon::mcp_http::tests::logout_then_login_as_different_user_succeeds_without_sub_mismatch`;
+    /// this test covers the CLI command itself).
+    ///
+    /// Holds `HOME_MUTEX` across the `.await` on `cmd_auth_logout`, which
+    /// clippy flags on principle (`await_holding_lock`) — correctness here
+    /// actually *requires* it: `cmd_auth_logout` itself reads `HOME` (via
+    /// `AppState::bootstrap`), so the fake value must stay in place for the
+    /// whole call, not just up to the `.await`. Safe to hold: every step
+    /// inside `cmd_auth_logout` is synchronous (no real I/O yield point),
+    /// so the awaited future never actually suspends and nothing else on
+    /// this single-threaded test runtime can be blocked by the guard.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn auth_logout_clears_device_session_state() {
+        let _guard = HOME_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = temp_dir("auth-logout-clears-session");
+        let original = std::env::var_os("HOME");
+        std::env::set_var("HOME", &tmp);
+
+        // Collected as plain values (no `.expect`/`unwrap` panics) inside
+        // this block, so HOME is restored below unconditionally before any
+        // assertion can panic — mirrors `with_fake_home`'s `catch_unwind`
+        // guarantee for the sync case.
+        let outcome: anyhow::Result<(Option<String>, Option<String>, Option<String>)> = async {
+            let state = AppState::bootstrap()?;
+            state.set_sync_state("device_id", "id-1")?;
+            state.set_sync_state("device_uuid", "uuid-1")?;
+            state.set_sync_state("mcp_user_id", "user-1")?;
+
+            crate::cmd_auth_logout("https://example.invalid").await?;
+
+            Ok((
+                state.get_sync_state("device_id")?,
+                state.get_sync_state("device_uuid")?,
+                state.get_sync_state("mcp_user_id")?,
+            ))
+        }
+        .await;
+
+        match original {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        let _ = fs::remove_dir_all(&tmp);
+
+        let (device_id, device_uuid, mcp_user_id) = outcome.expect("test body should succeed");
+        assert_eq!(device_id, None);
+        assert_eq!(device_uuid, None);
+        assert_eq!(mcp_user_id, None);
+    }
+
     fn brokered_row(mcp_server_id: &str, installation_id: &str, name: &str) -> McpInstallRow {
         McpInstallRow {
             mcp_server_id: mcp_server_id.to_string(),
