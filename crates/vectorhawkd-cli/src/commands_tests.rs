@@ -555,9 +555,14 @@ fn mcp_serve_parses() {
 fn mcp_setup_claude_code_parses() {
     use super::{Command, McpCommand};
     match parse(&["mcp", "setup", "--client", "claude-code"]).command {
-        Command::Mcp(McpCommand::Setup { client, dry_run }) => {
+        Command::Mcp(McpCommand::Setup {
+            client,
+            dry_run,
+            rotate_local_key,
+        }) => {
             assert_eq!(client.as_deref(), Some("claude-code"));
             assert!(!dry_run);
+            assert!(!rotate_local_key);
         }
         other => panic!("expected Mcp(Setup), got {other:?}"),
     }
@@ -567,9 +572,27 @@ fn mcp_setup_claude_code_parses() {
 fn mcp_setup_dry_run_parses() {
     use super::{Command, McpCommand};
     match parse(&["mcp", "setup", "--client", "claude-code", "--dry-run"]).command {
-        Command::Mcp(McpCommand::Setup { client, dry_run }) => {
+        Command::Mcp(McpCommand::Setup {
+            client,
+            dry_run,
+            rotate_local_key,
+        }) => {
             assert_eq!(client.as_deref(), Some("claude-code"));
             assert!(dry_run);
+            assert!(!rotate_local_key);
+        }
+        other => panic!("expected Mcp(Setup), got {other:?}"),
+    }
+}
+
+#[test]
+fn mcp_setup_rotate_local_key_parses() {
+    use super::{Command, McpCommand};
+    match parse(&["mcp", "setup", "--rotate-local-key"]).command {
+        Command::Mcp(McpCommand::Setup {
+            rotate_local_key, ..
+        }) => {
+            assert!(rotate_local_key);
         }
         other => panic!("expected Mcp(Setup), got {other:?}"),
     }
@@ -935,4 +958,27 @@ async fn skill_convert_produces_a_skill_md_that_passes_validation() {
         "converted SKILL.md failed validation: {:#?}",
         report.checks
     );
+}
+
+// ── M8 doctor: lsof output parsing ─────────────────────────────────────────
+
+#[test]
+fn parse_lsof_output_command_name_reads_first_data_row() {
+    let stdout = "COMMAND   PID  USER   FD   TYPE DEVICE SIZE/OFF NODE NAME\n\
+                  Claude    1234 adam   42u  IPv4 0x...      0t0  TCP 127.0.0.1:39150 (LISTEN)\n";
+    assert_eq!(
+        super::parse_lsof_output_command_name(stdout),
+        Some("Claude".to_string())
+    );
+}
+
+#[test]
+fn parse_lsof_output_command_name_none_for_header_only_output() {
+    let stdout = "COMMAND   PID  USER   FD   TYPE DEVICE SIZE/OFF NODE NAME\n";
+    assert_eq!(super::parse_lsof_output_command_name(stdout), None);
+}
+
+#[test]
+fn parse_lsof_output_command_name_none_for_empty_output() {
+    assert_eq!(super::parse_lsof_output_command_name(""), None);
 }

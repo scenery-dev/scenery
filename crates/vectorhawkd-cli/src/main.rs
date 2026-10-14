@@ -455,6 +455,15 @@ pub enum McpCommand {
         /// Print the config entry that would be written without modifying any files.
         #[arg(long, default_value_t = false)]
         dry_run: bool,
+
+        /// H3: generate a new per-user local key for the MCP HTTP resource
+        /// server, invalidating the old one, and rewrite Claude Code's
+        /// HTTP+OAuth config entry with it. `mcp setup` without this flag
+        /// keeps a key that already exists (stable across re-runs); pass
+        /// this only when you actually want to rotate (e.g. suspected
+        /// compromise, or hardening after noticing a stale config elsewhere).
+        #[arg(long, default_value_t = false)]
+        rotate_local_key: bool,
     },
 
     /// Remove the VectorHawk MCP entry from all AI client configs and delete
@@ -749,9 +758,11 @@ async fn run(cli: Cli) -> Result<()> {
         }) => cmd_auth_token(&token, &registry_url).await,
 
         Command::Mcp(McpCommand::Serve { server }) => cmd_mcp_serve(server).await,
-        Command::Mcp(McpCommand::Setup { client, dry_run }) => {
-            cmd_mcp_setup(client.as_deref(), dry_run).await
-        }
+        Command::Mcp(McpCommand::Setup {
+            client,
+            dry_run,
+            rotate_local_key,
+        }) => cmd_mcp_setup(client.as_deref(), dry_run, rotate_local_key).await,
         Command::Mcp(McpCommand::Remove) => cmd_mcp_remove().await,
         Command::Mcp(McpCommand::Sync) => cmd_mcp_sync().await,
         Command::Mcp(McpCommand::Backends) => cmd_mcp_backends().await,
@@ -879,6 +890,32 @@ async fn cmd_doctor(registry_url: Option<&str>) -> Result<()> {
 
             let reconcile_status = query_reconcile_status(&app.state.db_path);
             println!("Reconcile:       {reconcile_status}");
+
+            // M8/H3: Claude Code's HTTP+OAuth entry, if it has one — the
+            // configured callback port's current availability, and whether
+            // the config file holding the H3 local key is readable by
+            // other users on this machine.
+            if let Some(config) = vectorhawkd_mcp::setup::detect_claude_code() {
+                if let Some(port) = vectorhawkd_mcp::setup::read_claude_code_callback_port(
+                    &config.config_path,
+                    &config.mcp_key,
+                ) {
+                    println!(
+                        "Claude Code callback port {port}: {}",
+                        claude_code_callback_port_status(port)
+                    );
+                    match config_file_is_group_or_world_readable(&config.config_path) {
+                        Some(true) => println!(
+                            "Claude Code config:    {} is readable by other users on this \
+                             machine — it holds the H3 local key. Run `vectorhawk mcp setup \
+                             --rotate-local-key` to rotate it and tighten the file.",
+                            config.config_path.display()
+                        ),
+                        Some(false) => {}
+                        None => {}
+                    }
+                }
+            }
 
             print_device_revoked_notice(&app.state);
         }
@@ -1025,6 +1062,76 @@ async fn probe_oauth_listener_port(socket_path: &str) -> String {
 #[cfg(not(unix))]
 async fn probe_oauth_listener_port(_socket_path: &str) -> String {
     "not running (Unix sockets not supported on this platform)".to_string()
+}
+
+// ── M8 / H3: doctor checks for Claude Code's HTTP+OAuth entry ────────────────
+
+/// Parse `lsof -iTCP:<port> -sTCP:LISTEN -P -n` output for the `COMMAND`
+/// column of the first listening process, if any. Pure/offline so it's
+/// unit-testable without actually shelling out to `lsof` — [`port_holder_process_name`]
+/// is the (untested, impure) caller that does the real shell-out.
+///
+/// `lsof`'s default output is whitespace-column-aligned text with a header
+/// row; the command name is always the first whitespace-separated token on
+/// the first data row.
+fn parse_lsof_output_command_name(stdout: &str) -> Option<String> {
+    let mut lines = stdout.lines();
+    lines.next(); // header row ("COMMAND  PID  USER  FD  TYPE ...")
+    let first_data_row = lines.next()?;
+    first_data_row.split_whitespace().next().map(str::to_string)
+}
+
+/// Best-effort: who (if anyone) is listening on `port` right now, by name.
+/// `None` on any failure — `lsof` missing from PATH, it errors, or nothing
+/// is listening — so callers degrade silently rather than treating this as
+/// a doctor-run failure. Deliberately never kills or signals anything; this
+/// only ever shells out to `lsof`, which is read-only.
+fn port_holder_process_name(port: u16) -> Option<String> {
+    let output = std::process::Command::new("lsof")
+        .args(["-iTCP", "-sTCP:LISTEN", "-P", "-n"])
+        .arg(format!("-iTCP:{port}"))
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_lsof_output_command_name(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// M8: human-readable status of Claude Code's configured callback port, if
+/// it has an HTTP+OAuth entry at all (stdio-only clients have nothing to
+/// check here). Binds-then-releases to check freeness — the same "free at
+/// setup time" snapshot [`vectorhawkd_mcp::setup::pick_free_callback_port`]
+/// uses, not a persistent listener of our own.
+fn claude_code_callback_port_status(port: u16) -> String {
+    match std::net::TcpListener::bind(("127.0.0.1", port)) {
+        Ok(_) => "free".to_string(),
+        Err(_) => match port_holder_process_name(port) {
+            Some(name) if !name.to_lowercase().contains("claude") => format!(
+                "BUSY — held by '{name}' (not Claude Code); Authenticate will fail until \
+                 this port is free. Re-run `vectorhawk mcp setup` to pick a different one."
+            ),
+            Some(name) => format!("busy — held by '{name}'"),
+            None => "busy (holder unknown)".to_string(),
+        },
+    }
+}
+
+/// H3: whether `path` is readable or writable by anyone other than its
+/// owner — the mode the Zero-CLI Phase 2 spike found `~/.claude.json` at
+/// (0664) on Linux, which would hand the local key this file holds to
+/// every other local user. Unix only; `None` on Windows or any I/O error
+/// (doctor just omits the line rather than failing the whole run over it).
+#[cfg(unix)]
+fn config_file_is_group_or_world_readable(path: &std::path::Path) -> Option<bool> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(path).ok()?.permissions().mode();
+    Some(mode & 0o077 != 0)
+}
+
+#[cfg(not(unix))]
+fn config_file_is_group_or_world_readable(_path: &std::path::Path) -> Option<bool> {
+    None
 }
 
 /// Result of asking a running daemon to reload credentials and start syncing.
@@ -4407,6 +4514,16 @@ async fn cmd_auth_logout(registry_url: &str) -> Result<()> {
 
     let state = AppState::bootstrap().context("failed to bootstrap state")?;
     clear_tokens(&state, registry_url).context("failed to clear auth tokens")?;
+    // M6: also clear device_id/device_uuid/mcp_user_id — otherwise a
+    // different user logging in afterward (via `auth pair` or via the MCP
+    // HTTP resource server's first-run device exchange) would have their
+    // valid access token rejected as a stale sub_mismatch against this
+    // user's binding. Best-effort: the tokens are already cleared above,
+    // which is the primary goal of `logout`, so a failure here is reported
+    // but not fatal.
+    if let Err(e) = state.clear_device_session() {
+        eprintln!("warning: failed to clear local device/session state: {e:#}");
+    }
     println!("Logged out from {registry_url}.");
     Ok(())
 }
@@ -4778,11 +4895,194 @@ fn write_all_client_entries(
         .collect()
 }
 
-async fn cmd_mcp_setup(client: Option<&str>, dry_run: bool) -> Result<()> {
+/// Read back the local MCP HTTP resource server's bound port (Zero-CLI
+/// Phase 2), persisted by the daemon in `sync_state["mcp_http_port"]` the
+/// first time it binds. `None` means "don't write an HTTP+OAuth entry for
+/// Claude Code" — covers the feature being disabled, the daemon never
+/// having bound it, or any error reading state. By the time this is called,
+/// `cmd_mcp_setup` has already ensured the daemon is installed and running
+/// (see the `install::ensure_installed`/`wait_for_daemon_socket` calls
+/// around each call site below), so a freshly-started daemon has had a
+/// chance to bind and persist its port before this reads it — but this
+/// still degrades to `None` (stdio entry) rather than erroring if that
+/// race is ever lost, since `write_claude_code_entry` treats `None` as "use
+/// stdio" rather than a failure.
+fn resolve_mcp_http_port() -> Option<u16> {
+    let state = vectorhawkd_core::state::AppState::bootstrap().ok()?;
+    if !state.mcp_http_enabled() {
+        return None;
+    }
+    // M9: defense in depth. The daemon only ever persists
+    // `mcp_http_port` after its own issuer-scheme gate passes (see
+    // `vectorhawkd_daemon::mcp_http::start_listener`), so this is normally
+    // redundant — but it also catches the case where a port was persisted
+    // from a prior run against an `https://` registry and the user has
+    // since pointed this profile at a plain `http://` one: `mcp setup`
+    // must not write an HTTP entry for a daemon config that would now
+    // refuse to start the RS.
+    if let Ok(Some(registry_url)) = state.get_sync_state("registry_url") {
+        if !vectorhawkd_core::state::mcp_http_issuer_allowed(&registry_url) {
+            return None;
+        }
+    }
+    state
+        .get_sync_state(vectorhawkd_core::state::MCP_HTTP_PORT_SYNC_STATE_KEY)
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse().ok())
+}
+
+/// Read (generating if needed) the H3 per-user local key (same `state.db`
+/// row the daemon's `mcp_http` module reads/writes — see
+/// `AppState::local_mcp_key`). `None` on any error bootstrapping state;
+/// callers treat that the same as `resolve_mcp_http_port` returning `None`
+/// — fall back to the stdio entry rather than writing an HTTP entry with no
+/// key to protect it.
+fn resolve_local_mcp_key() -> Option<String> {
+    let state = vectorhawkd_core::state::AppState::bootstrap().ok()?;
+    state.local_mcp_key().ok()
+}
+
+/// Combine [`resolve_mcp_http_port`] and [`resolve_local_mcp_key`] into the
+/// single `Option<(u16, String)>` [`write_claude_code_entry`][wcce] expects
+/// — `None` unless both resolved, since an HTTP entry is only ever safe to
+/// write when there's a key to protect it with.
+///
+/// [wcce]: vectorhawkd_mcp::setup::write_claude_code_entry
+fn resolve_mcp_http() -> Option<(u16, String)> {
+    resolve_mcp_http_port().zip(resolve_local_mcp_key())
+}
+
+/// Render a human-readable one-or-two-line message for the outcome of
+/// writing Claude Code's MCP entry (M8: busy callback ports and permission
+/// tightening get an explicit note rather than being silently invisible).
+/// Shared by both `cmd_mcp_setup` call sites (`--client auto` and the
+/// legacy `--client claude-code` path) so the wording can't drift between
+/// them.
+fn describe_claude_code_entry(
+    kind: &vectorhawkd_mcp::setup::ClaudeCodeEntryKind,
+    config_path: &std::path::Path,
+) -> String {
     use vectorhawkd_mcp::setup::{
-        build_mcp_entry, detect_ai_clients, detect_claude_code, uninstall_claude_skills,
-        write_mcp_entry, MCP_SERVER_NAME,
+        ClaudeCodeEntryKind, StdioReason, CLAUDE_CODE_CALLBACK_PORT_RANGE,
+        MIN_CLAUDE_CODE_HTTP_OAUTH_VERSION,
     };
+
+    match kind {
+        ClaudeCodeEntryKind::Http {
+            callback_port,
+            busy_ports_skipped,
+            permissions_tightened,
+        } => {
+            let mut msg = format!(
+                "wrote vectorhawk MCP entry (HTTP + native OAuth, callback port \
+                 {callback_port}) to {}. Open `/mcp` in Claude Code and choose Authenticate.",
+                config_path.display()
+            );
+            if !busy_ports_skipped.is_empty() {
+                let busy = busy_ports_skipped
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                msg.push_str(&format!(
+                    "\n  note: callback port(s) {busy} were busy; used {callback_port} instead."
+                ));
+            }
+            if *permissions_tightened {
+                msg.push_str(&format!(
+                    "\n  note: tightened {} to owner-only permissions — it holds the local \
+                     key and was readable by other users on this machine.",
+                    config_path.display()
+                ));
+            }
+            msg
+        }
+        ClaudeCodeEntryKind::Stdio { reason } => match reason {
+            StdioReason::HttpUnavailable => {
+                format!("wrote vectorhawk MCP entry to {}.", config_path.display())
+            }
+            StdioReason::ClientTooOld => format!(
+                "wrote vectorhawk MCP entry (stdio) to {} — update Claude Code to {}.{}.{} \
+                 or newer for native HTTP + OAuth (no CLI login step).",
+                config_path.display(),
+                MIN_CLAUDE_CODE_HTTP_OAUTH_VERSION.0,
+                MIN_CLAUDE_CODE_HTTP_OAUTH_VERSION.1,
+                MIN_CLAUDE_CODE_HTTP_OAUTH_VERSION.2,
+            ),
+            StdioReason::NoFreeCallbackPort { busy_ports } => format!(
+                "wrote vectorhawk MCP entry (stdio) to {} — every Claude Code callback port \
+                 ({}-{}) is busy ({}), so HTTP + native OAuth is unavailable until one frees \
+                 up. Re-run `vectorhawk mcp setup` after freeing one.",
+                config_path.display(),
+                CLAUDE_CODE_CALLBACK_PORT_RANGE.start(),
+                CLAUDE_CODE_CALLBACK_PORT_RANGE.end(),
+                busy_ports
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+        },
+    }
+}
+
+async fn cmd_mcp_setup(client: Option<&str>, dry_run: bool, rotate_local_key: bool) -> Result<()> {
+    use vectorhawkd_mcp::setup::{
+        build_mcp_entry, claude_code_supports_http_oauth, detect_ai_clients, detect_claude_code,
+        pick_free_callback_port, uninstall_claude_skills, write_claude_code_entry, write_mcp_entry,
+        ClaudeCodeEntryKind, MCP_SERVER_NAME,
+    };
+
+    // H3: rotate, then fall through to the normal flow below with the new
+    // key already in place — rotating is only meaningful for Claude Code's
+    // HTTP entry, and `is_vectorhawk_configured` otherwise treats an
+    // existing HTTP entry as "already configured" and skips rewriting it,
+    // so this has to force a rewrite rather than relying on that path.
+    if rotate_local_key {
+        let state =
+            vectorhawkd_core::state::AppState::bootstrap().context("failed to bootstrap state")?;
+        let new_key = state
+            .rotate_local_mcp_key()
+            .context("failed to rotate the local MCP key")?;
+        println!("Rotated the local MCP key.");
+
+        if dry_run {
+            println!(
+                "(dry run: Claude Code's config was not rewritten; re-run without --dry-run.)"
+            );
+            return Ok(());
+        }
+
+        let config = detect_claude_code().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Claude Code not detected (neither ~/.claude nor ~/.claude.json found) — \
+                 the key was rotated, but there's no config to rewrite with it."
+            )
+        })?;
+        let mcp_http = resolve_mcp_http_port().map(|port| (port, new_key));
+        let kind = write_claude_code_entry(
+            &config,
+            mcp_http,
+            claude_code_supports_http_oauth,
+            pick_free_callback_port,
+        )
+        .context("failed to rewrite Claude Code's config with the rotated key")?;
+        match kind {
+            ClaudeCodeEntryKind::Http { callback_port, .. } => println!(
+                "Rewrote vectorhawk's MCP entry for Claude Code with the new key (HTTP + \
+                 native OAuth, callback port {callback_port}) at {}. Re-authenticate via \
+                 `/mcp` in Claude Code — the old key no longer works.",
+                config.config_path.display()
+            ),
+            ClaudeCodeEntryKind::Stdio { .. } => println!(
+                "Claude Code is on the stdio entry (no HTTP+OAuth) at {} — nothing there \
+                 needed the rotated key.",
+                config.config_path.display()
+            ),
+        }
+        return Ok(());
+    }
 
     // Resolve target client.  When no --client flag is given, configure all
     // detected clients; when a specific client name is given, restrict to that
@@ -4843,14 +5143,38 @@ async fn cmd_mcp_setup(client: Option<&str>, dry_run: bool) -> Result<()> {
             );
         }
 
+        // Resolved once, outside the per-client write loop: the daemon's
+        // local MCP HTTP port/local key don't vary by client, and only
+        // Claude Code ever consults them.
+        let mcp_http = resolve_mcp_http();
+        let claude_code_kind = std::cell::Cell::new(None::<ClaudeCodeEntryKind>);
+
         let outcomes = write_all_client_entries(&clients, |config| {
-            write_mcp_entry(config).with_context(|| {
-                format!(
-                    "failed to write {} config at {}",
-                    config.name,
-                    config.config_path.display()
+            if config.name == "Claude Code" {
+                let kind = write_claude_code_entry(
+                    config,
+                    mcp_http.clone(),
+                    claude_code_supports_http_oauth,
+                    pick_free_callback_port,
                 )
-            })
+                .with_context(|| {
+                    format!(
+                        "failed to write {} config at {}",
+                        config.name,
+                        config.config_path.display()
+                    )
+                })?;
+                claude_code_kind.replace(Some(kind));
+                Ok(())
+            } else {
+                write_mcp_entry(config).with_context(|| {
+                    format!(
+                        "failed to write {} config at {}",
+                        config.name,
+                        config.config_path.display()
+                    )
+                })
+            }
         });
 
         let mut wrote_claude_code = false;
@@ -4861,11 +5185,26 @@ async fn cmd_mcp_setup(client: Option<&str>, dry_run: bool) -> Result<()> {
                     println!("{}: vectorhawk already configured — skipped.", config.name);
                 }
                 ClientOutcome::Wrote => {
-                    println!(
-                        "{}: wrote vectorhawk MCP entry to {}.",
-                        config.name,
-                        config.config_path.display()
-                    );
+                    if config.name == "Claude Code" {
+                        match claude_code_kind.replace(None) {
+                            Some(kind) => println!(
+                                "{}: {}",
+                                config.name,
+                                describe_claude_code_entry(&kind, &config.config_path)
+                            ),
+                            None => println!(
+                                "{}: wrote vectorhawk MCP entry to {}.",
+                                config.name,
+                                config.config_path.display()
+                            ),
+                        }
+                    } else {
+                        println!(
+                            "{}: wrote vectorhawk MCP entry to {}.",
+                            config.name,
+                            config.config_path.display()
+                        );
+                    }
                     if config.name == "Claude Code" {
                         wrote_claude_code = true;
                     }
@@ -4967,13 +5306,14 @@ async fn cmd_mcp_setup(client: Option<&str>, dry_run: bool) -> Result<()> {
                     config.config_path.display()
                 );
             } else {
-                write_mcp_entry(&config).with_context(|| {
-                    format!("failed to write to {}", config.config_path.display())
-                })?;
-                println!(
-                    "Wrote vectorhawk MCP entry to {}.",
-                    config.config_path.display()
-                );
+                let kind = write_claude_code_entry(
+                    &config,
+                    resolve_mcp_http(),
+                    claude_code_supports_http_oauth,
+                    pick_free_callback_port,
+                )
+                .with_context(|| format!("failed to write to {}", config.config_path.display()))?;
+                println!("{}", describe_claude_code_entry(&kind, &config.config_path));
             }
 
             match uninstall_claude_skills() {

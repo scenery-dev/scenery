@@ -70,6 +70,7 @@ pub mod daemon_takeover;
 pub mod daemon_takeover_signal;
 mod instance_lock;
 pub mod managed_paths;
+mod mcp_http;
 mod oauth_listener;
 mod oauth_state;
 pub mod peer_handshake;
@@ -755,6 +756,42 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
         vh_registry.backend_count()
     );
 
+    // ── Zero-CLI Phase 2: local MCP HTTP resource server ─────────────────────
+    //
+    // Serves the exact same tool surface as the Unix socket (same
+    // `RealBackend`, same `sync_controller`) over `http://127.0.0.1:<port>/mcp`
+    // so Claude Code can authenticate with native OAuth via `/mcp` →
+    // Authenticate instead of the `vectorhawk_login` MCP-tool/CLI flow. Starts
+    // only after `daemon.lock` (`_instance_lock`, acquired at the very top of
+    // this function) is held. Non-fatal: `mcp_http::start_listener` returns
+    // `Ok(None)` (logging loudly) when the feature is disabled or the port
+    // can't be bound, and the daemon continues on stdio/Unix-socket only.
+    let mcp_http_ctx = DaemonContext {
+        backend: Arc::clone(&backend),
+        oauth_state: Arc::clone(&oauth_state),
+        listener_port,
+        list_changed_tx: list_changed_tx.clone(),
+        discoveries_kick: Arc::clone(&discoveries_kick),
+        sync_controller: Arc::clone(&sync_controller),
+        pending_alert: Arc::clone(&pending_alert),
+        state: state.clone(),
+        registry_url: registry_url.clone(),
+    };
+    let mcp_http_handle = match mcp_http::start_listener(mcp_http_ctx).await {
+        Ok(Some((addr, handle))) => {
+            info!(port = addr.port(), "local MCP HTTP resource server started");
+            Some(handle)
+        }
+        Ok(None) => {
+            info!("local MCP HTTP resource server not started — stdio/Unix-socket path unaffected");
+            None
+        }
+        Err(e) => {
+            warn!(error = %e, "local MCP HTTP resource server failed to start — stdio/Unix-socket path unaffected");
+            None
+        }
+    };
+
     // `socket_path` was already resolved above (before `attempt_daemon_takeover`),
     // from the same `opts.socket_path_override` / `state.socket_path()` logic.
     if let Some(parent) = socket_path.parent() {
@@ -991,6 +1028,11 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
 
     // Stop the OAuth HTTP listener.
     if let Some(handle) = listener_handle {
+        handle.abort();
+    }
+
+    // Stop the local MCP HTTP resource server (Zero-CLI Phase 2).
+    if let Some(handle) = mcp_http_handle {
         handle.abort();
     }
 
