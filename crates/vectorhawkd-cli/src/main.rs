@@ -5174,12 +5174,16 @@ async fn cmd_mcp_setup(client: Option<&str>, dry_run: bool, rotate_local_key: bo
                 install::InstallStatus::InstalledAndRunning { .. }
             );
 
-            if was_not_running {
-                tokio::task::spawn_blocking(install::ensure_installed)
-                    .await
-                    .context("ensure_installed task panicked")?
-                    .context("failed to provision daemon")?;
+            // Always run: ensure_installed also reconciles a competing service
+            // manager (brew services). After a brew upgrade our own duplicate can
+            // be the unit running the daemon, so "running" alone isn't enough to
+            // skip it. It's a no-op for a healthy, correctly managed daemon.
+            tokio::task::spawn_blocking(install::ensure_installed)
+                .await
+                .context("ensure_installed task panicked")?
+                .context("failed to provision daemon")?;
 
+            if was_not_running {
                 wait_for_daemon_socket(5_000).await;
             }
         }
@@ -5333,12 +5337,16 @@ async fn cmd_mcp_setup(client: Option<&str>, dry_run: bool, rotate_local_key: bo
                     install::InstallStatus::InstalledAndRunning { .. }
                 );
 
-                if was_not_running {
-                    tokio::task::spawn_blocking(install::ensure_installed)
-                        .await
-                        .context("ensure_installed task panicked")?
-                        .context("failed to provision daemon")?;
+                // Always run: ensure_installed also reconciles a competing service
+                // manager (brew services). After a brew upgrade our own duplicate can
+                // be the unit running the daemon, so "running" alone isn't enough to
+                // skip it. It's a no-op for a healthy, correctly managed daemon.
+                tokio::task::spawn_blocking(install::ensure_installed)
+                    .await
+                    .context("ensure_installed task panicked")?
+                    .context("failed to provision daemon")?;
 
+                if was_not_running {
                     wait_for_daemon_socket(5_000).await;
                 }
             }
