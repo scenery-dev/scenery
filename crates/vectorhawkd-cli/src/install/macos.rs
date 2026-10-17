@@ -32,6 +32,13 @@ use super::{daemon_socket_path, reap_stray_daemon_via_socket, socket_is_reachabl
 const LABEL: &str = "com.vectorhawk.agent";
 const PLIST_FILENAME: &str = "com.vectorhawk.agent.plist";
 
+/// `brew services`' launchd label for this formula — `homebrew.mxcl.<name>`
+/// is Homebrew's fixed naming convention, not something we control.
+const BREW_SERVICE_LABEL: &str = "homebrew.mxcl.vectorhawk";
+/// `brew services`' plist filename, written to the same
+/// `~/Library/LaunchAgents/` directory as our own agent.
+const BREW_PLIST_FILENAME: &str = "homebrew.mxcl.vectorhawk.plist";
+
 /// Return `~/Library/LaunchAgents/com.vectorhawk.agent.plist`.
 fn plist_path() -> Result<std::path::PathBuf> {
     let home = dirs::home_dir().context("failed to resolve HOME directory")?;
@@ -272,6 +279,52 @@ fn service_is_loaded(uid: u32) -> bool {
         .unwrap_or(false)
 }
 
+// ── Competing-service-manager detection (brew services) ─────────────────────
+//
+// `brew services` loads its own LaunchAgent for this formula
+// (`homebrew.mxcl.vectorhawk`, plist at
+// `~/Library/LaunchAgents/homebrew.mxcl.vectorhawk.plist`) — a completely
+// separate launchd job from ours (`com.vectorhawk.agent`). Both carry
+// `KeepAlive: true` against the same single-instance socket lock
+// (`daemon.lock`): whichever loses the race can never acquire it, exits
+// non-zero, and launchd restarts it right back — forever. `daemon install`
+// (and therefore `mcp setup`, which calls it transparently) must detect a
+// healthy brew-managed daemon and skip installing/enabling our own agent
+// entirely, rather than relying on bootout/bootstrap races to sort it out.
+
+/// Return `~/Library/LaunchAgents/homebrew.mxcl.vectorhawk.plist`.
+fn brew_plist_path() -> Result<std::path::PathBuf> {
+    let home = dirs::home_dir().context("failed to resolve HOME directory")?;
+    Ok(home
+        .join("Library")
+        .join("LaunchAgents")
+        .join(BREW_PLIST_FILENAME))
+}
+
+/// Check whether `brew services`' launchd job is currently loaded, via
+/// `launchctl print gui/<uid>/homebrew.mxcl.vectorhawk`.
+fn brew_service_is_loaded(uid: u32) -> bool {
+    Command::new("launchctl")
+        .args(["print", &format!("gui/{uid}/{BREW_SERVICE_LABEL}")])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Pure decision: is the daemon already managed by `brew services`?
+///
+/// Both conditions matter independently: a plist alone could be a leftover
+/// from a `brew services stop` that didn't clean up its file, and "loaded"
+/// alone (without the expected plist) isn't evidence this is actually the
+/// brew job rather than some coincidence — though in practice
+/// `launchctl print` only succeeds for a job launchd actually knows about,
+/// which for this exact label always traces back to the plist Homebrew
+/// wrote. Requiring both keeps this conservative rather than guessing from
+/// either signal alone.
+fn brew_service_is_managing(plist_exists: bool, service_loaded: bool) -> bool {
+    plist_exists && service_loaded
+}
+
 // ── Public install / uninstall ────────────────────────────────────────────────
 
 /// Install the LaunchAgent and start the daemon.
@@ -281,6 +334,23 @@ pub fn install() -> Result<()> {
     let bin_path =
         super::resolve_daemon_bin_path().context("failed to resolve daemon binary path")?;
     let uid = current_uid();
+
+    // ── Competing-manager guard — must run before anything else below ────────
+    // If `brew services` is already running a healthy daemon, writing and
+    // loading our own agent on top of it is exactly the bug this guard
+    // exists to prevent (see the module doc comment above
+    // `brew_service_is_managing`) — detect it first, skip our own
+    // install/enable entirely, and self-heal any damage from a previous run
+    // that didn't have this guard.
+    let brew_plist = brew_plist_path().context("failed to resolve brew plist path")?;
+    if brew_service_is_managing(brew_plist.exists(), brew_service_is_loaded(uid)) {
+        println!(
+            "VectorHawk daemon is managed by Homebrew services ({BREW_SERVICE_LABEL}); \
+             not installing {LABEL}."
+        );
+        self_heal_remove_our_agent(&plist, uid)?;
+        return Ok(());
+    }
 
     // ── Idempotency guard — but allow upgrade rewrites ────────────────────────
     // Skip only when the plist exists, the service is loaded, AND the plist
@@ -377,6 +447,34 @@ pub fn install() -> Result<()> {
     Ok(())
 }
 
+/// Disable, stop, and remove our own LaunchAgent (`com.vectorhawk.agent`),
+/// because the daemon is confirmed managed elsewhere (`brew services`).
+///
+/// Only touches our own plist/label — never `brew services`' job. A no-op
+/// when there is nothing of ours to clean up (fresh box that never had our
+/// agent installed in the first place).
+fn self_heal_remove_our_agent(plist: &std::path::Path, uid: u32) -> Result<()> {
+    let loaded = service_is_loaded(uid);
+    let exists = plist.exists();
+    if !super::should_remove_our_unit(true, exists, loaded) {
+        return Ok(());
+    }
+
+    if loaded {
+        let _ = launchctl(&["bootout", &service_target(uid)]);
+    }
+    if exists {
+        fs::remove_file(plist)
+            .with_context(|| format!("failed to remove stale plist: {}", plist.display()))?;
+    }
+
+    println!(
+        "Removed our own LaunchAgent ({LABEL}) — the daemon is managed by Homebrew services \
+         instead."
+    );
+    Ok(())
+}
+
 /// Stop the daemon and remove the LaunchAgent plist.
 pub fn uninstall() -> Result<()> {
     let plist = plist_path().context("failed to resolve plist path")?;
@@ -450,8 +548,41 @@ pub fn status() -> Result<InstallStatus> {
 
 #[cfg(test)]
 mod tests {
-    use super::{render_plist, resolve_registry_url_env};
+    use super::{brew_service_is_managing, render_plist, resolve_registry_url_env};
     use std::path::Path;
+
+    // ── brew_service_is_managing ─────────────────────────────────────────────
+    //
+    // Regression coverage for the live incident: spaceghost, 2026-10-13.
+    // `brew services` already owned a healthy daemon under
+    // `homebrew.mxcl.vectorhawk`; `mcp setup`'s `daemon install` step must
+    // recognize that and refuse to install/enable a second, competing
+    // `com.vectorhawk.agent` LaunchAgent that can never win the
+    // single-instance socket lock.
+
+    #[test]
+    fn managed_when_plist_exists_and_service_loaded() {
+        assert!(brew_service_is_managing(true, true));
+    }
+
+    #[test]
+    fn not_managed_when_plist_missing_even_if_something_is_loaded() {
+        // Guards against a coincidental launchctl success unrelated to a
+        // real brew-written plist.
+        assert!(!brew_service_is_managing(false, true));
+    }
+
+    #[test]
+    fn not_managed_when_plist_exists_but_nothing_is_loaded() {
+        // A leftover plist from a `brew services stop` that didn't clean up
+        // its file must not be mistaken for an actively-managed daemon.
+        assert!(!brew_service_is_managing(true, false));
+    }
+
+    #[test]
+    fn not_managed_when_neither_signal_present() {
+        assert!(!brew_service_is_managing(false, false));
+    }
 
     // D1 board card: INFO logging on by default, bounded log footprint on
     // disk. `render_plist` must set RUST_LOG=info, must no longer point

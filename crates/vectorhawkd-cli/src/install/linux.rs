@@ -36,9 +36,10 @@ use anyhow::{Context, Result};
 use std::{fs, process::Command};
 
 use super::{
-    cgroup_is_service, cmdline_is_daemon_run, daemon_socket_path, exe_is_stale,
-    resolve_daemon_bin_path, socket_is_reachable, take_over_verified_pid, unit_is_healthy,
-    wait_for_socket, InstallStatus, SystemdState,
+    cgroup_is_service, cgroup_owning_service, cmdline_is_daemon_run, daemon_socket_path,
+    exe_is_stale, find_other_active_daemon_unit, resolve_daemon_bin_path, should_remove_our_unit,
+    socket_is_reachable, take_over_verified_pid, unit_is_healthy, wait_for_socket, InstallStatus,
+    SystemdState,
 };
 
 const SERVICE_NAME: &str = "vectorhawk-agent.service";
@@ -579,6 +580,130 @@ fn reap_stray_daemons() {
     }
 }
 
+// ── Competing-service-manager detection ──────────────────────────────────────
+//
+// `brew services` loads its own systemd user unit for this formula —
+// `sh.brew.vectorhawk.service`, written to the same `~/.config/systemd/user/`
+// directory as our own `vectorhawk-agent.service`. Two such units both
+// `Restart=always` against the same single-instance socket lock
+// (`daemon.lock`) is a permanent crash-restart loop for whichever one loses
+// the acquire race. See `vectorhawkd_cli::install::find_other_active_daemon_unit`
+// and friends in `mod.rs` for the pure decision logic this wraps with real
+// file reads and `systemctl` calls.
+
+/// Scan every other `*.service` file in the systemd user unit directory
+/// (i.e. not `SERVICE_NAME`) for one that runs `vectorhawk daemon run` and
+/// is reported `Active`. Returns that unit's name, or `None` if the
+/// directory can't be read or no candidate qualifies — see
+/// [`find_other_active_daemon_unit`]'s doc comment for exactly what
+/// "qualifies" means.
+fn scan_unit_files_for_other_daemon_run() -> Option<String> {
+    let config = dirs::config_dir()?;
+    let unit_dir = config.join("systemd").join("user");
+    let entries = fs::read_dir(&unit_dir).ok()?;
+
+    let mut candidates = Vec::new();
+    for entry in entries.flatten() {
+        let file_name = entry.file_name().to_string_lossy().into_owned();
+        if file_name == SERVICE_NAME || !file_name.ends_with(".service") {
+            continue;
+        }
+        if let Ok(contents) = fs::read_to_string(entry.path()) {
+            candidates.push((file_name, contents));
+        }
+    }
+
+    find_other_active_daemon_unit(SERVICE_NAME, &candidates, other_unit_active_state)
+}
+
+/// Read another unit's `ActiveState`/`SubState` the same way [`unit_state`]
+/// reads ours — same explicit `XDG_RUNTIME_DIR`/`DBUS_SESSION_BUS_ADDRESS`
+/// plumbing, same reason (see `unit_state`'s doc comment). Kept separate
+/// from `unit_state` because that function is hard-coded to `SERVICE_NAME`;
+/// this one takes the unit name as a parameter so it can be injected as the
+/// `active_state_of` closure into [`find_other_active_daemon_unit`].
+fn other_unit_active_state(unit_name: &str) -> Option<SystemdState> {
+    let xdg = xdg_runtime_dir();
+    let bus = format!("unix:path={xdg}/bus");
+
+    let output = Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            unit_name,
+            "-p",
+            "ActiveState",
+            "-p",
+            "SubState",
+        ])
+        .env("XDG_RUNTIME_DIR", &xdg)
+        .env("DBUS_SESSION_BUS_ADDRESS", &bus)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+    parse_active_sub_state(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Fallback for when the competing unit's file can't be found by scanning
+/// the systemd user directory (unusual, but e.g. a non-standard unit search
+/// path): identify whichever process is actually holding the daemon socket
+/// right now, and ask the kernel (via `/proc/<pid>/cgroup`) which systemd
+/// unit owns it. Returns `None` when nothing is listening, the owning unit
+/// can't be determined, or it turns out to be our own unit after all.
+fn socket_peer_other_unit_name() -> Option<String> {
+    let xdg = xdg_runtime_dir();
+    let xdg_sock = format!("{xdg}/vectorhawk/agent.sock");
+    let path = camino::Utf8PathBuf::from_path_buf(std::path::PathBuf::from(&xdg_sock)).ok()?;
+
+    let (peer, _version) = vectorhawkd_daemon::peer_handshake::connect_and_probe(
+        &path,
+        std::time::Duration::from_millis(500),
+    );
+    let pid = peer.pid?;
+
+    let cgroup_contents = fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    let owner = cgroup_owning_service(&cgroup_contents)?;
+    if owner == SERVICE_NAME {
+        None
+    } else {
+        Some(owner)
+    }
+}
+
+/// Is the daemon already managed by a systemd user unit other than our own?
+/// Tries the unit-file scan first (names the unit without guessing); falls
+/// back to the socket-peer cgroup check only if that turns up nothing (e.g.
+/// permissions, non-standard unit search path).
+fn daemon_already_managed_by_other_unit() -> Option<String> {
+    scan_unit_files_for_other_daemon_run().or_else(socket_peer_other_unit_name)
+}
+
+/// Disable, stop, and remove our own `vectorhawk-agent.service`, because the
+/// daemon is confirmed managed elsewhere. Only touches our own unit — never
+/// the competing one. A no-op when there's nothing of ours to clean up.
+fn self_heal_remove_our_unit(unit: &std::path::Path) -> Result<()> {
+    let enabled = unit_is_enabled();
+    let exists = unit.exists();
+    if !should_remove_our_unit(true, exists, enabled) {
+        return Ok(());
+    }
+
+    if enabled {
+        let _ = systemctl_user(&["disable", "--now", SERVICE_NAME]);
+    }
+    if exists {
+        fs::remove_file(unit)
+            .with_context(|| format!("failed to remove stale unit file: {}", unit.display()))?;
+    }
+    let _ = systemctl_user(&["daemon-reload"]);
+
+    println!("Removed our own {SERVICE_NAME} — the daemon is managed by a different unit instead.");
+    Ok(())
+}
+
 // ── Public install / uninstall ────────────────────────────────────────────────
 
 /// Install and start the daemon via systemd user unit (or XDG autostart fallback).
@@ -611,6 +736,28 @@ fn install_systemd(bin_path: &std::path::Path) -> Result<()> {
     // below for the post-restart wait).
     let xdg = xdg_runtime_dir();
     let xdg_sock = format!("{xdg}/vectorhawk/agent.sock");
+
+    // ── Competing-manager guard — must run before anything else below ────────
+    // If a *different* systemd user unit (most commonly `brew services`'
+    // `sh.brew.vectorhawk.service`) is already running a healthy daemon on
+    // this same socket, writing and enabling our own `vectorhawk-agent.service`
+    // on top of it is exactly the bug this guard exists to prevent: both
+    // units carry `Restart=always` against the same single-instance socket
+    // lock (`daemon.lock`), so whichever loses the acquire race can never win
+    // it, exits 1, and systemd restarts it right back — forever. Only
+    // consulted when the socket is actually live; an inactive/failed/absent
+    // competing unit must not suppress our own install, since that's exactly
+    // the box that still needs it.
+    if socket_is_reachable(&xdg_sock, 200) {
+        if let Some(other) = daemon_already_managed_by_other_unit() {
+            println!(
+                "VectorHawk daemon is managed by a different systemd unit ({other}); not \
+                 installing {SERVICE_NAME}."
+            );
+            self_heal_remove_our_unit(&unit)?;
+            return Ok(());
+        }
+    }
 
     let unit_exists_and_enabled = unit.exists() && unit_is_enabled();
     let unit_has_current_binary = unit_exists_and_enabled
