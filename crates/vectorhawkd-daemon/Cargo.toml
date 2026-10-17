@@ -59,12 +59,12 @@ axum = { version = "0.8", default-features = false, features = ["http1", "query"
 
 # ES256 JWT verification for the local MCP HTTP resource server (Phase 2
 # zero-CLI OAuth, §8 of the frozen interface contract). Well-maintained,
-# widely used, no heavyweight transitive deps beyond its crypto backend
-# (`ring`, already a common dependency in the Rust TLS ecosystem via
-# rustls — no new crypto library is introduced). Default features only;
-# we don't need PEM parsing since JWKS keys are built directly from their
-# base64url `x`/`y` components via `DecodingKey::from_ec_components`.
-jsonwebtoken = "9"
+# widely used. >= 10.3 for the type-confusion authorization-bypass fix
+# (GHSA, Dependabot 2026-10). 10.x makes the crypto backend explicit:
+# `rust_crypto` (pure Rust, no C toolchain needed for cross builds).
+# `use_pem` is for the tests' PEM signing keys; production builds JWKS
+# keys from their base64url `x`/`y` via `DecodingKey::from_ec_components`.
+jsonwebtoken = { version = "10.3", default-features = false, features = ["rust_crypto", "use_pem"] }
 
 [dev-dependencies]
 serde_json.workspace = true
