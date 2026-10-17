@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.0.105"
+version = "1.0.106"
 edition = "2021"
 rust-version = "1.75"
 authors = ["VectorHawk"]
