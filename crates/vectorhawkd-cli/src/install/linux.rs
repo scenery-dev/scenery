@@ -37,9 +37,9 @@ use std::{fs, process::Command};
 
 use super::{
     cgroup_is_service, cgroup_owning_service, cmdline_is_daemon_run, daemon_socket_path,
-    exe_is_stale, find_other_active_daemon_unit, resolve_daemon_bin_path, should_remove_our_unit,
-    socket_is_reachable, take_over_verified_pid, unit_is_healthy, wait_for_socket, InstallStatus,
-    SystemdState,
+    exe_is_stale, find_other_owning_daemon_unit, parse_unit_file_state, resolve_daemon_bin_path,
+    should_remove_our_unit, should_start_other_unit, socket_is_reachable, take_over_verified_pid,
+    unit_is_healthy, wait_for_socket, InstallStatus, SystemdState, UnitFileState,
 };
 
 const SERVICE_NAME: &str = "vectorhawk-agent.service";
@@ -587,16 +587,17 @@ fn reap_stray_daemons() {
 // directory as our own `vectorhawk-agent.service`. Two such units both
 // `Restart=always` against the same single-instance socket lock
 // (`daemon.lock`) is a permanent crash-restart loop for whichever one loses
-// the acquire race. See `vectorhawkd_cli::install::find_other_active_daemon_unit`
+// the acquire race. See `vectorhawkd_cli::install::find_other_owning_daemon_unit`
 // and friends in `mod.rs` for the pure decision logic this wraps with real
 // file reads and `systemctl` calls.
 
 /// Scan every other `*.service` file in the systemd user unit directory
 /// (i.e. not `SERVICE_NAME`) for one that runs `vectorhawk daemon run` and
-/// is reported `Active`. Returns that unit's name, or `None` if the
-/// directory can't be read or no candidate qualifies — see
-/// [`find_other_active_daemon_unit`]'s doc comment for exactly what
-/// "qualifies" means.
+/// **owns** the daemon (`Active`, or installed+enabled — see
+/// [`find_other_owning_daemon_unit`]'s doc comment for exactly what
+/// "owns" means and why enabled-but-momentarily-inactive counts). Returns
+/// that unit's name, or `None` if the directory can't be read or no
+/// candidate qualifies.
 fn scan_unit_files_for_other_daemon_run() -> Option<String> {
     let config = dirs::config_dir()?;
     let unit_dir = config.join("systemd").join("user");
@@ -613,16 +614,24 @@ fn scan_unit_files_for_other_daemon_run() -> Option<String> {
         }
     }
 
-    find_other_active_daemon_unit(SERVICE_NAME, &candidates, other_unit_active_state)
+    find_other_owning_daemon_unit(SERVICE_NAME, &candidates, other_unit_info)
 }
 
-/// Read another unit's `ActiveState`/`SubState` the same way [`unit_state`]
-/// reads ours — same explicit `XDG_RUNTIME_DIR`/`DBUS_SESSION_BUS_ADDRESS`
-/// plumbing, same reason (see `unit_state`'s doc comment). Kept separate
-/// from `unit_state` because that function is hard-coded to `SERVICE_NAME`;
-/// this one takes the unit name as a parameter so it can be injected as the
-/// `active_state_of` closure into [`find_other_active_daemon_unit`].
-fn other_unit_active_state(unit_name: &str) -> Option<SystemdState> {
+/// Read another unit's `ActiveState`/`SubState`/`UnitFileState` in one
+/// `systemctl --user show` call — same explicit `XDG_RUNTIME_DIR`/
+/// `DBUS_SESSION_BUS_ADDRESS` plumbing as [`unit_state`], same reason (see
+/// that function's doc comment). Kept separate from `unit_state` because
+/// that function is hard-coded to `SERVICE_NAME`; this one takes the unit
+/// name as a parameter so it can be injected as the `unit_info_of` closure
+/// into [`find_other_owning_daemon_unit`], and is also called directly
+/// after self-healing to decide whether the now-recognized owner needs
+/// [`should_start_other_unit`]'s `systemctl --user start`.
+///
+/// `UnitFileState` defaults to [`UnitFileState::Other`] whenever it can't be
+/// determined (systemctl missing/failed, property absent, unparseable
+/// output) — `unit_file_state_counts_as_owner` (via
+/// [`find_other_owning_daemon_unit`]) correctly treats that as "not enabled."
+fn other_unit_info(unit_name: &str) -> (Option<SystemdState>, UnitFileState) {
     let xdg = xdg_runtime_dir();
     let bus = format!("unix:path={xdg}/bus");
 
@@ -635,16 +644,37 @@ fn other_unit_active_state(unit_name: &str) -> Option<SystemdState> {
             "ActiveState",
             "-p",
             "SubState",
+            "-p",
+            "UnitFileState",
         ])
         .env("XDG_RUNTIME_DIR", &xdg)
         .env("DBUS_SESSION_BUS_ADDRESS", &bus)
-        .output()
-        .ok()?;
+        .output();
 
+    let Ok(output) = output else {
+        return (None, UnitFileState::Other);
+    };
     if !output.status.success() {
-        return None;
+        return (None, UnitFileState::Other);
     }
-    parse_active_sub_state(&String::from_utf8_lossy(&output.stdout))
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let active = parse_active_sub_state(&text);
+    let unit_file_state = unit_file_state_from_show_output(&text);
+    (active, unit_file_state)
+}
+
+/// Extract and parse the `UnitFileState=` line out of a `systemctl --user
+/// show -p ... -p UnitFileState <unit>` output blob. Returns
+/// [`UnitFileState::Other`] when the line is absent — see
+/// [`other_unit_info`]'s doc comment for why that's the right default.
+fn unit_file_state_from_show_output(output: &str) -> UnitFileState {
+    for line in output.lines() {
+        if let Some(v) = line.strip_prefix("UnitFileState=") {
+            return parse_unit_file_state(v.trim());
+        }
+    }
+    UnitFileState::Other
 }
 
 /// Fallback for when the competing unit's file can't be found by scanning
@@ -737,26 +767,61 @@ fn install_systemd(bin_path: &std::path::Path) -> Result<()> {
     let xdg = xdg_runtime_dir();
     let xdg_sock = format!("{xdg}/vectorhawk/agent.sock");
 
-    // ── Competing-manager guard — must run before anything else below ────────
+    // ── Competing-manager guard — must run before anything else below, and ───
+    // ── regardless of whether the socket happens to be reachable right now ───
     // If a *different* systemd user unit (most commonly `brew services`'
-    // `sh.brew.vectorhawk.service`) is already running a healthy daemon on
-    // this same socket, writing and enabling our own `vectorhawk-agent.service`
-    // on top of it is exactly the bug this guard exists to prevent: both
-    // units carry `Restart=always` against the same single-instance socket
-    // lock (`daemon.lock`), so whichever loses the acquire race can never win
-    // it, exits 1, and systemd restarts it right back — forever. Only
-    // consulted when the socket is actually live; an inactive/failed/absent
-    // competing unit must not suppress our own install, since that's exactly
-    // the box that still needs it.
-    if socket_is_reachable(&xdg_sock, 200) {
-        if let Some(other) = daemon_already_managed_by_other_unit() {
-            println!(
-                "VectorHawk daemon is managed by a different systemd unit ({other}); not \
-                 installing {SERVICE_NAME}."
-            );
-            self_heal_remove_our_unit(&unit)?;
-            return Ok(());
+    // `sh.brew.vectorhawk.service`) owns the daemon, writing and enabling our
+    // own `vectorhawk-agent.service` on top of it is exactly the bug this
+    // guard exists to prevent: both units carry `Restart=always` against the
+    // same single-instance socket lock (`daemon.lock`), so whichever loses
+    // the acquire race can never win it, exits 1, and systemd restarts it
+    // right back — forever.
+    //
+    // "Owns the daemon" (see `find_other_owning_daemon_unit`'s doc comment)
+    // is deliberately broader than "is Active right now": gating this on
+    // `socket_is_reachable` first — as an earlier version of this guard did
+    // — missed the live `brew upgrade` race. `brew upgrade` replaces the
+    // binary and brew's unit exits to restart onto it; in that gap OUR unit
+    // won the socket-lock race, so the socket was reachable but held by
+    // *us*, while brew's unit (still enabled) sat `inactive (dead)`. Gating
+    // on socket reachability meant this guard never even ran. It now runs
+    // unconditionally and asks ownership questions ("Active, or installed +
+    // enabled") instead of "is anything listening right now" — an inactive
+    // but disabled/masked competing unit still does not count (that's
+    // exactly the box that still needs our own unit), but an enabled one
+    // does, even mid-restart.
+    if let Some(other) = daemon_already_managed_by_other_unit() {
+        println!(
+            "VectorHawk daemon is managed by a different systemd unit ({other}); not \
+             installing {SERVICE_NAME}."
+        );
+        self_heal_remove_our_unit(&unit)?;
+
+        // The owning unit may itself be down right now (the upgrade-race
+        // case above) — help it back up rather than leaving the daemon
+        // unreachable after we just stepped aside for it. Only ever
+        // `start`s that one unit; never modifies, disables, or stops it.
+        let (other_active, _) = other_unit_info(&other);
+        if should_start_other_unit(other_active) {
+            println!("{other} is not active — starting it.");
+            match systemctl_user(&["start", &other]) {
+                Ok(()) => {
+                    if wait_for_socket(&xdg_sock, std::time::Duration::from_secs(10)) {
+                        println!(
+                            "{other} is now running and the VectorHawk daemon socket is reachable."
+                        );
+                    } else {
+                        println!(
+                            "Started {other}, but the daemon socket did not become reachable \
+                             within 10s. Diagnose with:\n  \
+                             XDG_RUNTIME_DIR={xdg} systemctl --user status {other}"
+                        );
+                    }
+                }
+                Err(e) => println!("warning: failed to start {other}: {e:#}"),
+            }
         }
+        return Ok(());
     }
 
     let unit_exists_and_enabled = unit.exists() && unit_is_enabled();
