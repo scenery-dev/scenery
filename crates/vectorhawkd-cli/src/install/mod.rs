@@ -476,10 +476,14 @@ pub(crate) fn cgroup_owning_service(cgroup_file_contents: &str) -> Option<String
 /// describes for `/proc/<pid>/cmdline` matching.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn exec_start_is_daemon_run(exec_start: &str) -> bool {
-    let mut tokens = exec_start.split_whitespace();
+    let tokens = split_exec_start(exec_start);
+    let mut tokens = tokens.iter().map(String::as_str);
     let Some(argv0) = tokens.next() else {
         return false;
     };
+    // systemd allows special-executable prefixes before the path
+    // (`-`, `@`, `+`, `!`, `!!`, `:`); they aren't part of the program name.
+    let argv0 = argv0.trim_start_matches(['-', '@', '+', '!', ':']);
     let argv0_name = std::path::Path::new(argv0)
         .file_name()
         .and_then(|n| n.to_str())
@@ -488,6 +492,42 @@ pub(crate) fn exec_start_is_daemon_run(exec_start: &str) -> bool {
         return false;
     }
     tokens.next() == Some("daemon") && tokens.next() == Some("run")
+}
+
+/// Split an `ExecStart=` value into argv the way systemd does for the cases
+/// we care about: whitespace separates words, and single or double quotes
+/// group a word (and are removed). `brew services` quotes every element,
+/// e.g. `"/home/linuxbrew/.../vectorhawk" "daemon" "run" "--foreground"`.
+/// A leading exec prefix stays attached to the first word, as in systemd.
+fn split_exec_start(exec_start: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut in_word = false;
+    let mut quote: Option<char> = None;
+    for c in exec_start.chars() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => current.push(c),
+            None if c == '"' || c == '\'' => {
+                quote = Some(c);
+                in_word = true;
+            }
+            None if c.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut current));
+                    in_word = false;
+                }
+            }
+            None => {
+                current.push(c);
+                in_word = true;
+            }
+        }
+    }
+    if in_word {
+        words.push(current);
+    }
+    words
 }
 
 /// Tolerantly extract the value of a unit file's `ExecStart=` directive.
@@ -1256,6 +1296,42 @@ mod tests {
     #[test]
     fn exec_start_matches_bare_name_no_trailing_args() {
         assert!(exec_start_is_daemon_run("vectorhawk daemon run"));
+    }
+
+    /// The exact line `brew services` writes on Linux (verified on spaceghost
+    /// 2026-10-16): every argv element double-quoted. Before this test the
+    /// matcher split on whitespace and compared `"daemon"` with its quotes,
+    /// so brew's real unit was never recognised.
+    #[test]
+    fn exec_start_matches_brew_services_fully_quoted_line() {
+        assert!(exec_start_is_daemon_run(
+            r#""/home/linuxbrew/.linuxbrew/opt/vectorhawk/bin/vectorhawk" "daemon" "run" "--foreground""#
+        ));
+    }
+
+    #[test]
+    fn exec_start_matches_single_quoted_and_mixed_quoting() {
+        assert!(exec_start_is_daemon_run(
+            "'/usr/local/bin/vectorhawk' daemon 'run'"
+        ));
+        assert!(exec_start_is_daemon_run(
+            r#""/opt/Vector Hawk/bin/vectorhawk" daemon run"#
+        ));
+    }
+
+    #[test]
+    fn exec_start_matches_with_systemd_exec_prefixes() {
+        assert!(exec_start_is_daemon_run("-/usr/bin/vectorhawk daemon run"));
+        assert!(exec_start_is_daemon_run(
+            r#"+"/usr/bin/vectorhawk" "daemon" "run""#
+        ));
+    }
+
+    #[test]
+    fn exec_start_quoted_daemon_install_still_does_not_match() {
+        assert!(!exec_start_is_daemon_run(
+            r#""/home/linuxbrew/.linuxbrew/bin/vectorhawk" "daemon" "install""#
+        ));
     }
 
     #[test]
