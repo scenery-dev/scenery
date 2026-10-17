@@ -399,6 +399,158 @@ pub(crate) fn cgroup_is_service(cgroup_file_contents: &str, service_name: &str) 
         .any(|line| line.split('/').any(|segment| segment == service_name))
 }
 
+// ── Competing-service-manager detection (pure; shared by both platform ───────
+// ── installers, same reason as the block above: `mcp setup`/`daemon install` ─
+// ── must never write and enable `vectorhawk-agent.service` (or the macOS ────
+// ── LaunchAgent) when a *different* service-manager entry — most commonly ───
+// ── `brew services` (`sh.brew.vectorhawk.service` on Linux, ────────────────
+// ── `homebrew.mxcl.vectorhawk` on macOS) — is already running a healthy ─────
+// ── daemon. Two such units both `Restart=always`/`KeepAlive: true` on the ───
+// ── same single-instance socket lock is a permanent crash-restart loop for ──
+// ── whichever one loses the race: it can never acquire the lock, so it ──────
+// ── exits 1, systemd/launchd brings it right back, forever. ──────────────────
+
+/// Given the raw contents of `/proc/<pid>/cgroup`, return the name of the
+/// systemd unit that *directly* owns the process — i.e. the **final** path
+/// segment on a line, when that segment itself ends in `.service` — or
+/// `None` if the process's immediate cgroup leaf is something else (most
+/// commonly a `.scope`, e.g. a bare login-session process, or a `.slice`).
+///
+/// Deliberately checks only the trailing segment, not "any segment" like
+/// [`cgroup_is_service`]: every cgroup path under `systemd --user` has
+/// `user@<uid>.service` as an *ancestor* slice member (the user manager
+/// itself), so scanning every segment for anything ending in `.service`
+/// would misreport a plain terminal shell — cgrouped under
+/// `.../user@1000.service/app.slice/vte-spawn-abc.scope` — as being "owned"
+/// by `user@1000.service`. Only the leaf segment tells us which unit (if
+/// any) actually started this specific process.
+///
+/// Unlike `cgroup_is_service` (which tests membership in one *named* unit),
+/// this extracts whichever unit the process actually belongs to, so a caller
+/// can compare it against "is this unit ours?" without knowing the other
+/// unit's name in advance — exactly what's needed to recognize an unknown
+/// competing manager (e.g. `sh.brew.vectorhawk.service`) rather than only a
+/// specific one.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn cgroup_owning_service(cgroup_file_contents: &str) -> Option<String> {
+    cgroup_file_contents.lines().find_map(|line| {
+        let last_segment = line.rsplit('/').find(|s| !s.is_empty())?;
+        if last_segment.ends_with(".service") {
+            Some(last_segment.to_string())
+        } else {
+            None
+        }
+    })
+}
+
+/// Given the raw value of a systemd unit's `ExecStart=` directive (e.g.
+/// `/home/linuxbrew/.linuxbrew/opt/vectorhawk/bin/vectorhawk daemon run
+/// --foreground`), report whether it runs `vectorhawk daemon run`.
+///
+/// Matches **positionally** on the whitespace-split command line, mirroring
+/// [`cmdline_is_daemon_run`]'s argv-position matching and for the same
+/// reason: the first token's file-name component must be exactly
+/// `vectorhawk`, the second exactly `daemon`, the third exactly `run`.
+/// Trailing args (`--foreground`, etc.) are ignored. This deliberately
+/// excludes `daemon install`/`daemon restart` (a competing *installer*
+/// invocation, not a competing *running* daemon) and tolerates both a bare
+/// name and an absolute path in the first token.
+///
+/// A plain substring search (`contains("vectorhawk") && contains("daemon")
+/// && contains("run")`) would be fooled by an unrelated unit whose
+/// `ExecStart` happens to mention those words in some other order or
+/// position — the same class of bug `cmdline_is_daemon_run`'s doc comment
+/// describes for `/proc/<pid>/cmdline` matching.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn exec_start_is_daemon_run(exec_start: &str) -> bool {
+    let mut tokens = exec_start.split_whitespace();
+    let Some(argv0) = tokens.next() else {
+        return false;
+    };
+    let argv0_name = std::path::Path::new(argv0)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(argv0);
+    if argv0_name != "vectorhawk" {
+        return false;
+    }
+    tokens.next() == Some("daemon") && tokens.next() == Some("run")
+}
+
+/// Tolerantly extract the value of a unit file's `ExecStart=` directive.
+///
+/// Returns `None` when the file has no such line — never an error; an
+/// unparseable or unexpected unit (not one of ours or Homebrew's) is simply
+/// not a daemon-run candidate, not a failure.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn parse_exec_start_from_unit_file(unit_file_contents: &str) -> Option<String> {
+    for line in unit_file_contents.lines() {
+        if let Some(value) = line.trim().strip_prefix("ExecStart=") {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+/// Pure decision: among `candidates` — every other `*.service` file found in
+/// the systemd user directory (`(unit_name, raw_file_contents)`), gathered
+/// by the caller via plain file reads, **not** including `our_unit_name` —
+/// find the first one that (a) runs `vectorhawk daemon run` per its
+/// `ExecStart=` directive and (b) is reported `Active` by the
+/// caller-injected `active_state_of` lookup (real implementation:
+/// `systemctl --user show -p ActiveState -p SubState <unit>`; tests inject a
+/// fixed map/stub — this function never shells out itself).
+///
+/// Returns that unit's name, or `None` if no candidate is both a daemon-run
+/// unit and healthy. A `*.service` file that matches the `ExecStart` shape
+/// but is `Failed`/`Inactive`/stuck in `AutoRestart` must NOT suppress our
+/// own install — that is exactly the box that still needs
+/// `vectorhawk-agent.service` to make the daemon run at all, not one where
+/// something else already has it covered.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn find_other_active_daemon_unit<F>(
+    our_unit_name: &str,
+    candidates: &[(String, String)],
+    mut active_state_of: F,
+) -> Option<String>
+where
+    F: FnMut(&str) -> Option<SystemdState>,
+{
+    for (name, contents) in candidates {
+        if name == our_unit_name {
+            continue;
+        }
+        let Some(exec_start) = parse_exec_start_from_unit_file(contents) else {
+            continue;
+        };
+        if !exec_start_is_daemon_run(&exec_start) {
+            continue;
+        }
+        if active_state_of(name) == Some(SystemdState::Active) {
+            return Some(name.clone());
+        }
+    }
+    None
+}
+
+/// Pure decision: should the installer remove its *own* auto-start unit
+/// (`vectorhawk-agent.service` / `com.vectorhawk.agent.plist`)?
+///
+/// Only when the daemon is confirmed managed elsewhere (`managed_elsewhere`)
+/// AND our own unit actually has something to remove (it exists on disk, or
+/// is enabled/loaded with the service manager — either one, independently,
+/// since a half-finished prior install can have one without the other).
+/// When the daemon is *not* managed elsewhere, our own unit must be left
+/// alone even if present — that's the box that genuinely needs it.
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+pub(crate) fn should_remove_our_unit(
+    managed_elsewhere: bool,
+    our_unit_exists: bool,
+    our_unit_enabled_or_loaded: bool,
+) -> bool {
+    managed_elsewhere && (our_unit_exists || our_unit_enabled_or_loaded)
+}
+
 /// Given the raw, NUL-separated `/proc/<pid>/cmdline` bytes of a process,
 /// report whether it is a `vectorhawk daemon run` invocation (with or
 /// without trailing args such as `--foreground`).
@@ -621,8 +773,9 @@ pub(crate) fn reap_stray_daemon_via_socket(socket_path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        cgroup_is_service, cmdline_is_daemon_run, exe_is_stale, home_is_overridden,
-        unit_is_healthy, SystemdState,
+        cgroup_is_service, cgroup_owning_service, cmdline_is_daemon_run, exe_is_stale,
+        exec_start_is_daemon_run, find_other_active_daemon_unit, home_is_overridden,
+        parse_exec_start_from_unit_file, should_remove_our_unit, unit_is_healthy, SystemdState,
     };
 
     // ── home_is_overridden ─────────────────────────────────────────────────
@@ -922,4 +1075,195 @@ mod tests {
 
     // `rewrite_homebrew_cellar_to_symlink`'s own unit tests moved with it to
     // `vectorhawkd_core::binary_path` — see that module.
+
+    // ── cgroup_owning_service ───────────────────────────────────────────────
+
+    #[test]
+    fn cgroup_owning_service_extracts_brew_unit() {
+        let contents =
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/sh.brew.vectorhawk.service\n";
+        assert_eq!(
+            cgroup_owning_service(contents),
+            Some("sh.brew.vectorhawk.service".to_string())
+        );
+    }
+
+    #[test]
+    fn cgroup_owning_service_extracts_our_own_unit() {
+        let contents =
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/vectorhawk-agent.service\n";
+        assert_eq!(
+            cgroup_owning_service(contents),
+            Some("vectorhawk-agent.service".to_string())
+        );
+    }
+
+    #[test]
+    fn cgroup_owning_service_none_when_no_service_scope() {
+        let contents = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice/vte-spawn-abc.scope\n";
+        assert_eq!(cgroup_owning_service(contents), None);
+    }
+
+    #[test]
+    fn cgroup_owning_service_does_not_mistake_the_user_manager_ancestor_for_the_owner() {
+        // Every `systemd --user` cgroup path carries `user@<uid>.service` as
+        // an ANCESTOR slice member (the user manager itself) — a naive "any
+        // segment ending in .service" scan would misreport this plain
+        // terminal shell as owned by `user@1000.service`. Only the trailing
+        // leaf segment counts.
+        let contents = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice/vte-spawn-xyz.scope\n";
+        assert_ne!(
+            cgroup_owning_service(contents),
+            Some("user@1000.service".to_string())
+        );
+        assert_eq!(cgroup_owning_service(contents), None);
+    }
+
+    // ── exec_start_is_daemon_run ────────────────────────────────────────────
+
+    #[test]
+    fn exec_start_matches_brew_opt_path_with_foreground_flag() {
+        assert!(exec_start_is_daemon_run(
+            "/home/linuxbrew/.linuxbrew/opt/vectorhawk/bin/vectorhawk daemon run --foreground"
+        ));
+    }
+
+    #[test]
+    fn exec_start_matches_bare_name_no_trailing_args() {
+        assert!(exec_start_is_daemon_run("vectorhawk daemon run"));
+    }
+
+    #[test]
+    fn exec_start_does_not_match_daemon_install() {
+        assert!(!exec_start_is_daemon_run(
+            "/home/linuxbrew/.linuxbrew/bin/vectorhawk daemon install"
+        ));
+    }
+
+    #[test]
+    fn exec_start_does_not_match_unrelated_command() {
+        assert!(!exec_start_is_daemon_run(
+            "/bin/sh -c 'echo vectorhawk daemon run'"
+        ));
+    }
+
+    #[test]
+    fn exec_start_empty_does_not_match_and_does_not_panic() {
+        assert!(!exec_start_is_daemon_run(""));
+    }
+
+    // ── parse_exec_start_from_unit_file ─────────────────────────────────────
+
+    #[test]
+    fn parse_exec_start_extracts_the_value() {
+        let unit = "[Unit]\nDescription=x\n\n[Service]\nExecStart=/opt/vectorhawk/bin/vectorhawk daemon run --foreground\nRestart=always\n";
+        assert_eq!(
+            parse_exec_start_from_unit_file(unit),
+            Some("/opt/vectorhawk/bin/vectorhawk daemon run --foreground".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_exec_start_none_when_absent() {
+        let unit = "[Unit]\nDescription=x\n\n[Service]\nType=simple\n";
+        assert_eq!(parse_exec_start_from_unit_file(unit), None);
+    }
+
+    // ── find_other_active_daemon_unit ───────────────────────────────────────
+    //
+    // The regression this pins: spaceghost, 2026-10-13. `brew services` owns
+    // `sh.brew.vectorhawk.service`, healthy and Active; `mcp setup` must
+    // recognize it and never install/enable a second, competing
+    // `vectorhawk-agent.service` that can never win the single-instance
+    // socket lock and crash-loops forever.
+
+    #[test]
+    fn finds_healthy_brew_unit_as_the_manager() {
+        let candidates = vec![(
+            "sh.brew.vectorhawk.service".to_string(),
+            "[Service]\nExecStart=/home/linuxbrew/.linuxbrew/opt/vectorhawk/bin/vectorhawk daemon run --foreground\n".to_string(),
+        )];
+        let result =
+            find_other_active_daemon_unit("vectorhawk-agent.service", &candidates, |name| {
+                assert_eq!(name, "sh.brew.vectorhawk.service");
+                Some(SystemdState::Active)
+            });
+        assert_eq!(result, Some("sh.brew.vectorhawk.service".to_string()));
+    }
+
+    #[test]
+    fn ignores_our_own_unit_name_even_if_it_matches() {
+        let candidates = vec![(
+            "vectorhawk-agent.service".to_string(),
+            "[Service]\nExecStart=/opt/vectorhawk/bin/vectorhawk daemon run --foreground\n"
+                .to_string(),
+        )];
+        let result = find_other_active_daemon_unit("vectorhawk-agent.service", &candidates, |_| {
+            panic!("active_state_of must never be consulted for our own unit")
+        });
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn ignores_a_matching_unit_that_is_not_active() {
+        for state in [
+            Some(SystemdState::Failed),
+            Some(SystemdState::Inactive),
+            Some(SystemdState::AutoRestart),
+            Some(SystemdState::Activating),
+            Some(SystemdState::Unknown),
+            None,
+        ] {
+            let candidates = vec![(
+                "sh.brew.vectorhawk.service".to_string(),
+                "[Service]\nExecStart=/opt/vectorhawk/bin/vectorhawk daemon run --foreground\n"
+                    .to_string(),
+            )];
+            let result =
+                find_other_active_daemon_unit("vectorhawk-agent.service", &candidates, |_| state);
+            assert_eq!(
+                result, None,
+                "state={state:?} must not be treated as managed"
+            );
+        }
+    }
+
+    #[test]
+    fn ignores_an_unrelated_unit_even_if_active() {
+        let candidates = vec![(
+            "some-other-app.service".to_string(),
+            "[Service]\nExecStart=/usr/bin/some-other-app --flag\n".to_string(),
+        )];
+        let result = find_other_active_daemon_unit("vectorhawk-agent.service", &candidates, |_| {
+            Some(SystemdState::Active)
+        });
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn empty_candidate_list_is_none() {
+        let result = find_other_active_daemon_unit("vectorhawk-agent.service", &[], |_| {
+            panic!("active_state_of must never be called with no candidates")
+        });
+        assert_eq!(result, None);
+    }
+
+    // ── should_remove_our_unit ───────────────────────────────────────────────
+
+    #[test]
+    fn removes_stale_unit_when_managed_elsewhere_and_unit_exists() {
+        assert!(should_remove_our_unit(true, true, false));
+        assert!(should_remove_our_unit(true, false, true));
+        assert!(should_remove_our_unit(true, true, true));
+    }
+
+    #[test]
+    fn leaves_nothing_to_remove_when_managed_elsewhere_but_nothing_present() {
+        assert!(!should_remove_our_unit(true, false, false));
+    }
+
+    #[test]
+    fn never_removes_our_unit_when_not_managed_elsewhere() {
+        assert!(!should_remove_our_unit(false, true, true));
+    }
 }
