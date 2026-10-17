@@ -395,6 +395,62 @@ pub(crate) fn brew_recovery_argv(
     }
 }
 
+/// If `brew services` owns the daemon (see [`brew_service_is_managing`]),
+/// step aside: remove our own LaunchAgent and make sure brew's job is
+/// loaded and running. Returns `true` when it did, so callers skip
+/// installing or keeping our agent.
+///
+/// Called from both [`install`] and `ensure_installed`: after a `brew
+/// upgrade` race our own duplicate can be the one running the daemon, so
+/// `status()` reports "installed and running" and `install()` would never be
+/// reached.
+pub(super) fn reconcile_competing_manager() -> Result<bool> {
+    let plist = plist_path().context("failed to resolve plist path")?;
+    let uid = current_uid();
+    let brew_plist = brew_plist_path().context("failed to resolve brew plist path")?;
+    if !brew_service_is_managing(brew_plist.exists()) {
+        return Ok(false);
+    }
+    println!(
+        "VectorHawk daemon is managed by Homebrew services ({BREW_SERVICE_LABEL}); \
+         not installing {LABEL}."
+    );
+    self_heal_remove_our_agent(&plist, uid)?;
+
+    let loaded = brew_service_is_loaded(uid);
+    let socket_reachable = socket_is_reachable(&daemon_socket_path(), 200);
+    let action = brew_recovery_action(loaded, socket_reachable);
+    let brew_plist_str = brew_plist
+        .to_str()
+        .context("brew plist path is not valid UTF-8")?;
+    if let Some(argv) = brew_recovery_argv(action, uid, brew_plist_str) {
+        let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        match action {
+            BrewRecoveryAction::Bootstrap => {
+                println!("{BREW_SERVICE_LABEL} is not loaded — bootstrapping it.");
+            }
+            BrewRecoveryAction::Kickstart => {
+                println!(
+                    "{BREW_SERVICE_LABEL} is loaded but the daemon socket is not reachable \
+                     — kickstarting it."
+                );
+            }
+            BrewRecoveryAction::None => {}
+        }
+        if let Err(e) = launchctl(&argv_refs) {
+            println!("warning: failed to recover {BREW_SERVICE_LABEL}: {e:#}");
+        } else if wait_for_socket(&daemon_socket_path(), std::time::Duration::from_secs(10)) {
+            println!("{BREW_SERVICE_LABEL} is now running and the daemon socket is reachable.");
+        } else {
+            println!(
+                "Recovered {BREW_SERVICE_LABEL}, but the daemon socket did not become \
+                 reachable within 10s."
+            );
+        }
+    }
+    Ok(true)
+}
+
 // ── Public install / uninstall ────────────────────────────────────────────────
 
 /// Install the LaunchAgent and start the daemon.
@@ -413,45 +469,7 @@ pub fn install() -> Result<()> {
     // first, skip our own install/enable entirely, self-heal any damage from
     // a previous run that didn't have this guard, and help brew's job back
     // up if it isn't currently loaded/running (never touching its plist).
-    let brew_plist = brew_plist_path().context("failed to resolve brew plist path")?;
-    if brew_service_is_managing(brew_plist.exists()) {
-        println!(
-            "VectorHawk daemon is managed by Homebrew services ({BREW_SERVICE_LABEL}); \
-             not installing {LABEL}."
-        );
-        self_heal_remove_our_agent(&plist, uid)?;
-
-        let loaded = brew_service_is_loaded(uid);
-        let socket_reachable = socket_is_reachable(&daemon_socket_path(), 200);
-        let action = brew_recovery_action(loaded, socket_reachable);
-        let brew_plist_str = brew_plist
-            .to_str()
-            .context("brew plist path is not valid UTF-8")?;
-        if let Some(argv) = brew_recovery_argv(action, uid, brew_plist_str) {
-            let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-            match action {
-                BrewRecoveryAction::Bootstrap => {
-                    println!("{BREW_SERVICE_LABEL} is not loaded — bootstrapping it.");
-                }
-                BrewRecoveryAction::Kickstart => {
-                    println!(
-                        "{BREW_SERVICE_LABEL} is loaded but the daemon socket is not reachable \
-                         — kickstarting it."
-                    );
-                }
-                BrewRecoveryAction::None => {}
-            }
-            if let Err(e) = launchctl(&argv_refs) {
-                println!("warning: failed to recover {BREW_SERVICE_LABEL}: {e:#}");
-            } else if wait_for_socket(&daemon_socket_path(), std::time::Duration::from_secs(10)) {
-                println!("{BREW_SERVICE_LABEL} is now running and the daemon socket is reachable.");
-            } else {
-                println!(
-                    "Recovered {BREW_SERVICE_LABEL}, but the daemon socket did not become \
-                     reachable within 10s."
-                );
-            }
-        }
+    if reconcile_competing_manager()? {
         return Ok(());
     }
 

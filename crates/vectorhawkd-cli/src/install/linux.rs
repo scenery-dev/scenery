@@ -734,6 +734,55 @@ fn self_heal_remove_our_unit(unit: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// If a different systemd user unit owns the daemon (see
+/// [`find_other_owning_daemon_unit`]), step aside: remove our own unit and
+/// make sure the owning unit is running. Returns `true` when it did, so
+/// callers skip installing or keeping our unit.
+///
+/// Called from both [`install_systemd`] and `ensure_installed`. The latter
+/// matters: after a `brew upgrade` race our own duplicate can be the one
+/// running the daemon, so `status()` reports "installed and running" and
+/// `install()` would never be reached.
+pub(super) fn reconcile_competing_manager() -> Result<bool> {
+    let unit = unit_path().context("failed to resolve unit path")?;
+    let xdg = xdg_runtime_dir();
+    let xdg_sock = format!("{xdg}/vectorhawk/agent.sock");
+    let Some(other) = daemon_already_managed_by_other_unit() else {
+        return Ok(false);
+    };
+    println!(
+        "VectorHawk daemon is managed by a different systemd unit ({other}); not \
+         installing {SERVICE_NAME}."
+    );
+    self_heal_remove_our_unit(&unit)?;
+
+    // The owning unit may itself be down right now (the upgrade-race
+    // case above) — help it back up rather than leaving the daemon
+    // unreachable after we just stepped aside for it. Only ever
+    // `start`s that one unit; never modifies, disables, or stops it.
+    let (other_active, _) = other_unit_info(&other);
+    if should_start_other_unit(other_active) {
+        println!("{other} is not active — starting it.");
+        match systemctl_user(&["start", &other]) {
+            Ok(()) => {
+                if wait_for_socket(&xdg_sock, std::time::Duration::from_secs(10)) {
+                    println!(
+                        "{other} is now running and the VectorHawk daemon socket is reachable."
+                    );
+                } else {
+                    println!(
+                        "Started {other}, but the daemon socket did not become reachable \
+                         within 10s. Diagnose with:\n  \
+                         XDG_RUNTIME_DIR={xdg} systemctl --user status {other}"
+                    );
+                }
+            }
+            Err(e) => println!("warning: failed to start {other}: {e:#}"),
+        }
+    }
+    Ok(true)
+}
+
 // ── Public install / uninstall ────────────────────────────────────────────────
 
 /// Install and start the daemon via systemd user unit (or XDG autostart fallback).
@@ -790,37 +839,7 @@ fn install_systemd(bin_path: &std::path::Path) -> Result<()> {
     // but disabled/masked competing unit still does not count (that's
     // exactly the box that still needs our own unit), but an enabled one
     // does, even mid-restart.
-    if let Some(other) = daemon_already_managed_by_other_unit() {
-        println!(
-            "VectorHawk daemon is managed by a different systemd unit ({other}); not \
-             installing {SERVICE_NAME}."
-        );
-        self_heal_remove_our_unit(&unit)?;
-
-        // The owning unit may itself be down right now (the upgrade-race
-        // case above) — help it back up rather than leaving the daemon
-        // unreachable after we just stepped aside for it. Only ever
-        // `start`s that one unit; never modifies, disables, or stops it.
-        let (other_active, _) = other_unit_info(&other);
-        if should_start_other_unit(other_active) {
-            println!("{other} is not active — starting it.");
-            match systemctl_user(&["start", &other]) {
-                Ok(()) => {
-                    if wait_for_socket(&xdg_sock, std::time::Duration::from_secs(10)) {
-                        println!(
-                            "{other} is now running and the VectorHawk daemon socket is reachable."
-                        );
-                    } else {
-                        println!(
-                            "Started {other}, but the daemon socket did not become reachable \
-                             within 10s. Diagnose with:\n  \
-                             XDG_RUNTIME_DIR={xdg} systemctl --user status {other}"
-                        );
-                    }
-                }
-                Err(e) => println!("warning: failed to start {other}: {e:#}"),
-            }
-        }
+    if reconcile_competing_manager()? {
         return Ok(());
     }
 

@@ -120,6 +120,19 @@ pub fn restart() -> Result<()> {
 /// Used by `mcp setup` to provision the daemon transparently. Never errors if
 /// the daemon is already running.
 pub fn ensure_installed() -> Result<()> {
+    // Runs before the status check on purpose: after a `brew upgrade` race
+    // our own duplicate unit can be the one running the daemon, so status()
+    // says "installed and running" and install() — where this check also
+    // lives — would never be reached.
+    #[cfg(target_os = "linux")]
+    if linux::reconcile_competing_manager()? {
+        return Ok(());
+    }
+    #[cfg(target_os = "macos")]
+    if macos::reconcile_competing_manager()? {
+        return Ok(());
+    }
+
     match status()? {
         InstallStatus::NotInstalled => {
             install()?;
