@@ -332,11 +332,11 @@ pub(crate) fn socket_is_reachable(socket_path: &str, timeout_ms: u64) -> bool {
 /// wait: it is what install paths need right after starting the daemon,
 /// where the socket is not expected to exist yet for at least a few hundred
 /// milliseconds (tokio init + `state.db` open + bind).
-// Only `linux.rs` (`#[cfg(target_os = "linux")]`) calls these outside of the
-// `#[cfg(test)]` module below, so on a macOS build they are otherwise dead
-// code — genuinely unused there, not a bug.
+// Both `linux.rs` and `macos.rs` call this outside of the `#[cfg(test)]`
+// module below (macOS: waiting for Homebrew's job to come up after a
+// bootstrap/kickstart recovery — see `macos::install`'s competing-manager
+// guard).
 #[cfg(unix)]
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn wait_for_socket(socket_path: &str, timeout: std::time::Duration) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     loop {
@@ -492,29 +492,119 @@ pub(crate) fn parse_exec_start_from_unit_file(unit_file_contents: &str) -> Optio
     None
 }
 
+/// Coarse classification of a systemd unit's **installed** state, as read
+/// from `systemctl --user show -p UnitFileState <unit>` — independent of
+/// whether the unit is currently *running* ([`SystemdState`], which answers
+/// a different question). This is the signal that survives the gap the
+/// `find_other_owning_daemon_unit` fix below closes: a unit can be
+/// momentarily `Inactive` (mid-restart, just upgraded) while still being the
+/// thing that owns the daemon, because it will come back — `UnitFileState`
+/// doesn't flicker the way `ActiveState` does.
+///
+/// Every value systemd can report collapses to one of these seven; anything
+/// unrecognized (a future systemd value, unparseable `show` output, or the
+/// property simply absent) becomes [`UnitFileState::Other`], which
+/// [`unit_file_state_counts_as_owner`] conservatively treats as *not*
+/// enabled — "cannot tell" must never be mistaken for "this unit owns it."
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) enum UnitFileState {
+    /// Enabled persistently (survives reboot) — the normal `brew services
+    /// start` / `systemctl --user enable` outcome.
+    Enabled,
+    /// Enabled for this boot/session only.
+    EnabledRuntime,
+    /// Symlinked into the unit search path without a full `[Install]`
+    /// enable (e.g. `systemctl --user link`).
+    Linked,
+    /// Same as `Linked`, runtime-only.
+    LinkedRuntime,
+    /// Explicitly disabled — the user (or a prior uninstall) turned this
+    /// unit off. Must NOT count as ownership: a disabled competing unit is
+    /// exactly the box where *our* unit is legitimately needed.
+    Disabled,
+    /// Masked — symlinked to `/dev/null`, refuses to start at all. Same
+    /// non-ownership treatment as `Disabled`.
+    Masked,
+    /// Anything else, including "couldn't determine" — see the enum doc
+    /// comment's conservative-fallback rule.
+    Other,
+}
+
+/// Parse a raw `UnitFileState=` value (as it appears after the `=` in
+/// `systemctl --user show -p UnitFileState <unit>` output, already
+/// trimmed of the key and surrounding whitespace) into a [`UnitFileState`].
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn parse_unit_file_state(raw: &str) -> UnitFileState {
+    match raw.trim() {
+        "enabled" => UnitFileState::Enabled,
+        "enabled-runtime" => UnitFileState::EnabledRuntime,
+        "linked" => UnitFileState::Linked,
+        "linked-runtime" => UnitFileState::LinkedRuntime,
+        "disabled" => UnitFileState::Disabled,
+        "masked" | "masked-runtime" => UnitFileState::Masked,
+        _ => UnitFileState::Other,
+    }
+}
+
+/// Does this [`UnitFileState`] count as "installed and enabled" for the
+/// purposes of daemon ownership? `Enabled`/`EnabledRuntime`/`Linked`/
+/// `LinkedRuntime` do; `Disabled`/`Masked`/`Other` do not. See
+/// [`find_other_owning_daemon_unit`] for how this combines with
+/// [`SystemdState`] to decide ownership overall.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn unit_file_state_counts_as_owner(state: UnitFileState) -> bool {
+    matches!(
+        state,
+        UnitFileState::Enabled
+            | UnitFileState::EnabledRuntime
+            | UnitFileState::Linked
+            | UnitFileState::LinkedRuntime
+    )
+}
+
 /// Pure decision: among `candidates` — every other `*.service` file found in
 /// the systemd user directory (`(unit_name, raw_file_contents)`), gathered
 /// by the caller via plain file reads, **not** including `our_unit_name` —
 /// find the first one that (a) runs `vectorhawk daemon run` per its
-/// `ExecStart=` directive and (b) is reported `Active` by the
-/// caller-injected `active_state_of` lookup (real implementation:
-/// `systemctl --user show -p ActiveState -p SubState <unit>`; tests inject a
-/// fixed map/stub — this function never shells out itself).
+/// `ExecStart=` directive and (b) **owns** the daemon per the
+/// caller-injected `unit_info_of` lookup (real implementation:
+/// `systemctl --user show -p ActiveState -p SubState -p UnitFileState
+/// <unit>`; tests inject a fixed map/stub — this function never shells out
+/// itself).
 ///
-/// Returns that unit's name, or `None` if no candidate is both a daemon-run
-/// unit and healthy. A `*.service` file that matches the `ExecStart` shape
-/// but is `Failed`/`Inactive`/stuck in `AutoRestart` must NOT suppress our
-/// own install — that is exactly the box that still needs
+/// A candidate "owns" the daemon when it is reported `Active`, **or** its
+/// `UnitFileState` counts as enabled per [`unit_file_state_counts_as_owner`]
+/// — not `Active` alone, as an earlier version of this function (then named
+/// `find_other_active_daemon_unit`) required.
+///
+/// That `Active`-only rule had a live gap: a `brew upgrade` replaces the
+/// binary and the *running* brew-managed unit exits to restart onto it.
+/// During that gap it is briefly `Inactive` — enabled the whole time, about
+/// to come right back — but a second process (ours, from a stale prior
+/// install) can win the single-instance socket-lock race in that window and
+/// end up holding the socket while brew's unit settles into
+/// `inactive (dead)`, *still enabled*. An `Active`-only check sees no
+/// `Active` competing unit at that instant and lets the install proceed,
+/// permanently installing a second unit alongside a package-manager-owned
+/// one it should have deferred to. Treating "enabled" as ownership too
+/// closes that gap: a package manager's service, once installed and
+/// enabled, owns the daemon even while it is momentarily down for its own
+/// restart — ours must step aside and (per the caller) help it back up
+/// rather than compete with it.
+///
+/// A unit that is both `Disabled`/`Masked` *and* not `Active` genuinely owns
+/// nothing — that is exactly the box that still needs
 /// `vectorhawk-agent.service` to make the daemon run at all, not one where
 /// something else already has it covered.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub(crate) fn find_other_active_daemon_unit<F>(
+pub(crate) fn find_other_owning_daemon_unit<F>(
     our_unit_name: &str,
     candidates: &[(String, String)],
-    mut active_state_of: F,
+    mut unit_info_of: F,
 ) -> Option<String>
 where
-    F: FnMut(&str) -> Option<SystemdState>,
+    F: FnMut(&str) -> (Option<SystemdState>, UnitFileState),
 {
     for (name, contents) in candidates {
         if name == our_unit_name {
@@ -526,11 +616,31 @@ where
         if !exec_start_is_daemon_run(&exec_start) {
             continue;
         }
-        if active_state_of(name) == Some(SystemdState::Active) {
+        let (active_state, unit_file_state) = unit_info_of(name);
+        let owns_it = active_state == Some(SystemdState::Active)
+            || unit_file_state_counts_as_owner(unit_file_state);
+        if owns_it {
             return Some(name.clone());
         }
     }
     None
+}
+
+/// Pure decision: once a competing unit has been determined to own the
+/// daemon (see [`find_other_owning_daemon_unit`]), should the installer run
+/// `systemctl --user start <other>` on it?
+///
+/// Only when it isn't already `Active` — this is specifically the upgrade-
+/// race repair: the competing unit is enabled (hence "owns it") but not
+/// currently running, most commonly because it's mid-restart or because a
+/// stray from a previous buggy install won the socket race out from under
+/// it (see `find_other_owning_daemon_unit`'s doc comment for the live
+/// incident). Starting an already-`Active` unit would be a harmless no-op
+/// in practice, but skipping it keeps the self-heal's behavior — and its
+/// printed output — limited to exactly what was needed.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn should_start_other_unit(other_active: Option<SystemdState>) -> bool {
+    other_active != Some(SystemdState::Active)
 }
 
 /// Pure decision: should the installer remove its *own* auto-start unit
@@ -774,8 +884,10 @@ pub(crate) fn reap_stray_daemon_via_socket(socket_path: &str) -> bool {
 mod tests {
     use super::{
         cgroup_is_service, cgroup_owning_service, cmdline_is_daemon_run, exe_is_stale,
-        exec_start_is_daemon_run, find_other_active_daemon_unit, home_is_overridden,
-        parse_exec_start_from_unit_file, should_remove_our_unit, unit_is_healthy, SystemdState,
+        exec_start_is_daemon_run, find_other_owning_daemon_unit, home_is_overridden,
+        parse_exec_start_from_unit_file, parse_unit_file_state, should_remove_our_unit,
+        should_start_other_unit, unit_file_state_counts_as_owner, unit_is_healthy, SystemdState,
+        UnitFileState,
     };
 
     // ── home_is_overridden ─────────────────────────────────────────────────
@@ -1169,43 +1281,138 @@ mod tests {
         assert_eq!(parse_exec_start_from_unit_file(unit), None);
     }
 
-    // ── find_other_active_daemon_unit ───────────────────────────────────────
-    //
-    // The regression this pins: spaceghost, 2026-10-13. `brew services` owns
-    // `sh.brew.vectorhawk.service`, healthy and Active; `mcp setup` must
-    // recognize it and never install/enable a second, competing
-    // `vectorhawk-agent.service` that can never win the single-instance
-    // socket lock and crash-loops forever.
+    // ── parse_unit_file_state / unit_file_state_counts_as_owner ─────────────
 
     #[test]
-    fn finds_healthy_brew_unit_as_the_manager() {
+    fn parses_known_unit_file_states() {
+        assert_eq!(parse_unit_file_state("enabled"), UnitFileState::Enabled);
+        assert_eq!(
+            parse_unit_file_state("enabled-runtime"),
+            UnitFileState::EnabledRuntime
+        );
+        assert_eq!(parse_unit_file_state("linked"), UnitFileState::Linked);
+        assert_eq!(
+            parse_unit_file_state("linked-runtime"),
+            UnitFileState::LinkedRuntime
+        );
+        assert_eq!(parse_unit_file_state("disabled"), UnitFileState::Disabled);
+        assert_eq!(parse_unit_file_state("masked"), UnitFileState::Masked);
+        assert_eq!(
+            parse_unit_file_state("masked-runtime"),
+            UnitFileState::Masked
+        );
+    }
+
+    #[test]
+    fn unparseable_or_unknown_unit_file_state_is_other() {
+        for raw in ["static", "generated", "transient", "invalid", "", "  "] {
+            assert_eq!(
+                parse_unit_file_state(raw),
+                UnitFileState::Other,
+                "raw={raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn enabled_variants_count_as_owner_disabled_and_masked_do_not() {
+        for state in [
+            UnitFileState::Enabled,
+            UnitFileState::EnabledRuntime,
+            UnitFileState::Linked,
+            UnitFileState::LinkedRuntime,
+        ] {
+            assert!(unit_file_state_counts_as_owner(state), "state={state:?}");
+        }
+        for state in [
+            UnitFileState::Disabled,
+            UnitFileState::Masked,
+            UnitFileState::Other,
+        ] {
+            assert!(!unit_file_state_counts_as_owner(state), "state={state:?}");
+        }
+    }
+
+    // ── find_other_owning_daemon_unit ───────────────────────────────────────
+    //
+    // Original regression this pins: spaceghost, 2026-10-13. `brew services`
+    // owns `sh.brew.vectorhawk.service`, healthy and Active; `mcp setup`
+    // must recognize it and never install/enable a second, competing
+    // `vectorhawk-agent.service` that can never win the single-instance
+    // socket lock and crash-loops forever.
+    //
+    // Follow-on regression (also pinned here): spaceghost, brew upgrade
+    // race. `brew upgrade` replaces the binary and brew's managed unit
+    // exits to restart onto it; in that gap OUR unit won the socket-lock
+    // race, so ours ended up running the daemon while brew's unit — still
+    // *enabled* the whole time — settled into `inactive (dead)`. An
+    // `Active`-only ownership check missed this: brew's unit wasn't Active
+    // at the moment `mcp setup` ran, so the old check let the duplicate
+    // install stand. Ownership must also follow from "installed and
+    // enabled", not just "currently running" — see this function's doc
+    // comment for the full rationale.
+
+    #[test]
+    fn active_brew_unit_is_the_owner() {
         let candidates = vec![(
             "sh.brew.vectorhawk.service".to_string(),
             "[Service]\nExecStart=/home/linuxbrew/.linuxbrew/opt/vectorhawk/bin/vectorhawk daemon run --foreground\n".to_string(),
         )];
         let result =
-            find_other_active_daemon_unit("vectorhawk-agent.service", &candidates, |name| {
+            find_other_owning_daemon_unit("vectorhawk-agent.service", &candidates, |name| {
                 assert_eq!(name, "sh.brew.vectorhawk.service");
-                Some(SystemdState::Active)
+                (Some(SystemdState::Active), UnitFileState::Enabled)
             });
         assert_eq!(result, Some("sh.brew.vectorhawk.service".to_string()));
     }
 
     #[test]
-    fn ignores_our_own_unit_name_even_if_it_matches() {
+    fn enabled_but_inactive_brew_unit_is_still_the_owner() {
+        // The upgrade-race repro: brew's unit is momentarily Inactive (mid
+        // restart) but remains enabled the whole time. Must still be
+        // recognized as the owner so our unit self-heals away rather than
+        // standing as a permanent duplicate.
         let candidates = vec![(
-            "vectorhawk-agent.service".to_string(),
+            "sh.brew.vectorhawk.service".to_string(),
+            "[Service]\nExecStart=/home/linuxbrew/.linuxbrew/opt/vectorhawk/bin/vectorhawk daemon run --foreground\n".to_string(),
+        )];
+        let result = find_other_owning_daemon_unit("vectorhawk-agent.service", &candidates, |_| {
+            (Some(SystemdState::Inactive), UnitFileState::Enabled)
+        });
+        assert_eq!(result, Some("sh.brew.vectorhawk.service".to_string()));
+    }
+
+    #[test]
+    fn disabled_matching_unit_is_not_the_owner() {
+        // The user (or a prior uninstall) explicitly disabled brew's unit —
+        // that is exactly the box where our own unit is legitimately
+        // needed, so it must not be suppressed.
+        let candidates = vec![(
+            "sh.brew.vectorhawk.service".to_string(),
             "[Service]\nExecStart=/opt/vectorhawk/bin/vectorhawk daemon run --foreground\n"
                 .to_string(),
         )];
-        let result = find_other_active_daemon_unit("vectorhawk-agent.service", &candidates, |_| {
-            panic!("active_state_of must never be consulted for our own unit")
+        let result = find_other_owning_daemon_unit("vectorhawk-agent.service", &candidates, |_| {
+            (Some(SystemdState::Inactive), UnitFileState::Disabled)
         });
         assert_eq!(result, None);
     }
 
     #[test]
-    fn ignores_a_matching_unit_that_is_not_active() {
+    fn masked_matching_unit_is_not_the_owner() {
+        let candidates = vec![(
+            "sh.brew.vectorhawk.service".to_string(),
+            "[Service]\nExecStart=/opt/vectorhawk/bin/vectorhawk daemon run --foreground\n"
+                .to_string(),
+        )];
+        let result = find_other_owning_daemon_unit("vectorhawk-agent.service", &candidates, |_| {
+            (Some(SystemdState::Inactive), UnitFileState::Masked)
+        });
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn inactive_and_disabled_or_unknown_is_never_the_owner() {
         for state in [
             Some(SystemdState::Failed),
             Some(SystemdState::Inactive),
@@ -1220,32 +1427,68 @@ mod tests {
                     .to_string(),
             )];
             let result =
-                find_other_active_daemon_unit("vectorhawk-agent.service", &candidates, |_| state);
+                find_other_owning_daemon_unit("vectorhawk-agent.service", &candidates, |_| {
+                    (state, UnitFileState::Other)
+                });
             assert_eq!(
                 result, None,
-                "state={state:?} must not be treated as managed"
+                "state={state:?} with no enabled unit-file-state must not be treated as managed"
             );
         }
     }
 
     #[test]
-    fn ignores_an_unrelated_unit_even_if_active() {
+    fn ignores_our_own_unit_name_even_if_it_matches() {
+        let candidates = vec![(
+            "vectorhawk-agent.service".to_string(),
+            "[Service]\nExecStart=/opt/vectorhawk/bin/vectorhawk daemon run --foreground\n"
+                .to_string(),
+        )];
+        let result = find_other_owning_daemon_unit("vectorhawk-agent.service", &candidates, |_| {
+            panic!("unit_info_of must never be consulted for our own unit")
+        });
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn ignores_an_unrelated_unit_even_if_active_and_enabled() {
         let candidates = vec![(
             "some-other-app.service".to_string(),
             "[Service]\nExecStart=/usr/bin/some-other-app --flag\n".to_string(),
         )];
-        let result = find_other_active_daemon_unit("vectorhawk-agent.service", &candidates, |_| {
-            Some(SystemdState::Active)
+        let result = find_other_owning_daemon_unit("vectorhawk-agent.service", &candidates, |_| {
+            (Some(SystemdState::Active), UnitFileState::Enabled)
         });
         assert_eq!(result, None);
     }
 
     #[test]
     fn empty_candidate_list_is_none() {
-        let result = find_other_active_daemon_unit("vectorhawk-agent.service", &[], |_| {
-            panic!("active_state_of must never be called with no candidates")
+        let result = find_other_owning_daemon_unit("vectorhawk-agent.service", &[], |_| {
+            panic!("unit_info_of must never be called with no candidates")
         });
         assert_eq!(result, None);
+    }
+
+    // ── should_start_other_unit ──────────────────────────────────────────────
+
+    #[test]
+    fn should_not_start_an_already_active_other_unit() {
+        assert!(!should_start_other_unit(Some(SystemdState::Active)));
+    }
+
+    #[test]
+    fn should_start_an_other_unit_that_is_not_active() {
+        for state in [
+            Some(SystemdState::Inactive),
+            Some(SystemdState::Failed),
+            Some(SystemdState::AutoRestart),
+            Some(SystemdState::Activating),
+            Some(SystemdState::Unknown),
+            None,
+        ] {
+            assert!(should_start_other_unit(state), "state={state:?}");
+        }
     }
 
     // ── should_remove_our_unit ───────────────────────────────────────────────

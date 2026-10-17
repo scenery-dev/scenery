@@ -27,7 +27,10 @@
 use anyhow::{Context, Result};
 use std::{fs, process::Command};
 
-use super::{daemon_socket_path, reap_stray_daemon_via_socket, socket_is_reachable, InstallStatus};
+use super::{
+    daemon_socket_path, reap_stray_daemon_via_socket, socket_is_reachable, wait_for_socket,
+    InstallStatus,
+};
 
 const LABEL: &str = "com.vectorhawk.agent";
 const PLIST_FILENAME: &str = "com.vectorhawk.agent.plist";
@@ -313,16 +316,83 @@ fn brew_service_is_loaded(uid: u32) -> bool {
 
 /// Pure decision: is the daemon already managed by `brew services`?
 ///
-/// Both conditions matter independently: a plist alone could be a leftover
-/// from a `brew services stop` that didn't clean up its file, and "loaded"
-/// alone (without the expected plist) isn't evidence this is actually the
-/// brew job rather than some coincidence — though in practice
-/// `launchctl print` only succeeds for a job launchd actually knows about,
-/// which for this exact label always traces back to the plist Homebrew
-/// wrote. Requiring both keeps this conservative rather than guessing from
-/// either signal alone.
-fn brew_service_is_managing(plist_exists: bool, service_loaded: bool) -> bool {
-    plist_exists && service_loaded
+/// Plist presence alone is the signal, deliberately not combined with
+/// "currently loaded" the way an earlier version of this function required.
+/// `brew services start` is what writes
+/// `~/Library/LaunchAgents/homebrew.mxcl.vectorhawk.plist`, and `brew
+/// services stop` is what removes it — Homebrew does not leave this file
+/// behind for any other reason, so its mere presence already means brew
+/// owns this daemon, independent of whether the job happens to be loaded or
+/// running at this exact instant.
+///
+/// Requiring "loaded" too had a live gap: during a `brew upgrade`, brew's
+/// job can be briefly unloaded (or loaded-but-not-yet-running) while it
+/// cycles onto the new binary — the plist is untouched the whole time, but
+/// `launchctl print` can fail in that window. Gating ownership on "loaded"
+/// meant `daemon install` saw neither signal and proceeded to install our
+/// own competing `com.vectorhawk.agent`, exactly the bug this guard exists
+/// to prevent. The caller (`install`) still checks loaded/running state
+/// separately — see [`brew_recovery_action`] — to decide whether brew's job
+/// needs a bootstrap or kickstart, but that is a *recovery* decision, not
+/// an *ownership* one.
+fn brew_service_is_managing(plist_exists: bool) -> bool {
+    plist_exists
+}
+
+/// What this installer should do to help Homebrew's launchd job back up,
+/// once [`brew_service_is_managing`] has already determined brew owns the
+/// daemon and our own agent has been self-healed away. Never touches brew's
+/// plist file — only ever loads/starts the job it already describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BrewRecoveryAction {
+    /// The job isn't loaded into the launchd domain at all (e.g. brew's
+    /// `KeepAlive` job exited mid-upgrade and hasn't been re-bootstrapped
+    /// yet) — load it with `launchctl bootstrap`.
+    Bootstrap,
+    /// The job is loaded, but the daemon socket isn't reachable — force an
+    /// immediate (re)start with `launchctl kickstart`.
+    Kickstart,
+    /// The job is loaded and the socket is already reachable — nothing to
+    /// do.
+    None,
+}
+
+/// Pure decision: given whether brew's job is currently loaded and whether
+/// the daemon socket is currently reachable, which [`BrewRecoveryAction`]
+/// (if any) should run?
+pub(crate) fn brew_recovery_action(loaded: bool, socket_reachable: bool) -> BrewRecoveryAction {
+    if !loaded {
+        BrewRecoveryAction::Bootstrap
+    } else if !socket_reachable {
+        BrewRecoveryAction::Kickstart
+    } else {
+        BrewRecoveryAction::None
+    }
+}
+
+/// Render [`BrewRecoveryAction`] into the exact `launchctl` argv the real
+/// implementation passes to [`launchctl`] — pulled out as its own pure
+/// function so tests can assert on the argv a real run would execute
+/// without shelling out to `launchctl` at all. `brew_plist_str` is only
+/// consulted for `Bootstrap` (`launchctl bootstrap` needs the plist path;
+/// `kickstart` addresses the job purely by label).
+pub(crate) fn brew_recovery_argv(
+    action: BrewRecoveryAction,
+    uid: u32,
+    brew_plist_str: &str,
+) -> Option<Vec<String>> {
+    match action {
+        BrewRecoveryAction::Bootstrap => Some(vec![
+            "bootstrap".to_string(),
+            domain_target(uid),
+            brew_plist_str.to_string(),
+        ]),
+        BrewRecoveryAction::Kickstart => Some(vec![
+            "kickstart".to_string(),
+            format!("gui/{uid}/{BREW_SERVICE_LABEL}"),
+        ]),
+        BrewRecoveryAction::None => None,
+    }
 }
 
 // ── Public install / uninstall ────────────────────────────────────────────────
@@ -336,19 +406,52 @@ pub fn install() -> Result<()> {
     let uid = current_uid();
 
     // ── Competing-manager guard — must run before anything else below ────────
-    // If `brew services` is already running a healthy daemon, writing and
-    // loading our own agent on top of it is exactly the bug this guard
-    // exists to prevent (see the module doc comment above
-    // `brew_service_is_managing`) — detect it first, skip our own
-    // install/enable entirely, and self-heal any damage from a previous run
-    // that didn't have this guard.
+    // If `brew services` owns the daemon (plist present — see
+    // `brew_service_is_managing`'s doc comment for why presence alone is the
+    // right signal, not "loaded"), writing and loading our own agent on top
+    // of it is exactly the bug this guard exists to prevent — detect it
+    // first, skip our own install/enable entirely, self-heal any damage from
+    // a previous run that didn't have this guard, and help brew's job back
+    // up if it isn't currently loaded/running (never touching its plist).
     let brew_plist = brew_plist_path().context("failed to resolve brew plist path")?;
-    if brew_service_is_managing(brew_plist.exists(), brew_service_is_loaded(uid)) {
+    if brew_service_is_managing(brew_plist.exists()) {
         println!(
             "VectorHawk daemon is managed by Homebrew services ({BREW_SERVICE_LABEL}); \
              not installing {LABEL}."
         );
         self_heal_remove_our_agent(&plist, uid)?;
+
+        let loaded = brew_service_is_loaded(uid);
+        let socket_reachable = socket_is_reachable(&daemon_socket_path(), 200);
+        let action = brew_recovery_action(loaded, socket_reachable);
+        let brew_plist_str = brew_plist
+            .to_str()
+            .context("brew plist path is not valid UTF-8")?;
+        if let Some(argv) = brew_recovery_argv(action, uid, brew_plist_str) {
+            let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+            match action {
+                BrewRecoveryAction::Bootstrap => {
+                    println!("{BREW_SERVICE_LABEL} is not loaded — bootstrapping it.");
+                }
+                BrewRecoveryAction::Kickstart => {
+                    println!(
+                        "{BREW_SERVICE_LABEL} is loaded but the daemon socket is not reachable \
+                         — kickstarting it."
+                    );
+                }
+                BrewRecoveryAction::None => {}
+            }
+            if let Err(e) = launchctl(&argv_refs) {
+                println!("warning: failed to recover {BREW_SERVICE_LABEL}: {e:#}");
+            } else if wait_for_socket(&daemon_socket_path(), std::time::Duration::from_secs(10)) {
+                println!("{BREW_SERVICE_LABEL} is now running and the daemon socket is reachable.");
+            } else {
+                println!(
+                    "Recovered {BREW_SERVICE_LABEL}, but the daemon socket did not become \
+                     reachable within 10s."
+                );
+            }
+        }
         return Ok(());
     }
 
@@ -548,40 +651,111 @@ pub fn status() -> Result<InstallStatus> {
 
 #[cfg(test)]
 mod tests {
-    use super::{brew_service_is_managing, render_plist, resolve_registry_url_env};
+    use super::{
+        brew_recovery_action, brew_recovery_argv, brew_service_is_managing, render_plist,
+        resolve_registry_url_env, BrewRecoveryAction,
+    };
     use std::path::Path;
 
     // ── brew_service_is_managing ─────────────────────────────────────────────
     //
-    // Regression coverage for the live incident: spaceghost, 2026-10-13.
-    // `brew services` already owned a healthy daemon under
-    // `homebrew.mxcl.vectorhawk`; `mcp setup`'s `daemon install` step must
-    // recognize that and refuse to install/enable a second, competing
-    // `com.vectorhawk.agent` LaunchAgent that can never win the
-    // single-instance socket lock.
+    // Original regression coverage: spaceghost, 2026-10-13. `brew services`
+    // already owned a healthy daemon under `homebrew.mxcl.vectorhawk`;
+    // `mcp setup`'s `daemon install` step must recognize that and refuse to
+    // install/enable a second, competing `com.vectorhawk.agent` LaunchAgent
+    // that can never win the single-instance socket lock.
+    //
+    // Follow-on fix (also covered here): ownership now follows from plist
+    // *presence* alone, not "presence AND currently loaded" — see
+    // `brew_service_is_managing`'s doc comment for the upgrade-window gap
+    // that combining both signals left open.
 
     #[test]
-    fn managed_when_plist_exists_and_service_loaded() {
-        assert!(brew_service_is_managing(true, true));
+    fn managed_when_plist_exists_even_if_not_loaded() {
+        // `brew services start` writes this plist and `brew services stop`
+        // removes it — presence alone means brew owns the daemon,
+        // independent of whether the job happens to be loaded right this
+        // instant (e.g. mid `brew upgrade`, where the old job has already
+        // exited but the plist hasn't been touched).
+        assert!(brew_service_is_managing(true));
     }
 
     #[test]
-    fn not_managed_when_plist_missing_even_if_something_is_loaded() {
-        // Guards against a coincidental launchctl success unrelated to a
-        // real brew-written plist.
-        assert!(!brew_service_is_managing(false, true));
+    fn not_managed_when_plist_absent() {
+        assert!(!brew_service_is_managing(false));
+    }
+
+    // ── brew_recovery_action / brew_recovery_argv ────────────────────────────
+    //
+    // The recovery half of the same fix: once ownership is established from
+    // plist presence alone, brew's job may genuinely need help coming back
+    // up (not loaded, or loaded but not yet serving the socket). These pure
+    // functions are what `install` consults to decide — and to compute the
+    // exact `launchctl` argv for — that recovery, asserted here without
+    // shelling out to `launchctl` at all.
+
+    #[test]
+    fn not_loaded_bootstraps() {
+        assert_eq!(
+            brew_recovery_action(false, false),
+            BrewRecoveryAction::Bootstrap
+        );
+        // Socket reachability is irrelevant when the job isn't even
+        // loaded — there is nothing to serve it.
+        assert_eq!(
+            brew_recovery_action(false, true),
+            BrewRecoveryAction::Bootstrap
+        );
     }
 
     #[test]
-    fn not_managed_when_plist_exists_but_nothing_is_loaded() {
-        // A leftover plist from a `brew services stop` that didn't clean up
-        // its file must not be mistaken for an actively-managed daemon.
-        assert!(!brew_service_is_managing(true, false));
+    fn loaded_but_socket_unreachable_kickstarts() {
+        assert_eq!(
+            brew_recovery_action(true, false),
+            BrewRecoveryAction::Kickstart
+        );
     }
 
     #[test]
-    fn not_managed_when_neither_signal_present() {
-        assert!(!brew_service_is_managing(false, false));
+    fn loaded_and_socket_reachable_does_nothing() {
+        assert_eq!(brew_recovery_action(true, true), BrewRecoveryAction::None);
+    }
+
+    #[test]
+    fn bootstrap_argv_targets_the_brew_plist_in_the_domain() {
+        let argv = brew_recovery_argv(
+            BrewRecoveryAction::Bootstrap,
+            501,
+            "/Users/spaceghost/Library/LaunchAgents/homebrew.mxcl.vectorhawk.plist",
+        );
+        assert_eq!(
+            argv,
+            Some(vec![
+                "bootstrap".to_string(),
+                "gui/501".to_string(),
+                "/Users/spaceghost/Library/LaunchAgents/homebrew.mxcl.vectorhawk.plist".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn kickstart_argv_targets_the_brew_service_label_not_the_plist() {
+        let argv = brew_recovery_argv(BrewRecoveryAction::Kickstart, 501, "/ignored");
+        assert_eq!(
+            argv,
+            Some(vec![
+                "kickstart".to_string(),
+                "gui/501/homebrew.mxcl.vectorhawk".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn none_action_produces_no_argv() {
+        assert_eq!(
+            brew_recovery_argv(BrewRecoveryAction::None, 501, "/ignored"),
+            None
+        );
     }
 
     // D1 board card: INFO logging on by default, bounded log footprint on
