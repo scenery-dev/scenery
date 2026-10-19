@@ -1,7 +1,10 @@
 //! Unit tests for the reconciler snapshot-diff logic.
 #![allow(clippy::unwrap_used)]
 
-use super::{build_derived_events_blocking, load_local_skill_state, skill_lock, SkillLockMap};
+use super::{
+    build_derived_events_blocking, load_local_skill_state, localize_skill_names, skill_lock,
+    SkillLockMap,
+};
 use crate::sync::sse_client::{InstallationRecord, SyncEvent};
 use camino::Utf8PathBuf;
 use rusqlite::Connection;
@@ -121,6 +124,7 @@ fn snapshot_installs_missing_desired_skill() {
         version: "1.0.0".to_string(),
         state: "desired".to_string(),
         source: None,
+        local_slug: None,
     }];
 
     let events = build_derived_events_blocking(installations, &state);
@@ -157,6 +161,7 @@ fn snapshot_no_op_when_skill_already_installed() {
         version: "1.0.0".to_string(),
         state: "installed".to_string(),
         source: None,
+        local_slug: None,
     }];
 
     let events = build_derived_events_blocking(installations, &state);
@@ -189,6 +194,7 @@ fn snapshot_emits_install_when_locally_present_but_backend_not_yet_installed() {
         version: "1.0.0".to_string(),
         state: "desired".to_string(),
         source: None,
+        local_slug: None,
     }];
 
     let events = build_derived_events_blocking(installations, &state);
@@ -226,6 +232,7 @@ fn snapshot_deactivates_active_skill_when_state_is_deactivated() {
         version: "1.0.0".to_string(),
         state: "deactivated".to_string(),
         source: None,
+        local_slug: None,
     }];
 
     let events = build_derived_events_blocking(installations, &state);
@@ -256,6 +263,7 @@ fn snapshot_purges_present_skill_when_state_is_removed() {
         version: "1.0.0".to_string(),
         state: "removed".to_string(),
         source: None,
+        local_slug: None,
     }];
 
     let events = build_derived_events_blocking(installations, &state);
@@ -283,6 +291,7 @@ fn snapshot_no_purge_when_skill_not_locally_present() {
         version: "1.0.0".to_string(),
         state: "removed".to_string(),
         source: None,
+        local_slug: None,
     }];
 
     let events = build_derived_events_blocking(installations, &state);
@@ -307,6 +316,7 @@ fn snapshot_mixed_batch_generates_correct_events() {
             version: "1.0.0".to_string(),
             state: "desired".to_string(),
             source: None,
+            local_slug: None,
         },
         InstallationRecord {
             installation_id: install_id(),
@@ -314,6 +324,7 @@ fn snapshot_mixed_batch_generates_correct_events() {
             version: "1.0.0".to_string(),
             state: "deactivated".to_string(),
             source: None,
+            local_slug: None,
         },
         InstallationRecord {
             installation_id: install_id(),
@@ -321,6 +332,7 @@ fn snapshot_mixed_batch_generates_correct_events() {
             version: "1.0.0".to_string(),
             state: "removed".to_string(),
             source: None,
+            local_slug: None,
         },
         InstallationRecord {
             installation_id: install_id(),
@@ -328,6 +340,7 @@ fn snapshot_mixed_batch_generates_correct_events() {
             version: "2.0.0".to_string(),
             state: "installed".to_string(),
             source: None,
+            local_slug: None,
         },
     ];
 
@@ -371,6 +384,7 @@ fn snapshot_installed_state_treated_like_desired_when_missing_locally() {
         version: "1.2.3".to_string(),
         state: "installed".to_string(),
         source: None,
+        local_slug: None,
     }];
 
     let events = build_derived_events_blocking(installations, &state);
@@ -405,6 +419,7 @@ fn snapshot_installed_state_noop_when_already_present_locally() {
         version: "1.0.0".to_string(),
         state: "installed".to_string(),
         source: None,
+        local_slug: None,
     }];
 
     let events = build_derived_events_blocking(installations, &state);
@@ -428,6 +443,7 @@ fn snapshot_skips_rows_with_unresolved_latest_version() {
             version: "latest".to_string(),
             state: "desired".to_string(),
             source: None,
+            local_slug: None,
         },
         InstallationRecord {
             installation_id: install_id(),
@@ -435,6 +451,7 @@ fn snapshot_skips_rows_with_unresolved_latest_version() {
             version: String::new(),
             state: "desired".to_string(),
             source: None,
+            local_slug: None,
         },
     ];
 
@@ -455,6 +472,7 @@ fn snapshot_skips_error_state_rows() {
         version: "1.0.0".to_string(),
         state: "error".to_string(),
         source: None,
+        local_slug: None,
     }];
 
     let events = build_derived_events_blocking(installations, &state);
@@ -481,6 +499,7 @@ fn snapshot_propagates_migrated_local_source_to_install_event() {
         version: "0.0.0".to_string(),
         state: "installed".to_string(),
         source: Some("migrated:local".to_string()),
+        local_slug: None,
     }];
 
     let events = build_derived_events_blocking(installations, &state);
@@ -522,6 +541,7 @@ fn snapshot_propagates_none_source_when_backend_omits_it() {
         version: "1.0.0".to_string(),
         state: "desired".to_string(),
         source: None,
+        local_slug: None,
     }];
 
     let events = build_derived_events_blocking(installations, &state);
@@ -990,5 +1010,78 @@ async fn handle_deactivate_removes_f2_projection_even_when_mode_is_warn() {
         "BUG: managed_paths_mode=warn left the Claude Code link in place after Deactivate"
     );
 
+    cleanup(&root);
+}
+
+// ── Registry name → local folder name ──────────────────────────────────────
+
+/// An adopted skill registered under its own name (another user's private
+/// skill held the folder name) arrives as `x-bob` with `local_slug: x`. The
+/// snapshot records the mapping, and every later event — snapshot, deactivate,
+/// revoke — is translated to the folder name the rest of the reconciler uses.
+#[test]
+fn snapshot_records_folder_name_and_later_events_use_it() {
+    let root = temp_root("local-names");
+    let state = AppState::bootstrap_in(root.clone()).unwrap();
+
+    let snapshot = SyncEvent::Snapshot {
+        installations: vec![InstallationRecord {
+            installation_id: install_id(),
+            skill_id: "x-bob".to_string(),
+            version: "0.0.0".to_string(),
+            state: "installed".to_string(),
+            source: Some("migrated:local".to_string()),
+            local_slug: Some("x".to_string()),
+        }],
+        mcp_installations: None,
+        plugin_installations: vec![],
+        revocations: Some(vec![crate::sync::sse_client::RevocationRecord {
+            artifact_type: "skill".to_string(),
+            artifact_key: "x-bob".to_string(),
+            version: None,
+        }]),
+        org_policy: None,
+    };
+    match localize_skill_names(snapshot, &state) {
+        SyncEvent::Snapshot {
+            installations,
+            revocations,
+            ..
+        } => {
+            assert_eq!(installations[0].skill_id, "x");
+            assert_eq!(revocations.unwrap()[0].artifact_key, "x");
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+
+    let iid = install_id();
+    match localize_skill_names(
+        SyncEvent::Deactivate {
+            installation_id: iid,
+            skill_id: "x-bob".to_string(),
+        },
+        &state,
+    ) {
+        SyncEvent::Deactivate { skill_id, .. } => assert_eq!(skill_id, "x"),
+        other => panic!("unexpected {other:?}"),
+    }
+    cleanup(&root);
+}
+
+#[test]
+fn names_without_a_mapping_pass_through_unchanged() {
+    let root = temp_root("local-names-none");
+    let state = AppState::bootstrap_in(root.clone()).unwrap();
+    match localize_skill_names(
+        SyncEvent::Revoke {
+            artifact_type: "skill".to_string(),
+            artifact_key: "caveman".to_string(),
+            version: None,
+        },
+        &state,
+    ) {
+        SyncEvent::Revoke { artifact_key, .. } => assert_eq!(artifact_key, "caveman"),
+        other => panic!("unexpected {other:?}"),
+    }
     cleanup(&root);
 }

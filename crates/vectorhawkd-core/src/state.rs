@@ -284,6 +284,40 @@ impl AppState {
     /// Read a key from the `sync_state` key/value table.
     ///
     /// Returns `None` if the key does not exist or the table was not yet created.
+    /// Remember that the registry knows the skill in local folder
+    /// `local_slug` as `registry_id`. This happens when another user's
+    /// private skill already held the folder name, so this user's adopted
+    /// copy was registered under its own name.
+    pub fn record_skill_local_name(&self, registry_id: &str, local_slug: &str) -> Result<()> {
+        let conn = Connection::open(&self.db_path).context("failed to open state DB")?;
+        conn.execute(
+            "INSERT INTO skill_local_names (registry_id, local_slug) VALUES (?1, ?2) \
+             ON CONFLICT(registry_id) DO UPDATE SET local_slug = excluded.local_slug",
+            rusqlite::params![registry_id, local_slug],
+        )
+        .context("failed to record skill local name")?;
+        Ok(())
+    }
+
+    /// The local folder name for a registry skill name: the recorded mapping
+    /// if there is one, otherwise the registry name itself.
+    pub fn skill_local_name(&self, registry_id: &str) -> String {
+        use rusqlite::OptionalExtension;
+        Connection::open(&self.db_path)
+            .ok()
+            .and_then(|conn| {
+                conn.query_row(
+                    "SELECT local_slug FROM skill_local_names WHERE registry_id = ?1",
+                    [registry_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .ok()
+                .flatten()
+            })
+            .unwrap_or_else(|| registry_id.to_string())
+    }
+
     pub fn get_sync_state(&self, key: &str) -> Result<Option<String>> {
         use rusqlite::OptionalExtension;
         let conn = Connection::open(&self.db_path).context("failed to open state DB")?;
@@ -808,6 +842,10 @@ CREATE TABLE IF NOT EXISTS managed_path_markers (
     source_sha256   TEXT NOT NULL,
     migrated_at     TEXT NOT NULL,
     PRIMARY KEY (path)
+);
+CREATE TABLE IF NOT EXISTS skill_local_names (
+    registry_id TEXT PRIMARY KEY,
+    local_slug  TEXT NOT NULL
 );
 "#;
 

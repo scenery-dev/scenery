@@ -285,6 +285,96 @@ async fn run_loop(
 /// Snapshot events are not spawned directly; they fan out into derived
 /// install/deactivate/purge events which are spawned the same way.
 #[allow(clippy::too_many_arguments)]
+/// Skill names in backend events are registry names. An adopted skill can
+/// be registered under a different name than its folder (another user's
+/// private skill held the folder name), so translate them to this device's
+/// folder names first, recording any mapping a snapshot carries. Everything
+/// downstream then works on folder names, as it always has.
+fn localize_skill_names(event: SyncEvent, state: &AppState) -> SyncEvent {
+    let local = |name: &str| state.skill_local_name(name);
+    match event {
+        SyncEvent::Install {
+            installation_id,
+            skill_id,
+            version,
+            source,
+        } => SyncEvent::Install {
+            installation_id,
+            skill_id: local(&skill_id),
+            version,
+            source,
+        },
+        SyncEvent::Deactivate {
+            installation_id,
+            skill_id,
+        } => SyncEvent::Deactivate {
+            installation_id,
+            skill_id: local(&skill_id),
+        },
+        SyncEvent::Purge {
+            installation_id,
+            skill_id,
+        } => SyncEvent::Purge {
+            installation_id,
+            skill_id: local(&skill_id),
+        },
+        SyncEvent::Revoke {
+            artifact_type,
+            artifact_key,
+            version,
+        } if artifact_type == "skill" => SyncEvent::Revoke {
+            artifact_key: local(&artifact_key),
+            artifact_type,
+            version,
+        },
+        SyncEvent::Unrevoke {
+            artifact_type,
+            artifact_key,
+            version,
+        } if artifact_type == "skill" => SyncEvent::Unrevoke {
+            artifact_key: local(&artifact_key),
+            artifact_type,
+            version,
+        },
+        SyncEvent::Snapshot {
+            mut installations,
+            mcp_installations,
+            plugin_installations,
+            revocations,
+            org_policy,
+        } => {
+            for record in &mut installations {
+                if let Some(folder) = record
+                    .local_slug
+                    .as_deref()
+                    .filter(|f| *f != record.skill_id)
+                {
+                    if let Err(e) = state.record_skill_local_name(&record.skill_id, folder) {
+                        warn!(skill_id = %record.skill_id, error = %e, "reconciler: failed to record skill local name");
+                    }
+                }
+                record.skill_id = local(&record.skill_id);
+            }
+            let revocations = revocations.map(|mut revs| {
+                for rev in &mut revs {
+                    if rev.artifact_type == "skill" {
+                        rev.artifact_key = local(&rev.artifact_key);
+                    }
+                }
+                revs
+            });
+            SyncEvent::Snapshot {
+                installations,
+                mcp_installations,
+                plugin_installations,
+                revocations,
+                org_policy,
+            }
+        }
+        other => other,
+    }
+}
+
 async fn dispatch_event(
     event: SyncEvent,
     state: &Arc<AppState>,
@@ -297,6 +387,7 @@ async fn dispatch_event(
     list_changed_tx: broadcast::Sender<()>,
     pusher: Option<Arc<ManagedPathsPusher>>,
 ) {
+    let event = localize_skill_names(event, state);
     match event {
         SyncEvent::Install {
             installation_id,
