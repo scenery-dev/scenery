@@ -567,9 +567,13 @@ impl RegistryClient {
         );
         debug!(url, "fetching artifact metadata");
 
-        let resp = self
-            .http
-            .get(&url)
+        // Identify ourselves: a private (adopted) skill is only served to the
+        // user who owns it. Catalog skills are served either way.
+        let mut req = self.http.get(&url);
+        if let Some(token) = self.get_auth_token() {
+            req = req.bearer_auth(token);
+        }
+        let resp = req
             .send()
             .with_context(|| format!("failed to reach registry at {url}"))?;
 
@@ -597,9 +601,15 @@ impl RegistryClient {
     ) -> Result<()> {
         debug!(url = download_url, dest = %dest, "downloading artifact");
 
-        let mut resp = self
-            .http
-            .get(download_url)
+        // Send our token only to the registry itself. In redirect mode the URL
+        // is a presigned object-store link, which rejects a second auth method.
+        let mut req = self.http.get(download_url);
+        if download_url.starts_with(self.base_url.trim_end_matches('/')) {
+            if let Some(token) = self.get_auth_token() {
+                req = req.bearer_auth(token);
+            }
+        }
+        let mut resp = req
             .send()
             .with_context(|| format!("failed to download artifact from {download_url}"))?;
 
@@ -1783,6 +1793,68 @@ mod tests {
         assert!(governance.publisher.verified);
         assert_eq!(governance.policy.status, "approved");
         mock.assert();
+    }
+
+    /// Private (adopted) skills are served only to their owner, so the
+    /// metadata fetch identifies the runner when it's logged in.
+    #[test]
+    fn fetch_artifact_metadata_sends_the_runner_token() {
+        use mockito::Server;
+        let mut server = Server::new();
+        let mock = server
+            .mock("GET", "/skills/my-skill/versions/0.1.0")
+            .match_header("authorization", "Bearer eyJhbGciOiJIUzI1NiJ9.portal-jwt.sig")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"skill_id":"my-skill","version":"0.1.0","download_url":"x","sha256":"y","size_bytes":1}"#)
+            .create();
+
+        let client = RegistryClient::new(server.url());
+        client.set_auth("eyJhbGciOiJIUzI1NiJ9.portal-jwt.sig");
+        client.fetch_artifact_metadata("my-skill", "0.1.0").unwrap();
+        mock.assert();
+    }
+
+    /// The token goes to the registry's own artifact route, never to another
+    /// host (a presigned object-store URL rejects a second auth method).
+    #[test]
+    fn download_artifact_sends_the_token_only_to_the_registry() {
+        use mockito::{Matcher, Server};
+        use sha2::{Digest, Sha256};
+        let body = b"cskill-bytes";
+        let sha = hex::encode(Sha256::digest(body));
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = camino::Utf8PathBuf::from_path_buf(tmp.path().join("a.cskill")).unwrap();
+
+        let mut registry = Server::new();
+        let own = registry
+            .mock("GET", "/artifacts/skills/my-skill/0.1.0.cskill")
+            .match_header("authorization", "Bearer tok")
+            .with_status(200)
+            .with_body(body)
+            .create();
+        let mut store = Server::new();
+        let foreign = store
+            .mock("GET", "/bucket/obj")
+            .match_header("authorization", Matcher::Missing)
+            .with_status(200)
+            .with_body(body)
+            .create();
+
+        let client = RegistryClient::new(registry.url());
+        client.set_auth("tok");
+        client
+            .download_artifact(
+                &format!("{}/artifacts/skills/my-skill/0.1.0.cskill", registry.url()),
+                &sha,
+                &dest,
+            )
+            .unwrap();
+        client
+            .download_artifact(&format!("{}/bucket/obj", store.url()), &sha, &dest)
+            .unwrap();
+        own.assert();
+        foreign.assert();
     }
 
     /// Same call, logged out — must keep working with no auth_token set.
