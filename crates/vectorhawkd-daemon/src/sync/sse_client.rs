@@ -616,9 +616,17 @@ async fn dispatch_event(
             canonical_hash: Option<String>,
             #[allow(dead_code)]
             discovery_id: Option<String>,
+            /// Registry name, when it differs from `slug`.
+            #[serde(default)]
+            skill_id: Option<String>,
         }
         match serde_json::from_str::<WireAdopted>(event_data) {
             Ok(w) => {
+                if let Some(registry_id) = w.skill_id.as_deref().filter(|id| *id != w.slug) {
+                    if let Err(e) = state.record_skill_local_name(registry_id, &w.slug) {
+                        warn!(slug = %w.slug, error = %e, "adopt: failed to record skill local name");
+                    }
+                }
                 let state_arc: Arc<AppState> = Arc::new(state.clone());
                 let slug = w.slug.clone();
                 let kind = w.kind.clone();
@@ -920,6 +928,12 @@ pub struct InstallationRecord {
     /// the registry. `None` when the backend does not yet emit this field (older backends).
     #[serde(default)]
     pub source: Option<String>,
+    /// The skill's folder name on this device, when it differs from
+    /// `skill_id`: an adopted skill registered under its own name because
+    /// another user's private skill held the folder name. `None` when they
+    /// match (and from older backends).
+    #[serde(default)]
+    pub local_slug: Option<String>,
 }
 
 /// One entry in a [`SyncEvent::Snapshot`] plugin installations list.
