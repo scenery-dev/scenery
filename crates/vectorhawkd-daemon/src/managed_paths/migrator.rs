@@ -415,6 +415,11 @@ struct MigratedItem {
     installation_id: String,
     #[allow(dead_code)]
     is_new: bool,
+    /// Registry name, when the backend registered this skill under a name
+    /// other than its folder (another user's private skill held the folder
+    /// name). Absent from older backends.
+    #[serde(default)]
+    skill_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -489,11 +494,17 @@ async fn post_migrate(
         );
     }
 
-    let installation_id = migrate_resp
-        .migrated
-        .into_iter()
-        .next()
-        .map(|m| m.installation_id);
+    let first = migrate_resp.migrated.into_iter().next();
+    if let Some(registry_id) = first
+        .as_ref()
+        .and_then(|m| m.skill_id.as_deref())
+        .filter(|id| *id != item.slug)
+    {
+        if let Err(e) = state.record_skill_local_name(registry_id, &item.slug) {
+            warn!(slug = %item.slug, error = %e, "managed_paths: failed to record skill local name");
+        }
+    }
+    let installation_id = first.map(|m| m.installation_id);
 
     Ok(installation_id)
 }
