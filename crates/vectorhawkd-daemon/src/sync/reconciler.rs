@@ -1180,10 +1180,27 @@ async fn do_install_plugin(
         });
     }
 
-    // 1b. Imported plugins carry their declarative source tree in the registry
-    //     (components.files) — fetch and write it verbatim. Empty for
+    // 1b. Imported plugins carry their whole source tree in the registry
+    //     (components) — fetch and write it verbatim. Empty for
     //     VectorHawk-published plugins, which bundle registry skills above.
-    let imported_files = fetch_plugin_version_files(registry_url, plugin_slug, version).await;
+    //     A private (not yet published) import is served only to its owner,
+    //     so the fetch identifies the runner.
+    let st = Arc::clone(state);
+    let reg = registry_url.to_string();
+    let access_token = tokio::task::spawn_blocking(move || {
+        load_all_tokens(&st)
+            .ok()
+            .and_then(|rows| {
+                rows.into_iter()
+                    .find(|r| r.registry_url == reg)
+                    .map(|r| r.access_token)
+            })
+            .unwrap_or_default()
+    })
+    .await
+    .unwrap_or_default();
+    let imported =
+        fetch_plugin_version_files(registry_url, plugin_slug, version, &access_token).await;
 
     // 2. Materialize + register the plugin (direct file writes) off the async
     //    executor — the marketplace pusher does synchronous filesystem I/O.
@@ -1194,7 +1211,8 @@ async fn do_install_plugin(
         version: version.to_string(),
         author: author.to_string(),
         skills: bundled,
-        files: imported_files,
+        files: imported.files,
+        executables: imported.executables,
     };
     tokio::task::spawn_blocking(move || crate::managed_paths::install_plugin_bundle(&bundle))
         .await
@@ -1208,15 +1226,29 @@ async fn do_install_plugin(
     Ok(())
 }
 
-/// Fetch an imported plugin's mirrored source tree from the registry
-/// (`components.files`). Returns `(relative_path, bytes)` pairs, or empty when
-/// the plugin has no inline files (VectorHawk-published) or the fetch fails —
-/// the install is best-effort and still lists the plugin.
+/// An imported plugin's source tree as the registry serves it.
+#[derive(Debug, Default)]
+struct ImportedPluginContent {
+    /// `(relative_path, bytes)`: `components.files` (UTF-8 text) plus
+    /// `components.binary_files` (base64, decoded here).
+    files: Vec<(String, Vec<u8>)>,
+    /// `components.executables`: paths git marks executable.
+    executables: Vec<String>,
+}
+
+/// Fetch an imported plugin's mirrored source tree from the registry.
+/// Empty when the plugin has no inline files (VectorHawk-published) or the
+/// fetch fails — the install is best-effort and still lists the plugin.
+/// `access_token` is sent when non-empty: private plugins are served only to
+/// their owner, org-published ones to anyone.
 async fn fetch_plugin_version_files(
     registry_url: &str,
     slug: &str,
     version: &str,
-) -> Vec<(String, Vec<u8>)> {
+    access_token: &str,
+) -> ImportedPluginContent {
+    use base64::Engine as _;
+
     let url = format!(
         "{}/api/runner/plugins/{}/versions/{}",
         registry_url.trim_end_matches('/'),
@@ -1228,40 +1260,69 @@ async fn fetch_plugin_version_files(
         .build()
     {
         Ok(c) => c,
-        Err(_) => return Vec::new(),
+        Err(_) => return ImportedPluginContent::default(),
     };
-    let body: serde_json::Value = match client.get(&url).send().await {
+    let req = if access_token.is_empty() {
+        client.get(&url)
+    } else {
+        client.get(&url).bearer_auth(access_token)
+    };
+    let body: serde_json::Value = match req.send().await {
         Ok(r) if r.status().is_success() => match r.json().await {
             Ok(v) => v,
             Err(e) => {
                 warn!(slug, error = %e, "reconciler: plugin content parse failed");
-                return Vec::new();
+                return ImportedPluginContent::default();
             }
         },
         Ok(r) => {
             warn!(slug, http_status = %r.status(), "reconciler: plugin content fetch non-success");
-            return Vec::new();
+            return ImportedPluginContent::default();
         }
         Err(e) => {
             warn!(slug, error = %e, "reconciler: plugin content fetch failed");
-            return Vec::new();
+            return ImportedPluginContent::default();
         }
     };
-    let Some(files) = body
-        .get("components")
-        .and_then(|c| c.get("files"))
-        .and_then(|f| f.as_object())
-    else {
-        return Vec::new();
+    let Some(components) = body.get("components") else {
+        return ImportedPluginContent::default();
     };
-    files
-        .iter()
-        .filter_map(|(path, content)| {
-            content
-                .as_str()
-                .map(|s| (path.clone(), s.as_bytes().to_vec()))
+    let entries = |key: &str| {
+        components
+            .get(key)
+            .and_then(|f| f.as_object())
+            .cloned()
+            .unwrap_or_default()
+    };
+
+    let mut files: Vec<(String, Vec<u8>)> = entries("files")
+        .into_iter()
+        .filter_map(|(path, content)| content.as_str().map(|s| (path, s.as_bytes().to_vec())))
+        .collect();
+    for (path, content) in entries("binary_files") {
+        match content
+            .as_str()
+            .map(|b64| base64::engine::general_purpose::STANDARD.decode(b64))
+        {
+            Some(Ok(bytes)) => files.push((path, bytes)),
+            _ => warn!(
+                slug,
+                path, "reconciler: plugin binary file is not valid base64; skipped"
+            ),
+        }
+    }
+    let executables = components
+        .get("executables")
+        .and_then(|e| e.as_array())
+        .map(|paths| {
+            paths
+                .iter()
+                .filter_map(|p| p.as_str().map(str::to_string))
+                .collect()
         })
-        .collect()
+        .unwrap_or_default();
+
+    ImportedPluginContent { files, executables }
 }
 
 fn spawn_deactivate_plugin(

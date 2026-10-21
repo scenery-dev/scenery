@@ -18,6 +18,7 @@ fn bundle() -> PluginBundle {
             files: vec![("prompts/x.md".to_string(), b"p".to_vec())],
         }],
         files: vec![],
+        executables: vec![],
     }
 }
 
@@ -118,6 +119,7 @@ fn install_plugin_bundle_writes_imported_file_tree_verbatim() {
             // Path-traversal attempt must be ignored.
             ("../evil.sh".to_string(), b"rm -rf".to_vec()),
         ],
+        executables: vec![],
     };
 
     let result = install_plugin_bundle(&b);
@@ -149,6 +151,75 @@ fn install_plugin_bundle_writes_imported_file_tree_verbatim() {
     assert!(skill_ok, "skill file written");
     assert!(cache_ok, "tree copied into cache");
     assert!(traversal_blocked, "path traversal entry must be skipped");
+}
+
+/// Hooks and scripts that git marks executable must stay executable on the
+/// device, or a plugin that runs `${CLAUDE_PLUGIN_ROOT}/hooks/check.sh`
+/// directly breaks. The bit has to survive the copy into Claude Code's cache.
+#[cfg(unix)]
+#[test]
+fn install_plugin_bundle_keeps_executable_files_executable() {
+    use std::os::unix::fs::PermissionsExt;
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let fake_home = tempfile::tempdir().unwrap();
+    let prev = std::env::var_os("HOME");
+    std::env::set_var("HOME", fake_home.path());
+
+    let b = PluginBundle {
+        slug: "hooky".to_string(),
+        name: "hooky".to_string(),
+        description: "x".to_string(),
+        version: "1.0.0".to_string(),
+        author: "a".to_string(),
+        skills: vec![],
+        files: vec![
+            (
+                ".claude-plugin/plugin.json".to_string(),
+                br#"{"name":"hooky"}"#.to_vec(),
+            ),
+            (
+                "hooks/check.sh".to_string(),
+                b"#!/bin/sh\nexit 0\n".to_vec(),
+            ),
+            ("README.md".to_string(), b"readme".to_vec()),
+        ],
+        executables: vec!["hooks/check.sh".to_string(), "../evil.sh".to_string()],
+    };
+
+    let result = install_plugin_bundle(&b);
+
+    let h = fake_home.path();
+    let mode = |p: &str| {
+        std::fs::metadata(h.join(p))
+            .map(|m| m.permissions().mode())
+            .unwrap_or(0)
+    };
+    let src_hook = mode(".claude/plugins/marketplaces/vectorhawk/plugins/hooky/hooks/check.sh");
+    let cache_hook = mode(".claude/plugins/cache/vectorhawk/hooky/1.0.0/hooks/check.sh");
+    let readme = mode(".claude/plugins/marketplaces/vectorhawk/plugins/hooky/README.md");
+
+    if let Some(v) = prev {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+
+    assert!(result.is_ok(), "install must succeed: {result:?}");
+    assert_eq!(
+        src_hook & 0o111,
+        0o111,
+        "hook is executable in the marketplace source"
+    );
+    assert_eq!(
+        cache_hook & 0o111,
+        0o111,
+        "hook stays executable in the cache"
+    );
+    assert_eq!(
+        readme & 0o111,
+        0,
+        "files git doesn't mark executable stay plain"
+    );
 }
 
 #[test]

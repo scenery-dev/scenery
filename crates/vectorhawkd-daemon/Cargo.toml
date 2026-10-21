@@ -66,6 +66,10 @@ axum = { version = "0.8", default-features = false, features = ["http1", "query"
 # keys from their base64url `x`/`y` via `DecodingKey::from_ec_components`.
 jsonwebtoken = { version = "10.3", default-features = false, features = ["rust_crypto", "use_pem"] }
 
+# Imported plugins' binary files arrive base64-encoded from the registry.
+# Already linked through vectorhawkd-core.
+base64.workspace = true
+
 [dev-dependencies]
 serde_json.workspace = true
 dirs.workspace = true
@@ -79,7 +83,6 @@ rusqlite.workspace = true
 # reqwest used by oauth_listener unit tests to exercise the HTTP callback endpoint.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 mockito = "1"
-base64.workspace = true
 # See `refresh_loop_tests::disable_real_keychain_for_tests` — runs before any
 # `#[test]` in this crate's binary so the suite can never touch the real OS
 # keychain.
