@@ -778,3 +778,66 @@ async fn dispatch_event_snapshot_converges_deactivated_and_orphan_and_removed_pl
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// ── Imported plugin content fetch ─────────────────────────────────────────────
+
+const IMPORTED_CONTENT: &str = r##"{"components":{
+    "files":{"hooks/check.sh":"#!/bin/sh\nexit 0\n"},
+    "binary_files":{"assets/icon.png":"iVBORw0KGgo="},
+    "executables":["hooks/check.sh"]
+}}"##;
+
+/// A private (imported, not yet published) plugin is served only to its owner,
+/// so the content fetch identifies the runner. Binary files arrive base64 and
+/// must land byte for byte; executables come back so hooks stay runnable.
+#[tokio::test]
+async fn imported_plugin_fetch_sends_the_token_and_decodes_binaries() {
+    let mut server = mockito::Server::new_async().await;
+    let mock = server
+        .mock("GET", "/api/runner/plugins/hooky/versions/1.0.0")
+        .match_header("authorization", "Bearer tok")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(IMPORTED_CONTENT)
+        .create_async()
+        .await;
+
+    let got = super::fetch_plugin_version_files(&server.url(), "hooky", "1.0.0", "tok").await;
+
+    mock.assert_async().await;
+    let mut files = got.files.clone();
+    files.sort();
+    assert_eq!(
+        files,
+        vec![
+            (
+                "assets/icon.png".to_string(),
+                vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]
+            ),
+            (
+                "hooks/check.sh".to_string(),
+                b"#!/bin/sh\nexit 0\n".to_vec()
+            ),
+        ]
+    );
+    assert_eq!(got.executables, vec!["hooks/check.sh".to_string()]);
+}
+
+/// Logged out, the fetch still works for org-published plugins: no header.
+#[tokio::test]
+async fn imported_plugin_fetch_sends_no_header_when_logged_out() {
+    let mut server = mockito::Server::new_async().await;
+    let mock = server
+        .mock("GET", "/api/runner/plugins/hooky/versions/1.0.0")
+        .match_header("authorization", mockito::Matcher::Missing)
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(IMPORTED_CONTENT)
+        .create_async()
+        .await;
+
+    let got = super::fetch_plugin_version_files(&server.url(), "hooky", "1.0.0", "").await;
+
+    mock.assert_async().await;
+    assert_eq!(got.files.len(), 2);
+}
