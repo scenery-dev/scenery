@@ -61,6 +61,9 @@ pub struct PluginBundle {
     /// already include `.claude-plugin/plugin.json`, `commands/`, `agents/`,
     /// `skills/`, etc.
     pub files: Vec<(String, Vec<u8>)>,
+    /// Paths in `files` that git marks executable (hook and script entry
+    /// points). Written with mode 0755 so the plugin runs as it would natively.
+    pub executables: Vec<String>,
 }
 
 fn reconciler_disabled() -> bool {
@@ -240,6 +243,9 @@ fn write_plugin_source(plugin_src: &Path, bundle: &PluginBundle) -> Result<()> {
                 fs::create_dir_all(parent).ok();
             }
             atomic_write(&dest, bytes)?;
+            if bundle.executables.iter().any(|e| e == rel) {
+                make_executable(&dest)?;
+            }
             if rel == ".claude-plugin/plugin.json" {
                 wrote_plugin_json = true;
             }
@@ -463,6 +469,20 @@ fn atomic_write(dest: &Path, content: &[u8]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn make_executable(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("plugin_marketplace: chmod {path:?}"))
+}
+
+/// Windows has no executable bit; scripts run through their interpreter.
+#[cfg(not(unix))]
+fn make_executable(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+// `fs::copy` carries permissions over, so executables stay executable in the cache.
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     fs::create_dir_all(dst)?;
     for entry in fs::read_dir(src)? {
