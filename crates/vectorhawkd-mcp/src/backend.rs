@@ -660,7 +660,7 @@ impl Backend for RealBackend {
     async fn initialize(&self, params: Value) -> Result<InitializeResult> {
         #[cfg(feature = "daemon")]
         let instructions = {
-            let native_skills = crate::tools::client_loads_native_skills(&params);
+            let native_dir = crate::tools::native_skills_dir(&params);
             let logged_in = self.state.as_ref().map_or(false, |state| {
                 self.registry_url
                     .as_ref()
@@ -679,7 +679,7 @@ impl Backend for RealBackend {
             // the two can never drift apart.
             let exposed_tool_names: Vec<String> = match &self.state {
                 Some(state) => {
-                    crate::tools::build_tool_list(state, &self.registry_url, native_skills)
+                    crate::tools::build_tool_list(state, &self.registry_url, native_dir.as_deref())
                         .into_iter()
                         .map(|t| t.name)
                         .collect()
@@ -714,8 +714,8 @@ impl Backend for RealBackend {
         // Only available when the full context has been wired (daemon path).
         #[cfg(feature = "daemon")]
         let mut tools: Vec<ProtoToolDef> = if let Some(state) = &self.state {
-            let native_skills = crate::tools::client_loads_native_skills(&params);
-            crate::tools::build_tool_list(state, &self.registry_url, native_skills)
+            let native_dir = crate::tools::native_skills_dir(&params);
+            crate::tools::build_tool_list(state, &self.registry_url, native_dir.as_deref())
                 .into_iter()
                 .map(|td| ProtoToolDef {
                     name: td.name,
@@ -1363,11 +1363,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// End to end through the daemon's backend: Claude Code gets each
-    /// governed skill once (natively), other clients still get the tool.
+    /// End to end through the daemon's backend: whatever the client, a
+    /// governed skill without a native copy stays reachable as a tool.
     #[cfg(feature = "daemon")]
     #[tokio::test]
-    async fn real_backend_lists_skill_tools_only_for_clients_without_native_skills() {
+    async fn real_backend_never_leaves_a_client_without_a_governed_skill() {
         use std::collections::HashMap;
         use std::sync::Mutex as StdMutex;
         use vectorhawkd_core::{
@@ -1402,16 +1402,6 @@ mod tests {
         let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
         install_unpacked_skill(&state, &pkg, vectorhawkd_core::installer::InstallMode::Copy)
             .unwrap();
-        // The pusher wrote it into ~/.claude/skills.
-        rusqlite::Connection::open(&state.db_path)
-            .unwrap()
-            .execute(
-                "INSERT INTO managed_path_markers \
-                 (path, kind, slug, installation_id, source_sha256, migrated_at) \
-                 VALUES ('/skills/test-skill', 'skill', 'test-skill', NULL, 'abc', '2026-01-01T00:00:00Z')",
-                [],
-            )
-            .unwrap();
         let backend = RealBackend::with_full_context(
             Arc::new(BackendRegistry::new()),
             Arc::new(NoOpAuditBuffer),
@@ -1444,7 +1434,9 @@ mod tests {
         );
         let unknown = names(backend.list_tools(serde_json::json!({})).await.unwrap());
 
-        assert!(!claude.contains(&"test-skill".to_string()), "{claude:?}");
+        // No VectorHawk copy in this machine's ~/.claude/skills, so Claude
+        // Code keeps the tool (the hidden case is covered in tools.rs).
+        assert!(claude.contains(&"test-skill".to_string()), "{claude:?}");
         assert!(cursor.contains(&"test-skill".to_string()), "{cursor:?}");
         assert!(unknown.contains(&"test-skill".to_string()), "{unknown:?}");
         let _ = std::fs::remove_dir_all(&base);
