@@ -64,7 +64,9 @@ use vectorhawkd_core::{
     auth::{decode_jwt_sub, load_tokens, save_tokens},
     state::{self, AppState},
 };
-use vectorhawkd_mcp::protocol::{JsonRpcRequest, JsonRpcResponse, PARSE_ERROR};
+use vectorhawkd_mcp::protocol::{
+    with_client_meta, JsonRpcRequest, JsonRpcResponse, CLAUDE_CODE_CLIENT_NAME, PARSE_ERROR,
+};
 
 use crate::DaemonContext;
 
@@ -671,8 +673,19 @@ async fn handle_mcp_post(
     // this one, with JSON-RPC `-32601` at HTTP 200 — never an HTTP error —
     // which is exactly what makes Claude Code fall back cleanly to
     // `initialize`.
-    let response = crate::socket_dispatch::dispatch(&state.ctx, request).await;
+    let response = crate::socket_dispatch::dispatch(&state.ctx, from_claude_code(request)).await;
     json_response(StatusCode::OK, response)
+}
+
+/// Tag `tools/list` as coming from Claude Code, the only client this
+/// transport serves (`JWT_CLIENT_ID`). The request carries no clientInfo of
+/// its own, and Claude Code loads governed skills natively, so the daemon
+/// must leave them out of the tool list.
+pub(crate) fn from_claude_code(mut request: JsonRpcRequest) -> JsonRpcRequest {
+    if request.method == "tools/list" {
+        request.params = with_client_meta(request.params, CLAUDE_CODE_CLIENT_NAME);
+    }
+    request
 }
 
 /// Why a request failed authentication/binding — only used to pick which

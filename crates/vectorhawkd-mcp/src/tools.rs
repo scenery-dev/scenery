@@ -87,12 +87,22 @@ const GOVERNANCE_FOOTER: &str = "\n\n---\nTo add new MCP servers, use /mcp-reque
 /// portal — the management tools clutter the AI client's tool list. Set
 /// `VECTORHAWK_EXPOSE_BUILTIN_TOOLS=1` to surface them for CLI-style
 /// workflows.
-pub fn build_tool_list(state: &AppState, registry_url: &Option<String>) -> Vec<ToolDefinition> {
+///
+/// `native_skills` is true when the connected client already loads governed
+/// skills from `~/.claude/skills` (see [`client_loads_native_skills`]); the
+/// skills are then left out so each one appears once, natively.
+pub fn build_tool_list(
+    state: &AppState,
+    registry_url: &Option<String>,
+    native_skills: bool,
+) -> Vec<ToolDefinition> {
     let expose = std::env::var("VECTORHAWK_EXPOSE_BUILTIN_TOOLS")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
-    build_tool_list_inner(state, registry_url, expose)
+    build_tool_list_inner(state, registry_url, expose, native_skills)
 }
+
+pub use crate::protocol::{client_loads_native_skills, client_name, with_client_meta};
 
 /// Test-only entry point: same as `build_tool_list` but takes the
 /// `expose_builtins` flag explicitly so tests don't depend on env vars.
@@ -101,13 +111,14 @@ pub(crate) fn build_tool_list_with_builtins(
     state: &AppState,
     registry_url: &Option<String>,
 ) -> Vec<ToolDefinition> {
-    build_tool_list_inner(state, registry_url, true)
+    build_tool_list_inner(state, registry_url, true, false)
 }
 
 fn build_tool_list_inner(
     state: &AppState,
     registry_url: &Option<String>,
     expose_builtins: bool,
+    native_skills: bool,
 ) -> Vec<ToolDefinition> {
     let mut tools = Vec::new();
 
@@ -116,8 +127,8 @@ fn build_tool_list_inner(
         .and_then(|url| auth::load_tokens(state, url).ok().flatten())
         .is_some();
 
-    // Add installed skills as tools
-    if let Ok(skill_tools) = skill_tools_from_db(state) {
+    // Add installed skills as tools, except those the client already has natively.
+    if let Ok(skill_tools) = skill_tools_from_db(state, native_skills) {
         tools.extend(skill_tools);
     }
 
@@ -593,13 +604,21 @@ fn build_tool_list_inner(
 /// records in `installed_skills`) can never be surfaced as a VectorHawk tool.
 /// Do not add a filesystem walk here; native-vs-managed classification lives in
 /// [`crate::ownership`] and adoption goes through the daemon reconciler.
-fn skill_tools_from_db(state: &AppState) -> Result<Vec<ToolDefinition>> {
+///
+/// With `skip_native`, skills the managed-paths pusher has written into
+/// `~/.claude/skills` (a `managed_path_markers` row) are left out: the client
+/// loads those natively. A skill whose push failed stays a tool, since that
+/// is then the only way to reach it.
+fn skill_tools_from_db(state: &AppState, skip_native: bool) -> Result<Vec<ToolDefinition>> {
     let conn = Connection::open(&state.db_path)?;
     let mut stmt = conn.prepare(
-        "SELECT skill_id, install_root FROM installed_skills WHERE current_status = 'active'",
+        "SELECT skill_id, install_root FROM installed_skills s \
+         WHERE current_status = 'active' \
+           AND NOT (?1 AND EXISTS (SELECT 1 FROM managed_path_markers m \
+                                   WHERE m.kind = 'skill' AND m.slug = s.skill_id))",
     )?;
 
-    let rows = stmt.query_map([], |row| {
+    let rows = stmt.query_map([skip_native], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })?;
 
@@ -2986,7 +3005,7 @@ mod tests {
         let state = AppState::bootstrap_in(state_root.clone()).unwrap();
         let url = "http://localhost:8000".to_string();
 
-        let tools = build_tool_list_inner(&state, &Some(url), false);
+        let tools = build_tool_list_inner(&state, &Some(url), false, false);
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
 
         assert!(
@@ -3030,6 +3049,66 @@ mod tests {
 
         let _ = fs::remove_dir_all(&state_root);
         let _ = fs::remove_dir_all(&skill_root);
+    }
+
+    /// Claude Code loads governed skills natively from ~/.claude/skills, so
+    /// listing them again as MCP tools makes each one appear twice.
+    #[test]
+    fn build_tool_list_leaves_out_skills_for_clients_that_load_them_natively() {
+        let state_root = temp_root("tool-list-native");
+        let skill_root = temp_root("tool-list-native-bundle");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+        write_test_skill(&skill_root);
+        let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
+        install_unpacked_skill(&state, &pkg, InstallMode::Copy).unwrap();
+        let url = Some("http://localhost:8000".to_string());
+
+        // Until the native copy exists (the push can fail, e.g. on a slug
+        // collision), the tool is the only way to reach the skill.
+        let not_pushed = build_tool_list_inner(&state, &url, false, true);
+        assert!(not_pushed.iter().any(|t| t.name == "test-skill"));
+
+        mark_pushed_natively(&state, "test-skill");
+        let native = build_tool_list_inner(&state, &url, false, true);
+        let other = build_tool_list_inner(&state, &url, false, false);
+
+        assert!(!native.iter().any(|t| t.name == "test-skill"));
+        assert!(native.iter().any(|t| t.name == "vectorhawk_login"));
+        assert!(other.iter().any(|t| t.name == "test-skill"));
+
+        let _ = fs::remove_dir_all(&state_root);
+        let _ = fs::remove_dir_all(&skill_root);
+    }
+
+    /// What the daemon's managed-paths pusher records after writing a skill
+    /// into ~/.claude/skills.
+    fn mark_pushed_natively(state: &AppState, slug: &str) {
+        let conn = Connection::open(&state.db_path).unwrap();
+        conn.execute(
+            "INSERT INTO managed_path_markers \
+             (path, kind, slug, installation_id, source_sha256, migrated_at) \
+             VALUES (?1, 'skill', ?2, NULL, 'abc', '2026-01-01T00:00:00Z')",
+            rusqlite::params![format!("/skills/{slug}"), slug],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn only_claude_code_loads_skills_natively() {
+        let init = |name: &str| serde_json::json!({"clientInfo": {"name": name, "version": "1"}});
+        assert!(client_loads_native_skills(&init("claude-code")));
+        assert!(!client_loads_native_skills(&init("cursor-vscode")));
+        assert!(!client_loads_native_skills(&init("claude-ai")));
+        assert!(!client_loads_native_skills(&serde_json::json!({})));
+        // tools/list carries no clientInfo; the transport forwards it in _meta.
+        assert!(client_loads_native_skills(&with_client_meta(
+            serde_json::json!({}),
+            "claude-code"
+        )));
+        assert!(!client_loads_native_skills(&with_client_meta(
+            serde_json::json!({}),
+            "windsurf"
+        )));
     }
 
     #[test]
