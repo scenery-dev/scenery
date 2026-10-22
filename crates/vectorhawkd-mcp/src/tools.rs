@@ -33,6 +33,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 use semver::Version;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::debug;
@@ -88,18 +89,27 @@ const GOVERNANCE_FOOTER: &str = "\n\n---\nTo add new MCP servers, use /mcp-reque
 /// `VECTORHAWK_EXPOSE_BUILTIN_TOOLS=1` to surface them for CLI-style
 /// workflows.
 ///
-/// `native_skills` is true when the connected client already loads governed
-/// skills from `~/.claude/skills` (see [`client_loads_native_skills`]); the
-/// skills are then left out so each one appears once, natively.
+/// `native_skills_dir` is the skills folder the connected client loads
+/// natively (see [`native_skills_dir`]); skills with a VectorHawk copy there
+/// are left out so each appears once.
 pub fn build_tool_list(
     state: &AppState,
     registry_url: &Option<String>,
-    native_skills: bool,
+    native_skills_dir: Option<&Path>,
 ) -> Vec<ToolDefinition> {
     let expose = std::env::var("VECTORHAWK_EXPOSE_BUILTIN_TOOLS")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
-    build_tool_list_inner(state, registry_url, expose, native_skills)
+    build_tool_list_inner(state, registry_url, expose, native_skills_dir)
+}
+
+/// The skills folder the client that sent `params` loads natively, if any.
+pub fn native_skills_dir(params: &serde_json::Value) -> Option<PathBuf> {
+    if client_loads_native_skills(params) {
+        crate::ownership::claude_skills_dir()
+    } else {
+        None
+    }
 }
 
 pub use crate::protocol::{client_loads_native_skills, client_name, with_client_meta};
@@ -111,14 +121,14 @@ pub(crate) fn build_tool_list_with_builtins(
     state: &AppState,
     registry_url: &Option<String>,
 ) -> Vec<ToolDefinition> {
-    build_tool_list_inner(state, registry_url, true, false)
+    build_tool_list_inner(state, registry_url, true, None)
 }
 
 fn build_tool_list_inner(
     state: &AppState,
     registry_url: &Option<String>,
     expose_builtins: bool,
-    native_skills: bool,
+    native_skills_dir: Option<&Path>,
 ) -> Vec<ToolDefinition> {
     let mut tools = Vec::new();
 
@@ -128,7 +138,7 @@ fn build_tool_list_inner(
         .is_some();
 
     // Add installed skills as tools, except those the client already has natively.
-    if let Ok(skill_tools) = skill_tools_from_db(state, native_skills) {
+    if let Ok(skill_tools) = skill_tools_from_db(state, native_skills_dir) {
         tools.extend(skill_tools);
     }
 
@@ -605,26 +615,32 @@ fn build_tool_list_inner(
 /// Do not add a filesystem walk here; native-vs-managed classification lives in
 /// [`crate::ownership`] and adoption goes through the daemon reconciler.
 ///
-/// With `skip_native`, skills the managed-paths pusher has written into
-/// `~/.claude/skills` (a `managed_path_markers` row) are left out: the client
-/// loads those natively. A skill whose push failed stays a tool, since that
-/// is then the only way to reach it.
-fn skill_tools_from_db(state: &AppState, skip_native: bool) -> Result<Vec<ToolDefinition>> {
+/// With `native_skills_dir`, skills the client already has natively are
+/// left out: those with a VectorHawk-managed folder (our marker) holding a
+/// SKILL.md there. Anything else (push
+/// or link failed, the user's own folder of that name, a deleted link) keeps
+/// the tool, since it is then the only way to reach the skill.
+fn skill_tools_from_db(
+    state: &AppState,
+    native_skills_dir: Option<&Path>,
+) -> Result<Vec<ToolDefinition>> {
     let conn = Connection::open(&state.db_path)?;
     let mut stmt = conn.prepare(
-        "SELECT skill_id, install_root FROM installed_skills s \
-         WHERE current_status = 'active' \
-           AND NOT (?1 AND EXISTS (SELECT 1 FROM managed_path_markers m \
-                                   WHERE m.kind = 'skill' AND m.slug = s.skill_id))",
+        "SELECT skill_id, install_root FROM installed_skills WHERE current_status = 'active'",
     )?;
 
-    let rows = stmt.query_map([skip_native], |row| {
+    let rows = stmt.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })?;
 
     let mut tools = Vec::new();
     for row in rows {
+        // `skill_id` is the skill's local folder name (the reconciler maps
+        // registry names to it), which is what ~/.claude/skills uses.
         let (skill_id, install_root) = row?;
+        if native_skills_dir.is_some_and(|dir| has_native_copy(&dir.join(&skill_id))) {
+            continue;
+        }
         let active_path = format!("{}/active", install_root);
         if let Ok(tool) = skill_to_tool(&skill_id, &active_path) {
             tools.push(tool);
@@ -632,6 +648,10 @@ fn skill_tools_from_db(state: &AppState, skip_native: bool) -> Result<Vec<ToolDe
     }
 
     Ok(tools)
+}
+
+fn has_native_copy(dir: &Path) -> bool {
+    dir.join("SKILL.md").is_file() && crate::ownership::is_vectorhawk_managed(dir)
 }
 
 /// Convert a single installed skill into an MCP tool definition.
@@ -3005,7 +3025,7 @@ mod tests {
         let state = AppState::bootstrap_in(state_root.clone()).unwrap();
         let url = "http://localhost:8000".to_string();
 
-        let tools = build_tool_list_inner(&state, &Some(url), false, false);
+        let tools = build_tool_list_inner(&state, &Some(url), false, None);
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
 
         assert!(
@@ -3052,45 +3072,47 @@ mod tests {
     }
 
     /// Claude Code loads governed skills natively from ~/.claude/skills, so
-    /// listing them again as MCP tools makes each one appear twice.
+    /// listing them again as MCP tools makes each one appear twice. The tool
+    /// is only left out when Claude Code's copy is really there and ours.
     #[test]
-    fn build_tool_list_leaves_out_skills_for_clients_that_load_them_natively() {
+    fn build_tool_list_leaves_out_skills_claude_code_already_has() {
         let state_root = temp_root("tool-list-native");
         let skill_root = temp_root("tool-list-native-bundle");
+        let claude_skills = temp_root("tool-list-native-claude");
         let state = AppState::bootstrap_in(state_root.clone()).unwrap();
         write_test_skill(&skill_root);
         let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
         install_unpacked_skill(&state, &pkg, InstallMode::Copy).unwrap();
         let url = Some("http://localhost:8000".to_string());
+        let native_dir = Some(claude_skills.as_std_path());
+        let lists_skill = |dir| {
+            build_tool_list_inner(&state, &url, false, dir)
+                .iter()
+                .any(|t| t.name == "test-skill")
+        };
 
-        // Until the native copy exists (the push can fail, e.g. on a slug
-        // collision), the tool is the only way to reach the skill.
-        let not_pushed = build_tool_list_inner(&state, &url, false, true);
-        assert!(not_pushed.iter().any(|t| t.name == "test-skill"));
+        // No copy in ~/.claude/skills (push or link failed, or deleted): keep the tool.
+        assert!(lists_skill(native_dir));
 
-        mark_pushed_natively(&state, "test-skill");
-        let native = build_tool_list_inner(&state, &url, false, true);
-        let other = build_tool_list_inner(&state, &url, false, false);
+        // The user's own folder under that name is not the governed skill.
+        let dir = claude_skills.join("test-skill");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("SKILL.md"), "the user's own skill").unwrap();
+        assert!(lists_skill(native_dir));
 
-        assert!(!native.iter().any(|t| t.name == "test-skill"));
-        assert!(native.iter().any(|t| t.name == "vectorhawk_login"));
-        assert!(other.iter().any(|t| t.name == "test-skill"));
+        // VectorHawk's copy is there: Claude Code has it natively.
+        fs::write(dir.join(crate::ownership::MANAGED_MARKER_FILENAME), "{}").unwrap();
+        assert!(!lists_skill(native_dir));
+        assert!(build_tool_list_inner(&state, &url, false, native_dir)
+            .iter()
+            .any(|t| t.name == "vectorhawk_login"));
+
+        // Clients without native skills always get the tool.
+        assert!(lists_skill(None));
 
         let _ = fs::remove_dir_all(&state_root);
         let _ = fs::remove_dir_all(&skill_root);
-    }
-
-    /// What the daemon's managed-paths pusher records after writing a skill
-    /// into ~/.claude/skills.
-    fn mark_pushed_natively(state: &AppState, slug: &str) {
-        let conn = Connection::open(&state.db_path).unwrap();
-        conn.execute(
-            "INSERT INTO managed_path_markers \
-             (path, kind, slug, installation_id, source_sha256, migrated_at) \
-             VALUES (?1, 'skill', ?2, NULL, 'abc', '2026-01-01T00:00:00Z')",
-            rusqlite::params![format!("/skills/{slug}"), slug],
-        )
-        .unwrap();
+        let _ = fs::remove_dir_all(&claude_skills);
     }
 
     #[test]
