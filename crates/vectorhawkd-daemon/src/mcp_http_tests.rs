@@ -24,6 +24,7 @@ use vectorhawkd_core::state::AppState;
 use vectorhawkd_mcp::{
     aggregator::{BackendEntry, BackendRegistry, BackendTransport, ToolDefinition, ToolVisibility},
     backend::RealBackend,
+    protocol::JsonRpcRequest,
 };
 
 use super::DaemonContext;
@@ -1116,4 +1117,25 @@ async fn start_listener_refuses_insecure_issuer_and_binds_nothing() {
         None,
         "refusing before bind_listener means no port is ever persisted"
     );
+}
+
+/// Only Claude Code connects over this transport, and `tools/list` carries no
+/// clientInfo, so the request is tagged before dispatch. Without the tag
+/// Claude Code would get every governed skill twice: natively and as a tool.
+#[test]
+fn tools_list_is_tagged_as_coming_from_claude_code() {
+    let request = |method: &str| JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id: Some(serde_json::json!(1)),
+        method: method.to_string(),
+        params: serde_json::json!({}),
+    };
+
+    let list = super::from_claude_code(request("tools/list"));
+    assert!(vectorhawkd_mcp::protocol::client_loads_native_skills(
+        &list.params
+    ));
+
+    let call = super::from_claude_code(request("tools/call"));
+    assert_eq!(call.params, serde_json::json!({}));
 }

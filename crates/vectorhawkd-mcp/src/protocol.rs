@@ -239,6 +239,48 @@ pub const INTERNAL_ERROR: i64 = -32603;
 
 // ── Tests ──────────────────────────────────────────────────────────────────
 
+// ── Connected client ─────────────────────────────────────────────────────────
+
+/// `_meta` key a transport uses to pass the connected client's name along
+/// with requests (such as `tools/list`) that don't carry `clientInfo`.
+pub const CLIENT_META_KEY: &str = "vectorhawk/client";
+
+/// Claude Code's MCP `clientInfo.name`.
+pub const CLAUDE_CODE_CLIENT_NAME: &str = "claude-code";
+
+/// MCP `clientInfo.name`s of clients that load `~/.claude/skills` natively,
+/// where the runner pushes every governed skill.
+const NATIVE_SKILL_CLIENTS: &[&str] = &[CLAUDE_CODE_CLIENT_NAME];
+
+/// The connected client's name, from `initialize`'s `clientInfo` or from
+/// the `_meta` a transport added with [`with_client_meta`].
+pub fn client_name(params: &serde_json::Value) -> Option<&str> {
+    params["clientInfo"]["name"]
+        .as_str()
+        .or_else(|| params["_meta"][CLIENT_META_KEY].as_str())
+}
+
+/// Whether the client that sent `params` loads governed skills natively.
+pub fn client_loads_native_skills(params: &serde_json::Value) -> bool {
+    client_name(params).is_some_and(|name| NATIVE_SKILL_CLIENTS.contains(&name))
+}
+
+/// Tag request `params` with the connected client's name.
+pub fn with_client_meta(mut params: serde_json::Value, client: &str) -> serde_json::Value {
+    if !params.is_object() {
+        params = serde_json::json!({});
+    }
+    let meta = params
+        .as_object_mut()
+        .expect("params is an object")
+        .entry("_meta")
+        .or_insert_with(|| serde_json::json!({}));
+    if let Some(meta) = meta.as_object_mut() {
+        meta.insert(CLIENT_META_KEY.to_string(), serde_json::json!(client));
+    }
+    params
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
