@@ -368,6 +368,10 @@ pub struct SocketBackend {
     socket_path: std::path::PathBuf,
     /// Live connection to the daemon, established during `on_start`.
     stream: Arc<tokio::sync::Mutex<Option<UnixStream>>>,
+    /// `clientInfo.name` from this session's `initialize`. Forwarded on
+    /// `tools/list`, which carries no clientInfo of its own, so the daemon
+    /// can tailor the list to the client.
+    client: std::sync::Mutex<Option<String>>,
 }
 
 #[cfg(unix)]
@@ -376,6 +380,7 @@ impl SocketBackend {
         Self {
             socket_path: socket_path.into(),
             stream: Arc::new(tokio::sync::Mutex::new(None)),
+            client: std::sync::Mutex::new(None),
         }
     }
 
@@ -433,11 +438,21 @@ impl Backend for SocketBackend {
     }
 
     async fn initialize(&self, params: Value) -> Result<InitializeResult> {
+        if let Some(name) = crate::protocol::client_name(&params) {
+            if let Ok(mut client) = self.client.lock() {
+                *client = Some(name.to_string());
+            }
+        }
         let resp = self.relay("initialize", params).await?;
         serde_json::from_value(resp).context("failed to deserialize initialize result")
     }
 
     async fn list_tools(&self, params: Value) -> Result<ToolsListResult> {
+        let client = self.client.lock().ok().and_then(|c| c.clone());
+        let params = match client {
+            Some(name) => crate::protocol::with_client_meta(params, &name),
+            None => params,
+        };
         let resp = self.relay("tools/list", params).await?;
         serde_json::from_value(resp).context("failed to deserialize tools/list result")
     }
@@ -642,9 +657,10 @@ impl RealBackend {
 
 #[async_trait]
 impl Backend for RealBackend {
-    async fn initialize(&self, _params: Value) -> Result<InitializeResult> {
+    async fn initialize(&self, params: Value) -> Result<InitializeResult> {
         #[cfg(feature = "daemon")]
         let instructions = {
+            let native_skills = crate::tools::client_loads_native_skills(&params);
             let logged_in = self.state.as_ref().map_or(false, |state| {
                 self.registry_url
                     .as_ref()
@@ -662,10 +678,12 @@ impl Backend for RealBackend {
             // namespaced backend tools, which instructions never names) so
             // the two can never drift apart.
             let exposed_tool_names: Vec<String> = match &self.state {
-                Some(state) => crate::tools::build_tool_list(state, &self.registry_url)
-                    .into_iter()
-                    .map(|t| t.name)
-                    .collect(),
+                Some(state) => {
+                    crate::tools::build_tool_list(state, &self.registry_url, native_skills)
+                        .into_iter()
+                        .map(|t| t.name)
+                        .collect()
+                }
                 None => Vec::new(),
             };
             crate::instructions::build_instructions(
@@ -691,12 +709,13 @@ impl Backend for RealBackend {
         })
     }
 
-    async fn list_tools(&self, _params: Value) -> Result<ToolsListResult> {
+    async fn list_tools(&self, params: Value) -> Result<ToolsListResult> {
         // Management tools (vectorhawk_*) from the installed tools layer.
         // Only available when the full context has been wired (daemon path).
         #[cfg(feature = "daemon")]
         let mut tools: Vec<ProtoToolDef> = if let Some(state) = &self.state {
-            crate::tools::build_tool_list(state, &self.registry_url)
+            let native_skills = crate::tools::client_loads_native_skills(&params);
+            crate::tools::build_tool_list(state, &self.registry_url, native_skills)
                 .into_iter()
                 .map(|td| ProtoToolDef {
                     name: td.name,
@@ -1291,5 +1310,143 @@ mod tests {
         let (mut r, _w) = tokio::io::split(client_side);
         let result = relay_skip_notifications(&mut r).await.unwrap();
         assert_eq!(result, serde_json::json!({"tools": []}));
+    }
+
+    /// `tools/list` carries no clientInfo, so the shim must remember who
+    /// connected (from `initialize`) and tell the daemon on every list.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn socket_backend_forwards_the_connected_client_on_tools_list() {
+        use std::sync::{Arc, Mutex};
+        use tokio::net::UnixListener;
+
+        let dir = std::env::temp_dir().join(format!("vh-socket-client-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let sock = dir.join("d.sock");
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+        let seen: Arc<Mutex<Vec<Value>>> = Arc::default();
+        let seen_by_daemon = seen.clone();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            while let Ok(Some(frame)) = read_framed(&mut stream).await {
+                let req: Value = serde_json::from_slice(&frame).unwrap();
+                let result = match req["method"].as_str() {
+                    Some("initialize") => serde_json::json!({
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {},
+                        "serverInfo": {"name": "d", "version": "0"},
+                    }),
+                    _ => serde_json::json!({"tools": []}),
+                };
+                seen_by_daemon.lock().unwrap().push(req);
+                let resp = serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": result});
+                write_framed(&mut stream, &serde_json::to_vec(&resp).unwrap())
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let backend = SocketBackend::new(&sock);
+        backend.connect().await.unwrap();
+        backend
+            .initialize(serde_json::json!({"clientInfo": {"name": "claude-code", "version": "2"}}))
+            .await
+            .unwrap();
+        backend.list_tools(serde_json::json!({})).await.unwrap();
+
+        let list_params = seen.lock().unwrap()[1]["params"].clone();
+        assert!(
+            crate::protocol::client_loads_native_skills(&list_params),
+            "{list_params}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// End to end through the daemon's backend: Claude Code gets each
+    /// governed skill once (natively), other clients still get the tool.
+    #[cfg(feature = "daemon")]
+    #[tokio::test]
+    async fn real_backend_lists_skill_tools_only_for_clients_without_native_skills() {
+        use std::collections::HashMap;
+        use std::sync::Mutex as StdMutex;
+        use vectorhawkd_core::{
+            audit::NoOpAuditBuffer, installer::install_unpacked_skill, policy::MockPolicyClient,
+            state::AppState,
+        };
+        use vectorhawkd_manifest::SkillPackage;
+
+        let base = std::env::temp_dir().join(format!(
+            "vh-native-skills-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let state_root = camino::Utf8PathBuf::from_path_buf(base.join("state")).unwrap();
+        let skill_root = camino::Utf8PathBuf::from_path_buf(base.join("skill")).unwrap();
+        std::fs::create_dir_all(skill_root.join("prompts")).unwrap();
+        std::fs::write(
+            skill_root.join("SKILL.md"),
+            "---\nname: Test Skill\ndescription: A test skill\nmetadata:\n  vectorhawk:\n    version: 0.1.0\n    publisher: vectorhawk\n    permissions:\n      network: none\n      filesystem: none\n      clipboard: none\n    execution:\n      sandbox: strict\n      timeout_ms: 30000\n      memory_mb: 256\n    workflow_ref: workflow.yaml\n---\n\nDo the thing.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            skill_root.join("workflow.yaml"),
+            "name: test_skill\nsteps:\n  - id: run\n    type: llm\n    prompt: prompts/system.txt\n    inputs: {}\n",
+        )
+        .unwrap();
+        std::fs::write(skill_root.join("prompts/system.txt"), "Do the thing.").unwrap();
+
+        let state = Arc::new(AppState::bootstrap_in(state_root).unwrap());
+        let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
+        install_unpacked_skill(&state, &pkg, vectorhawkd_core::installer::InstallMode::Copy)
+            .unwrap();
+        // The pusher wrote it into ~/.claude/skills.
+        rusqlite::Connection::open(&state.db_path)
+            .unwrap()
+            .execute(
+                "INSERT INTO managed_path_markers \
+                 (path, kind, slug, installation_id, source_sha256, migrated_at) \
+                 VALUES ('/skills/test-skill', 'skill', 'test-skill', NULL, 'abc', '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        let backend = RealBackend::with_full_context(
+            Arc::new(BackendRegistry::new()),
+            Arc::new(NoOpAuditBuffer),
+            None,
+            state,
+            None,
+            Arc::new(MockPolicyClient::default()),
+            None,
+            Arc::new(StdMutex::new(HashMap::new())),
+        );
+        let names = |r: ToolsListResult| r.tools.into_iter().map(|t| t.name).collect::<Vec<_>>();
+
+        let claude = names(
+            backend
+                .list_tools(crate::tools::with_client_meta(
+                    serde_json::json!({}),
+                    "claude-code",
+                ))
+                .await
+                .unwrap(),
+        );
+        let cursor = names(
+            backend
+                .list_tools(crate::tools::with_client_meta(
+                    serde_json::json!({}),
+                    "cursor-vscode",
+                ))
+                .await
+                .unwrap(),
+        );
+        let unknown = names(backend.list_tools(serde_json::json!({})).await.unwrap());
+
+        assert!(!claude.contains(&"test-skill".to_string()), "{claude:?}");
+        assert!(cursor.contains(&"test-skill".to_string()), "{cursor:?}");
+        assert!(unknown.contains(&"test-skill".to_string()), "{unknown:?}");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
