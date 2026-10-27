@@ -127,36 +127,28 @@ pub async fn run(opts: UninstallOpts) -> Result<()> {
     // uninstall) — see `load_journal_entries`.
     let journal_entries = load_journal_entries(&mut report);
 
-    // ── 2. Restore first, so a failure mid-way never loses user data. ──
+    // ── 2. Stop every daemon first. ──
+    // A running daemon re-pushes client configs and re-saves refreshed
+    // tokens, so nothing below may run while one is up — including the
+    // `brew services` one, which `install::uninstall` does not own.
+    stop_daemons(&mut report).await?;
+
+    // ── 3. Restore first, so a failure mid-way never loses user data. ──
     // Native `~/.claude` takeovers + adopted originals from the restore journal.
     restore_from_journal(&journal_entries, &mut report);
 
-    // ── 3. Strip every client-config entry VectorHawk wrote. ──
+    // ── 4. Strip every client-config entry VectorHawk wrote. ──
     strip_client_configs(&plan, &journal_entries, &mut report);
 
-    // ── 4. Remove managed skills/plugins VH pushed into ~/.claude. ──
+    // ── 5. Remove managed skills/plugins VH pushed into ~/.claude. ──
     remove_managed_artifacts(&plan, &mut report);
 
-    // ── 5. Stop + deregister the daemon (LaunchAgent / systemd unit, logs). ──
-    if let Err(e) = tokio::task::spawn_blocking(crate::install::uninstall)
-        .await
-        .context("uninstall task panicked")?
-    {
-        report
-            .warnings
-            .push(format!("failed to remove the background service: {e:#}"));
-    }
-
-    // ── 6. Tell the backend this device is gone: release brokered creds + audit. ──
-    // auth logout clears the local token; device-deprovision releases the
-    // gateway-side credential bindings for this device.
-    if let Err(e) = crate::cmd_auth_logout(&opts.registry_url).await {
-        report
-            .warnings
-            .push(format!("could not log out / deprovision cleanly: {e:#}"));
-    }
+    // ── 6. Sign out of every registry and drop the local secrets. ──
+    sign_out_everywhere(&opts.registry_url, &mut report).await;
     // TODO(backend): POST /devices/{id}/deprovision so IT's audit log records the
-    // offboarding and the gateway drops this device's brokered credential grants.
+    // offboarding and the gateway drops this device's brokered credential grants,
+    // and revoke the refresh token server-side (portal refresh tokens are
+    // stateless today, so a copy taken before uninstall stays valid).
 
     // ── 7. Optional hard purge of local state. ──
     if opts.purge {
@@ -173,6 +165,53 @@ pub async fn run(opts: UninstallOpts) -> Result<()> {
     print_summary(&report, &paths);
     println!("\nRestart your AI client(s) to apply the change.");
     Ok(())
+}
+
+/// Stop and deregister our own service unit and the `brew services` one.
+async fn stop_daemons(report: &mut RestoreReport) -> Result<()> {
+    if let Err(e) = tokio::task::spawn_blocking(crate::install::uninstall)
+        .await
+        .context("uninstall task panicked")?
+    {
+        report
+            .warnings
+            .push(format!("failed to remove the background service: {e:#}"));
+    }
+    if let Err(e) = tokio::task::spawn_blocking(crate::install::stop_brew_service)
+        .await
+        .context("uninstall task panicked")?
+    {
+        report
+            .warnings
+            .push(format!("failed to stop the brew services daemon: {e:#}"));
+    }
+    Ok(())
+}
+
+/// Clear the tokens for `registry_url` and every other registry this machine
+/// signed in to, the device session, and the H3 local key. Uninstall is not
+/// `auth logout`: no VectorHawk secret may stay behind on the machine.
+async fn sign_out_everywhere(registry_url: &str, report: &mut RestoreReport) {
+    use vectorhawkd_core::auth::{clear_tokens, load_all_tokens};
+    use vectorhawkd_core::state::{AppState, LOCAL_MCP_KEY_SYNC_STATE_KEY};
+
+    if let Err(e) = crate::cmd_auth_logout(registry_url).await {
+        report
+            .warnings
+            .push(format!("could not log out / deprovision cleanly: {e:#}"));
+    }
+    let result = AppState::bootstrap().and_then(|state| {
+        for tokens in load_all_tokens(&state)? {
+            clear_tokens(&state, &tokens.registry_url)?;
+        }
+        state.delete_sync_state(LOCAL_MCP_KEY_SYNC_STATE_KEY)
+    });
+    if let Err(e) = result {
+        report
+            .warnings
+            .push(format!("could not clear stored credentials: {e:#}"));
+    }
+    delete_keychain_items();
 }
 
 /// What we intend to do, computed read-only up front.
@@ -700,29 +739,37 @@ fn purge_data_dir() -> Result<()> {
         }
     }
 
-    delete_keychain_item();
-
     Ok(())
 }
 
-/// Best-effort deletion of the `com.vectorhawk.agent` OS keychain service.
-/// `auth logout` (step 6 of `run`) already deletes the entry for the
-/// configured registry via `keyring`, keyed by account `registry::<url>`; a
-/// user who previously pointed at a different registry could still have a
-/// stale entry under this service, so purge makes a final best-effort sweep
-/// via the platform's own CLI rather than pulling the `keyring` crate into
-/// this binary. Never fails the purge — a missing/absent item is not an error.
+/// Best-effort deletion of every `com.vectorhawk.agent` keychain item.
+/// `clear_tokens` deletes the item for each registry `state.db` still knows
+/// about; an item for a registry whose row is gone would survive that, so
+/// this sweeps the service via the platform's own CLI rather than pulling
+/// the `keyring` crate into this binary. `security delete-generic-password`
+/// removes one matching item per call, hence the loop. Never fails, and
+/// leaves the keychain alone when `VECTORHAWK_DISABLE_KEYCHAIN` is set.
 #[cfg(target_os = "macos")]
-fn delete_keychain_item() {
-    let _ = std::process::Command::new("security")
-        .args(["delete-generic-password", "-s", "com.vectorhawk.agent"])
-        .output();
+fn delete_keychain_items() {
+    if vectorhawkd_core::auth::keychain_disabled() {
+        return;
+    }
+    for _ in 0..64 {
+        let deleted = std::process::Command::new("security")
+            .args(["delete-generic-password", "-s", "com.vectorhawk.agent"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !deleted {
+            break;
+        }
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
-fn delete_keychain_item() {
+fn delete_keychain_items() {
     // Linux never links the `keyring` crate (see vectorhawkd-core/src/auth.rs)
-    // — tokens live only in SQLite there, already removed with the data dir.
+    // — tokens live only in SQLite there, cleared by `sign_out_everywhere`.
 }
 
 // ── report rendering ────────────────────────────────────────────────────────
@@ -900,6 +947,56 @@ mod tests {
             Ok(v) => v,
             Err(e) => std::panic::resume_unwind(e),
         }
+    }
+
+    // ── sign out everywhere ─────────────────────────────────────────────────
+
+    /// Uninstall must leave no VectorHawk secret behind: the tokens for
+    /// every registry this machine signed in to (not just the configured
+    /// one) and the H3 local key.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn sign_out_everywhere_clears_every_registry_and_the_local_key() {
+        use vectorhawkd_core::auth::{load_all_tokens, save_tokens};
+        use vectorhawkd_core::state::LOCAL_MCP_KEY_SYNC_STATE_KEY;
+
+        let _guard = HOME_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = temp_dir("sign-out-everywhere");
+        let original_home = std::env::var_os("HOME");
+        let original_keychain = std::env::var_os("VECTORHAWK_DISABLE_KEYCHAIN");
+        std::env::set_var("HOME", &tmp);
+        std::env::set_var("VECTORHAWK_DISABLE_KEYCHAIN", "1");
+
+        let mut report = RestoreReport::default();
+        let outcome: anyhow::Result<(usize, Option<String>)> = async {
+            let state = AppState::bootstrap()?;
+            save_tokens(&state, "https://dev.example.invalid", "a1", "r1")?;
+            save_tokens(&state, "https://prod.example.invalid", "a2", "r2")?;
+            state.set_sync_state(LOCAL_MCP_KEY_SYNC_STATE_KEY, "local-key")?;
+
+            sign_out_everywhere("https://prod.example.invalid", &mut report).await;
+
+            Ok((
+                load_all_tokens(&state)?.len(),
+                state.get_sync_state(LOCAL_MCP_KEY_SYNC_STATE_KEY)?,
+            ))
+        }
+        .await;
+
+        match original_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match original_keychain {
+            Some(v) => std::env::set_var("VECTORHAWK_DISABLE_KEYCHAIN", v),
+            None => std::env::remove_var("VECTORHAWK_DISABLE_KEYCHAIN"),
+        }
+        let _ = fs::remove_dir_all(&tmp);
+
+        let (remaining, local_key) = outcome.expect("test body should succeed");
+        assert_eq!(remaining, 0, "tokens for every registry must be cleared");
+        assert_eq!(local_key, None);
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
     }
 
     // ── M6: auth logout clears device/session state ─────────────────────────

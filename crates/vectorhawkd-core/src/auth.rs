@@ -445,10 +445,8 @@ fn keyring_account(registry_url: &str) -> String {
 /// is treated as if it were unavailable, forcing the SQLite fallback. Used
 /// by the test suite (so tests don't pollute the real macOS Keychain) and
 /// by users on shared boxes who prefer to keep tokens out of system stores.
-/// On Linux the helper is unreferenced because keychain_get/set/delete
-/// always return Unavailable there, so we gate it to silence the warning.
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-fn keychain_disabled() -> bool {
+/// Public so `vectorhawk uninstall`'s keychain sweep honours it too.
+pub fn keychain_disabled() -> bool {
     std::env::var("VECTORHAWK_DISABLE_KEYCHAIN")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
@@ -768,6 +766,9 @@ pub fn load_all_tokens(state: &AppState) -> Result<Vec<StoredTokens>> {
 pub fn clear_tokens(state: &AppState, registry_url: &str) -> Result<()> {
     keychain_delete(registry_url);
     let conn = Connection::open(&state.db_path).context("failed to open state DB")?;
+    // Zero the deleted row's bytes instead of leaving them on a free page.
+    conn.execute_batch("PRAGMA secure_delete = ON;")
+        .context("failed to enable secure_delete")?;
     conn.execute(
         "DELETE FROM auth_tokens WHERE registry_url = ?1",
         [registry_url],
@@ -1170,6 +1171,29 @@ mod tests {
         assert!(loaded.is_none(), "tokens should be cleared");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn clear_tokens_leaves_no_token_bytes_in_the_db_file() {
+        let _guard = KeychainOff::enable();
+        let root = temp_root("token-scrub");
+        let state = AppState::bootstrap_in(root.clone()).expect("bootstrap");
+
+        save_tokens(
+            &state,
+            "http://localhost:8000",
+            "ACCESS-SENTINEL-7f3a",
+            "REFRESH-SENTINEL-7f3a",
+        )
+        .expect("save tokens");
+        clear_tokens(&state, "http://localhost:8000").expect("clear tokens");
+
+        let bytes = std::fs::read(&state.db_path).expect("read db");
+        let needle = b"SENTINEL-7f3a";
+        assert!(
+            !bytes.windows(needle.len()).any(|w| w == needle),
+            "a cleared token must not survive on a free page"
+        );
     }
 
     #[test]

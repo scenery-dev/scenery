@@ -98,6 +98,20 @@ pub fn uninstall() -> Result<()> {
     )
 }
 
+/// Stop and deregister `brew services`' own unit for this formula
+/// (`homebrew.mxcl.vectorhawk` / `sh.brew.vectorhawk.service`), which
+/// [`uninstall`] does not touch. Returns whether there was anything to stop.
+pub fn stop_brew_service() -> Result<bool> {
+    #[cfg(target_os = "macos")]
+    return macos::stop_brew_service();
+
+    #[cfg(target_os = "linux")]
+    return linux::stop_brew_service();
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    Ok(false)
+}
+
 /// Restart the daemon in place: kills the running process and starts a fresh
 /// one without rewriting the unit file. Useful for picking up a new auth
 /// token, env vars, or to recover from a stuck state.

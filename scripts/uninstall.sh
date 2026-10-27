@@ -36,10 +36,16 @@ if [[ "$(uname)" == "Darwin" ]]; then
   DATA="$HOME/Library/Application Support/VectorHawk"
   LOGS="$HOME/Library/Logs/VectorHawk"
   PLIST="$HOME/Library/LaunchAgents/com.vectorhawk.agent.plist"
+  BREW_PLIST="$HOME/Library/LaunchAgents/homebrew.mxcl.vectorhawk.plist"
 else
-  DATA="${XDG_DATA_HOME:-$HOME/.local/share}/vectorhawk"
+  # The runner uses dirs::data_dir()/VectorHawk; Linux paths are
+  # case-sensitive. Fall back to the lowercase spelling older copies of this
+  # script assumed, in case something created it.
+  DATA="${XDG_DATA_HOME:-$HOME/.local/share}/VectorHawk"
+  [[ -d "$DATA" ]] || [[ ! -d "${DATA%/*}/vectorhawk" ]] || DATA="${DATA%/*}/vectorhawk"
   LOGS="$DATA/logs"
   UNIT="$HOME/.config/systemd/user/vectorhawk-agent.service"
+  BREW_UNIT="$HOME/.config/systemd/user/sh.brew.vectorhawk.service"
   AUTOSTART="$HOME/.config/autostart/vectorhawk.desktop"
 fi
 JOURNAL="$DATA/restore-journal.json"   # written by the runner (see journal card)
@@ -288,14 +294,22 @@ for cfg in "${CLIENT_CONFIGS[@]}"; do
   done < <(json_list_keys "$cfg" "$key")
 done
 
-# ── 2. Stop + remove the background service ────────────────────────────────────
+# ── 2. Stop + remove every background service ─────────────────────────────────
+# First, before anything else is touched: a running daemon re-pushes client
+# configs and re-saves refreshed tokens. That includes the `brew services`
+# one, which is what Homebrew installs actually run.
 if [[ "$(uname)" == "Darwin" ]]; then
-  launchctl bootout "gui/$(id -u)/com.vectorhawk.agent" 2>/dev/null || true
-  [[ -f "$PLIST" ]] && rm -f "$PLIST"
+  for label in com.vectorhawk.agent homebrew.mxcl.vectorhawk; do
+    launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+  done
+  rm -f "$PLIST" "$BREW_PLIST"
 else
-  systemctl --user disable --now vectorhawk-agent.service 2>/dev/null || true
-  [[ -f "${UNIT:-}" ]] && rm -f "$UNIT" && systemctl --user daemon-reload 2>/dev/null || true
-  [[ -f "${AUTOSTART:-}" ]] && rm -f "$AUTOSTART"
+  for svc in vectorhawk-agent.service sh.brew.vectorhawk.service; do
+    systemctl --user disable --now "$svc" 2>/dev/null || true
+  done
+  rm -f "$UNIT" "$BREW_UNIT"
+  systemctl --user daemon-reload 2>/dev/null || true
+  rm -f "$AUTOSTART"
 fi
 
 # ── 3. Restore native takeovers + adopted originals from the journal ──────────
@@ -351,20 +365,48 @@ for base in "$HOME/.claude/skills" "$HOME/.claude/plugins"; do
   done < <(find "$base" -maxdepth 2 -name '.vectorhawk-managed.json' 2>/dev/null)
 done
 
-# ── 6. Optional hard purge ────────────────────────────────────────────────────
+# ── 6. Sign out: drop every stored credential, with or without --purge ───────
+# Mirrors `vectorhawk uninstall`, which signs out of every registry. Tokens,
+# the PAT and the H3 local key live in state.db (always, on Linux); secure_delete
+# zeroes the deleted rows instead of leaving them on free pages.
+DB="$DATA/state.db"
+SIGNOUT_SQL="PRAGMA secure_delete = ON;
+DELETE FROM auth_tokens;
+DELETE FROM sync_state WHERE key IN ('mcp_local_key', 'device_id', 'device_uuid', 'mcp_user_id');"
+if [[ -f "$DB" ]]; then
+  if have sqlite3 && sqlite3 "$DB" "$SIGNOUT_SQL" 2>/dev/null; then
+    REMOVED+=("stored VectorHawk sign-in tokens")
+  elif have python3 && python3 - "$DB" "$SIGNOUT_SQL" <<'PYEOF'
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1])
+conn.executescript(sys.argv[2])
+conn.close()
+PYEOF
+  then
+    REMOVED+=("stored VectorHawk sign-in tokens")
+  else
+    WARN+=("could not clear sign-in tokens from $DB — delete that file by hand")
+  fi
+fi
+# macOS keychain: one item per registry, and each call deletes only one.
+if have security; then
+  for _ in $(seq 1 64); do
+    security delete-generic-password -s "com.vectorhawk.agent" >/dev/null 2>&1 || break
+  done
+fi
+
+# ── 7. Optional hard purge ────────────────────────────────────────────────────
 rm -f "$HOME/.claude.json.lock"
 if [[ "$PURGE" -eq 1 ]]; then
   rm -rf "$DATA" "$LOGS"
-  # keychain token (macOS); best-effort
-  have security && security delete-generic-password -s "com.vectorhawk.agent" >/dev/null 2>&1 || true
 fi
 
-# ── 7. Write the restore report ───────────────────────────────────────────────
+# ── 8. Write the restore report ───────────────────────────────────────────────
 {
   echo "# VectorHawk uninstall — restore report"
   echo
   echo "## Removed completely"
-  echo "_Re-add these on your own configuration; credentials were brokered and never stored locally._"
+  echo "_Re-add these on your own configuration. VectorHawk's own sign-in tokens have been cleared from this machine._"
   echo
   if [[ ${#REMOVED[@]} -eq 0 ]]; then echo "- (none)"; else printf -- '- %s\n' "${REMOVED[@]}"; fi
   echo
