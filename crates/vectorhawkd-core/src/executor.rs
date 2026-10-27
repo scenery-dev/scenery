@@ -872,6 +872,31 @@ mod tests {
         let _ = fs::remove_dir_all(&outside);
     }
 
+    #[test]
+    fn validate_output_refuses_schema_file_outside_bundle() {
+        let skill_root = temp_root("schema-escape");
+        let outside = temp_root("schema-escape-outside");
+        write_skill_bundle(&skill_root, "{}");
+        fs::create_dir_all(&outside).expect("outside dir");
+        fs::write(outside.join("s.json"), r#"{"type":"object"}"#).expect("outside schema");
+        let outside_name = outside.file_name().expect("outside dir name");
+
+        for rel in [
+            outside.join("s.json").to_string(),
+            format!("../{outside_name}/s.json"),
+        ] {
+            let err = validate_output(&skill_root, &rel, &serde_json::json!({}))
+                .expect_err("escaping schema path must be refused");
+            assert!(
+                err.to_string().contains("outside the skill bundle"),
+                "{rel}: {err:#}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&skill_root);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
     // ── F21: crafted schemas must be refused, never crash or hang the daemon ─
 
     use crate::schema_guard::tests::{

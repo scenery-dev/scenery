@@ -89,12 +89,24 @@ pub fn compile_skill_schema(schema: &Value) -> Result<jsonschema::JSONSchema> {
     jsonschema::JSONSchema::compile(schema).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
-/// Read, parse and compile a schema file shipped in a skill bundle.
+/// Read, parse and compile a schema file shipped in a skill bundle. The path
+/// must resolve inside the bundle, symlinks included, like prompt files.
 pub fn compile_schema_file(
     pkg_root: &Utf8Path,
     schema_rel: &str,
 ) -> Result<jsonschema::JSONSchema> {
-    let schema_path = pkg_root.join(schema_rel);
+    let schema_path = match vectorhawkd_manifest::resolve_bundle_file(pkg_root, schema_rel) {
+        Ok(path) => path,
+        Err(vectorhawkd_manifest::BundlePathError::OutsideBundle) => {
+            anyhow::bail!("schema file {schema_rel} resolves outside the skill bundle")
+        }
+        Err(vectorhawkd_manifest::BundlePathError::Io(e)) => {
+            return Err(anyhow::Error::new(e).context(format!(
+                "failed to read schema {}",
+                pkg_root.join(schema_rel)
+            )));
+        }
+    };
     let schema_text = std::fs::read_to_string(&schema_path)
         .with_context(|| format!("failed to read schema {schema_path}"))?;
     let schema_json: Value = serde_json::from_str(&schema_text)

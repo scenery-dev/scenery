@@ -2461,14 +2461,21 @@ fn scaffold_skill_md(params: SkillMdParams<'_>) -> Result<String> {
     } = params;
     use std::fs;
 
+    // The id becomes a directory name and lands unquoted in the YAML below,
+    // so the same rule as SKILL.md import applies (no `..`, `/` or quotes).
+    vectorhawkd_core::importer::validate_skill_id(skill_id)?;
     let base = camino::Utf8PathBuf::from(output_dir);
     let skill_dir = base.join(skill_id);
 
-    if skill_dir.exists() {
+    // symlink_metadata, not exists(): a dangling symlink counts as taken.
+    if skill_dir.symlink_metadata().is_ok() {
         anyhow::bail!("directory '{}' already exists", skill_dir);
     }
 
-    fs::create_dir_all(&skill_dir)
+    fs::create_dir_all(&base).with_context(|| format!("failed to create directory '{base}'"))?;
+    // Plain create_dir fails on anything already there, a symlink planted
+    // since the check included, so the files below land in a fresh directory.
+    fs::create_dir(&skill_dir)
         .with_context(|| format!("failed to create directory '{skill_dir}'"))?;
 
     // Produce the triggers YAML block nested under metadata.vectorhawk.
@@ -2892,6 +2899,60 @@ mod tests {
             std::env::temp_dir().join(format!("mcp-tools-tests-{label}-{nanos}")),
         )
         .unwrap()
+    }
+
+    fn author_confirm_in(out: &camino::Utf8Path, skill_id: &str) -> ToolCallResult {
+        let state = AppState::bootstrap_in(out.join("state")).unwrap();
+        handle_author_confirm(
+            &serde_json::json!({
+                "skill_id": skill_id,
+                "system_prompt": "Do the thing.",
+                "output_dir": out.join("skills").as_str(),
+                "publisher_id": "acme",
+            }),
+            &state,
+            None,
+        )
+    }
+
+    #[test]
+    fn author_confirm_refuses_ids_that_leave_the_output_dir() {
+        let out = temp_root("author-traversal");
+        for id in ["../escaped", "/tmp/escaped", "a/b", "x\"y"] {
+            let result = author_confirm_in(&out, id);
+            assert_eq!(result.is_error, Some(true), "{id} must be refused");
+        }
+        assert!(!out.join("escaped").exists());
+        assert!(!out.join("skills/a").exists());
+        let _ = fs::remove_dir_all(&out);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn author_confirm_refuses_a_planted_symlink_at_the_skill_dir() {
+        let out = temp_root("author-symlink");
+        let elsewhere = out.join("elsewhere");
+        fs::create_dir_all(out.join("skills")).unwrap();
+        // Dangling: exists() says false, so the old check let it through.
+        std::os::unix::fs::symlink(&elsewhere, out.join("skills/my-skill")).unwrap();
+
+        let result = author_confirm_in(&out, "my-skill");
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            !elsewhere.exists(),
+            "nothing may be written through the link"
+        );
+        let _ = fs::remove_dir_all(&out);
+    }
+
+    #[test]
+    fn author_confirm_still_scaffolds_a_normal_skill() {
+        let out = temp_root("author-ok");
+        let result = author_confirm_in(&out, "My Skill");
+        assert_ne!(result.is_error, Some(true));
+        assert!(out.join("skills/my-skill/SKILL.md").exists());
+        let _ = fs::remove_dir_all(&out);
     }
 
     fn write_test_skill(root: &camino::Utf8PathBuf) {
