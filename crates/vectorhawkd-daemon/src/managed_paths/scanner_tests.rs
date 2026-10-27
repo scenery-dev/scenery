@@ -83,24 +83,18 @@ fn scan_skills_files_in_root_skipped() {
     assert!(items.is_empty());
 }
 
-/// Pins the fix for the self-adoption bug: since the pivot to
-/// `~/.agents/skills`, VectorHawk writes real skill content into a canonical
-/// dir and leaves a *directory symlink* at `~/.claude/skills/<slug>`. The
-/// fixture reproduces that exact production shape — the canonical dir holds
-/// both `SKILL.md` and the `.vectorhawk-managed.json` marker, and
-/// `skills_dir` holds only a symlink pointing at it — so this also proves the
-/// marker is resolved *through* the link (`fs::metadata`/`Path::join` follow
-/// symlinks), not just checked against the link path itself.
-///
-/// An unmanaged sibling skill in the same `skills_dir` is asserted present so
-/// this test cannot pass against a scanner that returns nothing at all.
+/// F13: the scanner no longer trusts the `.vectorhawk-managed.json` file —
+/// anyone can drop one into a skill. It hands every well-formed dir to the
+/// migrator, which decides ownership from `managed_path_markers` (exact
+/// canonical path + hash). So both a forged-marker dir and the production
+/// symlink shape (`~/.claude/skills/<slug>` -> canonical managed dir) are
+/// returned here; `migrator_tests` pins that the real managed one is skipped.
 #[test]
-fn scan_skills_skips_vectorhawk_managed_symlink_but_keeps_sibling() {
+fn scan_skills_returns_marked_dirs_for_the_migrator_to_judge() {
     let tmp = tempfile::tempdir().unwrap();
     let skills = tmp.path().join("skills");
     fs::create_dir_all(&skills).unwrap();
 
-    // Canonical dir (simulates ~/.agents/skills/<slug>): real content + marker.
     let canonical_root = tmp.path().join("agents-skills");
     let canonical_dir = write_skill_dir(
         &canonical_root,
@@ -112,30 +106,22 @@ fn scan_skills_skips_vectorhawk_managed_symlink_but_keeps_sibling() {
         r#"{"marker_version":1,"installation_id":null,"source_sha256":"abc","migrated_at":"2026-01-01T00:00:00Z"}"#,
     )
     .unwrap();
+    std::os::unix::fs::symlink(&canonical_dir, skills.join("managed-skill")).unwrap();
 
-    // Directory symlink at ~/.claude/skills/<slug> — the exact production shape.
-    let link_path = skills.join("managed-skill");
-    std::os::unix::fs::symlink(&canonical_dir, &link_path).unwrap();
+    // A third-party skill that ships a forged marker.
+    let forged = write_skill_dir(&skills, "forged-skill", "---\nname: forged-skill\n---");
+    fs::write(
+        forged.join(vectorhawkd_mcp::ownership::MANAGED_MARKER_FILENAME),
+        "{}",
+    )
+    .unwrap();
 
-    // Unmanaged sibling skill, a real dir directly under skills_dir.
     write_skill_dir(&skills, "native-skill", "---\nname: native-skill\n---");
 
     let items = scan_skills_dir(&skills).unwrap();
-    let slugs: Vec<&str> = items.iter().map(|i| i.slug.as_str()).collect();
-
-    assert_eq!(
-        items.len(),
-        1,
-        "only the unmanaged sibling should be returned: {slugs:?}"
-    );
-    assert!(
-        slugs.contains(&"native-skill"),
-        "unmanaged sibling must still be discovered: {slugs:?}"
-    );
-    assert!(
-        !slugs.contains(&"managed-skill"),
-        "VectorHawk-managed symlink must be skipped: {slugs:?}"
-    );
+    let mut slugs: Vec<&str> = items.iter().map(|i| i.slug.as_str()).collect();
+    slugs.sort();
+    assert_eq!(slugs, vec!["forged-skill", "managed-skill", "native-skill"]);
 }
 
 // ── Plugins ───────────────────────────────────────────────────────────────────
@@ -288,8 +274,10 @@ fn marketplace_walk_skips_native_adopts_custom() {
     assert!(items.iter().all(|i| i.kind == ItemKind::Plugin));
 }
 
+/// F13 (reviewer's bypass): a forged marker in a plugin dir must not hide it
+/// from F1 adoption. Ownership is decided by the migrator from the DB.
 #[test]
-fn marketplace_walk_skips_already_managed() {
+fn marketplace_walk_returns_plugin_with_forged_marker() {
     let tmp = tempfile::tempdir().unwrap();
     let plugins = tmp.path().join("plugins");
     write_known_marketplaces(&plugins, &[("acme-mp", "acme/acme-mp")]);
@@ -297,18 +285,19 @@ fn marketplace_walk_skips_already_managed() {
     let pdir = write_marketplace_plugin(
         &plugins,
         "acme-mp",
-        "plugins",
+        "external_plugins",
         "acme-tool",
         r#"{"name":"acme-tool"}"#,
     );
-    // Stamp it as already VectorHawk-managed.
     fs::write(
         pdir.join(vectorhawkd_mcp::ownership::MANAGED_MARKER_FILENAME),
         "{}",
     )
     .unwrap();
 
-    assert!(scan_plugin_marketplaces(&plugins).unwrap().is_empty());
+    let items = scan_plugin_marketplaces(&plugins).unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].slug, "acme-tool");
 }
 
 // ── MCP / claude.json ─────────────────────────────────────────────────────────
@@ -366,4 +355,157 @@ fn scan_claude_json_each_mcp_has_unique_canonical_hash() {
         items.iter().map(|i| i.canonical_hash.as_str()).collect();
     // Each server has a distinct config so hashes must differ.
     assert_eq!(hashes.len(), 2);
+}
+
+// ── F9: migrate payloads carry no secret values ───────────────────────────────
+
+/// Substrings that appear only in secret positions of the fixtures below.
+/// None may ever appear anywhere in a serialised migrate payload.
+const SECRET_MARKERS: &[&str] = &[
+    "ghp_ENVSECRET",
+    "HDRSECRET",
+    "ARGSECRET",
+    "USERINFOSECRET",
+    "PATHSECRET",
+    "QUERYSECRET",
+    "FRAGSECRET",
+    "CMDSECRET",
+    "PLUGINSECRET",
+    "alice",
+];
+
+fn assert_no_secrets(payload: &serde_json::Value) {
+    let s = payload.to_string();
+    for m in SECRET_MARKERS {
+        assert!(!s.contains(m), "payload leaked {m:?}: {s}");
+    }
+}
+
+#[test]
+fn scan_claude_json_payload_has_no_env_header_or_arg_values() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = write_claude_json(
+        tmp.path(),
+        r#"{"mcpServers":{
+            "github":{
+                "command":"/Users/alice/.nvm/versions/node/v20/bin/npx",
+                "args":["-y","@modelcontextprotocol/server-github","--token","ARGSECRET"],
+                "env":{"GITHUB_TOKEN":"ghp_ENVSECRET"}
+            },
+            "remote":{
+                "type":"http",
+                "url":"https://bob:USERINFOSECRET@mcp.example.com:8443/PATHSECRET?key=QUERYSECRET#FRAGSECRET",
+                "headers":{"Authorization":"Bearer HDRSECRET"}
+            }
+        }}"#,
+    );
+    let items = scan_claude_json(&path).unwrap();
+    assert_eq!(items.len(), 2);
+
+    for item in &items {
+        assert_no_secrets(&item.payload);
+        let cfg = item.payload.get("mcp_config").expect("mcp_config key");
+        let obj = cfg.as_object().unwrap();
+        for k in obj.keys() {
+            assert!(
+                [
+                    "transport",
+                    "command_basename",
+                    "package_identifier",
+                    "url",
+                    "env_keys",
+                    "header_keys",
+                    "arg_count"
+                ]
+                .contains(&k.as_str()),
+                "unexpected mcp_config field {k:?}"
+            );
+        }
+    }
+
+    let gh = items.iter().find(|i| i.slug == "github").unwrap();
+    let cfg = &gh.payload["mcp_config"];
+    assert_eq!(cfg["transport"], "stdio");
+    assert_eq!(cfg["command_basename"], "npx");
+    assert_eq!(
+        cfg["package_identifier"],
+        "@modelcontextprotocol/server-github"
+    );
+    assert_eq!(cfg["env_keys"], serde_json::json!(["GITHUB_TOKEN"]));
+    assert_eq!(cfg["arg_count"], 4);
+
+    let remote = items.iter().find(|i| i.slug == "remote").unwrap();
+    let cfg = &remote.payload["mcp_config"];
+    assert_eq!(cfg["transport"], "http");
+    assert_eq!(cfg["url"], "https://mcp.example.com:8443");
+    assert_eq!(cfg["header_keys"], serde_json::json!(["Authorization"]));
+}
+
+/// The migrate path must not trust `Path::file_name` on an arbitrary command
+/// string: a shell one-liner's "file name" is whatever follows the last `/`,
+/// which can be a secret.
+#[test]
+fn scan_claude_json_payload_drops_unsafe_command_basename() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = write_claude_json(
+        tmp.path(),
+        r#"{"mcpServers":{
+            "shell":{"command":"sh -c 'curl https://h.example/CMDSECRET'"},
+            "spaced":{"command":"/opt/my tool/run CMDSECRET"}
+        }}"#,
+    );
+    let items = scan_claude_json(&path).unwrap();
+    assert_eq!(items.len(), 2);
+    for item in &items {
+        assert_no_secrets(&item.payload);
+        assert!(item.payload["mcp_config"]["command_basename"].is_null());
+    }
+}
+
+const PLUGIN_WITH_SECRETS: &str = r#"{
+    "name":"acme-tool",
+    "version":"1.2.3",
+    "description":"Acme tooling",
+    "author":{"name":"Acme","email":"alice@acme.example"},
+    "mcpServers":{"acme":{"command":"npx","args":["acme","--key","PLUGINSECRET"],
+        "env":{"ACME_KEY":"PLUGINSECRET"},"headers":{"Authorization":"PLUGINSECRET"}}},
+    "hooks":{"PreToolUse":[{"command":"curl https://x/PLUGINSECRET"}]}
+}"#;
+
+fn assert_plugin_payload_allowlisted(payload: &serde_json::Value) {
+    assert_no_secrets(payload);
+    let m = payload["manifest_json"].as_object().expect("manifest_json");
+    let mut keys: Vec<&str> = m.keys().map(String::as_str).collect();
+    keys.sort();
+    assert_eq!(keys, vec!["description", "name", "version"]);
+    assert_eq!(m["name"], "acme-tool");
+    assert_eq!(m["version"], "1.2.3");
+    assert_eq!(m["description"], "Acme tooling");
+}
+
+#[test]
+fn scan_plugins_dir_payload_is_allowlisted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plugins = tmp.path().join("plugins");
+    write_plugin_dir(&plugins, "acme-tool", PLUGIN_WITH_SECRETS);
+    let items = scan_plugins_dir(&plugins).unwrap();
+    assert_eq!(items.len(), 1);
+    assert_plugin_payload_allowlisted(&items[0].payload);
+}
+
+#[test]
+fn scan_plugin_marketplaces_payload_is_allowlisted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plugins = tmp.path().join("plugins");
+    write_known_marketplaces(&plugins, &[("acme-mp", "acme/acme-mp")]);
+    write_marketplace_plugin(
+        &plugins,
+        "acme-mp",
+        "external_plugins",
+        "acme-tool",
+        PLUGIN_WITH_SECRETS,
+    );
+    let items = scan_plugin_marketplaces(&plugins).unwrap();
+    assert_eq!(items.len(), 1);
+    assert_plugin_payload_allowlisted(&items[0].payload);
 }

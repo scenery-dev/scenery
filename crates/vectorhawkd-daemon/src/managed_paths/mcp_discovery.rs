@@ -856,13 +856,82 @@ fn is_sha256_digest(candidate: &str) -> bool {
 /// doesn't parse as an absolute URL with a host (e.g. schemeless) — never
 /// the raw string. Userinfo, path, query, and fragment are always dropped,
 /// unconditionally, regardless of what they contain.
-fn safe_url_origin(url: &str) -> Option<String> {
+pub(crate) fn safe_url_origin(url: &str) -> Option<String> {
     let parsed = reqwest::Url::parse(url).ok()?;
     let host = parsed.host_str()?;
     match parsed.port() {
         Some(port) => Some(format!("{}://{}:{}", parsed.scheme(), host, port)),
         None => Some(format!("{}://{}", parsed.scheme(), host)),
     }
+}
+
+// ── F1 migrate payload (allowlist) ──────────────────────────────────────────
+
+/// The only fields an MCP entry's `mcp_config` may carry in the
+/// `POST /portal/managed-paths/migrate` payload. Same allowlist as
+/// [`McpDiscoveryDetail`], minus the client/server naming (the migrate item
+/// carries the server key as its `slug`).
+pub(crate) const MIGRATE_MCP_CONFIG_FIELDS: &[&str] = &[
+    "transport",
+    "command_basename",
+    "package_identifier",
+    "url",
+    "env_keys",
+    "header_keys",
+    "arg_count",
+];
+
+/// Build the allowlisted `mcp_config` for the F1 migrate payload from a raw
+/// `mcpServers.<key>` entry. Never copies an env/header value, a raw arg, the
+/// raw command string or a full URL — see the module-level privacy doc.
+///
+/// The command basename goes through [`migrate_command_basename_of`], which is
+/// stricter than [`command_basename_of`] (the shadow-discovery helper, left
+/// unchanged on purpose).
+pub(crate) fn migrate_mcp_config(value: &serde_json::Value) -> serde_json::Value {
+    let command = value.get("command").and_then(|v| v.as_str());
+    let raw_args: Vec<String> = value
+        .get("args")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let raw_url = value.get("url").and_then(|v| v.as_str());
+    let type_field = value.get("type").and_then(|v| v.as_str());
+
+    let command_basename = command.and_then(migrate_command_basename_of);
+    let package_identifier = command_basename
+        .as_deref()
+        .and_then(|basename| derive_package_identifier(basename, &raw_args));
+
+    serde_json::json!({
+        "transport": infer_transport(command, raw_url, type_field),
+        "command_basename": command_basename,
+        "package_identifier": package_identifier,
+        "url": raw_url.and_then(safe_url_origin),
+        "env_keys": object_keys(value, "env"),
+        "header_keys": object_keys(value, "headers"),
+        "arg_count": raw_args.len(),
+    })
+}
+
+/// Strict executable-name extraction for the migrate payload. `Path::file_name`
+/// on an arbitrary command string returns whatever follows the last `/`, so a
+/// shell one-liner (`sh -c 'curl https://h/<token>'`) would hand back part of
+/// its argument. Accept only a plain, short file name made of
+/// `[A-Za-z0-9._+-]`; anything else (whitespace, quotes, `=`, non-ASCII, ...)
+/// yields `None`.
+pub(crate) fn migrate_command_basename_of(command: &str) -> Option<String> {
+    let name = std::path::Path::new(command).file_name()?.to_str()?;
+    let ok = !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'+' | b'-'));
+    ok.then(|| name.to_string())
 }
 
 // ── SHA-256 helper ────────────────────────────────────────────────────────────

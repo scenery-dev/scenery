@@ -1,7 +1,9 @@
 //! Migration logic: backup, POST to backend, write markers.
 //!
 //! For each `MigrationItem`:
-//! 1. Check the SQLite `managed_path_markers` table — if already present, skip.
+//! 1. Check the SQLite `managed_path_markers` table (path-keyed, canonicalised)
+//!    — if already tracked, skip. The `.vectorhawk-managed.json` file is never
+//!    trusted for this.
 //! 2. Back up original files to the run-scoped backup directory.
 //! 3. POST to `POST /portal/managed-paths/migrate` (single-item batch).
 //! 4. Write the marker (file sidecar or SQLite row).
@@ -11,7 +13,11 @@
 //! the next daemon start.  The backup is still preserved.
 
 use super::{
-    marker::{insert_db_marker, is_already_marked, write_file_marker, ManagedPathMarker},
+    marker::{
+        insert_db_marker, is_already_marked, tracked_marker_for_path, write_file_marker,
+        ManagedPathMarker,
+    },
+    mcp_discovery::MIGRATE_MCP_CONFIG_FIELDS,
     scanner::MigrationItem,
     ItemKind,
 };
@@ -158,40 +164,29 @@ pub async fn migrate_item(
         return Ok(false);
     }
 
-    // ── 0.5 Never re-adopt VectorHawk's own managed content ───────────────────
-    // Defense-in-depth alongside the scanner's own check, exactly as for
-    // Anthropic-native content above.
+    // ── 0.5 / 1. Never re-adopt content VectorHawk already tracks ─────────────
+    // Ownership comes from `managed_path_markers` alone (F13). The
+    // `.vectorhawk-managed.json` sidecar is attacker-controllable — any skill
+    // or plugin can ship one — so it is not consulted here.
     //
-    // The path-equality idempotency check in step 1 is NOT sufficient here.
-    // Since the pivot to `~/.agents/skills`, the `managed_path_markers` row for
-    // a pushed skill is keyed on the canonical `.agents` path, while the
-    // scanner walks `~/.claude/skills` and would hand us the *symlink* path —
-    // a different key, so `is_already_marked` returns false and the item would
-    // sail through. Everything downstream then compounds: the org's own skill
-    // is POSTed to the backend as a newly discovered native item (a duplicate,
-    // governance-visible installation), a second marker row is inserted at the
-    // link path, and `write_file_marker` writes *through the symlink* into the
-    // canonical directory — which is precisely the write-through-a-link
-    // failure mode the `links` module exists to prevent.
+    // The lookup compares canonicalised paths. Since the pivot to
+    // `~/.agents/skills`, a pushed skill's row is keyed on the canonical
+    // `.agents` dir while the scanner walks `~/.claude/skills` and hands us
+    // the *symlink*; canonicalising resolves the link onto the row, so our own
+    // skill is never POSTed back as a native discovery or re-marked through
+    // the link.
     //
-    // Ownership is content-based (the `.vectorhawk-managed.json` marker), not
-    // link-based, so a user's own symlinked skill still gets adopted normally.
-    if ownership::is_vectorhawk_managed(&item.source_path) {
-        debug!(
-            slug = %item.slug,
-            path = %path_key,
-            "managed_paths: refusing to adopt VectorHawk-managed item (already ours)"
-        );
-        return Ok(false);
-    }
-
-    // ── 1. Idempotency check ──────────────────────────────────────────────────
+    // A tracked path whose hash no longer matches is still skipped: it is
+    // already governed, and the drift reconciler reports (and per policy
+    // quarantines) it. Adopting it again would create a duplicate row and
+    // write a marker through the link.
     {
         let conn = Connection::open(&state.db_path).context("migrator: failed to open state DB")?;
         if is_already_marked(&conn, &path_key)
             .context("migrator: failed to check managed_path_markers")?
+            || is_tracked(&conn, item)?
         {
-            debug!(slug = %item.slug, "managed_paths: already tracked — skipping");
+            debug!(slug = %item.slug, path = %path_key, "managed_paths: already tracked — skipping");
             return Ok(false);
         }
     }
@@ -459,7 +454,7 @@ async fn post_migrate(
             "kind": item.kind.to_string(),
             "slug": item.slug,
             "canonical_hash": item.canonical_hash,
-            "payload": item.payload,
+            "payload": migrate_payload(item),
         }]
     });
 
@@ -507,6 +502,88 @@ async fn post_migrate(
     let installation_id = first.map(|m| m.installation_id);
 
     Ok(installation_id)
+}
+
+/// Whether `item` is already tracked in `managed_path_markers` (path-keyed,
+/// canonicalised — see step 0.5 in [`migrate_item`]).
+fn is_tracked(conn: &Connection, item: &MigrationItem) -> Result<bool> {
+    let kind = match item.kind {
+        ItemKind::Skill => "skill",
+        ItemKind::Plugin => "plugin",
+        // MCP rows are keyed on the virtual `<claude.json>:<key>` path, which
+        // the exact-path check already covers.
+        ItemKind::Mcp => return Ok(false),
+    };
+    if tracked_marker_for_path(conn, kind, &item.source_path)?.is_some() {
+        return Ok(true);
+    }
+    // Copy-mode link (Windows without symlink support): `~/.claude/skills/<slug>`
+    // is a real copy of our canonical `~/.agents/skills/<slug>` dir, so the
+    // paths do not canonicalise together. Accept it only when a row exists at
+    // the canonical path AND the copy's content hash equals that row's.
+    if item.kind == ItemKind::Skill {
+        if let (Some(link_dir), Some(canonical_root)) = (
+            super::paths::claude_skills_link_dir(),
+            super::paths::agents_skills_dir(),
+        ) {
+            if item.source_path.parent() == Some(link_dir.as_path()) {
+                if let Some(row) =
+                    tracked_marker_for_path(conn, "skill", &canonical_root.join(&item.slug))?
+                {
+                    return Ok(row.source_sha256 == item.canonical_hash);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// The payload actually POSTed for `item` (F9). Defense in depth on top of the
+/// scanner, which already builds allowlisted payloads: whatever `item.payload`
+/// holds, only these fields leave the machine.
+///
+/// - skill: `skill_md` (the skill's own content — what adoption uploads).
+/// - plugin: `manifest_json` reduced to string `name` / `version` /
+///   `description`.
+/// - mcp: `mcp_config` reduced to the [`MIGRATE_MCP_CONFIG_FIELDS`] keys —
+///   no env/header values, raw args, raw command or full URL.
+pub(crate) fn migrate_payload(item: &MigrationItem) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    match item.kind {
+        ItemKind::Skill => {
+            if let Some(md) = item.payload.get("skill_md").filter(|v| v.is_string()) {
+                out.insert("skill_md".to_string(), md.clone());
+            }
+        }
+        ItemKind::Plugin => {
+            let raw = item
+                .payload
+                .get("manifest_json")
+                .cloned()
+                .unwrap_or_default();
+            out.insert(
+                "manifest_json".to_string(),
+                super::scanner::sanitize_plugin_manifest(&raw),
+            );
+        }
+        ItemKind::Mcp => {
+            let mut cfg = serde_json::Map::new();
+            if let Some(raw) = item.payload.get("mcp_config").and_then(|v| v.as_object()) {
+                for field in MIGRATE_MCP_CONFIG_FIELDS {
+                    if let Some(v) = raw.get(*field) {
+                        cfg.insert((*field).to_string(), v.clone());
+                    }
+                }
+            }
+            // `url` is re-reduced to an origin in case a raw URL slipped in.
+            if let Some(url) = cfg.get("url").and_then(|v| v.as_str()) {
+                let origin = super::mcp_discovery::safe_url_origin(url);
+                cfg.insert("url".to_string(), serde_json::json!(origin));
+            }
+            out.insert("mcp_config".to_string(), serde_json::Value::Object(cfg));
+        }
+    }
+    serde_json::Value::Object(out)
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

@@ -1202,3 +1202,111 @@ fn push_skill_writes_no_journal_entry_when_reconciler_disabled() {
         "no journal entry should be written when the reconciler is disabled"
     );
 }
+
+// ── F13: remove_skill crash window ───────────────────────────────────────────
+
+fn row_for(pusher: &ManagedPathsPusher, path: &std::path::Path) -> Option<String> {
+    use rusqlite::OptionalExtension;
+    let conn = Connection::open(&pusher.db_path).unwrap();
+    conn.query_row(
+        "SELECT source_sha256 FROM managed_path_markers WHERE path = ?1",
+        [path.to_string_lossy().to_string()],
+        |r| r.get(0),
+    )
+    .optional()
+    .unwrap()
+}
+
+/// A removal that dies after deleting the DB row but before deleting the
+/// directory used to leave a marked dir with no row — which discovery and F1
+/// would then treat as foreign and re-adopt. The row must outlive the dir:
+/// when the directory removal fails, the row is still there.
+#[test]
+fn remove_skill_keeps_row_when_directory_removal_fails() {
+    use std::os::unix::fs::PermissionsExt;
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let (pusher, _tmp) = make_pusher();
+    let fake_home = tempfile::tempdir().unwrap();
+    let prev_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", fake_home.path());
+
+    pusher
+        .push_skill("demo", None, b"---\nname: demo\n---\n", &[])
+        .unwrap();
+    let canonical = fake_home.path().join(".agents/skills/demo");
+    // Make the directory's entries undeletable so remove_dir_all fails.
+    fs::set_permissions(&canonical, fs::Permissions::from_mode(0o555)).unwrap();
+    let result = pusher.remove_skill("demo");
+    fs::set_permissions(&canonical, fs::Permissions::from_mode(0o755)).unwrap();
+
+    if let Some(v) = prev_home {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+
+    assert!(result.is_err(), "removal must report the failure");
+    assert!(
+        row_for(&pusher, &canonical).is_some(),
+        "the DB row must not be dropped while the directory still exists"
+    );
+}
+
+/// Retrying after a partial removal must finish the job even if the
+/// `.vectorhawk-managed.json` file was already deleted: the DB row at the
+/// exact path is proof enough that VectorHawk owns the dir.
+#[test]
+fn remove_skill_finishes_a_half_removed_dir_tracked_by_its_row() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let (pusher, _tmp) = make_pusher();
+    let fake_home = tempfile::tempdir().unwrap();
+    let prev_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", fake_home.path());
+
+    pusher
+        .push_skill("demo", None, b"---\nname: demo\n---\n", &[])
+        .unwrap();
+    let canonical = fake_home.path().join(".agents/skills/demo");
+    fs::remove_file(canonical.join(".vectorhawk-managed.json")).unwrap();
+    let result = pusher.remove_skill("demo");
+
+    if let Some(v) = prev_home {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+
+    result.unwrap();
+    assert!(!canonical.exists());
+    assert!(row_for(&pusher, &canonical).is_none());
+}
+
+/// A re-push with new content must refresh the row's hash, or the managed
+/// skill would fail the path+hash ownership check (and be reported as shadow).
+#[test]
+fn push_skill_repush_refreshes_row_hash() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let (pusher, _tmp) = make_pusher();
+    let fake_home = tempfile::tempdir().unwrap();
+    let prev_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", fake_home.path());
+
+    pusher
+        .push_skill("demo", None, b"---\nname: demo\n---\nv1", &[])
+        .unwrap();
+    pusher
+        .push_skill("demo", None, b"---\nname: demo\n---\nv2", &[])
+        .unwrap();
+    let canonical = fake_home.path().join(".agents/skills/demo");
+
+    if let Some(v) = prev_home {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+
+    assert_eq!(
+        row_for(&pusher, &canonical).as_deref(),
+        Some(hex_sha256(b"---\nname: demo\n---\nv2").as_str())
+    );
+}
