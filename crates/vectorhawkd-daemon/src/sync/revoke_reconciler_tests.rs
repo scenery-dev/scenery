@@ -79,6 +79,38 @@ impl<T> OptionalExt<T> for rusqlite::Result<T> {
     }
 }
 
+struct FakeHome {
+    _tmp: tempfile::TempDir,
+    prev: Option<std::ffi::OsString>,
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+impl FakeHome {
+    fn new() -> Self {
+        let guard = crate::managed_paths::ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", tmp.path());
+        Self {
+            _tmp: tmp,
+            prev,
+            _guard: guard,
+        }
+    }
+}
+
+impl Drop for FakeHome {
+    fn drop(&mut self) {
+        if let Some(v) = self.prev.take() {
+            std::env::set_var("HOME", v);
+        } else {
+            std::env::remove_var("HOME");
+        }
+    }
+}
+
 fn skill_locks() -> super::SkillLockMap {
     Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()))
 }
@@ -89,6 +121,10 @@ async fn dispatch(
     state: &Arc<AppState>,
     backend_registry: &Arc<BackendRegistry>,
 ) {
+    // Revoke teardown and the skill-revoke plugin strip work under
+    // `~/.claude` — point HOME at a temp dir so these tests never read or
+    // modify the real one.
+    let _home = FakeHome::new();
     let registry_url = "https://example.invalid".to_string();
     let sem = Arc::new(tokio::sync::Semaphore::new(4));
     let locks = skill_locks();

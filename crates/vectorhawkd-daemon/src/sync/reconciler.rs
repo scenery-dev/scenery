@@ -49,6 +49,19 @@ use vectorhawkd_mcp::aggregator::BackendRegistry;
 /// parallel. The outer `std::sync::Mutex` is only held during the
 /// get-or-insert lookup; the per-resource `tokio::sync::Mutex` guards the
 /// actual work.
+///
+/// # Lock order
+///
+/// Keys are raw `skill_id`, raw `mcp_server_id`, or `"plugin:<slug>"`. The
+/// per-resource mutexes are not reentrant, and the only path that ever
+/// holds two at once is a plugin install, which takes them in this order:
+///
+/// 1. `"plugin:<slug>"` (held for the whole install), then
+/// 2. each bundled `skill_id`, one at a time, released before the next.
+///
+/// Nothing may take a `"plugin:<slug>"` lock while holding a skill lock.
+/// `spawn_revoke` for a skill therefore drops the skill lock *before* it
+/// takes each plugin lock to strip the revoked skill from plugins.
 pub(crate) type SkillLockMap = Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>;
 
 pub(crate) fn skill_lock(locks: &SkillLockMap, skill_id: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -1014,12 +1027,15 @@ fn spawn_install_plugin(
     // rewrite of the plugin source tree, so two concurrent installs for the
     // same slug could otherwise interleave and mix versions.
     let lock = skill_lock(skill_locks, &format!("plugin:{plugin_slug}"));
+    let locks = Arc::clone(skill_locks);
 
     increment_pending(stats);
 
     install_tasks.spawn(async move {
         // Acquired before the semaphore, same rationale as spawn_install: a
-        // stalled per-plugin queue shouldn't burn a semaphore permit.
+        // stalled per-plugin queue shouldn't burn a semaphore permit. Lock
+        // order: this plugin lock first, then each bundled skill's lock
+        // inside do_install_plugin (see `SkillLockMap`).
         let _plugin_guard = lock.lock_owned().await;
         let _permit = sem_clone.acquire().await;
         handle_install_plugin(
@@ -1033,6 +1049,7 @@ fn spawn_install_plugin(
             &st,
             &reg_url,
             &stats_clone,
+            &locks,
         )
         .await
     });
@@ -1054,15 +1071,19 @@ async fn handle_install_plugin(
     state: &Arc<AppState>,
     registry_url: &str,
     stats: &Arc<Mutex<ReconcilerStats>>,
+    skill_locks: &SkillLockMap,
 ) -> bool {
     // Revoke overrides desired state — see the matching check in
     // `handle_install_mcp` for why this must also live at the live-event
     // choke point, not just in the Snapshot arm's pre-dispatch reconcile.
+    // Checked at the version being installed so a version-scoped revoke
+    // blocks it (a whole-plugin revoke still matches every version).
     {
         let state_check = Arc::clone(state);
         let slug_check = plugin_slug.to_string();
+        let version_check = version.to_string();
         let revoked = tokio::task::spawn_blocking(move || {
-            revocation::is_revoked(&state_check, "plugin", &slug_check, None)
+            revocation::is_revoked(&state_check, "plugin", &slug_check, Some(&version_check))
         })
         .await
         .unwrap_or(Ok(false))
@@ -1095,6 +1116,7 @@ async fn handle_install_plugin(
         skills,
         state,
         registry_url,
+        skill_locks,
     )
     .await
     {
@@ -1137,12 +1159,57 @@ async fn do_install_plugin(
     skills: &[PluginSkillRef],
     state: &Arc<AppState>,
     registry_url: &str,
+    skill_locks: &SkillLockMap,
 ) -> Result<()> {
-    // 1. Ensure each bundled skill is present in local state, then read its
-    //    content. Downloads happen on a blocking thread; no native-skill push —
-    //    the skill lives only inside the plugin bundle (self-contained model).
+    // 1. For each bundled skill: refuse it if revoked, make sure the exact
+    //    referenced version is present in local state, and read that
+    //    version's content. Downloads happen on a blocking thread; no
+    //    native-skill push — the skill lives only inside the plugin bundle
+    //    (self-contained model).
+    //
+    //    The caller holds `"plugin:<slug>"`; each skill's own lock is taken
+    //    here (plugin → skill, the documented order) so the gate, download
+    //    and read cannot interleave with a `spawn_revoke` purging the same
+    //    skill. It is released before the next skill.
     let mut bundled = Vec::with_capacity(skills.len());
     for skill in skills {
+        let skill_guard = skill_lock(skill_locks, &skill.skill_id).lock_owned().await;
+
+        let revoked = {
+            let st = Arc::clone(state);
+            let sid = skill.skill_id.clone();
+            let ver = skill.version.clone();
+            tokio::task::spawn_blocking(move || {
+                revocation::is_revoked(&st, "skill", &sid, Some(&ver))
+            })
+            .await
+            .context("plugin: revocation check task panicked")?
+            .context("plugin: revocation check failed")?
+        };
+        if revoked {
+            warn!(
+                plugin_slug,
+                skill_id = %skill.skill_id,
+                version = %skill.version,
+                "reconciler: bundled skill is revoked — left out of the plugin"
+            );
+            vectorhawkd_core::audit::write_audit_event_direct(
+                &state.db_path,
+                &vectorhawkd_core::audit::AuditEvent {
+                    event_type: "plugin_skill_blocked".to_string(),
+                    payload: serde_json::json!({
+                        "plugin_slug": plugin_slug,
+                        "plugin_version": version,
+                        "skill_id": skill.skill_id,
+                        "skill_version": skill.version,
+                        "reason": "revoked",
+                    }),
+                },
+            );
+            drop(skill_guard);
+            continue;
+        }
+
         let already = check_version_local(state, &skill.skill_id, &skill.version)
             .await
             .unwrap_or(false);
@@ -1161,20 +1228,26 @@ async fn do_install_plugin(
             })?;
         }
 
-        let active_dir = state
+        // Read the exact version that passed the gate above — never
+        // `active/`, which can point at a different (possibly revoked)
+        // version of the same skill.
+        let version_dir = state
             .root_dir
             .join("skills")
             .join(&skill.skill_id)
-            .join("active");
-        let skill_md = std::fs::read(active_dir.join("SKILL.md")).with_context(|| {
+            .join("versions")
+            .join(&skill.version);
+        let skill_md = std::fs::read(version_dir.join("SKILL.md")).with_context(|| {
             format!(
-                "plugin: cannot read SKILL.md for bundled skill {}",
-                skill.skill_id
+                "plugin: cannot read SKILL.md for bundled skill {}@{}",
+                skill.skill_id, skill.version
             )
         })?;
-        let files = collect_referenced_files(active_dir.as_std_path());
+        let files = collect_referenced_files(version_dir.as_std_path());
+        drop(skill_guard);
         bundled.push(crate::managed_paths::BundledSkill {
             skill_id: skill.skill_id.clone(),
+            version: skill.version.clone(),
             skill_md,
             files,
         });
@@ -1214,10 +1287,39 @@ async fn do_install_plugin(
         files: imported.files,
         executables: imported.executables,
     };
+    let bundled_refs: Vec<(String, String)> = bundle
+        .skills
+        .iter()
+        .map(|s| (s.skill_id.clone(), s.version.clone()))
+        .collect();
     tokio::task::spawn_blocking(move || crate::managed_paths::install_plugin_bundle(&bundle))
         .await
         .context("plugin: marketplace write task panicked")?
         .context("plugin: failed to write plugin into vectorhawk marketplace")?;
+
+    // 3. Close the race with a skill revoke that landed after a skill passed
+    //    its gate above: the revoke may have looked for plugins carrying the
+    //    skill before this one was written. Re-check now that the bundle
+    //    (and its bundled-skills record) is on disk; any revoke persisted
+    //    after this point finds the plugin through the record instead.
+    //    We still hold `"plugin:<slug>"`, which `remove_bundled_skill`
+    //    requires.
+    if !bundled_refs.is_empty() {
+        let st = Arc::clone(state);
+        let slug = plugin_slug.to_string();
+        tokio::task::spawn_blocking(move || {
+            for (sid, ver) in bundled_refs {
+                if revocation::is_revoked(&st, "skill", &sid, Some(&ver)).unwrap_or(true) {
+                    if let Err(e) = crate::managed_paths::remove_bundled_skill(&slug, &sid) {
+                        warn!(plugin_slug = %slug, skill_id = %sid, error = %e,
+                            "reconciler: failed to strip skill revoked during plugin install");
+                    }
+                }
+            }
+        })
+        .await
+        .context("plugin: post-install revocation check task panicked")?;
+    }
 
     info!(
         plugin_slug,
@@ -1429,7 +1531,12 @@ fn spawn_purge_plugin(
 ///    (`purge_skill_blocking`, `teardown_mcp_server_locally`,
 ///    `uninstall_plugin_bundle`) — all three are already no-ops when
 ///    nothing is installed, which is what makes this idempotent and
-///    race-safe against a concurrent install;
+///    race-safe against a concurrent install. A version-scoped revoke only
+///    tears down what is (or, for an unpinned MCP server, may be) that
+///    version, so revoke and reinstall of another version do not flap;
+/// 2b. for a skill, strips it from every plugin VectorHawk bundled it into
+///    (per the plugin bundled-skills record), after releasing the skill
+///    lock — see the lock order on [`SkillLockMap`];
 /// 3. emits a `<artifact_type>_revoked` audit event through the runner
 ///    audit pipeline (`audit_events` table → `POST /api/runner/audit`),
 ///    unconditionally — the backend wants to see every daemon converge,
@@ -1454,11 +1561,18 @@ fn spawn_revoke(
         _ => artifact_key.clone(),
     };
     let lock = skill_lock(skill_locks, &lock_key);
+    let locks = Arc::clone(skill_locks);
     let state = Arc::clone(state);
     let backend_registry = Arc::clone(backend_registry);
+    // `None` and `Some("")` both mean "every version".
+    let scoped_version: Option<String> = version
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string);
 
     install_tasks.spawn(async move {
-        let _guard = lock.lock_owned().await;
+        let guard = lock.lock_owned().await;
 
         // Persist durably first — a crash mid-teardown still leaves the
         // artifact blocked locally on restart (the next snapshot will also
@@ -1482,14 +1596,21 @@ fn spawn_revoke(
             }
         }
 
-        let changed = match artifact_type.as_str() {
+        // Teardown is scoped to the revoked version: a revoke of 1.2.0 must
+        // not remove an installed 1.3.0 (which the next snapshot would just
+        // reinstall — revoke/reinstall flapping). Each arm tears down only
+        // when what is installed is, or may be, the revoked version.
+        let mut changed = match artifact_type.as_str() {
             "skill" => {
                 let state2 = Arc::clone(&state);
                 let skill_id = artifact_key.clone();
-                match tokio::task::spawn_blocking(move || purge_skill_blocking(&state2, &skill_id))
-                    .await
+                let ver = scoped_version.clone();
+                match tokio::task::spawn_blocking(move || {
+                    revoke_skill_locally(&state2, &skill_id, ver.as_deref())
+                })
+                .await
                 {
-                    Ok(Ok(())) => true,
+                    Ok(Ok(removed)) => removed,
                     Ok(Err(e)) => {
                         warn!(error = %e, skill_id = %artifact_key, "reconciler: revoke purge failed");
                         false
@@ -1505,7 +1626,11 @@ fn spawn_revoke(
                 let backend_registry2 = Arc::clone(&backend_registry);
                 let server_id = artifact_key.clone();
                 let pusher2 = pusher.clone();
+                let ver = scoped_version.clone();
                 match tokio::task::spawn_blocking(move || {
+                    if !mcp_revoke_applies(&state2, &server_id, ver.as_deref())? {
+                        return Ok(false);
+                    }
                     teardown_mcp_server_locally(&server_id, &state2, &backend_registry2, pusher2.as_deref())
                 })
                 .await
@@ -1523,12 +1648,19 @@ fn spawn_revoke(
             }
             "plugin" => {
                 let slug = artifact_key.clone();
+                let ver = scoped_version.clone();
                 match tokio::task::spawn_blocking(move || {
-                    crate::managed_paths::uninstall_plugin_bundle(&slug)
+                    if let Some(v) = ver.as_deref() {
+                        let installed = crate::managed_paths::list_governed_plugins()?;
+                        if installed.get(&slug).is_some_and(|iv| iv != v) {
+                            return Ok(false);
+                        }
+                    }
+                    crate::managed_paths::uninstall_plugin_bundle(&slug).map(|()| true)
                 })
                 .await
                 {
-                    Ok(Ok(())) => true,
+                    Ok(Ok(removed)) => removed,
                     Ok(Err(e)) => {
                         warn!(error = %e, plugin_slug = %artifact_key, "reconciler: revoke plugin purge failed");
                         false
@@ -1549,11 +1681,62 @@ fn spawn_revoke(
             }
         };
 
+        // Lock order (see `SkillLockMap`): release the skill lock BEFORE
+        // taking any plugin lock. A plugin install holds its plugin lock and
+        // then takes skill locks, so holding both here in the opposite
+        // order could deadlock.
+        drop(guard);
+
+        // A revoked skill must also leave every plugin VectorHawk bundled it
+        // into earlier. Only plugins whose bundled-skills record lists this
+        // skill (at the revoked version, when scoped) are touched — never an
+        // imported plugin's own same-named folder or a plugin from another
+        // marketplace. A plugin install racing this revoke re-checks after
+        // writing its bundle, so it is covered either way.
+        let mut stripped_from: Vec<String> = Vec::new();
+        if artifact_type == "skill" {
+            let skill_id = artifact_key.clone();
+            let ver = scoped_version.clone();
+            let slugs = tokio::task::spawn_blocking(move || {
+                crate::managed_paths::plugins_bundling_skill(&skill_id, ver.as_deref())
+            })
+            .await
+            .unwrap_or_else(|e| Err(anyhow::anyhow!("plugin lookup task panicked: {e}")))
+            .unwrap_or_else(|e| {
+                warn!(error = %e, skill_id = %artifact_key, "reconciler: cannot list plugins bundling revoked skill");
+                Vec::new()
+            });
+            for slug in slugs {
+                let _plugin_guard = skill_lock(&locks, &format!("plugin:{slug}"))
+                    .lock_owned()
+                    .await;
+                let s2 = slug.clone();
+                let sid = artifact_key.clone();
+                match tokio::task::spawn_blocking(move || {
+                    crate::managed_paths::remove_bundled_skill(&s2, &sid)
+                })
+                .await
+                {
+                    Ok(Ok(true)) => {
+                        changed = true;
+                        stripped_from.push(slug);
+                    }
+                    Ok(Ok(false)) => {}
+                    Ok(Err(e)) => warn!(
+                        error = %e, plugin_slug = %slug, skill_id = %artifact_key,
+                        "reconciler: failed to strip revoked skill from plugin"
+                    ),
+                    Err(e) => warn!(error = %e, "reconciler: plugin strip task panicked"),
+                }
+            }
+        }
+
         info!(
             artifact_type = %artifact_type,
             artifact_key = %artifact_key,
             version = ?version,
             removed_locally = changed,
+            stripped_from_plugins = ?stripped_from,
             "reconciler: artifact revoked"
         );
 
@@ -1566,12 +1749,86 @@ fn spawn_revoke(
                     "artifact_key": artifact_key,
                     "version": version,
                     "removed_locally": changed,
+                    "stripped_from_plugins": stripped_from,
                 }),
             },
         );
 
         changed
     });
+}
+
+/// Local teardown for a skill revoke. Whole-skill revoke (`version` None):
+/// purge the skill. Version-scoped revoke: purge it when the active version
+/// is the revoked one; otherwise remove only that version's files and row,
+/// so nothing can roll back to it, and leave the active version alone.
+/// Returns whether anything was removed.
+fn revoke_skill_locally(state: &AppState, skill_id: &str, version: Option<&str>) -> Result<bool> {
+    let Some(version) = version else {
+        purge_skill_blocking(state, skill_id)?;
+        return Ok(true);
+    };
+    let conn = rusqlite::Connection::open(&state.db_path)
+        .context("failed to open state DB for scoped revoke")?;
+    let active: Option<String> = conn
+        .query_row(
+            "SELECT active_version FROM installed_skills WHERE skill_id = ?1",
+            rusqlite::params![skill_id],
+            |row| row.get(0),
+        )
+        .ok();
+    if active.as_deref() == Some(version) {
+        purge_skill_blocking(state, skill_id)?;
+        return Ok(true);
+    }
+
+    // The version arrives from the backend and is joined into a path that
+    // is then deleted — refuse anything that is not one plain component.
+    if version.contains(['/', '\\']) || version == "." || version == ".." {
+        anyhow::bail!("refusing revoked skill version {version:?}: not a single path component");
+    }
+    let version_dir = state
+        .root_dir
+        .join("skills")
+        .join(skill_id)
+        .join("versions")
+        .join(version);
+    let mut removed = false;
+    if version_dir.exists() {
+        std::fs::remove_dir_all(&version_dir)
+            .with_context(|| format!("failed to delete revoked skill version {version_dir}"))?;
+        removed = true;
+    }
+    conn.execute(
+        "DELETE FROM skill_versions WHERE skill_id = ?1 AND version = ?2",
+        rusqlite::params![skill_id, version],
+    )
+    .context("failed to remove revoked skill_versions row")?;
+    Ok(removed)
+}
+
+/// Does a revoke of `mcp_server_id` (at `version`, when scoped) apply to the
+/// local install? A whole-server revoke always does. A version-scoped one
+/// does when the install is pinned to that version, or is unpinned — an
+/// unpinned server may be running the revoked version, the same fail-closed
+/// rule the install gate in `handle_install_mcp` uses.
+fn mcp_revoke_applies(
+    state: &AppState,
+    mcp_server_id: &str,
+    version: Option<&str>,
+) -> Result<bool> {
+    let Some(version) = version else {
+        return Ok(true);
+    };
+    let pin = state
+        .list_mcp_installs()
+        .context("failed to read mcp_installations for scoped revoke")?
+        .into_iter()
+        .find(|r| r.mcp_server_id == mcp_server_id)
+        .and_then(|r| r.version_pin)
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty());
+    Ok(pin.map_or(true, |p| p == version))
 }
 
 /// Handle one live `Unrevoke` event (Bug 2 fix — live "unblock" push).
@@ -1649,10 +1906,24 @@ async fn handle_install_mcp(
     // check at the other choke point — the live SSE event — so neither
     // path depends on event ordering).
     {
+        // A pinned install is checked at its pin. An unpinned one runs
+        // whatever version the package source resolves at launch, so it
+        // cannot prove it avoids a revoked version: any version-scoped
+        // revoke of this server blocks it (fail closed).
         let state_check = Arc::clone(state);
         let server_id_check = mcp_server_id.to_string();
-        let revoked = tokio::task::spawn_blocking(move || {
-            revocation::is_revoked(&state_check, "mcp_server", &server_id_check, None)
+        let pin = version_pin
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string);
+        let revoked = tokio::task::spawn_blocking(move || match pin {
+            Some(pin) => {
+                revocation::is_revoked(&state_check, "mcp_server", &server_id_check, Some(&pin))
+            }
+            None => {
+                revocation::is_any_version_revoked(&state_check, "mcp_server", &server_id_check)
+            }
         })
         .await
         .unwrap_or(Ok(false))
@@ -3512,7 +3783,16 @@ pub(crate) fn build_derived_plugin_events_blocking(
         match record.state.as_str() {
             // "desired", "installing", "installed" → plugin should be present locally.
             "desired" | "installing" | "installed" => {
-                if !local.contains_key(&record.plugin_slug) {
+                // A governed plugin with registry skills but no
+                // bundled-skills record was written by an older daemon; a
+                // skill revoke could not find it to strip the skill.
+                // Reinstall it once through the gated path, which writes
+                // the record.
+                let legacy = local.contains_key(&record.plugin_slug)
+                    && !record.skills.is_empty()
+                    && !crate::managed_paths::has_bundled_skill_record(&record.plugin_slug)
+                        .unwrap_or(true);
+                if !local.contains_key(&record.plugin_slug) || legacy {
                     events.push(SyncEvent::InstallPlugin {
                         installation_id: record.installation_id,
                         plugin_slug: record.plugin_slug.clone(),
@@ -3836,3 +4116,7 @@ mod plugin_tests;
 #[cfg(test)]
 #[path = "revoke_reconciler_tests.rs"]
 mod revoke_tests;
+
+#[cfg(test)]
+#[path = "revocation_scope_tests.rs"]
+mod revocation_scope_tests;
