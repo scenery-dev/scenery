@@ -367,8 +367,16 @@ done
 
 # ── 6. Sign out: drop every stored credential, with or without --purge ───────
 # Mirrors `vectorhawk uninstall`, which signs out of every registry. Tokens,
-# the PAT and the H3 local key live in state.db (always, on Linux); secure_delete
-# zeroes the deleted rows instead of leaving them on free pages.
+# the PAT and the H3 local key live in $DATA/secrets (and, on macOS, the
+# keychain). Builds before 1.0.114 kept them in state.db, so clear that too;
+# secure_delete zeroes the deleted rows instead of leaving them on free pages.
+if [[ -d "$DATA/secrets" ]]; then
+  if rm -rf "$DATA/secrets"; then
+    REMOVED+=("stored VectorHawk secrets ($DATA/secrets)")
+  else
+    WARN+=("could not delete $DATA/secrets — delete it by hand")
+  fi
+fi
 DB="$DATA/state.db"
 SIGNOUT_SQL="PRAGMA secure_delete = ON;
 DELETE FROM auth_tokens;
