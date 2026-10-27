@@ -39,6 +39,7 @@ pub mod importer;
 pub mod installer;
 pub mod ollama;
 pub mod resolver;
+pub mod schema_guard;
 pub mod validator;
 
 // `updater` re-enabled in M1.4 — RegistryClient now has the full HTTP impl

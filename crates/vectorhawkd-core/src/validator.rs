@@ -141,7 +141,7 @@ pub fn validate_bundle(path: &Utf8Path) -> ValidationReport {
         } else {
             format!("input schema  required: [{required_fields}]")
         };
-        match jsonschema::JSONSchema::compile(schema) {
+        match crate::schema_guard::compile_skill_schema(schema) {
             Ok(_) => checks.push(pass("input schema", &{
                 if required_fields.is_empty() {
                     "valid JSON Schema".to_string()
@@ -158,7 +158,7 @@ pub fn validate_bundle(path: &Utf8Path) -> ValidationReport {
     // ── Output schema check ──────────────────────────────────────────────────
 
     if let Some(schema) = pkg.manifest.outputs_schema.as_ref() {
-        match jsonschema::JSONSchema::compile(schema) {
+        match crate::schema_guard::compile_skill_schema(schema) {
             Ok(_) => checks.push(pass("output schema", "valid JSON Schema")),
             Err(e) => checks.push(fail(
                 "output schema",
@@ -167,6 +167,28 @@ pub fn validate_bundle(path: &Utf8Path) -> ValidationReport {
         }
     } else {
         checks.push(pass("output schema", "none declared"));
+    }
+
+    // ── Workflow schema files check ──────────────────────────────────────────
+
+    let schema_files = crate::schema_guard::workflow_schema_files(&pkg);
+    if !schema_files.is_empty() {
+        let errors: Vec<String> = schema_files
+            .iter()
+            .filter_map(|rel| {
+                crate::schema_guard::compile_schema_file(&pkg.root, rel)
+                    .err()
+                    .map(|e| format!("{e:#}"))
+            })
+            .collect();
+        if errors.is_empty() {
+            checks.push(pass(
+                "workflow schemas",
+                &format!("{} valid schema file(s)", schema_files.len()),
+            ));
+        } else {
+            checks.push(fail("workflow schemas", &errors.join("; ")));
+        }
     }
 
     // ── Triggers check ───────────────────────────────────────────────────────
@@ -428,6 +450,105 @@ mod tests {
             Some(format!("\"{}…\"", "a".repeat(58)).as_str())
         );
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── F21: reference-bearing / oversized schemas fail validation ──────────
+
+    use crate::schema_guard::tests::{deep_schema, fanout_schema};
+
+    fn with_schemas(dir: &Utf8PathBuf, inputs: &serde_json::Value, outputs: &serde_json::Value) {
+        let skill_md = fs::read_to_string(dir.join("SKILL.md")).expect("read SKILL.md");
+        fs::write(
+            dir.join("SKILL.md"),
+            skill_md.replace(
+                "    workflow_ref:",
+                &format!("    schemas:\n      inputs: {inputs}\n      outputs: {outputs}\n    workflow_ref:"),
+            ),
+        )
+        .expect("write SKILL.md");
+    }
+
+    fn check_level(report: &ValidationReport, name: &str) -> (CheckLevel, String) {
+        let c = report
+            .checks
+            .iter()
+            .find(|c| c.name.starts_with(name))
+            .unwrap_or_else(|| panic!("{name} check must exist: {report:?}"));
+        (c.level, c.detail.clone().unwrap_or_default())
+    }
+
+    #[test]
+    fn validate_fails_self_referential_input_schema() {
+        let dir = temp_dir("f21-in-ref");
+        write_valid_bundle(&dir);
+        with_schemas(
+            &dir,
+            &serde_json::json!({"$ref": "#"}),
+            &serde_json::json!({}),
+        );
+        let report = validate_bundle(&dir);
+        let (level, detail) = check_level(&report, "input schema");
+        assert_eq!(level, CheckLevel::Fail, "{report:?}");
+        assert!(detail.contains("$ref"), "{detail}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_fails_ref_fanout_and_over_deep_output_schema() {
+        for (label, schema, expect) in [
+            ("fanout", fanout_schema(40), "$ref"),
+            ("deep", deep_schema(40), "nested too deeply"),
+        ] {
+            let dir = temp_dir(&format!("f21-out-{label}"));
+            write_valid_bundle(&dir);
+            with_schemas(&dir, &serde_json::json!({"type": "object"}), &schema);
+            let report = validate_bundle(&dir);
+            let (level, detail) = check_level(&report, "output schema");
+            assert_eq!(level, CheckLevel::Fail, "{label}: {report:?}");
+            assert!(detail.contains(expect), "{label}: {detail}");
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn validate_fails_ref_in_workflow_schema_file() {
+        let dir = temp_dir("f21-wf-ref");
+        write_valid_bundle(&dir);
+        fs::create_dir_all(dir.join("schemas")).expect("mkdir");
+        fs::write(dir.join("schemas/out.json"), r##"{"$ref":"#"}"##).expect("write");
+        let wf = fs::read_to_string(dir.join("workflow.yaml")).expect("read wf");
+        fs::write(
+            dir.join("workflow.yaml"),
+            format!("{wf}    output_schema: schemas/out.json\n"),
+        )
+        .expect("write wf");
+        let report = validate_bundle(&dir);
+        let (level, detail) = check_level(&report, "workflow schemas");
+        assert_eq!(level, CheckLevel::Fail, "{report:?}");
+        assert!(detail.contains("$ref"), "{detail}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_passes_normal_schemas_and_schema_files() {
+        let dir = temp_dir("f21-normal");
+        write_valid_bundle(&dir);
+        with_schemas(
+            &dir,
+            &serde_json::json!({"type": "object", "required": ["q"], "properties": {"q": {"type": "string"}}}),
+            &serde_json::json!({"type": "object"}),
+        );
+        fs::create_dir_all(dir.join("schemas")).expect("mkdir");
+        fs::write(dir.join("schemas/out.json"), r#"{"type":"object"}"#).expect("write");
+        let wf = fs::read_to_string(dir.join("workflow.yaml")).expect("read wf");
+        fs::write(
+            dir.join("workflow.yaml"),
+            format!("{wf}    output_schema: schemas/out.json\n"),
+        )
+        .expect("write wf");
+        let report = validate_bundle(&dir);
+        assert!(report.all_passed(), "{report:?}");
         let _ = fs::remove_dir_all(&dir);
     }
 }
