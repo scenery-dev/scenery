@@ -181,6 +181,49 @@ fn modify_claude_json_creates_file_when_absent() {
     assert!(servers.contains_key("test-server"));
 }
 
+/// `~/.claude.json` holds other MCP servers' secrets, and Claude Code keeps
+/// it at 0600. A governed push must not replace it with a umask-default copy.
+#[cfg(unix)]
+#[test]
+fn modify_claude_json_keeps_owner_only_mode_of_existing_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(".claude.json");
+    fs::write(
+        &path,
+        r#"{"mcpServers":{"other":{"env":{"TOKEN":"secret"}}}}"#,
+    )
+    .unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    modify_claude_json(&path, |root| {
+        root["mcpServers"]["test-server"] = serde_json::json!({"command": "vectorhawk"});
+    })
+    .unwrap();
+
+    let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+    let names: Vec<_> = fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains("tmp"))
+        .collect();
+    assert!(names.is_empty(), "no temp file left behind: {names:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn modify_claude_json_creates_new_file_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(".claude.json");
+
+    modify_claude_json(&path, |_| {}).unwrap();
+
+    let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+}
+
 #[test]
 fn modify_claude_json_preserves_existing_entries() {
     let dir = tempfile::tempdir().unwrap();

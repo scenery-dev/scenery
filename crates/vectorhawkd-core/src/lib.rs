@@ -19,6 +19,7 @@
 //! once the daemon/shim socket protocol is validated end-to-end.
 
 pub mod app;
+pub mod atomic_file;
 pub mod audit;
 pub mod binary_path;
 pub mod managed;

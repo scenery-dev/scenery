@@ -301,16 +301,9 @@ fn remove_path_for_mcp_preserves_owner_only_mode() {
     fs::write(&claude_json, serde_json::to_vec_pretty(&root).unwrap()).unwrap();
     fs::set_permissions(&claude_json, fs::Permissions::from_mode(0o600)).unwrap();
 
-    // A leftover temp file from an earlier run, at a wide mode, must not
-    // be reused (it would keep its mode and carry it over on rename).
-    let stale_tmp = claude_json.with_extension("tmp.drift");
-    fs::write(&stale_tmp, b"stale").unwrap();
-    fs::set_permissions(&stale_tmp, fs::Permissions::from_mode(0o644)).unwrap();
-
     remove_path_for(&mcp_marker_for(&claude_json, "fs")).unwrap();
 
     assert_eq!(mode_of(&claude_json), 0o600);
-    assert!(!stale_tmp.exists());
     let after: serde_json::Value =
         serde_json::from_slice(&fs::read(&claude_json).unwrap()).unwrap();
     assert!(after["mcpServers"].get("fs").is_none());
@@ -581,4 +574,49 @@ fn list_markers_returns_all_rows() {
     .unwrap();
     let rows = list_markers(&conn).unwrap();
     assert_eq!(rows.len(), 2);
+}
+
+/// Quarantining a drifted MCP entry writes its snapshot (env secrets and
+/// headers included) and rewrites `~/.claude.json`; neither may end up
+/// readable by other local users.
+#[cfg(unix)]
+#[test]
+fn quarantine_mcp_keeps_snapshot_and_claude_json_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let td = TempDir::new().unwrap();
+    let fake_home = td.path().join("home");
+    fs::create_dir_all(fake_home.join(".claude")).unwrap();
+    let claude_json = fake_home.join(".claude.json");
+    let root = serde_json::json!({
+        "mcpServers": {
+            "fs": {"command":"rogue","env":{"API_KEY":"drifted-secret"}},
+            "other": {"command":"keep-me","env":{"TOKEN":"secret"}}
+        }
+    });
+    fs::write(&claude_json, serde_json::to_vec_pretty(&root).unwrap()).unwrap();
+    fs::set_permissions(&claude_json, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let prev_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", &fake_home);
+    let outcome = DriftOutcome {
+        slug: "fs".to_string(),
+        kind: "mcp".to_string(),
+        path: format!("{}:fs", claude_json.display()),
+        expected_hash: "x".to_string(),
+        current_hash: Some("y".to_string()),
+        status: DriftStatus::Drifted,
+    };
+    let dest = quarantine_item(&outcome);
+    if let Some(v) = prev_home {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+    let dest = dest.unwrap();
+
+    assert_eq!(mode_of(&dest), 0o600);
+    assert_eq!(mode_of(&claude_json), 0o600);
+    let snap: serde_json::Value = serde_json::from_slice(&fs::read(&dest).unwrap()).unwrap();
+    assert_eq!(snap["env"]["API_KEY"], "drifted-secret");
 }

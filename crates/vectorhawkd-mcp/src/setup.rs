@@ -690,39 +690,9 @@ fn atomic_write(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
     // (e.g. a fresh dotfiles checkout); create it so the write below can
     // still land there rather than failing.
     fs::create_dir_all(parent)?;
-    let file_name = real_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("config");
-    let unique = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let tmp_path = parent.join(format!(
-        ".{file_name}.vh-tmp-{}-{unique}",
-        std::process::id()
-    ));
-
-    fs::write(&tmp_path, contents)?;
-
-    // Preserve the resolved file's own permissions (not the symlink's —
-    // symlink permissions are meaningless on the platforms this runs on).
-    #[cfg(unix)]
-    if let Ok(meta) = fs::metadata(&real_path) {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(
-            &tmp_path,
-            fs::Permissions::from_mode(meta.permissions().mode()),
-        );
-    }
-
-    match fs::rename(&tmp_path, &real_path) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = fs::remove_file(&tmp_path);
-            Err(e)
-        }
-    }
+    // Created fresh with the existing file's mode, so a 0600 config is never
+    // briefly readable by others; a new config gets the umask default.
+    vectorhawkd_core::atomic_file::write_atomic(&real_path, contents.as_bytes(), None)
 }
 
 fn write_mcp_entry_json(config: &ClientConfig) -> Result<()> {
