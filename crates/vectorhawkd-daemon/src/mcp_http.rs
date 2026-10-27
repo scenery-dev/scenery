@@ -75,6 +75,10 @@ const DEFAULT_PORT: u16 = 39140;
 /// Last port tried on a first-ever bind (inclusive) — `DEFAULT_PORT..=PORT_RANGE_END`
 /// is exactly the 10-port range `39140–39149` the contract reserves for this.
 const PORT_RANGE_END: u16 = 39149;
+/// Binds of the persisted port before treating it as held by someone else.
+/// The retries absorb a previous daemon of ours that is still exiting.
+const PINNED_PORT_BIND_ATTEMPTS: u32 = 5;
+const PINNED_PORT_RETRY_DELAY: Duration = Duration::from_millis(200);
 /// The `sync_state` key the resolved user id (the access token's `sub` this
 /// daemon is bound to) is cached under, so repeated requests don't have to
 /// re-decode the stored portal JWT every time. Shared with
@@ -154,7 +158,10 @@ pub async fn start_listener(ctx: DaemonContext) -> Result<Option<(SocketAddr, Jo
         return Ok(None);
     }
 
-    let Some((listener, port)) = bind_listener(&ctx.state).await? else {
+    let claude_json = dirs::home_dir().map(|h| h.join(".claude.json"));
+    let Some((listener, port)) =
+        bind_listener(&ctx.state, claude_json.as_deref(), &ctx.pending_alert).await?
+    else {
         return Ok(None);
     };
 
@@ -242,13 +249,19 @@ async fn serve_on(
 
 /// Resolve the port to bind, applying the "never hop silently" rule.
 ///
-/// - A persisted port is tried exactly once; on failure the daemon logs
-///   loudly and stays stdio-only (`Ok(None)`) — it never falls through to a
-///   different port, because the Claude Code config written by
-///   `vectorhawk mcp setup` pins this exact number.
+/// - A persisted port is retried briefly (covering a previous daemon of ours
+///   that is still exiting). If another process still holds it, the daemon
+///   fails closed ([`on_pinned_port_conflict`]): Claude Code's entry goes
+///   back to stdio, the local key is rotated, the user is alerted, and only
+///   then — with nothing pinning the old port any more — is a new one picked
+///   from the range below.
 /// - With no persisted port (first run), the first free port in
 ///   `DEFAULT_PORT..=PORT_RANGE_END` is bound and persisted.
-async fn bind_listener(state: &AppState) -> Result<Option<(TcpListener, u16)>> {
+async fn bind_listener(
+    state: &AppState,
+    claude_json: Option<&std::path::Path>,
+    pending_alert: &std::sync::Mutex<Option<(String, Instant)>>,
+) -> Result<Option<(TcpListener, u16)>> {
     if let Some(persisted) =
         state.get_sync_state(vectorhawkd_core::state::MCP_HTTP_PORT_SYNC_STATE_KEY)?
     {
@@ -263,20 +276,40 @@ async fn bind_listener(state: &AppState) -> Result<Option<(TcpListener, u16)>> {
                 return Ok(None);
             }
         };
-        return match TcpListener::bind(("127.0.0.1", port)).await {
-            Ok(listener) => Ok(Some((listener, port))),
-            Err(e) => {
-                error!(
-                    port, error = %e,
-                    "mcp http: persisted mcp_http_port is already in use by another \
-                     process — staying stdio-only. This port is pinned in the Claude \
-                     Code config written by `vectorhawk mcp setup`; it will NOT be \
-                     hopped to a different port automatically. Free the port, or \
-                     re-run `vectorhawk mcp setup` after resolving the conflict."
-                );
-                Ok(None)
+        let mut last_err = None;
+        for attempt in 0..PINNED_PORT_BIND_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(PINNED_PORT_RETRY_DELAY).await;
             }
-        };
+            match TcpListener::bind(("127.0.0.1", port)).await {
+                Ok(listener) => return Ok(Some((listener, port))),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        error!(
+            port,
+            error = ?last_err,
+            "mcp http: persisted mcp_http_port is held by another process — failing \
+             closed: Claude Code goes back to stdio and the local key is rotated, so \
+             nothing is sent to whoever holds the port"
+        );
+        let reverted = on_pinned_port_conflict(state, port, claude_json)?;
+        if reverted {
+            let msg = format!(
+                "VectorHawk's local port {port} was taken by another program, so Claude \
+                 Code was switched back to the standard VectorHawk connection and the \
+                 local key was replaced. Run `vectorhawk mcp setup` to restore browser \
+                 sign-in. If you didn't expect this, tell IT — another user on this \
+                 machine may have tried to intercept VectorHawk."
+            );
+            if let Ok(mut guard) = pending_alert.lock() {
+                let combined = match guard.take() {
+                    Some((existing, _)) => format!("{existing}\n\n{msg}"),
+                    None => msg,
+                };
+                *guard = Some((combined, Instant::now()));
+            }
+        }
     }
 
     for port in DEFAULT_PORT..=PORT_RANGE_END {
@@ -304,6 +337,32 @@ async fn bind_listener(state: &AppState) -> Result<Option<(TcpListener, u16)>> {
         "mcp http: every port in the fallback range is already in use — staying stdio-only"
     );
     Ok(None)
+}
+
+/// Fail closed when the pinned port is held by another process: point Claude
+/// Code's entry for it back at the stdio shim, rotate the local key it may
+/// already have sent there, and forget the pinned port so a new one can be
+/// picked. Returns whether Claude Code's entry was rewritten.
+fn on_pinned_port_conflict(
+    state: &AppState,
+    port: u16,
+    claude_json: Option<&std::path::Path>,
+) -> Result<bool> {
+    let reverted = match claude_json {
+        Some(path) => vectorhawkd_mcp::setup::revert_claude_code_http_entry(path, port)
+            .unwrap_or_else(|e| {
+                error!(error = %e, "mcp http: failed to point Claude Code back at stdio");
+                false
+            }),
+        None => false,
+    };
+    state
+        .rotate_local_mcp_key()
+        .context("mcp http: failed to rotate the local key after a port conflict")?;
+    state
+        .delete_sync_state(vectorhawkd_core::state::MCP_HTTP_PORT_SYNC_STATE_KEY)
+        .context("mcp http: failed to clear the conflicting mcp_http_port")?;
+    Ok(reverted)
 }
 
 /// JWKS cache: `kid` → verified EC public key, plus the last time a refetch

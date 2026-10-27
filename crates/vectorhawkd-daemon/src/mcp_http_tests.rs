@@ -1139,3 +1139,80 @@ fn tools_list_is_tagged_as_coming_from_claude_code() {
     let call = super::from_claude_code(request("tools/call"));
     assert_eq!(call.params, serde_json::json!({}));
 }
+
+/// F14: when the persisted port is held by another process, the daemon must
+/// fail closed — Claude Code's HTTP entry for that port goes back to stdio,
+/// the local key it may have sent there is rotated, the user is alerted,
+/// and the squatted port is never bound or kept as the pinned port.
+///
+/// Reverting the entry goes through `write_mcp_entry`, which records a
+/// restore-journal entry under the data dir resolved from `$HOME`, so `HOME`
+/// points at a temp dir for the whole call (holding the shared `ENV_MUTEX`
+/// across the `.await` is the point) and is restored before any assertion.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn pinned_port_held_by_another_process_fails_closed() {
+    use vectorhawkd_core::state::MCP_HTTP_PORT_SYNC_STATE_KEY;
+
+    let _guard = crate::managed_paths::ENV_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    let original_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", home.path());
+
+    let squatter = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let squatted = squatter.local_addr().unwrap().port();
+
+    let state = make_test_state();
+    state
+        .set_sync_state(MCP_HTTP_PORT_SYNC_STATE_KEY, &squatted.to_string())
+        .unwrap();
+    let old_key = state.local_mcp_key().unwrap();
+
+    let claude_json = home.path().join(".claude.json");
+    let root = serde_json::json!({
+        "mcpServers": {
+            "vectorhawk": vectorhawkd_mcp::setup::build_claude_code_http_entry(squatted, 39200, &old_key)
+        }
+    });
+    std::fs::write(&claude_json, serde_json::to_string(&root).unwrap()).unwrap();
+
+    let alert = std::sync::Mutex::new(None);
+    let bound = super::bind_listener(&state, Some(&claude_json), &alert).await;
+
+    match original_home {
+        Some(v) => std::env::set_var("HOME", v),
+        None => std::env::remove_var("HOME"),
+    }
+    drop(squatter);
+
+    let bound = bound.expect("a conflict is handled, not an error");
+    if let Some((_, port)) = &bound {
+        assert_ne!(*port, squatted, "the squatted port must never be bound");
+    }
+    let persisted = state.get_sync_state(MCP_HTTP_PORT_SYNC_STATE_KEY).unwrap();
+    assert_ne!(persisted, Some(squatted.to_string()));
+    assert_ne!(
+        state.local_mcp_key().unwrap(),
+        old_key,
+        "local key must rotate"
+    );
+
+    let after: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&claude_json).unwrap()).unwrap();
+    let entry = &after["mcpServers"]["vectorhawk"];
+    assert!(
+        entry.get("type").is_none() && entry.get("headers").is_none(),
+        "{entry}"
+    );
+    assert!(entry.get("command").is_some(), "{entry}");
+
+    let message = alert.lock().unwrap().clone().map(|(m, _)| m);
+    assert!(
+        message
+            .as_deref()
+            .is_some_and(|m| m.contains(&squatted.to_string())),
+        "user must be alerted: {message:?}"
+    );
+}
