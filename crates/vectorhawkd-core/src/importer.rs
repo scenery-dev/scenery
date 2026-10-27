@@ -228,7 +228,7 @@ pub fn import_local_skill_md_with_scan(
 
 /// A skill id becomes a directory name, so it must be non-empty and use only
 /// `[a-z0-9-]`. Anything else is rejected rather than normalised.
-fn validate_skill_id(id: &str) -> Result<()> {
+pub fn validate_skill_id(id: &str) -> Result<()> {
     if id.is_empty()
         || !id
             .bytes()
