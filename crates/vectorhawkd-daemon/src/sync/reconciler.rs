@@ -1537,10 +1537,10 @@ fn spawn_purge_plugin(
 ///    nothing is installed, which is what makes this idempotent and
 ///    race-safe against a concurrent install. A version-scoped revoke only
 ///    tears down what is (or, for an unpinned MCP server, may be) that
-///    version, so revoke and reinstall of another version do not flap;
-/// 2b. for a skill, strips it from every plugin VectorHawk bundled it into
-///    (per the plugin bundled-skills record), after releasing the skill
-///    lock — see the lock order on [`SkillLockMap`];
+///    version, so revoke and reinstall of another version do not flap.
+///    For a skill it then strips it from every plugin VectorHawk bundled
+///    it into (per the plugin bundled-skills record), after releasing the
+///    skill lock — see the lock order on [`SkillLockMap`];
 /// 3. emits a `<artifact_type>_revoked` audit event through the runner
 ///    audit pipeline (`audit_events` table → `POST /api/runner/audit`),
 ///    unconditionally — the backend wants to see every daemon converge,
