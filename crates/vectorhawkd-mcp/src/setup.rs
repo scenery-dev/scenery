@@ -337,7 +337,7 @@ pub fn claude_code_supports_http_oauth() -> bool {
 /// `claude` binary on PATH or real port binds; production callers pass
 /// those two functions.
 ///
-/// After writing the HTTP entry, best-effort tightens `config.config_path`
+/// Before writing the HTTP entry, best-effort tightens `config.config_path`
 /// to mode 0600 if it's group- or world-readable (Unix only) — an empirical
 /// run found `~/.claude.json` at mode 0664 on Linux, which would otherwise
 /// leak the H3 local key this call just wrote into it to every other local
@@ -355,13 +355,16 @@ pub fn write_claude_code_entry(
         if supports_http_oauth() {
             let pick = pick_callback_port();
             if let Some(callback_port) = pick.port {
+                // Tighten before the key goes in, not after: the write keeps
+                // the file's mode, so a 0644 config would show the key to
+                // other users between the rename and a later chmod.
+                let permissions_tightened = config.config_path.exists()
+                    && tighten_permissions_if_group_or_world_readable(&config.config_path)
+                        .unwrap_or(false);
                 write_mcp_entry_json_with_value(
                     config,
                     build_claude_code_http_entry(port, callback_port, &local_key),
                 )?;
-                let permissions_tightened =
-                    tighten_permissions_if_group_or_world_readable(&config.config_path)
-                        .unwrap_or(false);
                 return Ok(ClaudeCodeEntryKind::Http {
                     callback_port,
                     busy_ports_skipped: pick.busy_ports,
@@ -716,8 +719,9 @@ fn atomic_write(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
     // still land there rather than failing.
     fs::create_dir_all(parent)?;
     // Created fresh with the existing file's mode, so a 0600 config is never
-    // briefly readable by others; a new config gets the umask default.
-    vectorhawkd_core::atomic_file::write_atomic(&real_path, contents.as_bytes(), None)
+    // briefly readable by others. A new config is owner-only: client configs
+    // carry MCP servers' env secrets and, for Claude Code, the H3 local key.
+    vectorhawkd_core::atomic_file::write_atomic(&real_path, contents.as_bytes(), Some(0o600))
 }
 
 fn write_mcp_entry_json(config: &ClientConfig) -> Result<()> {
@@ -2313,6 +2317,24 @@ mod tests {
             0o600,
             "config file holding the H3 local key must end up owner-only"
         );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_creates_a_missing_config_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // No chmod afterwards: the file must never have existed with a
+        // wider mode, since the H3 key is in it from the first byte.
+        let tmp = temp_root("atomic-write-new-0600");
+        fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join(".claude.json");
+        atomic_write(&path, "{}").unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
 
         let _ = fs::remove_dir_all(&tmp);
     }
