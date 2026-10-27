@@ -1086,8 +1086,12 @@ async fn handle_install_plugin(
             revocation::is_revoked(&state_check, "plugin", &slug_check, Some(&version_check))
         })
         .await
-        .unwrap_or(Ok(false))
-        .unwrap_or(false);
+        // Fail closed: if the revocation list can't be read, don't install.
+        .unwrap_or(Ok(true))
+        .unwrap_or_else(|e| {
+            warn!(error = %e, "reconciler: revocation check failed; refusing install");
+            true
+        });
         if revoked {
             warn!(
                 plugin_slug,
@@ -1926,8 +1930,12 @@ async fn handle_install_mcp(
             }
         })
         .await
-        .unwrap_or(Ok(false))
-        .unwrap_or(false);
+        // Fail closed: if the revocation list can't be read, don't install.
+        .unwrap_or(Ok(true))
+        .unwrap_or_else(|e| {
+            warn!(error = %e, "reconciler: revocation check failed; refusing install");
+            true
+        });
         if revoked {
             warn!(
                 mcp_server_id = %mcp_server_id,
@@ -2450,8 +2458,12 @@ async fn handle_install(
             revocation::is_revoked(&state_check, "skill", &skill_id_check, Some(&version_check))
         })
         .await
-        .unwrap_or(Ok(false))
-        .unwrap_or(false);
+        // Fail closed: if the revocation list can't be read, don't install.
+        .unwrap_or(Ok(true))
+        .unwrap_or_else(|e| {
+            warn!(error = %e, "reconciler: revocation check failed; refusing install");
+            true
+        });
         if revoked {
             warn!(
                 skill_id,
