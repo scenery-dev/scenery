@@ -193,8 +193,25 @@ this time because you are already authorized.</p>
         .to_string()
 }
 
+/// Escape `s` for safe interpolation into HTML text or a quoted attribute.
+///
+/// `&` is replaced first so the entities produced for the other characters
+/// are not themselves re-escaped.
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
+}
+
 /// HTML page shown when the authorization server returns an error.
+///
+/// `error` comes straight from the request's query string, and any web page
+/// can send the browser to this loopback URL, so it is attacker-controlled.
+/// It must be HTML-escaped before it reaches the page.
 fn build_error_page(error: &str) -> String {
+    let error = html_escape(error);
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">

@@ -500,9 +500,16 @@ fn validate_workflow_prompt_refs(
                             "llm step prompt path must be non-empty".to_string(),
                         ));
                     }
-                    let p = root.join(path.as_str());
-                    if !p.exists() {
-                        return Err(ManifestError::MissingFile(path.clone()));
+                    match crate::resolve_bundle_file(root, path) {
+                        Ok(_) => {}
+                        Err(crate::BundlePathError::OutsideBundle) => {
+                            return Err(ManifestError::Invalid(format!(
+                                "llm step prompt path '{path}' resolves outside the skill bundle"
+                            )));
+                        }
+                        Err(crate::BundlePathError::Io(_)) => {
+                            return Err(ManifestError::MissingFile(path.clone()));
+                        }
                     }
                 }
             }

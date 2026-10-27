@@ -1250,7 +1250,7 @@ pub fn handle_login_with_oauth(
                              **Option B — Personal Access Token (easier for SSH):**\n\
                              1. Open https://app.vectorhawk.ai/portal/settings\n\
                              2. Create a token (starts with `vh_pat_`)\n\
-                             3. Run: `vectorhawk auth token <vh_pat_...>`"
+                             3. Run: `vectorhawk auth token` and paste the token at the prompt"
                         )
                     };
                     #[cfg(not(target_os = "linux"))]

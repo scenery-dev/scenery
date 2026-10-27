@@ -101,7 +101,13 @@ pub fn validate_bundle(path: &Utf8Path) -> ValidationReport {
     } else {
         // Show a truncated preview in the detail.
         let preview = if desc.len() > 60 {
-            format!("\"{}…\"", &desc[..59])
+            // Cut at the last char boundary at or before byte 59: slicing a
+            // multi-byte character in two panics, which aborts the daemon.
+            let mut end = 59;
+            while !desc.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("\"{}…\"", &desc[..end])
         } else {
             format!("\"{desc}\"")
         };
@@ -388,6 +394,38 @@ mod tests {
         assert!(
             !report.all_passed(),
             "report with a failed check should not be considered passing"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_truncates_long_description_on_a_char_boundary() {
+        let dir = temp_dir("multibyte-desc");
+        write_valid_bundle(&dir);
+        // 58 ASCII bytes then a 2-byte 'é', so byte 59 falls inside it.
+        let desc = format!("{}é and more text after it", "a".repeat(58));
+        let skill_md = fs::read_to_string(dir.join("SKILL.md")).expect("read SKILL.md");
+        fs::write(
+            dir.join("SKILL.md"),
+            skill_md.replace(
+                "description: A test skill.",
+                &format!("description: {desc}"),
+            ),
+        )
+        .expect("write SKILL.md");
+
+        let report = validate_bundle(&dir);
+
+        let desc_check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "description")
+            .expect("description check must exist");
+        assert_eq!(desc_check.level, CheckLevel::Pass);
+        assert_eq!(
+            desc_check.detail.as_deref(),
+            Some(format!("\"{}…\"", "a".repeat(58)).as_str())
         );
 
         let _ = fs::remove_dir_all(&dir);

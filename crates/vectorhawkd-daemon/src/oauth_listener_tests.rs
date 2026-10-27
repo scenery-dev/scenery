@@ -148,3 +148,37 @@ async fn callback_oauth_error_param_returns_200_with_error_page() {
 
     handle.abort();
 }
+
+/// The `error` query parameter is attacker-controlled (any web page can
+/// navigate the browser to the loopback callback), so it must be rendered as
+/// escaped text, never as markup.
+#[tokio::test]
+async fn callback_oauth_error_param_is_html_escaped() {
+    let oauth_state = Arc::new(OAuthState::new());
+
+    let (addr, handle) = start_listener(Arc::clone(&oauth_state))
+        .await
+        .unwrap()
+        .expect("listener should bind");
+
+    // error=<script>alert('x')</script>&"
+    let url = format!(
+        "http://127.0.0.1:{}/oauth/cli/callback?error=%3Cscript%3Ealert(%27x%27)%3C%2Fscript%3E%26%22",
+        addr.port()
+    );
+
+    let resp = reqwest::get(&url).await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body = resp.text().await.unwrap();
+    assert!(
+        !body.contains("<script>"),
+        "error value must not be injected as markup; got: {body}"
+    );
+    assert!(
+        body.contains("&lt;script&gt;alert(&#x27;x&#x27;)&lt;/script&gt;&amp;&quot;"),
+        "error value should be rendered HTML-escaped; got: {body}"
+    );
+
+    handle.abort();
+}

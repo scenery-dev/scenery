@@ -28,7 +28,12 @@
 use anyhow::{Context, Result};
 use fs2::FileExt;
 use serde_json::{json, Map, Value};
-use std::{collections::HashMap, fs, path::Path, path::PathBuf};
+use std::{
+    collections::HashMap,
+    ffi::OsStr,
+    fs,
+    path::{Component, Path, PathBuf},
+};
 use tracing::{debug, info};
 
 /// Marketplace name (the `@<marketplace>` suffix Claude Code uses).
@@ -90,12 +95,34 @@ fn plugin_key(slug: &str) -> String {
     format!("{slug}@{MARKETPLACE_NAME}")
 }
 
+/// Refuse a plugin slug or version that is not exactly one plain path
+/// component. Both arrive from the backend (the version verbatim from a
+/// third-party `plugin.json`) and are joined into marketplace and cache paths
+/// that are then `remove_dir_all`'d and refilled, so an empty value, `.`,
+/// `..`, a separator, or a root/drive prefix would aim those operations
+/// outside the `vectorhawk` dirs.
+fn ensure_single_path_component(what: &str, value: &str) -> Result<()> {
+    let mut components = Path::new(value).components();
+    let single_normal = matches!(
+        (components.next(), components.next()),
+        (Some(Component::Normal(c)), None) if c == OsStr::new(value)
+    );
+    if !single_normal || value.contains(['/', '\\']) {
+        anyhow::bail!(
+            "plugin_marketplace: refusing plugin {what} {value:?}: not a single path component"
+        );
+    }
+    Ok(())
+}
+
 /// Install (or refresh) a governed plugin so it appears enabled in
 /// `/plugin list`, bundling its skills. Idempotent.
 pub fn install_plugin_bundle(bundle: &PluginBundle) -> Result<()> {
     if reconciler_disabled() {
         return Ok(());
     }
+    ensure_single_path_component("slug", &bundle.slug)?;
+    ensure_single_path_component("version", &bundle.version)?;
     let home = home()?;
     let mp = marketplace_dir(&home);
     let plugin_src = mp.join("plugins").join(&bundle.slug);
@@ -181,6 +208,7 @@ pub fn uninstall_plugin_bundle(slug: &str) -> Result<()> {
     if reconciler_disabled() {
         return Ok(());
     }
+    ensure_single_path_component("slug", slug)?;
     let home = home()?;
     let mp = marketplace_dir(&home);
     let key = plugin_key(slug);

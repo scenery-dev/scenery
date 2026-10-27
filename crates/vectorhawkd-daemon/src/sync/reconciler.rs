@@ -2875,6 +2875,13 @@ fn unpack_tar_gz(archive_path: &camino::Utf8Path, dest: &camino::Utf8Path) -> Re
             anyhow::bail!("unsafe path in tar archive: {}", rel_path.display());
         }
 
+        // `Entry::unpack` hard-links to the entry's link name as given, so a
+        // hard-link entry could pull any file on disk into the bundle (and the
+        // copy into the versioned layout would then read its contents).
+        if entry.header().entry_type().is_hard_link() {
+            anyhow::bail!("hard link in tar archive: {}", rel_path.display());
+        }
+
         let target = std::path::PathBuf::from(dest.as_str()).join(&rel_path);
 
         if entry.header().entry_type().is_dir() {
