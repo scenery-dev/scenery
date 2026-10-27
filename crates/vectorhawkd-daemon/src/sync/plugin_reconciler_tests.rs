@@ -103,6 +103,28 @@ fn seed_installed_plugins(home: &std::path::Path, entries: &[(&str, &str)]) {
     }
     let root = serde_json::json!({ "version": 2, "plugins": plugins });
     std::fs::write(&path, serde_json::to_vec_pretty(&root).unwrap()).unwrap();
+
+    // Also seed the bundled-skills record `install_plugin_bundle` writes, so
+    // these read as installs by the current daemon. Without it the snapshot
+    // diff treats a governed plugin as legacy and reinstalls it once (see
+    // `revocation_scope_tests::snapshot_reinstalls_a_governed_plugin_with_no_bundled_skill_record`).
+    let record_path =
+        home.join(".claude/plugins/marketplaces/vectorhawk/.vectorhawk/bundled-skills.json");
+    std::fs::create_dir_all(record_path.parent().unwrap()).unwrap();
+    let mut record = serde_json::Map::new();
+    for (key, version) in entries {
+        if let Some(slug) = key.strip_suffix("@vectorhawk") {
+            record.insert(
+                slug.to_string(),
+                serde_json::json!({ "version": version, "skills": { "some-skill": "1.0.0" } }),
+            );
+        }
+    }
+    std::fs::write(
+        &record_path,
+        serde_json::to_vec_pretty(&serde_json::Value::Object(record)).unwrap(),
+    )
+    .unwrap();
 }
 
 fn read_installed_plugins(home: &std::path::Path) -> serde_json::Value {

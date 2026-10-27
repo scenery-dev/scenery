@@ -14,6 +14,7 @@ fn bundle() -> PluginBundle {
         author: "Jesse Vincent".to_string(),
         skills: vec![BundledSkill {
             skill_id: "tdd".to_string(),
+            version: "1.0.0".to_string(),
             skill_md: b"---\nname: tdd\n---\nWrite tests first.".to_vec(),
             files: vec![("prompts/x.md".to_string(), b"p".to_vec())],
         }],

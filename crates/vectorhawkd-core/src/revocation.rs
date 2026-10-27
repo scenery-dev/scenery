@@ -139,6 +139,31 @@ pub fn is_revoked(
     Ok(hit.is_some())
 }
 
+/// Is any version of `artifact_key` revoked right now — a whole-artifact
+/// row or a row for any specific version?
+///
+/// The fail-closed gate for an install that cannot name the version it will
+/// end up running (an MCP server with no `version_pin` resolves whatever the
+/// package source serves at launch time). Such an install cannot prove it
+/// avoids a revoked version, so any version-scoped revocation blocks it.
+pub fn is_any_version_revoked(
+    state: &AppState,
+    artifact_type: &str,
+    artifact_key: &str,
+) -> Result<bool> {
+    let conn =
+        Connection::open(&state.db_path).context("failed to open state DB for revoke check")?;
+    let hit: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM artifact_revocations \
+             WHERE artifact_type = ?1 AND artifact_key = ?2 LIMIT 1",
+            params![artifact_type, artifact_key],
+            |row| row.get(0),
+        )
+        .optional_result()?;
+    Ok(hit.is_some())
+}
+
 /// `rusqlite::OptionalExtension` is the usual way to do this, but importing
 /// it just for one call site reads worse than a tiny local helper.
 trait OptionalResult<T> {
@@ -198,6 +223,20 @@ mod tests {
         // revocation must not block an unscoped check for a different use.
         // (In practice every install path always has a concrete version.)
 
+        cleanup(&state);
+    }
+
+    #[test]
+    fn any_version_check_sees_version_scoped_and_whole_rows() {
+        let state = temp_state("any-version");
+        assert!(!is_any_version_revoked(&state, "mcp_server", "srv").unwrap());
+        upsert_revocation(&state, "mcp_server", "srv", Some("1.0.0")).unwrap();
+        assert!(is_any_version_revoked(&state, "mcp_server", "srv").unwrap());
+        assert!(!is_any_version_revoked(&state, "mcp_server", "other").unwrap());
+        assert!(!is_any_version_revoked(&state, "plugin", "srv").unwrap());
+        clear_revocation(&state, "mcp_server", "srv", Some("1.0.0")).unwrap();
+        upsert_revocation(&state, "mcp_server", "srv", None).unwrap();
+        assert!(is_any_version_revoked(&state, "mcp_server", "srv").unwrap());
         cleanup(&state);
     }
 

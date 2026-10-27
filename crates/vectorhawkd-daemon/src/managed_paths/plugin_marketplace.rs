@@ -22,6 +22,15 @@
 //! | `plugins/known_marketplaces.json` | marketplace registry (merge `vectorhawk`) |
 //! | `plugins/installed_plugins.json` | installed-plugin registry v2 (merge `<slug>@vectorhawk`) |
 //! | `settings.json` | merge `extraKnownMarketplaces.vectorhawk` + `enabledPlugins["<slug>@vectorhawk"]` |
+//! | `plugins/marketplaces/vectorhawk/.vectorhawk/bundled-skills.json` | which registry skills (id → version) VectorHawk bundled into each plugin |
+//!
+//! The bundled-skills record is what lets a skill revoke strip that skill
+//! from plugins installed earlier ([`plugins_bundling_skill`] +
+//! [`remove_bundled_skill`]). It lives outside every plugin tree, so an
+//! imported plugin's mirrored files can never forge an entry, and only
+//! skills VectorHawk itself bundled from the registry are ever listed — an
+//! imported plugin's own `skills/<name>` folder, or any plugin from another
+//! marketplace, is never touched.
 //!
 //! All writes honour the `VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER` killswitch.
 
@@ -44,6 +53,10 @@ pub const MARKETPLACE_NAME: &str = "vectorhawk";
 #[derive(Debug, Clone)]
 pub struct BundledSkill {
     pub skill_id: String,
+    /// The registry version whose content is in `skill_md`/`files` — the one
+    /// that passed the revocation gate. Recorded so a later version-scoped
+    /// skill revoke can find the plugins carrying exactly that version.
+    pub version: String,
     pub skill_md: Vec<u8>,
     pub files: Vec<(String, Vec<u8>)>,
 }
@@ -129,6 +142,26 @@ pub fn install_plugin_bundle(bundle: &PluginBundle) -> Result<()> {
 
     // 1. Write the per-plugin dir in the marketplace source (plugin.json + skills).
     write_plugin_source(&plugin_src, bundle)?;
+
+    // 1a. Record which registry skills this plugin carries. Imported plugins
+    //     (verbatim source tree) get an empty set: their skill folders are the
+    //     plugin author's, not registry skills, so a skill revoke never strips
+    //     them.
+    let registry_skills: Map<String, Value> = if bundle.files.is_empty() {
+        bundle
+            .skills
+            .iter()
+            .map(|s| (s.skill_id.clone(), json!(s.version)))
+            .collect()
+    } else {
+        Map::new()
+    };
+    edit_json_create(&bundled_record_path(&mp), |root| {
+        ensure_object(root).insert(
+            bundle.slug.clone(),
+            json!({ "version": bundle.version, "skills": registry_skills }),
+        );
+    })?;
 
     // 2. Refresh marketplace.json so the catalog lists this plugin.
     upsert_marketplace_manifest(&mp, bundle)?;
@@ -222,6 +255,11 @@ pub fn uninstall_plugin_bundle(slug: &str) -> Result<()> {
     )
     .ok();
     remove_from_marketplace_manifest(&mp, slug)?;
+    edit_json(&bundled_record_path(&mp), |root| {
+        if let Some(obj) = root.as_object_mut() {
+            obj.remove(slug);
+        }
+    })?;
 
     // installed_plugins.json: drop the key.
     edit_json(&plugins_dir(&home).join("installed_plugins.json"), |root| {
@@ -244,6 +282,134 @@ pub fn uninstall_plugin_bundle(slug: &str) -> Result<()> {
         "plugin_marketplace: uninstalled plugin from vectorhawk marketplace"
     );
     Ok(())
+}
+
+// ── Bundled registry skills record ──────────────────────────────────────────
+
+fn bundled_record_path(mp: &Path) -> PathBuf {
+    mp.join(".vectorhawk").join("bundled-skills.json")
+}
+
+/// `slug -> (plugin_version, skill_id -> skill_version)` from the record.
+fn read_bundled_record(mp: &Path) -> HashMap<String, (String, HashMap<String, String>)> {
+    let Some(root) = read_json(&bundled_record_path(mp)) else {
+        return HashMap::new();
+    };
+    let Some(obj) = root.as_object() else {
+        return HashMap::new();
+    };
+    obj.iter()
+        .map(|(slug, entry)| {
+            let version = entry
+                .get("version")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let skills = entry
+                .get("skills")
+                .and_then(Value::as_object)
+                .map(|m| {
+                    m.iter()
+                        .map(|(id, v)| (id.clone(), v.as_str().unwrap_or("").to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            (slug.clone(), (version, skills))
+        })
+        .collect()
+}
+
+/// Does the bundled-skills record have an entry for `slug`? A governed
+/// plugin without one was written by an older daemon, before the record
+/// existed; the snapshot reconcile reinstalls it once so its registry
+/// skills become revocable.
+pub fn has_bundled_skill_record(slug: &str) -> Result<bool> {
+    if reconciler_disabled() {
+        return Ok(true);
+    }
+    let mp = marketplace_dir(&home()?);
+    Ok(read_bundled_record(&mp).contains_key(slug))
+}
+
+/// Slugs of VectorHawk-installed plugins that bundle registry skill
+/// `skill_id` — at `version` when given, at any version otherwise.
+pub fn plugins_bundling_skill(skill_id: &str, version: Option<&str>) -> Result<Vec<String>> {
+    if reconciler_disabled() {
+        return Ok(Vec::new());
+    }
+    let mp = marketplace_dir(&home()?);
+    let version = version.map(str::trim).filter(|v| !v.is_empty());
+    let mut slugs: Vec<String> = read_bundled_record(&mp)
+        .into_iter()
+        .filter(|(_, (_, skills))| match (skills.get(skill_id), version) {
+            (Some(_), None) => true,
+            (Some(bundled), Some(v)) => bundled == v,
+            (None, _) => false,
+        })
+        .map(|(slug, _)| slug)
+        .collect();
+    slugs.sort();
+    Ok(slugs)
+}
+
+/// Remove registry skill `skill_id` from VectorHawk-installed plugin `slug`
+/// (marketplace source and install cache — the copy Claude Code loads) and
+/// drop it from the record. Acts only when the record says VectorHawk
+/// bundled that skill into that plugin, so an imported plugin's own folder
+/// of the same name is never touched. Returns whether anything was removed.
+/// Idempotent.
+///
+/// The caller must hold the `"plugin:<slug>"` reconciler lock — this
+/// rewrites the same tree `install_plugin_bundle` does.
+pub fn remove_bundled_skill(slug: &str, skill_id: &str) -> Result<bool> {
+    if reconciler_disabled() {
+        return Ok(false);
+    }
+    ensure_single_path_component("slug", slug)?;
+    ensure_single_path_component("skill id", skill_id)?;
+    let home = home()?;
+    let mp = marketplace_dir(&home);
+    let Some((plugin_version, skills)) = read_bundled_record(&mp).remove(slug) else {
+        return Ok(false);
+    };
+    if !skills.contains_key(skill_id) {
+        return Ok(false);
+    }
+
+    let mut dirs = vec![mp.join("plugins").join(slug).join("skills").join(skill_id)];
+    if ensure_single_path_component("version", &plugin_version).is_ok() {
+        dirs.push(
+            plugins_dir(&home)
+                .join("cache")
+                .join(MARKETPLACE_NAME)
+                .join(slug)
+                .join(&plugin_version)
+                .join("skills")
+                .join(skill_id),
+        );
+    }
+    for dir in &dirs {
+        if dir.exists() {
+            fs::remove_dir_all(dir)
+                .with_context(|| format!("plugin_marketplace: remove {dir:?}"))?;
+        }
+    }
+
+    edit_json(&bundled_record_path(&mp), |root| {
+        if let Some(skills) = root
+            .get_mut(slug)
+            .and_then(|e| e.get_mut("skills"))
+            .and_then(Value::as_object_mut)
+        {
+            skills.remove(skill_id);
+        }
+    })?;
+
+    info!(
+        slug,
+        skill_id, "plugin_marketplace: removed revoked skill from governed plugin"
+    );
+    Ok(true)
 }
 
 // ── Marketplace source dir ──────────────────────────────────────────────────
