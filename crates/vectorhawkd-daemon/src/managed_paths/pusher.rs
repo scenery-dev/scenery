@@ -273,9 +273,17 @@ impl ManagedPathsPusher {
     /// Remove a skill from `~/.agents/skills/<slug>/`, dropping its
     /// `~/.claude/skills/<slug>` link.
     ///
-    /// Deletes the marker from SQLite first to avoid a race where F3's drift
-    /// detector sees a manageless directory mid-cleanup, then removes the
-    /// directory.  Idempotent — returns `Ok(())` if the directory is absent.
+    /// Order matters (F13): the link and the directory go first, the
+    /// `managed_path_markers` row last. The row is the only trusted proof that
+    /// a directory is ours — discovery and F1 adoption ignore the
+    /// `.vectorhawk-managed.json` file — so a crash mid-removal must never
+    /// leave our directory on disk without its row, or the next scan would
+    /// report (and F1 would re-adopt) VectorHawk's own leftover. With this
+    /// order a crash leaves either the row plus (part of) the directory —
+    /// retried here, or classified by drift — or the row alone, which drift
+    /// retires as DELETED.
+    ///
+    /// Idempotent — returns `Ok(())` if the directory is absent.
     pub fn remove_skill(&self, slug: &str) -> Result<()> {
         if reconciler_disabled() {
             return Ok(());
@@ -284,10 +292,6 @@ impl ManagedPathsPusher {
         let skills_dir = resolve_skills_dir()?;
         let skill_dir = skills_dir.join(slug);
         let path_key = skill_dir.to_string_lossy().to_string();
-
-        // Delete SQLite marker first.
-        self.delete_db_marker(&path_key)
-            .context("pusher: failed to delete managed_path_markers for skill")?;
 
         // Drop Claude Code's link before removing the canonical directory, so
         // a crash between the two leaves a dangling link rather than a live
@@ -302,19 +306,34 @@ impl ManagedPathsPusher {
             // Defense-in-depth: never delete Anthropic-native content.
             ownership::ensure_not_native(&skill_dir)?;
             // Same ownership rule as push_skill's guard and `links::unlink_dir`:
-            // a real directory here is removed only when it carries the
-            // `.vectorhawk-managed.json` marker. Without this, a slug
-            // collision that push_skill refused to annex (or any other
-            // unmanaged directory a caller mistakenly targets) would still be
-            // destroyed here. Refuse rather than delete; the caller already
-            // treats `remove_skill` failures as non-fatal (warn-and-continue).
-            if !skill_dir.is_symlink() && !ownership::is_vectorhawk_managed(&skill_dir) {
+            // a real directory here is removed only when it is ours — it
+            // carries the `.vectorhawk-managed.json` marker, or our own DB row
+            // sits at this exact path (a retry after a crash may find the
+            // marker file already deleted). Without this, a slug collision
+            // that push_skill refused to annex would still be destroyed here.
+            // Refuse rather than delete; the caller already treats
+            // `remove_skill` failures as non-fatal (warn-and-continue).
+            let row_present = {
+                let conn = Connection::open(&self.db_path)
+                    .context("pusher: failed to open state DB for ownership check")?;
+                is_already_marked(&conn, &path_key)
+                    .context("pusher: failed to check managed_path_markers")?
+            };
+            if !skill_dir.is_symlink()
+                && !row_present
+                && !ownership::is_vectorhawk_managed(&skill_dir)
+            {
                 anyhow::bail!(
                     "pusher: refusing to remove the directory at {} — not VectorHawk-managed.",
                     skill_dir.display()
                 );
             }
-            fs::remove_dir_all(&skill_dir).with_context(|| {
+            if skill_dir.is_symlink() {
+                fs::remove_file(&skill_dir)
+            } else {
+                fs::remove_dir_all(&skill_dir)
+            }
+            .with_context(|| {
                 format!(
                     "pusher: failed to remove skill dir: {}",
                     skill_dir.display()
@@ -327,6 +346,10 @@ impl ManagedPathsPusher {
                 "pusher: skill dir absent — nothing to remove (idempotent)"
             );
         }
+
+        // Only now that nothing of ours is left on disk, drop the row.
+        self.delete_db_marker(&path_key)
+            .context("pusher: failed to delete managed_path_markers for skill")?;
 
         Ok(())
     }
@@ -473,6 +496,13 @@ impl ManagedPathsPusher {
             .context("pusher: failed to check managed_path_markers")?;
 
         if already {
+            // Refresh the hash: VectorHawk just wrote this content, and the
+            // path+hash ownership check (F13) must keep recognising it.
+            conn.execute(
+                "UPDATE managed_path_markers SET source_sha256 = ?1 WHERE path = ?2",
+                rusqlite::params![sha256, path],
+            )
+            .context("pusher: failed to refresh source_sha256 in managed_path_markers")?;
             // Update installation_id if provided.
             if let Some(id) = installation_id {
                 update_db_marker_installation_id(&conn, path, id)
