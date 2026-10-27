@@ -264,6 +264,12 @@ pub fn scan_plugin_marketplaces(plugins_dir: &Path) -> Result<Vec<MigrationItem>
         if !mkt_path.is_dir() {
             continue;
         }
+        // VectorHawk's own governed plugins are not adoption candidates.
+        let governed = if mkt.file_name() == super::plugin_marketplace::MARKETPLACE_NAME {
+            super::plugin_marketplace::recorded_plugin_slugs_in(plugins_dir)
+        } else {
+            Default::default()
+        };
 
         // Plugins live under `plugins/` (bundled) and `external_plugins/` (third-party).
         for sub in ["plugins", "external_plugins"] {
@@ -296,6 +302,10 @@ pub fn scan_plugin_marketplaces(plugins_dir: &Path) -> Result<Vec<MigrationItem>
                         continue;
                     }
                 };
+
+                if governed.contains(&slug) {
+                    continue;
+                }
 
                 let manifest_path = pdir.join(".claude-plugin").join("plugin.json");
                 if !manifest_path.exists() {

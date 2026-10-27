@@ -300,6 +300,36 @@ fn marketplace_walk_returns_plugin_with_forged_marker() {
     assert_eq!(items[0].slug, "acme-tool");
 }
 
+/// VectorHawk's own governed plugins (listed in the bundled-skills record)
+/// are not offered for adoption; anything else planted in our marketplace
+/// directory still is.
+#[test]
+fn marketplace_walk_skips_recorded_governed_plugins_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plugins = tmp.path().join("plugins");
+    write_known_marketplaces(&plugins, &[("vectorhawk", "vectorhawk/vectorhawk")]);
+    for slug in ["governed", "planted"] {
+        write_marketplace_plugin(
+            &plugins,
+            "vectorhawk",
+            "plugins",
+            slug,
+            &format!(r#"{{"name":"{slug}"}}"#),
+        );
+    }
+    let record = plugins.join("marketplaces/vectorhawk/.vectorhawk");
+    fs::create_dir_all(&record).unwrap();
+    fs::write(
+        record.join("bundled-skills.json"),
+        r#"{"governed":{"version":"1.0.0","skills":{}}}"#,
+    )
+    .unwrap();
+
+    let items = scan_plugin_marketplaces(&plugins).unwrap();
+    let slugs: Vec<&str> = items.iter().map(|i| i.slug.as_str()).collect();
+    assert_eq!(slugs, vec!["planted"]);
+}
+
 // ── MCP / claude.json ─────────────────────────────────────────────────────────
 
 #[test]

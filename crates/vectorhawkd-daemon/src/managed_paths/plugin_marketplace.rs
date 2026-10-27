@@ -319,6 +319,17 @@ fn read_bundled_record(mp: &Path) -> HashMap<String, (String, HashMap<String, St
         .collect()
 }
 
+/// Slugs VectorHawk itself installed into its marketplace under
+/// `plugins_dir`, per the bundled-skills record (which lives outside every
+/// plugin tree, so a plugin can't forge an entry). The F1 adoption scan
+/// skips exactly these; anything else in our marketplace directory is
+/// reported like any other plugin.
+pub fn recorded_plugin_slugs_in(plugins_dir: &Path) -> std::collections::HashSet<String> {
+    read_bundled_record(&plugins_dir.join("marketplaces").join(MARKETPLACE_NAME))
+        .into_keys()
+        .collect()
+}
+
 /// Does the bundled-skills record have an entry for `slug`? A governed
 /// plugin without one was written by an older daemon, before the record
 /// existed; the snapshot reconcile reinstalls it once so its registry
