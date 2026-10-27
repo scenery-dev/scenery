@@ -1,3 +1,4 @@
+use crate::secret_file;
 use anyhow::{Context, Result};
 use camino::Utf8PathBuf;
 use rusqlite::Connection;
@@ -21,16 +22,24 @@ pub const MCP_HTTP_PORT_SYNC_STATE_KEY: &str = "mcp_http_port";
 /// `sub_mismatch`).
 pub const MCP_USER_ID_SYNC_STATE_KEY: &str = "mcp_user_id";
 
-/// `sync_state` key the per-user local key for the MCP HTTP resource
-/// server's `X-VectorHawk-Local-Key` header is persisted under (H3 — defeats
-/// another OS user on this machine from reaching `127.0.0.1:<mcp_http_port>`,
-/// which has no same-user ACL the way the Unix socket does). User-private
-/// because `sync_state` lives in `state.db` under the per-user data
-/// directory. Shared between `vectorhawkd-daemon::mcp_http` (which checks
-/// it on every request) and `vectorhawkd-cli`'s `mcp setup` (which writes it
-/// into Claude Code's HTTP entry headers) — both read/write the same
-/// `state.db`, so neither side ever needs to ask the other for the value.
-pub const LOCAL_MCP_KEY_SYNC_STATE_KEY: &str = "mcp_local_key";
+/// `sync_state` key older builds kept the H3 local MCP key under. It now
+/// lives in the secrets store as [`LOCAL_MCP_KEY_SECRET`]; bootstrap moves
+/// any value still here and deletes the row.
+const LEGACY_LOCAL_MCP_KEY_SYNC_STATE_KEY: &str = "mcp_local_key";
+
+/// Secrets-store name ([`crate::secret_file`]) of the per-user key for the
+/// local MCP HTTP resource server's `X-VectorHawk-Local-Key` header (H3 —
+/// defeats another OS user on this machine from reaching
+/// `127.0.0.1:<mcp_http_port>`, which has no same-user ACL the way the Unix
+/// socket does). `vectorhawkd-daemon::mcp_http` checks it on every request
+/// and `vectorhawkd-cli`'s `mcp setup` writes it into Claude Code's HTTP
+/// entry headers; both read the same file, so neither side ever needs to
+/// ask the other for the value.
+pub const LOCAL_MCP_KEY_SECRET: &str = "mcp_local_key";
+
+/// `sync_state` marker set once [`crate::auth::move_legacy_secrets`] has
+/// moved every secret out of `state.db` and vacuumed it.
+const LEGACY_SECRETS_MOVED_SYNC_STATE_KEY: &str = "legacy_secrets_moved";
 
 /// Env var that lets the local MCP HTTP resource server (and `mcp setup`'s
 /// decision to write a Claude Code HTTP+OAuth entry) accept a non-`https://`
@@ -189,12 +198,53 @@ impl AppState {
         // backend's revocation list, reconciled on every snapshot/connect.
         conn.execute_batch(SCHEMA_REVOKE_SQL)
             .context("failed to apply artifact-revocation schema additions")?;
+        drop(conn);
 
-        Ok(Self {
+        restrict_to_owner(&root_dir, &db_path);
+
+        let state = Self {
             root_dir,
             db_path,
             block_third_party_inference: Arc::new(AtomicBool::new(false)),
-        })
+        };
+        state.move_legacy_secrets_once();
+        Ok(state)
+    }
+
+    /// Run [`crate::auth::move_legacy_secrets`] until it has succeeded once.
+    /// A failure (another process holding the database during the VACUUM,
+    /// say) never blocks startup; the next bootstrap tries again.
+    fn move_legacy_secrets_once(&self) {
+        if matches!(
+            self.get_sync_state(LEGACY_SECRETS_MOVED_SYNC_STATE_KEY),
+            Ok(Some(_))
+        ) {
+            return;
+        }
+        match crate::auth::move_legacy_secrets(self) {
+            Ok(()) => {
+                let _ = self.set_sync_state(LEGACY_SECRETS_MOVED_SYNC_STATE_KEY, "1");
+            }
+            Err(e) => tracing::warn!(
+                error = %e,
+                "could not move secrets out of state.db yet; will retry on next start"
+            ),
+        }
+    }
+
+    /// Move an H3 local key older builds kept in `sync_state` into the
+    /// secrets store, keeping its value so Claude Code's entry stays valid,
+    /// and delete the row. Part of [`crate::auth::move_legacy_secrets`].
+    pub(crate) fn move_legacy_local_mcp_key(&self) -> Result<()> {
+        if let Some(old) = self.get_sync_state(LEGACY_LOCAL_MCP_KEY_SYNC_STATE_KEY)? {
+            let root = self.root_dir.as_std_path();
+            if !old.is_empty() && secret_file::read(root, LOCAL_MCP_KEY_SECRET)?.is_none() {
+                secret_file::write(root, LOCAL_MCP_KEY_SECRET, &old)
+                    .context("failed to move the local MCP key to the secrets store")?;
+            }
+            self.delete_sync_state(LEGACY_LOCAL_MCP_KEY_SYNC_STATE_KEY)?;
+        }
+        Ok(())
     }
 
     /// Return all skill IDs currently tracked in `installed_skills`.
@@ -378,10 +428,10 @@ impl AppState {
 
     /// The per-user local key for the MCP HTTP resource server's
     /// `X-VectorHawk-Local-Key` header (H3), generating and persisting one on
-    /// first use. Stable across calls/processes — both the daemon and
-    /// `mcp setup` read the same `state.db` row, so they always agree without
-    /// an extra IPC round trip, and `mcp setup` re-running keeps the existing
-    /// key rather than silently invalidating Claude Code's config.
+    /// first use. Stable across calls/processes — the daemon and `mcp setup`
+    /// read the same [`LOCAL_MCP_KEY_SECRET`] file, so they always agree
+    /// without an extra IPC round trip, and `mcp setup` re-running keeps the
+    /// existing key rather than silently invalidating Claude Code's config.
     ///
     /// 256 bits from the OS CSPRNG (`getrandom`, same source
     /// [`generate_code_verifier`](crate::auth) already uses for PKCE
@@ -389,7 +439,9 @@ impl AppState {
     /// no base64 padding/URL-safety edge cases to get wrong in a header
     /// value.
     pub fn local_mcp_key(&self) -> Result<String> {
-        if let Some(existing) = self.get_sync_state(LOCAL_MCP_KEY_SYNC_STATE_KEY)? {
+        if let Some(existing) = secret_file::read(self.root_dir.as_std_path(), LOCAL_MCP_KEY_SECRET)
+            .context("failed to read the local MCP key")?
+        {
             if !existing.is_empty() {
                 return Ok(existing);
             }
@@ -407,8 +459,16 @@ impl AppState {
             anyhow::anyhow!("failed to generate local MCP key (OS RNG unavailable): {e}")
         })?;
         let key = hex::encode(bytes);
-        self.set_sync_state(LOCAL_MCP_KEY_SYNC_STATE_KEY, &key)?;
+        secret_file::write(self.root_dir.as_std_path(), LOCAL_MCP_KEY_SECRET, &key)
+            .context("failed to save the local MCP key")?;
         Ok(key)
+    }
+
+    /// Delete the local key, so the next [`Self::local_mcp_key`] generates a
+    /// new one. Used by `vectorhawk uninstall`.
+    pub fn clear_local_mcp_key(&self) -> Result<()> {
+        secret_file::remove(self.root_dir.as_std_path(), LOCAL_MCP_KEY_SECRET)
+            .context("failed to delete the local MCP key")
     }
 
     /// Clear this daemon's device/user session identity: `device_id`,
@@ -893,6 +953,24 @@ CREATE TABLE IF NOT EXISTS artifact_revocations (
 "#;
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+/// Make the data directory and `state.db` owner-only. Defence in depth now
+/// that secrets live elsewhere: the database still describes what is
+/// installed and where, and older builds created both world-readable.
+/// SQLite gives its journal files the database's mode. Best effort — a
+/// failure is logged, never fatal.
+#[cfg(unix)]
+fn restrict_to_owner(root_dir: &camino::Utf8Path, db_path: &camino::Utf8Path) {
+    use std::os::unix::fs::PermissionsExt;
+    for (path, mode) in [(root_dir, 0o700), (db_path, 0o600)] {
+        if let Err(e) = fs::set_permissions(path, fs::Permissions::from_mode(mode)) {
+            tracing::warn!(path = %path, error = %e, "could not restrict permissions");
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn restrict_to_owner(_root_dir: &camino::Utf8Path, _db_path: &camino::Utf8Path) {}
 
 #[cfg(test)]
 mod tests {

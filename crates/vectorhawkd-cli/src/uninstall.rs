@@ -193,7 +193,7 @@ async fn stop_daemons(report: &mut RestoreReport) -> Result<()> {
 /// `auth logout`: no VectorHawk secret may stay behind on the machine.
 async fn sign_out_everywhere(registry_url: &str, report: &mut RestoreReport) {
     use vectorhawkd_core::auth::{clear_tokens, load_all_tokens};
-    use vectorhawkd_core::state::{AppState, LOCAL_MCP_KEY_SYNC_STATE_KEY};
+    use vectorhawkd_core::{secret_file, state::AppState};
 
     if let Err(e) = crate::cmd_auth_logout(registry_url).await {
         report
@@ -204,7 +204,12 @@ async fn sign_out_everywhere(registry_url: &str, report: &mut RestoreReport) {
         for tokens in load_all_tokens(&state)? {
             clear_tokens(&state, &tokens.registry_url)?;
         }
-        state.delete_sync_state(LOCAL_MCP_KEY_SYNC_STATE_KEY)
+        state.clear_local_mcp_key()?;
+        // Catches token files whose auth_tokens row was already gone.
+        match std::fs::remove_dir_all(secret_file::secrets_dir(state.root_dir.as_std_path())) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+            _ => Ok(()),
+        }
     });
     if let Err(e) = result {
         report
@@ -958,7 +963,7 @@ mod tests {
     #[tokio::test]
     async fn sign_out_everywhere_clears_every_registry_and_the_local_key() {
         use vectorhawkd_core::auth::{load_all_tokens, save_tokens};
-        use vectorhawkd_core::state::LOCAL_MCP_KEY_SYNC_STATE_KEY;
+        use vectorhawkd_core::secret_file;
 
         let _guard = HOME_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = temp_dir("sign-out-everywhere");
@@ -968,17 +973,17 @@ mod tests {
         std::env::set_var("VECTORHAWK_DISABLE_KEYCHAIN", "1");
 
         let mut report = RestoreReport::default();
-        let outcome: anyhow::Result<(usize, Option<String>)> = async {
+        let outcome: anyhow::Result<(usize, bool)> = async {
             let state = AppState::bootstrap()?;
             save_tokens(&state, "https://dev.example.invalid", "a1", "r1")?;
             save_tokens(&state, "https://prod.example.invalid", "a2", "r2")?;
-            state.set_sync_state(LOCAL_MCP_KEY_SYNC_STATE_KEY, "local-key")?;
+            state.local_mcp_key()?;
 
             sign_out_everywhere("https://prod.example.invalid", &mut report).await;
 
             Ok((
                 load_all_tokens(&state)?.len(),
-                state.get_sync_state(LOCAL_MCP_KEY_SYNC_STATE_KEY)?,
+                secret_file::secrets_dir(state.root_dir.as_std_path()).exists(),
             ))
         }
         .await;
@@ -993,9 +998,9 @@ mod tests {
         }
         let _ = fs::remove_dir_all(&tmp);
 
-        let (remaining, local_key) = outcome.expect("test body should succeed");
+        let (remaining, secrets_left) = outcome.expect("test body should succeed");
         assert_eq!(remaining, 0, "tokens for every registry must be cleared");
-        assert_eq!(local_key, None);
+        assert!(!secrets_left, "the secrets directory must be gone");
         assert!(report.warnings.is_empty(), "{:?}", report.warnings);
     }
 
