@@ -38,6 +38,12 @@ pub fn install_unpacked_skill(
     skill: &SkillPackage,
     mode: InstallMode,
 ) -> Result<()> {
+    // F21: refuse reference-bearing or oversized schemas before anything is
+    // written, so a crafted skill fails to install instead of crashing the
+    // daemon when it runs. The executor repeats the check at run time.
+    crate::schema_guard::check_package_schemas(skill)
+        .with_context(|| format!("skill '{}' has an unacceptable schema", skill.manifest.id))?;
+
     let install_root = state.root_dir.join("skills").join(&skill.manifest.id);
     let versions_dir = install_root.join("versions");
     fs::create_dir_all(&versions_dir)?;
@@ -379,6 +385,48 @@ mod tests {
     fn example_skill_path() -> Utf8PathBuf {
         // Relative to the crate root — works from `cargo test` invocation
         Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/skills/contract-compare")
+    }
+
+    #[test]
+    fn install_refuses_skill_with_reference_in_schema() {
+        let root = temp_root("f21-install");
+        let src = temp_root("f21-install-src");
+        copy_dir_recursive(&example_skill_path(), &src);
+        // The example's llm step names schemas/output.schema.json.
+        fs::write(src.join("schemas/output.schema.json"), r##"{"$ref":"#"}"##)
+            .expect("write crafted schema");
+        let state = AppState::bootstrap_in(root.clone()).expect("bootstrap");
+        let skill = SkillPackage::load_from_dir(&src).expect("crafted skill still parses");
+
+        let err = install_unpacked_skill(&state, &skill, InstallMode::Copy)
+            .expect_err("install must refuse a $ref schema");
+        assert!(format!("{err:#}").contains("$ref"), "got: {err:#}");
+        assert!(
+            !state
+                .root_dir
+                .join("skills")
+                .join(&skill.manifest.id)
+                .exists(),
+            "nothing may be written for a refused install"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&src);
+    }
+
+    fn copy_dir_recursive(from: &Utf8Path, to: &Utf8Path) {
+        fs::create_dir_all(to).expect("mkdir");
+        for entry in fs::read_dir(from).expect("read_dir") {
+            let entry = entry.expect("entry");
+            let name = entry.file_name();
+            let name = name.to_str().expect("utf-8 name");
+            let (src, dst) = (from.join(name), to.join(name));
+            if entry.file_type().expect("type").is_dir() {
+                copy_dir_recursive(&src, &dst);
+            } else {
+                fs::copy(&src, &dst).expect("copy");
+            }
+        }
     }
 
     #[test]

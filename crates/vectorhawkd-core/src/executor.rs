@@ -509,8 +509,10 @@ fn validate_input_against_schema(
     schema_json: &serde_json::Value,
     input: &serde_json::Value,
 ) -> Result<()> {
-    let validator = jsonschema::JSONSchema::compile(schema_json)
-        .map_err(|e| anyhow::anyhow!("inputs_schema is not a valid JSON Schema: {e}"))?;
+    // F21: refuse reference keywords and oversized schemas before jsonschema
+    // compiles them (a `$ref` cycle overflows the stack in jsonschema 0.17).
+    let validator = crate::schema_guard::compile_skill_schema(schema_json)
+        .map_err(|e| anyhow::anyhow!("inputs_schema is not an acceptable JSON Schema: {e}"))?;
 
     if !validator.is_valid(input) {
         anyhow::bail!("input failed validation against inputs_schema");
@@ -524,14 +526,8 @@ fn validate_output(
     schema_rel: &str,
     output: &serde_json::Value,
 ) -> Result<()> {
-    let schema_path = pkg_root.join(schema_rel);
-    let schema_text = fs::read_to_string(&schema_path)
-        .with_context(|| format!("failed to read output schema {schema_path}"))?;
-    let schema_json: serde_json::Value = serde_json::from_str(&schema_text)
-        .with_context(|| format!("{schema_rel} is not valid JSON"))?;
-
-    let validator = jsonschema::JSONSchema::compile(&schema_json)
-        .map_err(|e| anyhow::anyhow!("{schema_rel} is not a valid JSON Schema: {e}"))?;
+    // F21: structural guard runs before jsonschema compiles the file.
+    let validator = crate::schema_guard::compile_schema_file(pkg_root, schema_rel)?;
 
     if !validator.is_valid(output) {
         anyhow::bail!("output failed validation against {schema_rel}");
@@ -874,5 +870,129 @@ mod tests {
 
         let _ = fs::remove_dir_all(&skill_root);
         let _ = fs::remove_dir_all(&outside);
+    }
+
+    // ── F21: crafted schemas must be refused, never crash or hang the daemon ─
+
+    use crate::schema_guard::tests::{
+        deep_schema, fanout_schema, is_child, run_isolated, wide_schema,
+    };
+    use std::time::Duration;
+
+    /// Place a project-scope skill whose inline inputs schema is `schema` (no
+    /// install step, so the run-time guard is what's under test, modelling a
+    /// tampered or pre-fix install) and run it; the run must fail with a clear
+    /// error mentioning `expect`.
+    fn run_with_input_schema_expect_refusal(label: &str, schema: &serde_json::Value, expect: &str) {
+        let state_root = temp_root(label);
+        let project = temp_root(&format!("{label}-project"));
+        let state = AppState::bootstrap_in(state_root.clone()).expect("bootstrap");
+        write_skill_bundle(
+            &project.join(".vectorhawk/skills/test-skill"),
+            &schema.to_string(),
+        );
+        let err = run_skill_with_scope(
+            &state,
+            &MockPolicyClient::new(),
+            "test-skill",
+            &serde_json::json!({}),
+            None,
+            Some(&project),
+        )
+        .expect_err("crafted inputs schema must be refused");
+        assert!(format!("{err:#}").contains(expect), "got: {err:#}");
+        let _ = fs::remove_dir_all(&state_root);
+        let _ = fs::remove_dir_all(&project);
+    }
+
+    #[test]
+    fn run_refuses_self_referential_input_schema() {
+        run_isolated(
+            "executor::tests::child_run_self_ref_input_schema",
+            Duration::from_secs(30),
+        );
+    }
+
+    #[test]
+    #[ignore = "child of run_refuses_self_referential_input_schema"]
+    fn child_run_self_ref_input_schema() {
+        if !is_child() {
+            return;
+        }
+        run_with_input_schema_expect_refusal(
+            "f21-selfref",
+            &serde_json::json!({"$ref": "#"}),
+            "$ref",
+        );
+    }
+
+    #[test]
+    fn run_refuses_ref_fanout_input_schema_quickly() {
+        run_isolated(
+            "executor::tests::child_run_fanout_input_schema",
+            Duration::from_secs(30),
+        );
+    }
+
+    #[test]
+    #[ignore = "child of run_refuses_ref_fanout_input_schema_quickly"]
+    fn child_run_fanout_input_schema() {
+        if !is_child() {
+            return;
+        }
+        run_with_input_schema_expect_refusal("f21-fanout", &fanout_schema(40), "$ref");
+    }
+
+    #[test]
+    fn run_refuses_over_deep_input_schema() {
+        run_with_input_schema_expect_refusal("f21-deep", &deep_schema(40), "nested too deeply");
+    }
+
+    #[test]
+    fn run_refuses_over_large_input_schema() {
+        run_with_input_schema_expect_refusal("f21-large", &wide_schema(10_000), "too large");
+    }
+
+    #[test]
+    fn validate_output_refuses_self_referential_schema_file() {
+        run_isolated(
+            "executor::tests::child_validate_output_self_ref",
+            Duration::from_secs(30),
+        );
+    }
+
+    #[test]
+    #[ignore = "child of validate_output_refuses_self_referential_schema_file"]
+    fn child_validate_output_self_ref() {
+        if !is_child() {
+            return;
+        }
+        for (label, schema) in [
+            ("selfref", serde_json::json!({"$ref": "#"})),
+            ("fanout", fanout_schema(40)),
+        ] {
+            let root = temp_root(&format!("f21-out-{label}"));
+            fs::create_dir_all(root.join("schemas")).expect("mkdir");
+            fs::write(root.join("schemas/out.json"), schema.to_string()).expect("write");
+            let err = validate_output(&root, "schemas/out.json", &serde_json::json!({}))
+                .expect_err("crafted output schema must be refused");
+            assert!(format!("{err:#}").contains("$ref"), "{label}: {err:#}");
+            let _ = fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn validate_output_still_checks_normal_schema() {
+        let root = temp_root("f21-out-normal");
+        fs::create_dir_all(root.join("schemas")).expect("mkdir");
+        fs::write(
+            root.join("schemas/out.json"),
+            r#"{"type":"object","required":["a"]}"#,
+        )
+        .expect("write");
+        validate_output(&root, "schemas/out.json", &serde_json::json!({"a": 1})).expect("valid");
+        validate_output(&root, "schemas/out.json", &serde_json::json!({}))
+            .expect_err("missing field must fail");
+        let _ = fs::remove_dir_all(&root);
     }
 }
