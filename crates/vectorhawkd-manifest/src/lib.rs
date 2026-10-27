@@ -281,6 +281,74 @@ impl SkillPackage {
     }
 }
 
+// ── Bundle path confinement ──────────────────────────────────────────────────
+
+/// Why [`resolve_bundle_file`] did not return a path.
+#[derive(Debug, thiserror::Error)]
+pub enum BundlePathError {
+    /// The path resolves to a location outside the bundle root.
+    #[error("path resolves outside the skill bundle")]
+    OutsideBundle,
+    /// The path stays inside the bundle but could not be resolved there
+    /// (typically because the file does not exist).
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+}
+
+/// Resolve `rel`, a file path taken from a skill manifest, against the bundle
+/// `root` and return the canonical path it names. Refuses any path that
+/// resolves outside the bundle; `.`/`..` segments and absolute paths are fine
+/// as long as they land inside it.
+///
+/// Two checks, in order:
+/// 1. Lexical, with no filesystem access: the joined path is folded (`.`
+///    dropped, `..` pops the previous component) and must sit under the bundle,
+///    named either by its canonical path or (for an absolute `rel`) by `root`
+///    as given. A path that fails this is refused before anything outside the
+///    bundle is touched, so the error says nothing about whether it exists.
+/// 2. Canonical: the joined path is canonicalized, resolving symlinks, and
+///    must still sit under the canonical root. This defeats symlinks inside
+///    the bundle that point out of it.
+pub fn resolve_bundle_file(root: &Utf8Path, rel: &str) -> Result<Utf8PathBuf, BundlePathError> {
+    let canonical_root = root.canonicalize_utf8()?;
+    let joined = canonical_root.join(rel);
+
+    let folded = lexical_fold(&joined);
+    let lexically_inside = folded.starts_with(&canonical_root)
+        || (Utf8Path::new(rel).is_absolute() && folded.starts_with(lexical_fold(root)));
+    if !lexically_inside {
+        return Err(BundlePathError::OutsideBundle);
+    }
+
+    let resolved = joined.canonicalize_utf8()?;
+    if !resolved.starts_with(&canonical_root) {
+        return Err(BundlePathError::OutsideBundle);
+    }
+    Ok(resolved)
+}
+
+/// Fold `.` and `..` out of `path` without consulting the filesystem.
+/// `..` at the root stays at the root; a leading `..` on a relative path is kept.
+fn lexical_fold(path: &Utf8Path) -> Utf8PathBuf {
+    use camino::Utf8Component;
+
+    let mut out = Utf8PathBuf::new();
+    for component in path.components() {
+        match component {
+            Utf8Component::CurDir => {}
+            Utf8Component::ParentDir => match out.components().next_back() {
+                Some(Utf8Component::Normal(_)) => {
+                    out.pop();
+                }
+                Some(Utf8Component::RootDir) | Some(Utf8Component::Prefix(_)) => {}
+                _ => out.push(".."),
+            },
+            other => out.push(other.as_str()),
+        }
+    }
+    out
+}
+
 // ── Plugin Manifest ─────────────────────────────────────────────────────────
 
 /// A plugin is a composite, governed bundle that packages skills + MCP servers
@@ -608,6 +676,136 @@ steps:
         }
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    // ── Bundle path confinement ─────────────────────────────────────────────
+
+    /// `<tmp>/bundle` holding `prompts/system.txt`, next to `<tmp>/outside/secret.txt`.
+    fn bundle_fixture() -> (tempfile::TempDir, Utf8PathBuf) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).expect("utf-8 tempdir");
+        let root = base.join("bundle");
+        fs::create_dir_all(root.join("prompts")).expect("prompts dir");
+        fs::write(root.join("prompts/system.txt"), "in bundle").expect("prompt");
+        fs::create_dir_all(base.join("outside")).expect("outside dir");
+        fs::write(base.join("outside/secret.txt"), "secret").expect("secret");
+        (tmp, root)
+    }
+
+    fn write_workflow_prompt(root: &Utf8Path, prompt: &str) {
+        fs::write(
+            root.join("workflow.yaml"),
+            format!("name: contract_compare\nsteps:\n  - id: compare\n    type: llm\n    prompt: '{prompt}'\n"),
+        )
+        .expect("workflow should be written");
+    }
+
+    #[test]
+    fn resolve_bundle_file_accepts_paths_that_land_inside_the_bundle() {
+        let (_tmp, root) = bundle_fixture();
+        let expected = root
+            .join("prompts/system.txt")
+            .canonicalize_utf8()
+            .expect("canonical prompt");
+        let absolute = root.join("prompts/system.txt");
+        for rel in [
+            "prompts/system.txt",
+            "./prompts/system.txt",
+            "prompts/../prompts/system.txt",
+            "../bundle/prompts/system.txt",
+            absolute.as_str(),
+        ] {
+            let got = resolve_bundle_file(&root, rel).unwrap_or_else(|e| panic!("{rel}: {e}"));
+            assert_eq!(got, expected, "{rel}");
+        }
+    }
+
+    #[test]
+    fn resolve_bundle_file_refuses_escapes_whether_or_not_the_target_exists() {
+        let (_tmp, root) = bundle_fixture();
+        let base = root.parent().expect("bundle has a parent").to_path_buf();
+        let secret_abs = base.join("outside/secret.txt");
+        let missing_abs = base.join("outside/missing.txt");
+        for rel in [
+            "../outside/secret.txt",
+            "../outside/missing.txt",
+            "prompts/../../outside/secret.txt",
+            "../bundle-sibling/system.txt",
+            "../../../../../../../../../../etc/passwd",
+            "/etc/passwd",
+            secret_abs.as_str(),
+            missing_abs.as_str(),
+        ] {
+            match resolve_bundle_file(&root, rel) {
+                Err(BundlePathError::OutsideBundle) => {}
+                other => panic!("{rel}: expected OutsideBundle, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_bundle_file_reports_a_missing_in_bundle_file_as_io() {
+        let (_tmp, root) = bundle_fixture();
+        assert!(matches!(
+            resolve_bundle_file(&root, "prompts/missing.txt"),
+            Err(BundlePathError::Io(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_bundle_file_refuses_a_symlink_that_points_out_of_the_bundle() {
+        let (_tmp, root) = bundle_fixture();
+        let secret = root.parent().expect("parent").join("outside/secret.txt");
+        std::os::unix::fs::symlink(&secret, root.join("prompts/out.txt")).expect("symlink out");
+        std::os::unix::fs::symlink(root.join("prompts/system.txt"), root.join("prompts/in.txt"))
+            .expect("symlink in");
+
+        assert!(matches!(
+            resolve_bundle_file(&root, "prompts/out.txt"),
+            Err(BundlePathError::OutsideBundle)
+        ));
+        assert!(resolve_bundle_file(&root, "prompts/in.txt").is_ok());
+    }
+
+    #[test]
+    fn load_from_dir_rejects_prompt_ref_outside_the_bundle() {
+        let (tmp, root) = bundle_fixture();
+        write_example_skill(&root);
+        let secret =
+            Utf8PathBuf::from_path_buf(tmp.path().join("outside/secret.txt")).expect("utf-8 path");
+        for prompt in [
+            "../outside/secret.txt",
+            secret.as_str(),
+            "/nonexistent/secret.txt",
+        ] {
+            write_workflow_prompt(&root, prompt);
+            match SkillPackage::load_from_dir(&root) {
+                Err(ManifestError::Invalid(message)) => {
+                    assert!(
+                        message.contains("outside the skill bundle"),
+                        "{prompt}: {message}"
+                    )
+                }
+                other => panic!("{prompt}: expected invalid manifest error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn load_from_dir_accepts_in_bundle_prompt_ref_with_dot_dot() {
+        let (_tmp, root) = bundle_fixture();
+        write_example_skill(&root);
+        write_workflow_prompt(&root, "prompts/../prompts/compare.txt");
+
+        let pkg = SkillPackage::load_from_dir(&root).expect("in-bundle .. path should load");
+        match &pkg.workflow.steps[0] {
+            WorkflowStep::Llm {
+                prompt: PromptSource::File(path),
+                ..
+            } => assert_eq!(path, "prompts/../prompts/compare.txt"),
+            other => panic!("expected llm step with file prompt, got {other:?}"),
+        }
     }
 
     // ── Plugin manifest tests ───────────────────────────────────────────────

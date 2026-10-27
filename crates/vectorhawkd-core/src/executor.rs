@@ -8,7 +8,9 @@ use anyhow::{Context, Result};
 use camino::Utf8PathBuf;
 use std::collections::HashMap;
 use std::fs;
-use vectorhawkd_manifest::{PromptSource, SkillPackage, WorkflowStep};
+use vectorhawkd_manifest::{
+    resolve_bundle_file, BundlePathError, PromptSource, SkillPackage, WorkflowStep,
+};
 
 // ── Public result types ───────────────────────────────────────────────────────
 
@@ -331,7 +333,17 @@ fn execute_llm_step(pkg: &SkillPackage, p: LlmStepParams<'_>) -> Result<StepResu
     let system_prompt = match prompt_source {
         PromptSource::Inline(body) => body.clone(),
         PromptSource::File(rel_path) => {
-            let prompt_path = pkg.root.join(rel_path.as_str());
+            let prompt_path = match resolve_bundle_file(&pkg.root, rel_path) {
+                Ok(path) => path,
+                Err(BundlePathError::OutsideBundle) => {
+                    anyhow::bail!("prompt file {rel_path} resolves outside the skill bundle")
+                }
+                Err(BundlePathError::Io(e)) => {
+                    let prompt_path = pkg.root.join(rel_path.as_str());
+                    return Err(anyhow::Error::new(e)
+                        .context(format!("failed to read prompt file {prompt_path}")));
+                }
+            };
             fs::read_to_string(&prompt_path)
                 .with_context(|| format!("failed to read prompt file {prompt_path}"))?
         }
@@ -750,5 +762,117 @@ mod tests {
 
         let _ = fs::remove_dir_all(&state_root);
         let _ = fs::remove_dir_all(&skill_root);
+    }
+
+    // ── Prompt file confinement ─────────────────────────────────────────────
+
+    /// Records every system prompt it is sent.
+    struct RecordingModelClient {
+        system_prompts: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl ModelClient for RecordingModelClient {
+        fn generate(&self, request: ModelRequest) -> Result<crate::model::ModelResponse> {
+            self.system_prompts
+                .lock()
+                .expect("lock")
+                .push(request.system_prompt);
+            Ok(crate::model::ModelResponse {
+                text: "ok".to_string(),
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                latency_ms: 1,
+                source: ModelSource::Local("recording".to_string()),
+                cost_usd: 0.0,
+            })
+        }
+    }
+
+    fn run_llm_step_with_prompt_file(
+        pkg: &SkillPackage,
+        rel: &str,
+        client: &RecordingModelClient,
+    ) -> Result<StepResult> {
+        execute_llm_step(
+            pkg,
+            LlmStepParams {
+                id: "run",
+                prompt_source: &PromptSource::File(rel.to_string()),
+                step_inputs: &None,
+                output_schema_rel: None,
+                run_input: &serde_json::json!({}),
+                step_outputs: &HashMap::new(),
+                client,
+            },
+        )
+    }
+
+    #[test]
+    fn llm_step_reads_in_bundle_prompt_reached_through_dot_dot_and_absolute_path() {
+        let skill_root = temp_root("prompt-in-bundle");
+        write_skill_bundle(&skill_root, "{}");
+        let pkg = SkillPackage::load_from_dir(&skill_root).expect("load skill");
+        let bundle_name = skill_root.file_name().expect("bundle dir name");
+        let absolute = skill_root.join("prompts/system.txt");
+
+        let client = RecordingModelClient {
+            system_prompts: std::sync::Mutex::new(Vec::new()),
+        };
+        for rel in [
+            "prompts/../prompts/system.txt".to_string(),
+            format!("../{bundle_name}/prompts/system.txt"),
+            absolute.to_string(),
+        ] {
+            run_llm_step_with_prompt_file(&pkg, &rel, &client)
+                .unwrap_or_else(|e| panic!("{rel}: {e:#}"));
+        }
+        assert_eq!(
+            *client.system_prompts.lock().expect("lock"),
+            vec!["Do the thing.".to_string(); 3]
+        );
+
+        let _ = fs::remove_dir_all(&skill_root);
+    }
+
+    #[test]
+    fn llm_step_refuses_prompt_file_outside_bundle_without_calling_the_model() {
+        let skill_root = temp_root("prompt-escape");
+        let outside = temp_root("prompt-escape-outside");
+        write_skill_bundle(&skill_root, "{}");
+        fs::create_dir_all(&outside).expect("outside dir");
+        fs::write(outside.join("secret.txt"), "TOP SECRET").expect("secret");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            outside.join("secret.txt"),
+            skill_root.join("prompts/link.txt"),
+        )
+        .expect("symlink");
+        let pkg = SkillPackage::load_from_dir(&skill_root).expect("load skill");
+        let outside_name = outside.file_name().expect("outside dir name");
+
+        let client = RecordingModelClient {
+            system_prompts: std::sync::Mutex::new(Vec::new()),
+        };
+        let mut escapes = vec![
+            outside.join("secret.txt").to_string(),
+            outside.join("missing.txt").to_string(),
+            format!("../{outside_name}/secret.txt"),
+            format!("../{outside_name}/missing.txt"),
+        ];
+        if cfg!(unix) {
+            escapes.push("prompts/link.txt".to_string());
+        }
+        for rel in &escapes {
+            let err = run_llm_step_with_prompt_file(&pkg, rel, &client)
+                .expect_err("escaping prompt path must be refused");
+            assert!(
+                err.to_string().contains("outside the skill bundle"),
+                "{rel}: {err:#}"
+            );
+        }
+        assert!(client.system_prompts.lock().expect("lock").is_empty());
+
+        let _ = fs::remove_dir_all(&skill_root);
+        let _ = fs::remove_dir_all(&outside);
     }
 }

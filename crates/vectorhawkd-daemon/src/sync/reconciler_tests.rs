@@ -1085,3 +1085,75 @@ fn names_without_a_mapping_pass_through_unchanged() {
     }
     cleanup(&root);
 }
+
+// ── .cskill tar.gz unpacking ─────────────────────────────────────────────────
+
+/// Build `<dir>/bundle.cskill` (tar.gz, wrapped in a `bundle/` dir) holding a
+/// regular `SKILL.md` and, optionally, a hard-link entry `prompts/system.txt`.
+fn write_cskill(dir: &Utf8PathBuf, hard_link_to: Option<&Utf8PathBuf>) -> Utf8PathBuf {
+    let archive_path = dir.join("bundle.cskill");
+    let file = std::fs::File::create(&archive_path).expect("create archive");
+    let gz = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+    let mut builder = tar::Builder::new(gz);
+
+    let body = b"---\nname: T\ndescription: T.\n---\n\nBody.\n";
+    let mut header = tar::Header::new_gnu();
+    header.set_size(body.len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    builder
+        .append_data(&mut header, "bundle/SKILL.md", &body[..])
+        .expect("append SKILL.md");
+
+    if let Some(target) = hard_link_to {
+        let mut link = tar::Header::new_gnu();
+        link.set_entry_type(tar::EntryType::Link);
+        link.set_size(0);
+        link.set_mode(0o644);
+        builder
+            .append_link(&mut link, "bundle/prompts/system.txt", target.as_std_path())
+            .expect("append hard link");
+    }
+
+    builder
+        .into_inner()
+        .expect("finish tar")
+        .finish()
+        .expect("finish gzip");
+    archive_path
+}
+
+#[test]
+fn unpack_cskill_archive_refuses_a_hard_link_entry() {
+    let root = temp_root("unpack-hard-link");
+    std::fs::create_dir_all(&root).unwrap();
+    let secret = root.join("secret.txt");
+    std::fs::write(&secret, "TOP SECRET").unwrap();
+    let archive = write_cskill(&root, Some(&secret));
+    let dest = root.join("unpacked");
+
+    let err =
+        super::unpack_cskill_archive(&archive, &dest).expect_err("hard-link entry must be refused");
+    assert!(err.to_string().contains("hard link"), "got: {err:#}");
+    assert!(
+        !dest.join("prompts/system.txt").exists(),
+        "hard link must not be created"
+    );
+
+    cleanup(&root);
+}
+
+#[test]
+fn unpack_cskill_archive_still_unpacks_regular_entries() {
+    let root = temp_root("unpack-regular");
+    std::fs::create_dir_all(&root).unwrap();
+    let archive = write_cskill(&root, None);
+    let dest = root.join("unpacked");
+
+    super::unpack_cskill_archive(&archive, &dest).expect("regular archive unpacks");
+    assert!(std::fs::read_to_string(dest.join("SKILL.md"))
+        .unwrap()
+        .contains("Body."));
+
+    cleanup(&root);
+}

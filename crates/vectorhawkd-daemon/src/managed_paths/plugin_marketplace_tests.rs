@@ -277,3 +277,118 @@ fn install_then_uninstall_is_clean_and_preserves_other_marketplaces() {
     assert!(theme_kept, "unrelated settings preserved");
     assert!(foreign_mkt_kept, "foreign marketplace preserved");
 }
+
+/// The plugin version comes verbatim from a third-party `plugin.json`, and the
+/// slug from the backend. Either one is joined into the cache path that gets
+/// `remove_dir_all`'d and refilled, so a value with `..` or a separator must be
+/// refused before any filesystem write, never resolved outside the cache.
+#[test]
+fn install_plugin_bundle_refuses_traversal_in_version_or_slug() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let fake_home = tempfile::tempdir().unwrap();
+    let prev = std::env::var_os("HOME");
+    std::env::set_var("HOME", fake_home.path());
+    let h = fake_home.path();
+
+    // A user directory outside the plugin cache that must survive.
+    let victim = h.join("victim");
+    std::fs::create_dir_all(&victim).unwrap();
+    std::fs::write(victim.join("keep.txt"), b"precious").unwrap();
+    // An earlier version is cached, so `<slug>/<version>` resolves on disk.
+    std::fs::create_dir_all(h.join(".claude/plugins/cache/vectorhawk/superpowers/5.0.6")).unwrap();
+
+    let mut bad_version = bundle();
+    bad_version.version = "../../../../../victim".to_string();
+    let version_result = install_plugin_bundle(&bad_version);
+
+    let mut bad_slug = bundle();
+    bad_slug.slug = "../../../../../victim".to_string();
+    let slug_result = install_plugin_bundle(&bad_slug);
+
+    let victim_kept = std::fs::read(victim.join("keep.txt")).ok() == Some(b"precious".to_vec());
+    let nothing_copied_into_victim = !victim.join(".claude-plugin").exists();
+    let no_source_written = !h
+        .join(".claude/plugins/marketplaces/vectorhawk/plugins/superpowers")
+        .exists();
+
+    if let Some(v) = prev {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+
+    assert!(version_result.is_err(), "traversal version must be refused");
+    assert!(slug_result.is_err(), "traversal slug must be refused");
+    assert!(
+        victim_kept,
+        "directory outside the cache must not be deleted"
+    );
+    assert!(
+        nothing_copied_into_victim,
+        "plugin tree must not be copied outside the cache"
+    );
+    assert!(
+        no_source_written,
+        "refusal happens before anything is written"
+    );
+}
+
+#[test]
+fn uninstall_plugin_bundle_refuses_traversal_in_slug() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let fake_home = tempfile::tempdir().unwrap();
+    let prev = std::env::var_os("HOME");
+    std::env::set_var("HOME", fake_home.path());
+    let h = fake_home.path();
+
+    install_plugin_bundle(&bundle()).unwrap();
+    let results: Vec<_> = ["..", "", ".", "../../../..", "a/b"]
+        .iter()
+        .map(|s| uninstall_plugin_bundle(s))
+        .collect();
+
+    let source_kept = h
+        .join(".claude/plugins/marketplaces/vectorhawk/plugins/superpowers/.claude-plugin/plugin.json")
+        .exists();
+    let cache_kept = h
+        .join(".claude/plugins/cache/vectorhawk/superpowers/5.0.7")
+        .exists();
+
+    if let Some(v) = prev {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+
+    assert!(
+        results.iter().all(|r| r.is_err()),
+        "unsafe slugs must be refused: {results:?}"
+    );
+    assert!(source_kept, "marketplace source must survive");
+    assert!(cache_kept, "plugin cache must survive");
+}
+
+#[test]
+fn single_path_component_check_accepts_versions_and_rejects_traversal() {
+    for ok in [
+        "5.0.7",
+        "1.0.0-beta.1+build.5",
+        "v2",
+        "None",
+        "superpowers",
+        "a..b",
+    ] {
+        assert!(
+            ensure_single_path_component("version", ok).is_ok(),
+            "{ok:?} should be accepted"
+        );
+    }
+    for bad in [
+        "", ".", "..", "../x", "x/..", "a/b", "a\\b", "/abs", "1.0/", "./1.0",
+    ] {
+        assert!(
+            ensure_single_path_component("version", bad).is_err(),
+            "{bad:?} should be rejected"
+        );
+    }
+}
