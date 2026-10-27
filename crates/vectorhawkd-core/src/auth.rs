@@ -1,3 +1,4 @@
+use crate::secret_file;
 use crate::state::AppState;
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -417,17 +418,18 @@ pub fn decode_jwt_sub(token: &str) -> Option<String> {
 
 // ── Token storage ────────────────────────────────────────────────────────────
 //
-// Secure-by-default-when-possible: token *secrets* (access_token, refresh_token)
-// live in the OS keychain when one is available (macOS Keychain, Windows
-// Credential Manager, Linux Secret Service). When the keychain probe fails —
-// headless boxes, CI containers, WSL without setup — we fall back to the
-// SQLite `auth_tokens` table.
+// Token *secrets* (access_token, refresh_token — a PAT is stored as the
+// access token) live in the OS keychain when one is usable (macOS Keychain,
+// Windows Credential Manager) and otherwise in an owner-only file in the
+// secrets store (`crate::secret_file`): always on Linux, and on headless or
+// keychain-disabled macOS. Never in `state.db` — older builds kept them in
+// the `auth_tokens` columns, and `move_legacy_secrets` moves them out.
 //
 // Backoff state (`refresh_failures`, `next_refresh_attempt_at`,
 // `last_refresh_status`) ALWAYS lives in SQLite. It's not secret, it's
 // structured, and the keychain isn't a great fit for non-secret metadata.
-// We always insert a backoff-state row even when secrets are in the
-// keychain, so `load_all_tokens` has something to iterate over.
+// We always insert a backoff-state row, with the secret columns empty, so
+// `load_all_tokens` has something to iterate over.
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 const KEYRING_SERVICE: &str = "com.vectorhawk.agent";
@@ -442,7 +444,7 @@ fn keyring_account(registry_url: &str) -> String {
 }
 
 /// Escape hatch — when `VECTORHAWK_DISABLE_KEYCHAIN=1` is set the OS keychain
-/// is treated as if it were unavailable, forcing the SQLite fallback. Used
+/// is treated as if it were unavailable, forcing the secrets-file fallback. Used
 /// by the test suite (so tests don't pollute the real macOS Keychain) and
 /// by users on shared boxes who prefer to keep tokens out of system stores.
 /// Public so `vectorhawk uninstall`'s keychain sweep honours it too.
@@ -452,7 +454,6 @@ pub fn keychain_disabled() -> bool {
         .unwrap_or(false)
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
 #[derive(Serialize, Deserialize)]
 struct KeychainBlob<'a> {
     access_token: &'a str,
@@ -483,8 +484,8 @@ enum KeychainProbe {
 // On macOS and Windows we link the `keyring` crate and use the OS-native
 // keystore. On Linux the crate is intentionally not pulled in (would force
 // a libdbus dep on the binary) — every call below returns Unavailable so
-// the SQLite fallback is used. Linux files keep 0600 perms; matches what
-// `gh`, `kubectl`, and `aws cli` do.
+// the secrets file is used: 0600 in a 0700 directory, which matches what
+// `gh`, `gcloud`, `kubectl` and Claude Code do on Linux.
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 fn keychain_get(registry_url: &str) -> KeychainProbe {
@@ -508,7 +509,7 @@ fn keychain_get(registry_url: &str) -> KeychainProbe {
         },
         Err(keyring::Error::NoEntry) => KeychainProbe::NotFound,
         Err(e) => {
-            debug!(error = %e, "keychain get_password failed — falling back to SQLite");
+            debug!(error = %e, "keychain get_password failed — falling back to the secrets file");
             KeychainProbe::Unavailable
         }
     }
@@ -521,7 +522,7 @@ fn keychain_get(_registry_url: &str) -> KeychainProbe {
 
 /// Try to write the secrets to the OS keychain. Returns Ok(true) on success,
 /// Ok(false) when the keychain isn't usable (caller should fall back to
-/// SQLite), or Err on a programming error.
+/// the secrets file), or Err on a programming error.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 fn keychain_set(registry_url: &str, access_token: &str, refresh_token: &str) -> Result<bool> {
     if keychain_disabled() {
@@ -530,7 +531,7 @@ fn keychain_set(registry_url: &str, access_token: &str, refresh_token: &str) -> 
     let entry = match keyring::Entry::new(KEYRING_SERVICE, &keyring_account(registry_url)) {
         Ok(e) => e,
         Err(e) => {
-            debug!(error = %e, "keychain entry constructor failed; will store in SQLite");
+            debug!(error = %e, "keychain entry constructor failed; will store in the secrets file");
             return Ok(false);
         }
     };
@@ -542,7 +543,7 @@ fn keychain_set(registry_url: &str, access_token: &str, refresh_token: &str) -> 
     match entry.set_password(&blob) {
         Ok(()) => Ok(true),
         Err(e) => {
-            debug!(error = %e, "keychain set_password failed; will store in SQLite");
+            debug!(error = %e, "keychain set_password failed; will store in the secrets file");
             Ok(false)
         }
     }
@@ -566,7 +567,53 @@ fn keychain_delete(registry_url: &str) {
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn keychain_delete(_registry_url: &str) {}
 
-/// Write secrets to the keychain (when available) or SQLite (fallback), and
+/// Secrets-store file name for a registry's tokens. Hashed, so any URL makes
+/// a safe file name.
+fn token_secret_name(registry_url: &str) -> String {
+    let digest = hex::encode(Sha256::digest(registry_url.as_bytes()));
+    format!("token-{}.json", &digest[..32])
+}
+
+/// A registry's secrets: the keychain's copy when it has one, else the
+/// secrets file's.
+fn secrets_get(state: &AppState, registry_url: &str) -> Result<Option<OwnedKeychainBlob>> {
+    if let KeychainProbe::Found(blob) = keychain_get(registry_url) {
+        return Ok(Some(blob));
+    }
+    let json = secret_file::read(
+        state.root_dir.as_std_path(),
+        &token_secret_name(registry_url),
+    )
+    .context("failed to read auth tokens from the secrets store")?;
+    json.map(|j| serde_json::from_str(&j).context("auth tokens file is not valid JSON"))
+        .transpose()
+}
+
+/// Store a registry's secrets in the keychain, or the secrets file when the
+/// keychain isn't usable.
+fn secrets_set(
+    state: &AppState,
+    registry_url: &str,
+    access_token: &str,
+    refresh_token: &str,
+) -> Result<()> {
+    let root = state.root_dir.as_std_path();
+    let name = token_secret_name(registry_url);
+    if keychain_set(registry_url, access_token, refresh_token)? {
+        // A file copy from a time the keychain was unusable is now stale.
+        let _ = secret_file::remove(root, &name);
+        return Ok(());
+    }
+    let blob = serde_json::to_string(&KeychainBlob {
+        access_token,
+        refresh_token,
+    })
+    .context("failed to serialize auth tokens")?;
+    secret_file::write(root, &name, &blob)
+        .context("failed to write auth tokens to the secrets store")
+}
+
+/// Write secrets to the keychain (when available) or the secrets file, and
 /// always update the SQLite backoff-state row so callers can iterate.
 ///
 /// On a successful save the backoff counters reset — the new tokens are
@@ -577,16 +624,7 @@ pub fn save_tokens(
     access_token: &str,
     refresh_token: &str,
 ) -> Result<()> {
-    let used_keychain = keychain_set(registry_url, access_token, refresh_token)?;
-
-    // SQLite row always exists. When the keychain has the secrets, the
-    // access_token / refresh_token columns are left empty so a stale fallback
-    // never wins after migration.
-    let (sqlite_access, sqlite_refresh): (&str, &str) = if used_keychain {
-        ("", "")
-    } else {
-        (access_token, refresh_token)
-    };
+    secrets_set(state, registry_url, access_token, refresh_token)?;
 
     let conn = Connection::open(&state.db_path).context("failed to open state DB")?;
     conn.execute(
@@ -594,15 +632,15 @@ pub fn save_tokens(
              registry_url, access_token, refresh_token,
              refresh_failures, next_refresh_attempt_at, last_refresh_status
          )
-         VALUES (?1, ?2, ?3, 0, NULL, 'ok')
+         VALUES (?1, '', '', 0, NULL, 'ok')
          ON CONFLICT(registry_url) DO UPDATE SET
-             access_token = excluded.access_token,
-             refresh_token = excluded.refresh_token,
+             access_token = '',
+             refresh_token = '',
              refresh_failures = 0,
              next_refresh_attempt_at = NULL,
              last_refresh_status = 'ok',
              saved_at = CURRENT_TIMESTAMP",
-        params![registry_url, sqlite_access, sqlite_refresh],
+        params![registry_url],
     )
     .context("failed to save auth tokens")?;
     Ok(())
@@ -630,15 +668,14 @@ pub fn record_refresh_failure(
 }
 
 /// Row shape returned by the SQLite half of `load_tokens`.
-/// `(access_token, refresh_token, refresh_failures, next_refresh_attempt_at,
-///   last_refresh_status)`.
+/// `(legacy access_token, legacy refresh_token, refresh_failures,
+///   next_refresh_attempt_at, last_refresh_status)`. The token columns are
+/// empty except on a database `move_legacy_secrets` hasn't processed yet.
 type SqliteAuthRow = (String, String, u32, Option<i64>, Option<String>);
 
-/// Load tokens for a single registry, transparently handling the keychain →
-/// SQLite fallback and performing a one-shot migration when SQLite still has
-/// the secrets but the keychain is now available.
+/// Load tokens for a single registry: secrets from the keychain or secrets
+/// file, backoff state from SQLite.
 pub fn load_tokens(state: &AppState, registry_url: &str) -> Result<Option<StoredTokens>> {
-    // Backoff state always reads from SQLite.
     let conn = Connection::open(&state.db_path).context("failed to open state DB")?;
     let sqlite_row: Option<SqliteAuthRow> = conn
         .query_row(
@@ -659,73 +696,18 @@ pub fn load_tokens(state: &AppState, registry_url: &str) -> Result<Option<Stored
             },
         )
         .optional()?;
+    drop(conn);
 
-    // Secrets: keychain wins when present.
-    let (access_token, refresh_token, sqlite_meta) = match keychain_get(registry_url) {
-        KeychainProbe::Found(blob) => {
-            // Drop the now-redundant SQLite copy if it was hanging around from
-            // a pre-keychain install.
-            if let Some(ref row) = sqlite_row {
-                if !row.0.is_empty() || !row.1.is_empty() {
-                    let _ = conn.execute(
-                        "UPDATE auth_tokens
-                         SET access_token = '', refresh_token = ''
-                         WHERE registry_url = ?1",
-                        [registry_url],
-                    );
-                }
-            }
-            (blob.access_token, blob.refresh_token, sqlite_row)
-        }
-        KeychainProbe::NotFound => {
-            // Migration path: if SQLite has secrets but the keychain doesn't,
-            // promote them now. Best-effort — if the keychain set fails we
-            // keep the SQLite copy and try again next load.
-            if let Some(ref row) = sqlite_row {
-                if !row.0.is_empty() && !row.1.is_empty() {
-                    if let Ok(true) = keychain_set(registry_url, &row.0, &row.1) {
-                        let _ = conn.execute(
-                            "UPDATE auth_tokens
-                             SET access_token = '', refresh_token = ''
-                             WHERE registry_url = ?1",
-                            [registry_url],
-                        );
-                        info!(
-                            registry_url,
-                            "migrated auth tokens from SQLite to OS keychain"
-                        );
-                        return Ok(Some(StoredTokens {
-                            access_token: row.0.clone(),
-                            refresh_token: row.1.clone(),
-                            registry_url: registry_url.to_string(),
-                            refresh_failures: row.2,
-                            next_refresh_attempt_at: row.3,
-                            last_refresh_status: row.4.clone(),
-                        }));
-                    }
-                    return Ok(Some(StoredTokens {
-                        access_token: row.0.clone(),
-                        refresh_token: row.1.clone(),
-                        registry_url: registry_url.to_string(),
-                        refresh_failures: row.2,
-                        next_refresh_attempt_at: row.3,
-                        last_refresh_status: row.4.clone(),
-                    }));
-                }
-            }
-            return Ok(None);
-        }
-        KeychainProbe::Unavailable => {
-            // Keychain isn't usable on this box — fall back to SQLite entirely.
-            let row = match sqlite_row {
-                Some(r) if !r.0.is_empty() && !r.1.is_empty() => r,
-                _ => return Ok(None),
-            };
-            (row.0.clone(), row.1.clone(), Some(row))
-        }
+    let (access_token, refresh_token) = match secrets_get(state, registry_url)? {
+        Some(blob) => (blob.access_token, blob.refresh_token),
+        // Not moved out of state.db yet (the move retries on every start).
+        None => match &sqlite_row {
+            Some(row) if !row.0.is_empty() && !row.1.is_empty() => (row.0.clone(), row.1.clone()),
+            _ => return Ok(None),
+        },
     };
 
-    let meta = sqlite_meta.unwrap_or((String::new(), String::new(), 0, None, None));
+    let meta = sqlite_row.unwrap_or((String::new(), String::new(), 0, None, None));
     Ok(Some(StoredTokens {
         access_token,
         refresh_token,
@@ -734,6 +716,42 @@ pub fn load_tokens(state: &AppState, registry_url: &str) -> Result<Option<Stored
         next_refresh_attempt_at: meta.3,
         last_refresh_status: meta.4,
     }))
+}
+
+/// Move every secret older builds kept in `state.db` out of it: auth tokens
+/// to the keychain or secrets file, the H3 local key to the secrets file.
+/// Then blank the columns and VACUUM, so no copy survives on a free page —
+/// every token refresh used to rewrite the row and leave the previous tokens
+/// behind. Idempotent; `AppState::bootstrap_in` runs it until it succeeds
+/// once.
+pub fn move_legacy_secrets(state: &AppState) -> Result<()> {
+    let conn = Connection::open(&state.db_path).context("failed to open state DB")?;
+    let mut stmt = conn.prepare(
+        "SELECT registry_url, access_token, refresh_token FROM auth_tokens
+         WHERE access_token != '' AND refresh_token != ''",
+    )?;
+    let rows: Vec<(String, String, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect::<std::result::Result<_, _>>()?;
+    drop(stmt);
+
+    for (registry_url, access_token, refresh_token) in rows {
+        if secrets_get(state, &registry_url)?.is_none() {
+            secrets_set(state, &registry_url, &access_token, &refresh_token)?;
+        }
+        info!(registry_url, "moved auth tokens out of state.db");
+    }
+    state.move_legacy_local_mcp_key()?;
+
+    conn.execute(
+        "UPDATE auth_tokens SET access_token = '', refresh_token = ''
+         WHERE access_token != '' OR refresh_token != ''",
+        [],
+    )
+    .context("failed to blank legacy token columns")?;
+    conn.execute_batch("VACUUM")
+        .context("failed to vacuum state.db")?;
+    Ok(())
 }
 
 /// Load all stored token rows. Used by the daemon refresh loop to check
@@ -761,10 +779,15 @@ pub fn load_all_tokens(state: &AppState) -> Result<Vec<StoredTokens>> {
     Ok(tokens)
 }
 
-/// Clear tokens for a single registry. Removes both the keychain entry (when
-/// present) and the SQLite row.
+/// Clear tokens for a single registry. Removes the keychain entry, the
+/// secrets file and the SQLite row.
 pub fn clear_tokens(state: &AppState, registry_url: &str) -> Result<()> {
     keychain_delete(registry_url);
+    secret_file::remove(
+        state.root_dir.as_std_path(),
+        &token_secret_name(registry_url),
+    )
+    .context("failed to delete auth tokens from the secrets store")?;
     let conn = Connection::open(&state.db_path).context("failed to open state DB")?;
     // Zero the deleted row's bytes instead of leaving them on a free page.
     conn.execute_batch("PRAGMA secure_delete = ON;")
@@ -1211,27 +1234,108 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// When the keychain is unavailable, save_tokens must still write the
-    /// secrets into the SQLite row so load_tokens can return them. This is
-    /// the headless/CI/container path.
+    fn db_contains(state: &AppState, needle: &[u8]) -> bool {
+        let bytes = std::fs::read(&state.db_path).expect("read db");
+        bytes.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// With the keychain unusable (Linux, headless macOS) the secrets go to
+    /// an owner-only file and never into state.db.
     #[test]
-    fn save_writes_to_sqlite_when_keychain_disabled() {
+    fn save_writes_to_the_secrets_file_not_sqlite_when_keychain_disabled() {
         let _guard = KeychainOff::enable();
-        let root = temp_root("sqlite-fallback");
+        let root = temp_root("file-fallback");
         let state = AppState::bootstrap_in(root.clone()).expect("bootstrap");
 
-        save_tokens(&state, "http://localhost:8000", "sqlite-acc", "sqlite-ref").expect("save");
+        save_tokens(
+            &state,
+            "http://localhost:8000",
+            "FILE-ACC-91c2",
+            "FILE-REF-91c2",
+        )
+        .expect("save");
 
-        let conn = Connection::open(&state.db_path).expect("open db");
-        let (a, r): (String, String) = conn
-            .query_row(
-                "SELECT access_token, refresh_token FROM auth_tokens WHERE registry_url = ?1",
-                ["http://localhost:8000"],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+        assert!(!db_contains(&state, b"91c2"), "no token bytes in state.db");
+        let file = secret_file::read(
+            state.root_dir.as_std_path(),
+            &token_secret_name("http://localhost:8000"),
+        )
+        .expect("read secrets file")
+        .expect("secrets file written");
+        assert!(file.contains("FILE-ACC-91c2") && file.contains("FILE-REF-91c2"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A state.db from an older build — tokens in the auth_tokens columns,
+    /// the H3 key in sync_state, stale copies of earlier tokens on free
+    /// pages — comes out of the next bootstrap with no secret bytes left in
+    /// it and every secret still readable.
+    #[test]
+    fn bootstrap_moves_legacy_secrets_out_of_state_db() {
+        let _guard = KeychainOff::enable();
+        let root = temp_root("legacy-move");
+        let state = AppState::bootstrap_in(root.clone()).expect("bootstrap");
+        {
+            let conn = Connection::open(&state.db_path).unwrap();
+            // An older build's refresh: a token row rewritten in place,
+            // leaving the earlier token on a free page.
+            conn.execute(
+                "INSERT INTO auth_tokens (registry_url, access_token, refresh_token)
+                 VALUES ('https://r.example', 'OLDACC-5e8d', 'OLDREF-5e8d')",
+                [],
             )
-            .expect("row");
-        assert_eq!(a, "sqlite-acc");
-        assert_eq!(r, "sqlite-ref");
+            .unwrap();
+            conn.execute(
+                "UPDATE auth_tokens SET access_token = 'NEWACC-5e8d', refresh_token = 'NEWREF-5e8d'",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO sync_state (key, value) VALUES ('mcp_local_key', 'LOCALKEY-5e8d')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "DELETE FROM sync_state WHERE key = 'legacy_secrets_moved'",
+                [],
+            )
+            .unwrap();
+        }
+        assert!(db_contains(&state, b"5e8d"), "fixture must plant the bytes");
+
+        let state = AppState::bootstrap_in(root.clone()).expect("bootstrap again");
+
+        assert!(
+            !db_contains(&state, b"5e8d"),
+            "no secret bytes left in state.db"
+        );
+        let tokens = load_tokens(&state, "https://r.example")
+            .unwrap()
+            .expect("tokens still there");
+        assert_eq!(tokens.access_token, "NEWACC-5e8d");
+        assert_eq!(tokens.refresh_token, "NEWREF-5e8d");
+        assert_eq!(state.local_mcp_key().unwrap(), "LOCALKEY-5e8d");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn clear_tokens_removes_the_secrets_file() {
+        let _guard = KeychainOff::enable();
+        let root = temp_root("clear-file");
+        let state = AppState::bootstrap_in(root.clone()).expect("bootstrap");
+
+        save_tokens(&state, "http://localhost:8000", "acc", "ref").expect("save");
+        clear_tokens(&state, "http://localhost:8000").expect("clear");
+        assert_eq!(
+            secret_file::read(
+                state.root_dir.as_std_path(),
+                &token_secret_name("http://localhost:8000"),
+            )
+            .unwrap(),
+            None
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
