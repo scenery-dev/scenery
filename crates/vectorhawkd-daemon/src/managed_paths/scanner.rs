@@ -11,7 +11,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
 };
-use tracing::{debug, warn};
+use tracing::warn;
 use vectorhawkd_mcp::ownership::{self, is_excluded_plugin_dir, is_vectorhawk_mcp_key};
 
 /// One discovered item ready for migration.
@@ -70,19 +70,12 @@ pub fn scan_skills_dir(skills_dir: &Path) -> Result<Vec<MigrationItem>> {
             continue;
         }
 
-        // Already ours — nothing to adopt. Same content-based ownership test
-        // `scan_plugin_marketplaces` applies to plugins.
-        //
-        // This matters most since the pivot to `~/.agents/skills`: VectorHawk
-        // now writes real skill content there and leaves a *symlink* at
-        // `~/.claude/skills/<slug>` for Claude Code. `fs::metadata` above
-        // follows that link, so without this check the daemon would rediscover
-        // its own pushed skills as freshly-found native items on every start.
-        // The marker is read through the link, i.e. from the canonical dir.
-        if ownership::is_vectorhawk_managed(&path) {
-            debug!(path = %path.display(), "managed_paths/scanner: skipping already-managed skill entry");
-            continue;
-        }
+        // Ownership is NOT decided here (F13): a `.vectorhawk-managed.json`
+        // file is attacker-controllable, so this scanner returns every
+        // well-formed dir and `migrator::migrate_item` decides from
+        // `managed_path_markers` (exact canonical path) whether it is ours —
+        // which also covers the post-pivot symlink at `~/.claude/skills/<slug>`
+        // pointing at our canonical `~/.agents/skills/<slug>` dir.
 
         let slug = match path.file_name().and_then(|n| n.to_str()) {
             Some(s) => s.to_string(),
@@ -208,7 +201,8 @@ pub fn scan_plugins_dir(plugins_dir: &Path) -> Result<Vec<MigrationItem>> {
             }
         };
 
-        let payload = serde_json::json!({ "manifest_json": manifest_value });
+        let payload =
+            serde_json::json!({ "manifest_json": sanitize_plugin_manifest(&manifest_value) });
 
         items.push(MigrationItem {
             kind: ItemKind::Plugin,
@@ -237,7 +231,6 @@ pub fn scan_plugins_dir(plugins_dir: &Path) -> Result<Vec<MigrationItem>> {
 /// Skipped:
 /// - **Anthropic-native** plugins — the internal `plugins/` subtree of the
 ///   official marketplace (see [`ownership::is_anthropic_native_in`]).
-/// - **Already-managed** plugins — those carrying a `.vectorhawk-managed.json`.
 ///
 /// Classification reads `known_marketplaces.json` from the *passed* `plugins_dir`
 /// so it stays self-consistent (and unit-testable) regardless of `$HOME`.
@@ -309,10 +302,8 @@ pub fn scan_plugin_marketplaces(plugins_dir: &Path) -> Result<Vec<MigrationItem>
                     continue;
                 }
 
-                // Already ours — nothing to adopt.
-                if ownership::is_vectorhawk_managed(&pdir) {
-                    continue;
-                }
+                // Ownership is decided by the migrator from the DB, not by a
+                // marker file the plugin could ship itself (F13).
                 // Anthropic first-party — strictly out of scope.
                 if ownership::is_anthropic_native_in(&pdir, plugins_dir, marketplaces.as_ref()) {
                     continue;
@@ -337,7 +328,7 @@ pub fn scan_plugin_marketplaces(plugins_dir: &Path) -> Result<Vec<MigrationItem>
                 };
 
                 let canonical_hash = sha256_bytes(&manifest_bytes);
-                let payload = serde_json::json!({ "manifest_json": manifest_value });
+                let payload = serde_json::json!({ "manifest_json": sanitize_plugin_manifest(&manifest_value) });
 
                 items.push(MigrationItem {
                     kind: ItemKind::Plugin,
@@ -411,11 +402,31 @@ pub fn scan_claude_json(claude_json: &Path) -> Result<Vec<MigrationItem>> {
             source_path: PathBuf::from(virtual_path),
             files: vec![claude_json.to_path_buf()],
             canonical_hash,
-            payload: serde_json::json!({ "mcp_config": value }),
+            // F9: allowlisted fields only — never env/header values or raw args.
+            payload: serde_json::json!({ "mcp_config": super::mcp_discovery::migrate_mcp_config(value) }),
         });
     }
 
     Ok(items)
+}
+
+// ── F9: plugin manifest allowlist ─────────────────────────────────────────────
+
+/// The only `plugin.json` fields uploaded in the migrate payload.
+pub(crate) const MIGRATE_PLUGIN_MANIFEST_FIELDS: &[&str] = &["name", "version", "description"];
+
+/// Reduce a raw `plugin.json` to the allowlisted, string-valued descriptive
+/// fields the backend reads (`name`, `version`, `description`). Everything
+/// else — inline `mcpServers` (env/headers/args), `hooks` commands, author
+/// contact details, paths — is dropped. Idempotent.
+pub(crate) fn sanitize_plugin_manifest(manifest: &serde_json::Value) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    for field in MIGRATE_PLUGIN_MANIFEST_FIELDS {
+        if let Some(v) = manifest.get(*field).filter(|v| v.is_string()) {
+            out.insert((*field).to_string(), v.clone());
+        }
+    }
+    serde_json::Value::Object(out)
 }
 
 // ── SHA-256 helper ────────────────────────────────────────────────────────────

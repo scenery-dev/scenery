@@ -144,6 +144,88 @@ pub fn is_already_marked(conn: &Connection, path: &str) -> Result<bool> {
     Ok(result.is_some())
 }
 
+// ── DB-backed ownership (F13) ─────────────────────────────────────────────────
+
+/// Whether a skill/plugin directory is VectorHawk-managed according to the
+/// authoritative `managed_path_markers` table.
+///
+/// The `.vectorhawk-managed.json` sidecar is deliberately NOT consulted: any
+/// skill author can ship one. Only a row VectorHawk itself wrote, at this
+/// exact canonical path, counts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DbOwnership {
+    /// A row exists at this canonical path and the on-disk content hash
+    /// matches it.
+    Verified,
+    /// A row exists at this canonical path but the content no longer matches
+    /// its hash (edited, replaced, or half-written).
+    HashMismatch,
+    /// No row at this path — not ours, whatever marker file it carries.
+    Untracked,
+}
+
+/// Return the `kind` row whose path is `dir`, comparing canonicalised paths so
+/// a symlink (e.g. `~/.claude/skills/<slug>` -> `~/.agents/skills/<slug>`) or
+/// a `/var` vs `/private/var` spelling resolves to the same row. Slug is never
+/// used as the key.
+pub fn tracked_marker_for_path(
+    conn: &Connection,
+    kind: &str,
+    dir: &Path,
+) -> Result<Option<ManagedPathMarker>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT path, kind, slug, installation_id, source_sha256, migrated_at \
+             FROM managed_path_markers WHERE kind = ?1",
+        )
+        .context("failed to prepare managed_path_markers lookup")?;
+    let rows = stmt
+        .query_map([kind], |row| {
+            Ok(ManagedPathMarker {
+                path: row.get(0)?,
+                kind: row.get(1)?,
+                slug: row.get(2)?,
+                installation_id: row.get(3)?,
+                source_sha256: row.get(4)?,
+                migrated_at: row.get(5)?,
+            })
+        })
+        .context("failed to query managed_path_markers")?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to read managed_path_markers rows")?;
+
+    let raw = dir.to_string_lossy();
+    if let Some(row) = rows.iter().find(|r| r.path == raw) {
+        return Ok(Some(row.clone()));
+    }
+    let Ok(canonical) = std::fs::canonicalize(dir) else {
+        return Ok(None);
+    };
+    Ok(rows.into_iter().find(|r| {
+        std::fs::canonicalize(&r.path)
+            .map(|p| p == canonical)
+            .unwrap_or(false)
+    }))
+}
+
+/// Classify `dir` against `managed_path_markers` — see [`DbOwnership`].
+/// A DB error is treated as [`DbOwnership::Untracked`] (fail-open towards
+/// reporting/adopting, never towards hiding).
+pub fn db_ownership(conn: &Connection, kind: &str, dir: &Path) -> DbOwnership {
+    let row = match tracked_marker_for_path(conn, kind, dir) {
+        Ok(Some(row)) => row,
+        Ok(None) => return DbOwnership::Untracked,
+        Err(e) => {
+            warn!(path = %dir.display(), error = %e, "managed_paths/marker: ownership lookup failed");
+            return DbOwnership::Untracked;
+        }
+    };
+    match super::drift::current_hash_for(&row) {
+        Ok(Some(h)) if h == row.source_sha256 => DbOwnership::Verified,
+        _ => DbOwnership::HashMismatch,
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

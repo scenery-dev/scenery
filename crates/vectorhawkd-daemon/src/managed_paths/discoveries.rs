@@ -2,9 +2,9 @@
 //!
 //! Scans extra roots (`~/.agents/skills/`, `~/.pi/agent/skills/`, and any
 //! paths in `VECTORHAWK_EXTRA_SKILL_ROOTS`) for skills that are NOT already
-//! tracked in `managed_path_markers`. Found items are POSTed to the backend
-//! in a single batch so the portal can present them to the user for optional
-//! adoption.
+//! verifiably managed (exact path + hash in `managed_path_markers`; F13).
+//! Found items are POSTed to the backend in a single batch so the portal can
+//! present them to the user for optional adoption.
 //!
 //! **This module is REPORT-ONLY.** It never writes markers, never moves files,
 //! and never takes any local action. If the POST fails the daemon continues
@@ -64,6 +64,7 @@ use tracing::{debug, info, warn};
 use vectorhawkd_core::{auth::load_all_tokens, state::AppState};
 use vectorhawkd_mcp::setup::ClientConfig;
 
+use super::marker::{db_ownership, DbOwnership};
 use super::mcp_discovery;
 
 const ENV_DISABLE: &str = "VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER";
@@ -85,8 +86,10 @@ pub struct DiscoveryItem {
     pub slug: String,
     pub source_path: String,
     pub canonical_hash: String,
-    /// Kind-specific metadata. `None` for skill items (which carry nothing
-    /// beyond the fields above); `Some(...)` for `kind="mcp"` items, holding
+    /// Kind-specific metadata. `None` for ordinary skill items;
+    /// `{"suspicious": true, "suspicious_reason": ...}` for a skill that
+    /// claims to be VectorHawk-managed but fails the DB check (see
+    /// [`collect_discoveries`]); `Some(...)` for `kind="mcp"` items, holding
     /// the JSON-serialized, already-allowlisted
     /// [`super::mcp_discovery::McpDiscoveryDetail`] — see
     /// [`mcp_item_to_discovery_item`]. The backend's `DiscoveryItem` schema
@@ -255,7 +258,7 @@ pub async fn run_once(state: Arc<AppState>, registry_url: String) -> Result<usiz
 ///
 /// Always includes `~/.agents/skills/` (if it exists) — note this is now also
 /// VectorHawk's own canonical write location, so the scan filters out
-/// directories carrying a `.vectorhawk-managed.json` marker.
+/// directories with a matching `managed_path_markers` row (path + hash).
 ///
 /// Also always includes `~/.pi/agent/skills/` — Pi (the pi coding agent,
 /// github.com/earendil-works/pi) already scans `~/.agents/skills/` natively
@@ -289,8 +292,17 @@ pub fn extra_roots() -> Vec<PathBuf> {
 
 // ── Scan ──────────────────────────────────────────────────────────────────────
 
-/// Scan all `roots`, skip roots that do not exist, and return only items whose
-/// slug is NOT already present in `managed_path_markers` (kind='skill').
+/// Scan all `roots`, skip roots that do not exist, and return every skill that
+/// is not *verifiably* VectorHawk-managed.
+///
+/// F13: "managed" means a `managed_path_markers` row of `kind='skill'` at this
+/// exact canonical path whose hash matches the on-disk SKILL.md — never a
+/// slug match, and never the `.vectorhawk-managed.json` file (which any skill
+/// author can ship). Items that look managed but fail that check are reported
+/// with a `detail.suspicious_reason`:
+///
+/// - `"unverified_managed_marker"` — carries a marker file but has no row.
+/// - `"managed_hash_mismatch"` — has a row, but its content does not match.
 pub fn collect_discoveries(roots: &[PathBuf], state: &AppState) -> Vec<DiscoveryItem> {
     let mut items: Vec<DiscoveryItem> = Vec::new();
 
@@ -310,10 +322,30 @@ pub fn collect_discoveries(roots: &[PathBuf], state: &AppState) -> Vec<Discovery
 
         match scan_root(root) {
             Ok(found) => {
-                for item in found {
-                    if is_already_managed(&conn, &item.slug) {
-                        debug!(slug = %item.slug, "discoveries: already managed — skipping");
-                        continue;
+                for mut item in found {
+                    let path = Path::new(&item.source_path);
+                    let reason = match db_ownership(&conn, "skill", path) {
+                        DbOwnership::Verified => {
+                            debug!(slug = %item.slug, "discoveries: verified managed — skipping");
+                            continue;
+                        }
+                        DbOwnership::HashMismatch => Some("managed_hash_mismatch"),
+                        DbOwnership::Untracked => {
+                            vectorhawkd_mcp::ownership::is_vectorhawk_managed(path)
+                                .then_some("unverified_managed_marker")
+                        }
+                    };
+                    if let Some(reason) = reason {
+                        warn!(
+                            slug = %item.slug,
+                            path = %item.source_path,
+                            reason,
+                            "discoveries: skill claims to be VectorHawk-managed but is not verifiable — reporting as suspicious"
+                        );
+                        item.detail = Some(serde_json::json!({
+                            "suspicious": true,
+                            "suspicious_reason": reason,
+                        }));
                     }
                     items.push(item);
                 }
@@ -399,15 +431,9 @@ fn scan_root(root: &Path) -> Result<Vec<DiscoveryItem>> {
             continue;
         }
 
-        // Post-pivot, `~/.agents/skills/` is also VectorHawk's own write
-        // location. `collect_discoveries` filters managed slugs via SQLite,
-        // but that lags the filesystem — `remove_skill` drops the DB marker
-        // before the directory, so a scan in that window would report our own
-        // half-removed skill as foreign. The on-disk marker is the backstop.
-        if vectorhawkd_mcp::ownership::is_vectorhawk_managed(&path) {
-            debug!(path = %path.display(), "discoveries: VectorHawk-managed — skipping");
-            continue;
-        }
+        // No ownership decision here (F13): `~/.agents/skills/` is also
+        // VectorHawk's own write location, but a `.vectorhawk-managed.json`
+        // file proves nothing — `collect_discoveries` checks the DB row.
 
         let slug = match path.file_name().and_then(|n| n.to_str()) {
             Some(s) => s.to_string(),
@@ -454,22 +480,6 @@ fn scan_root(root: &Path) -> Result<Vec<DiscoveryItem>> {
     }
 
     Ok(items)
-}
-
-// ── Already-managed check ─────────────────────────────────────────────────────
-
-/// Return `true` if there is already a `managed_path_markers` row with
-/// `kind='skill'` and `slug=slug`.
-fn is_already_managed(conn: &Connection, slug: &str) -> bool {
-    use rusqlite::OptionalExtension;
-    conn.query_row(
-        "SELECT 1 FROM managed_path_markers WHERE kind = 'skill' AND slug = ?1 LIMIT 1",
-        [slug],
-        |_row| Ok(()),
-    )
-    .optional()
-    .unwrap_or(None)
-    .is_some()
 }
 
 // ── HTTP report ───────────────────────────────────────────────────────────────
@@ -668,10 +678,11 @@ mod tests {
             conn.execute(
                 "INSERT INTO managed_path_markers \
                  (path, kind, slug, installation_id, source_sha256, migrated_at) \
-                 VALUES (?1, 'skill', ?2, NULL, 'aabbcc', '2026-01-01T000000Z')",
+                 VALUES (?1, 'skill', ?2, NULL, ?3, '2026-01-01T000000Z')",
                 rusqlite::params![
                     root.join("managed-skill").to_string_lossy().to_string(),
-                    "managed-skill"
+                    "managed-skill",
+                    hex_sha256(b"---\nname: managed-skill\n---\n"),
                 ],
             )
             .unwrap();
@@ -856,32 +867,134 @@ mod tests {
         assert!(!should_skip_debounced_kick(true, Duration::from_secs(3600)));
     }
 
-    // ── 8. scan_root skips VectorHawk-managed dirs but keeps foreign ones ─────
+    // ── 8. F13: ownership comes from the DB row, never the marker file ──────
 
-    #[test]
-    fn scan_skips_vectorhawk_managed_dirs_in_agents_root() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("skills");
+    fn insert_skill_row(state: &AppState, path: &Path, slug: &str, sha: &str) {
+        let conn = Connection::open(&state.db_path).unwrap();
+        conn.execute(
+            "INSERT INTO managed_path_markers \
+             (path, kind, slug, installation_id, source_sha256, migrated_at) \
+             VALUES (?1, 'skill', ?2, NULL, ?3, '2026-01-01T00:00:00Z')",
+            rusqlite::params![path.to_string_lossy().to_string(), slug, sha],
+        )
+        .unwrap();
+    }
 
-        // Ours — must not be reported as a discovery.
-        let managed = root.join("managed-skill");
-        std::fs::create_dir_all(&managed).unwrap();
-        std::fs::write(managed.join("SKILL.md"), b"---\nname: managed-skill\n---\n").unwrap();
-        std::fs::write(
-            managed.join(".vectorhawk-managed.json"),
+    fn forge_marker(dir: &Path) {
+        fs::write(
+            dir.join(".vectorhawk-managed.json"),
             br#"{"marker_version":1,"installation_id":null,"source_sha256":"abc","migrated_at":"2026-01-01T00:00:00Z"}"#,
         )
         .unwrap();
+    }
 
-        // Theirs — installed by `npx skills`, must be reported.
-        let foreign = root.join("foreign-skill");
-        std::fs::create_dir_all(&foreign).unwrap();
-        std::fs::write(foreign.join("SKILL.md"), b"---\nname: foreign-skill\n---\n").unwrap();
+    fn suspicious_reason(item: &DiscoveryItem) -> Option<String> {
+        item.detail
+            .as_ref()
+            .and_then(|d| d.get("suspicious_reason"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    }
 
-        let found = super::scan_root(&root).unwrap();
-        let slugs: Vec<&str> = found.iter().map(|d| d.slug.as_str()).collect();
+    #[test]
+    fn forged_marker_without_db_row_is_reported_as_suspicious() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("skills");
+        let forged = write_skill(&root, "forged-skill");
+        forge_marker(&forged);
+        write_skill(&root, "foreign-skill");
 
-        assert_eq!(slugs, vec!["foreign-skill"]);
+        let (state, _guard) = temp_state();
+        let items = collect_discoveries(&[root], &state);
+        let mut slugs: Vec<&str> = items.iter().map(|d| d.slug.as_str()).collect();
+        slugs.sort();
+        assert_eq!(slugs, vec!["foreign-skill", "forged-skill"]);
+
+        let forged_item = items.iter().find(|i| i.slug == "forged-skill").unwrap();
+        assert_eq!(
+            suspicious_reason(forged_item).as_deref(),
+            Some("unverified_managed_marker")
+        );
+        let foreign_item = items.iter().find(|i| i.slug == "foreign-skill").unwrap();
+        assert!(foreign_item.detail.is_none());
+    }
+
+    /// Reusing a managed slug in another root must not hide a skill: the
+    /// already-managed check is keyed on path, not slug.
+    #[test]
+    fn managed_slug_at_a_different_path_is_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let managed_root = tmp.path().join("managed");
+        let real = write_skill(&managed_root, "pdf");
+        let (state, _guard) = temp_state();
+        insert_skill_row(&state, &real, "pdf", &hex_sha256(b"---\nname: pdf\n---\n"));
+
+        let pi_root = tmp.path().join("pi-skills");
+        let shadow = write_skill(&pi_root, "pdf");
+        fs::write(shadow.join("SKILL.md"), "---\nname: pdf\n---\nevil").unwrap();
+
+        let items = collect_discoveries(&[pi_root], &state);
+        assert_eq!(items.len(), 1, "same-slug skill elsewhere must be reported");
+        assert_eq!(items[0].slug, "pdf");
+    }
+
+    #[test]
+    fn managed_dir_with_matching_row_and_hash_is_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("skills");
+        let ours = write_skill(&root, "ours");
+        forge_marker(&ours); // a real managed dir carries the marker too
+        let (state, _guard) = temp_state();
+        insert_skill_row(
+            &state,
+            &ours,
+            "ours",
+            &hex_sha256(b"---\nname: ours\n---\n"),
+        );
+
+        let items = collect_discoveries(&[root], &state);
+        assert!(
+            items.is_empty(),
+            "verified managed skill must be skipped: {items:?}"
+        );
+    }
+
+    /// Row keyed on a non-canonical spelling of the same directory (e.g. a
+    /// symlinked root) still matches after canonicalisation.
+    #[test]
+    fn managed_dir_reached_through_a_symlinked_root_is_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real_root = tmp.path().join("real");
+        let ours = write_skill(&real_root, "ours");
+        let (state, _guard) = temp_state();
+        insert_skill_row(
+            &state,
+            &ours,
+            "ours",
+            &hex_sha256(b"---\nname: ours\n---\n"),
+        );
+        let link_root = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real_root, &link_root).unwrap();
+
+        let items = collect_discoveries(&[link_root], &state);
+        assert!(items.is_empty(), "{items:?}");
+    }
+
+    #[test]
+    fn managed_dir_with_hash_mismatch_is_reported_as_suspicious() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("skills");
+        let ours = write_skill(&root, "ours");
+        forge_marker(&ours);
+        let (state, _guard) = temp_state();
+        insert_skill_row(&state, &ours, "ours", "0000");
+
+        let items = collect_discoveries(&[root], &state);
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            suspicious_reason(&items[0]).as_deref(),
+            Some("managed_hash_mismatch")
+        );
     }
 
     // ── 9. R2: merged batch contains both a skill and an MCP item ─────────────

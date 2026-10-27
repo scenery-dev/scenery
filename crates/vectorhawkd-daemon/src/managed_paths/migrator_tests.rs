@@ -168,19 +168,43 @@ async fn migrate_item_marks_adopted_skill_as_managed() {
     );
 }
 
-/// Pins the fix for the self-adoption bug (step "0.5" in `migrate_item`):
-/// a `MigrationItem` whose `source_path` already carries
-/// `.vectorhawk-managed.json` must never be adopted — no backup POST, no DB
-/// marker row, and `migrate_item` must return `Ok(false)` rather than
-/// `Ok(true)`. Without this check the idempotency check in step 1 is not
-/// sufficient, because since the `.agents` pivot the DB marker is keyed on
-/// the canonical path while the scanner can hand back a different (symlink)
-/// `source_path` for the same content.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(bytes))
+}
+
+fn insert_row(state: &AppState, path: &std::path::Path, kind: &str, slug: &str, sha: &str) {
+    let conn = rusqlite::Connection::open(&state.db_path).unwrap();
+    crate::managed_paths::marker::insert_db_marker(
+        &conn,
+        &crate::managed_paths::marker::ManagedPathMarker {
+            path: path.to_string_lossy().to_string(),
+            kind: kind.to_string(),
+            slug: slug.to_string(),
+            installation_id: None,
+            source_sha256: sha.to_string(),
+            migrated_at: "2026-01-01T00:00:00Z".to_string(),
+        },
+    )
+    .unwrap();
+}
+
+fn row_count(state: &AppState) -> i64 {
+    let conn = rusqlite::Connection::open(&state.db_path).unwrap();
+    conn.query_row("SELECT COUNT(*) FROM managed_path_markers", [], |r| {
+        r.get(0)
+    })
+    .unwrap()
+}
+
+/// F13: a `.vectorhawk-managed.json` file is attacker-controllable, so a skill
+/// that ships one but has no `managed_path_markers` row is NOT ours and must
+/// be adopted (and so reported) like any other user skill.
 #[tokio::test]
-async fn migrate_item_does_not_adopt_vectorhawk_managed_source() {
+async fn migrate_item_adopts_skill_with_forged_marker_and_no_row() {
     let tmp = tempfile::tempdir().unwrap();
     let (state, _guard) = temp_state();
-    let item = skill_item("already-managed", tmp.path());
+    let item = skill_item("forged", tmp.path());
     fs::write(
         item.source_path
             .join(vectorhawkd_mcp::ownership::MANAGED_MARKER_FILENAME),
@@ -193,20 +217,222 @@ async fn migrate_item_does_not_adopt_vectorhawk_managed_source() {
     let result = migrate_item(&item, &backup_root, &state, "http://unused", &client)
         .await
         .unwrap();
+    assert!(
+        result,
+        "a forged marker must not hide a skill from adoption"
+    );
+}
 
+/// F13 (reviewer's bypass): same for plugin dirs.
+#[tokio::test]
+async fn migrate_item_adopts_plugin_with_forged_marker_and_no_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (state, _guard) = temp_state();
+    let pdir = tmp.path().join("acme-tool");
+    fs::create_dir_all(pdir.join(".claude-plugin")).unwrap();
+    let manifest = pdir.join(".claude-plugin").join("plugin.json");
+    fs::write(&manifest, r#"{"name":"acme-tool"}"#).unwrap();
+    fs::write(
+        pdir.join(vectorhawkd_mcp::ownership::MANAGED_MARKER_FILENAME),
+        "{}",
+    )
+    .unwrap();
+    let item = MigrationItem {
+        kind: ItemKind::Plugin,
+        slug: "acme-tool".to_string(),
+        source_path: pdir.clone(),
+        files: vec![manifest],
+        canonical_hash: sha256_hex(br#"{"name":"acme-tool"}"#),
+        payload: serde_json::json!({"manifest_json": {"name": "acme-tool"}}),
+    };
+    let client = reqwest::Client::new();
+    let result = migrate_item(
+        &item,
+        &tmp.path().join("backup"),
+        &state,
+        "http://unused",
+        &client,
+    )
+    .await
+    .unwrap();
+    assert!(
+        result,
+        "a forged marker must not hide a plugin from adoption"
+    );
+}
+
+/// The production self-adoption shape: the DB row is keyed on the canonical
+/// `~/.agents/skills/<slug>` dir and the scanner hands back the
+/// `~/.claude/skills/<slug>` symlink. Matching on the canonicalised path keeps
+/// VectorHawk from re-adopting its own skill — without trusting the marker.
+#[tokio::test]
+async fn migrate_item_skips_symlink_to_db_tracked_canonical_skill() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (state, _guard) = temp_state();
+    let canonical = tmp.path().join("agents-skills");
+    let item_canon = skill_item("ours", &canonical);
+    insert_row(
+        &state,
+        &item_canon.source_path,
+        "skill",
+        "ours",
+        &sha256_hex(b"---\nname: test\n---\n"),
+    );
+    let links = tmp.path().join("claude-skills");
+    fs::create_dir_all(&links).unwrap();
+    let link = links.join("ours");
+    std::os::unix::fs::symlink(&item_canon.source_path, &link).unwrap();
+
+    let item = MigrationItem {
+        source_path: link.clone(),
+        ..item_canon.clone()
+    };
+    let client = reqwest::Client::new();
+    let result = migrate_item(
+        &item,
+        &tmp.path().join("backup"),
+        &state,
+        "http://unused",
+        &client,
+    )
+    .await
+    .unwrap();
     assert!(
         !result,
-        "an already-managed source_path must never be (re)adopted"
+        "our own skill reached through its link must not be re-adopted"
     );
+    assert_eq!(
+        row_count(&state),
+        1,
+        "no second marker row at the link path"
+    );
+}
 
-    let conn = rusqlite::Connection::open(&state.db_path).unwrap();
-    assert!(
-        !crate::managed_paths::marker::is_already_marked(
-            &conn,
-            &item.source_path.to_string_lossy(),
+/// A DB-tracked path whose content changed is drift's business (drift reports
+/// it to the backend); F1 must not adopt it a second time.
+#[tokio::test]
+async fn migrate_item_skips_tracked_path_even_when_hash_differs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (state, _guard) = temp_state();
+    let item = skill_item("drifted", tmp.path());
+    insert_row(&state, &item.source_path, "skill", "drifted", "0000");
+    let client = reqwest::Client::new();
+    let result = migrate_item(
+        &item,
+        &tmp.path().join("backup"),
+        &state,
+        "http://unused",
+        &client,
+    )
+    .await
+    .unwrap();
+    assert!(!result);
+    assert_eq!(row_count(&state), 1);
+}
+
+// ── F9: the migrate POST only ever carries allowlisted fields ────────────────
+
+/// Defense in depth: even if a scanner bug hands `post_migrate` a raw
+/// payload, only allowlisted fields leave the machine.
+#[tokio::test]
+async fn post_migrate_strips_non_allowlisted_payload_fields() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (state, _guard) = temp_state();
+    let mut server = mockito::Server::new_async().await;
+    let registry_url = server.url();
+    vectorhawkd_core::auth::save_tokens(&state, &registry_url, "tok", "rtok").unwrap();
+
+    let bodies: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+    let cap = bodies.clone();
+    let _m = server
+        .mock("POST", "/portal/managed-paths/migrate")
+        .match_request(move |req| {
+            cap.lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(req.body().unwrap()).to_string());
+            true
+        })
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"migrated":[{"installation_id":"i-1","is_new":true}],"errors":[]}"#)
+        .expect_at_least(1)
+        .create_async()
+        .await;
+
+    let claude_json = tmp.path().join(".claude.json");
+    fs::write(&claude_json, "{}").unwrap();
+    let mcp = MigrationItem {
+        kind: ItemKind::Mcp,
+        slug: "raw".to_string(),
+        source_path: std::path::PathBuf::from(format!("{}:raw", claude_json.display())),
+        files: vec![claude_json.clone()],
+        canonical_hash: "h".to_string(),
+        payload: serde_json::json!({
+            "mcp_config": {
+                "command": "npx",
+                "args": ["--token", "ARGSECRET"],
+                "env": {"K": "ghp_ENVSECRET"},
+                "headers": {"Authorization": "Bearer HDRSECRET"},
+                "url": "https://u:USERINFOSECRET@h.example/PATHSECRET",
+                "transport": "stdio",
+                "env_keys": ["K"],
+                "arg_count": 2
+            },
+            "extra": "EXTRASECRET"
+        }),
+    };
+    let pdir = tmp.path().join("p");
+    fs::create_dir_all(pdir.join(".claude-plugin")).unwrap();
+    let manifest = pdir.join(".claude-plugin").join("plugin.json");
+    fs::write(&manifest, "{}").unwrap();
+    let plugin = MigrationItem {
+        kind: ItemKind::Plugin,
+        slug: "p".to_string(),
+        source_path: pdir,
+        files: vec![manifest],
+        canonical_hash: "h2".to_string(),
+        payload: serde_json::json!({"manifest_json": {
+            "name": "p", "version": "1", "description": "d",
+            "mcpServers": {"x": {"env": {"K": "PLUGINSECRET"}}}
+        }}),
+    };
+
+    let client = reqwest::Client::new();
+    for item in [&mcp, &plugin] {
+        migrate_item(
+            item,
+            &tmp.path().join("backup"),
+            &state,
+            &registry_url,
+            &client,
         )
-        .unwrap(),
-        "no managed_path_markers row should be inserted for already-managed content"
+        .await
+        .unwrap();
+    }
+
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 2, "both items must have been POSTed");
+    for b in bodies.iter() {
+        for secret in [
+            "ARGSECRET",
+            "ghp_ENVSECRET",
+            "HDRSECRET",
+            "USERINFOSECRET",
+            "PATHSECRET",
+            "EXTRASECRET",
+            "PLUGINSECRET",
+        ] {
+            assert!(!b.contains(secret), "POST body leaked {secret}: {b}");
+        }
+    }
+    let mcp_body: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+    let cfg = &mcp_body["items"][0]["payload"]["mcp_config"];
+    assert_eq!(cfg["env_keys"], serde_json::json!(["K"]));
+    assert_eq!(cfg["transport"], "stdio");
+    let plugin_body: serde_json::Value = serde_json::from_str(&bodies[1]).unwrap();
+    assert_eq!(
+        plugin_body["items"][0]["payload"]["manifest_json"],
+        serde_json::json!({"name": "p", "version": "1", "description": "d"})
     );
 }
 
