@@ -265,6 +265,75 @@ fn quarantine_mcp_writes_entry_snapshot_and_removes() {
     }
 }
 
+#[cfg(unix)]
+fn mcp_marker_for(claude_json: &std::path::Path, slug: &str) -> ManagedPathMarker {
+    ManagedPathMarker {
+        path: format!("{}:{slug}", claude_json.display()),
+        kind: "mcp".to_string(),
+        slug: slug.to_string(),
+        installation_id: None,
+        source_sha256: "x".to_string(),
+        migrated_at: "2026-05-24T00:00:00Z".to_string(),
+    }
+}
+
+#[cfg(unix)]
+fn mode_of(path: &std::path::Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+/// restore_canonical's MCP path rewrites `~/.claude.json`, which holds
+/// other MCP servers' secrets. The rewrite must keep the owner-only mode
+/// rather than landing a umask-default (world-readable) copy.
+#[cfg(unix)]
+#[test]
+fn remove_path_for_mcp_preserves_owner_only_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let td = TempDir::new().unwrap();
+    let claude_json = td.path().join(".claude.json");
+    let root = serde_json::json!({
+        "mcpServers": {
+            "fs": {"command":"rogue"},
+            "other": {"command":"keep-me","env":{"TOKEN":"secret"}}
+        }
+    });
+    fs::write(&claude_json, serde_json::to_vec_pretty(&root).unwrap()).unwrap();
+    fs::set_permissions(&claude_json, fs::Permissions::from_mode(0o600)).unwrap();
+
+    // A leftover temp file from an earlier run, at a wide mode, must not
+    // be reused (it would keep its mode and carry it over on rename).
+    let stale_tmp = claude_json.with_extension("tmp.drift");
+    fs::write(&stale_tmp, b"stale").unwrap();
+    fs::set_permissions(&stale_tmp, fs::Permissions::from_mode(0o644)).unwrap();
+
+    remove_path_for(&mcp_marker_for(&claude_json, "fs")).unwrap();
+
+    assert_eq!(mode_of(&claude_json), 0o600);
+    assert!(!stale_tmp.exists());
+    let after: serde_json::Value =
+        serde_json::from_slice(&fs::read(&claude_json).unwrap()).unwrap();
+    assert!(after["mcpServers"].get("fs").is_none());
+    assert_eq!(after["mcpServers"]["other"]["env"]["TOKEN"], "secret");
+}
+
+/// The rewrite keeps whatever mode the file already had — it neither
+/// widens nor changes a mode the user chose.
+#[cfg(unix)]
+#[test]
+fn remove_path_for_mcp_keeps_existing_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let td = TempDir::new().unwrap();
+    let claude_json = td.path().join(".claude.json");
+    let root = serde_json::json!({"mcpServers": {"fs": {"command":"rogue"}}});
+    fs::write(&claude_json, serde_json::to_vec_pretty(&root).unwrap()).unwrap();
+    fs::set_permissions(&claude_json, fs::Permissions::from_mode(0o640)).unwrap();
+
+    remove_path_for(&mcp_marker_for(&claude_json, "fs")).unwrap();
+
+    assert_eq!(mode_of(&claude_json), 0o640);
+}
+
 #[test]
 fn policy_mode_parses_known_strings() {
     assert_eq!(PolicyMode::from_str_or_default("warn"), PolicyMode::Warn);

@@ -38,6 +38,7 @@ mod commands_migrate;
 mod install;
 mod logging;
 mod pair;
+mod token_input;
 mod uninstall;
 
 // ── CLI structure ─────────────────────────────────────────────────────────────
@@ -381,14 +382,16 @@ pub enum AuthCommand {
 
     /// Save a Personal Access Token for headless / CI environments.
     ///
-    /// Creates a vh_pat_... token in the VectorHawk portal, then run:
-    ///   vectorhawk auth token <vh_pat_...>
+    /// Create a vh_pat_... token in the VectorHawk portal, then run
+    /// `vectorhawk auth token` and paste it at the hidden prompt, or pipe
+    /// it in on stdin, e.g. `vectorhawk auth token < pat.txt`.
+    ///
+    /// The token is never accepted as a command-line argument: arguments
+    /// are visible to other local users in the process list and are kept
+    /// in shell history.
     ///
     /// Or set VECTORHAWK_TOKEN=<vh_pat_...> and restart the daemon.
     Token {
-        /// The Personal Access Token to save (must start with vh_pat_).
-        token: String,
-
         #[arg(
             long,
             env = "VECTORHAWK_REGISTRY_URL",
@@ -752,10 +755,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Auth(AuthCommand::Pair { code, registry_url }) => {
             cmd_auth_pair(code.as_deref(), &registry_url).await
         }
-        Command::Auth(AuthCommand::Token {
-            token,
-            registry_url,
-        }) => cmd_auth_token(&token, &registry_url).await,
+        Command::Auth(AuthCommand::Token { registry_url }) => cmd_auth_token(&registry_url).await,
 
         Command::Mcp(McpCommand::Serve { server }) => cmd_mcp_serve(server).await,
         Command::Mcp(McpCommand::Setup {
@@ -4365,7 +4365,7 @@ async fn cmd_auth_login(registry_url: &str) -> Result<()> {
         println!("Option B — Personal Access Token (no tunnel needed):");
         println!("  1. Open https://app.vectorhawk.ai/portal/settings in your browser.");
         println!("  2. Create a token (starts with vh_pat_...).");
-        println!("  3. Run:  vectorhawk auth token <vh_pat_...>");
+        println!("  3. Run:  vectorhawk auth token   (paste the token at the prompt)");
         println!();
     } else {
         let browser_opened = try_open_browser(&init.auth_url);
@@ -4590,11 +4590,15 @@ fn print_device_revoked_notice(state: &vectorhawkd_core::state::AppState) {
 
 // ── auth token ────────────────────────────────────────────────────────────────
 
-async fn cmd_auth_token(token: &str, registry_url: &str) -> Result<()> {
+async fn cmd_auth_token(registry_url: &str) -> Result<()> {
     use vectorhawkd_core::{
         auth::{save_tokens, AuthClient},
         state::AppState,
     };
+
+    // Read from stdin / a hidden prompt, never argv — see `token_input`.
+    let token = token_input::read_token_live().map_err(|e| anyhow::anyhow!(e))?;
+    let token = token.as_str();
 
     if !token.starts_with("vh_pat_") {
         anyhow::bail!(

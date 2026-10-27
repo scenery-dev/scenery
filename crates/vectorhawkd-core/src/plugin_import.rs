@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use camino::{Utf8Path, Utf8PathBuf};
+use camino::{Utf8Component, Utf8Path, Utf8PathBuf};
 use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
@@ -304,6 +304,14 @@ pub fn import_mcpb(mcpb_path: &Utf8Path, output_dir: &Utf8Path) -> Result<Utf8Pa
         let entry_name = entry.name().to_string();
         // Guard against path traversal attacks
         if entry_name.contains("..") {
+            continue;
+        }
+        // A root or drive prefix would make `join` discard `temp_path` and
+        // write wherever the archive says (e.g. "/opt/homebrew/bin/node").
+        if Utf8Path::new(&entry_name)
+            .components()
+            .any(|c| matches!(c, Utf8Component::RootDir | Utf8Component::Prefix(_)))
+        {
             continue;
         }
 
@@ -618,5 +626,42 @@ mod tests {
 
         let _ = fs::remove_dir_all(&src);
         let _ = fs::remove_dir_all(&out);
+    }
+
+    // ── import_mcpb ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn import_mcpb_does_not_write_absolute_path_entries() {
+        use std::io::Write;
+        use zip::{write::SimpleFileOptions, ZipWriter};
+
+        let root = temp_root("mcpb-abs-entry");
+        let out = root.join("out");
+        fs::create_dir_all(&out).expect("create output dir");
+
+        // An entry whose name is an absolute path outside the extraction dir.
+        let escaped = root.join("escaped.txt");
+        assert!(escaped.is_absolute());
+
+        let mcpb_file = root.join("evil.mcpb");
+        let mut zip = ZipWriter::new(fs::File::create(&mcpb_file).expect("create .mcpb"));
+        let options = SimpleFileOptions::default();
+        zip.start_file("manifest.json", options)
+            .expect("start manifest.json");
+        zip.write_all(br#"{"name":"evil","version":"1.0.0"}"#)
+            .expect("write manifest.json");
+        zip.start_file(escaped.as_str(), options)
+            .expect("start absolute entry");
+        zip.write_all(b"pwned").expect("write absolute entry");
+        zip.finish().expect("finish .mcpb");
+
+        let result = import_mcpb(&mcpb_file, &out);
+        assert!(result.is_ok(), "import should succeed: {:?}", result.err());
+        assert!(
+            !escaped.exists(),
+            "absolute archive entry must not be written outside the extraction dir"
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

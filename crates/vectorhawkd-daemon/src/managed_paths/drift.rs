@@ -578,12 +578,48 @@ fn remove_path_for(marker: &ManagedPathMarker) -> Result<()> {
                 map.remove(&slug);
             }
             let tmp = json_path.with_extension("tmp.drift");
-            fs::write(&tmp, serde_json::to_vec_pretty(&root)?)?;
+            write_tmp_keeping_mode(&json_path, &tmp, &serde_json::to_vec_pretty(&root)?)?;
             fs::rename(&tmp, &json_path)?;
             Ok(())
         }
         _ => Ok(()),
     }
+}
+
+/// Write `contents` to `tmp` with the same permission bits `target` has, so
+/// renaming `tmp` over `target` does not change its mode.
+///
+/// `~/.claude.json` is normally 0600 because it holds other MCP servers'
+/// secrets. `fs::write` would create `tmp` at the umask default (often 0644)
+/// and the rename would carry that wider mode onto the real file. Any
+/// leftover `tmp` is removed first rather than reused: an existing file keeps
+/// its old mode on open and may already be open by another process.
+#[cfg(unix)]
+fn write_tmp_keeping_mode(target: &Path, tmp: &Path, contents: &[u8]) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let mode = fs::metadata(target)?.permissions().mode() & 0o777;
+    match fs::remove_file(tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(tmp)?;
+    // `mode()` above is filtered by the umask; set the exact bits.
+    file.set_permissions(fs::Permissions::from_mode(mode))?;
+    file.write_all(contents)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_tmp_keeping_mode(_target: &Path, tmp: &Path, contents: &[u8]) -> Result<()> {
+    fs::write(tmp, contents)?;
+    Ok(())
 }
 
 // ── Link integrity ────────────────────────────────────────────────────────────
