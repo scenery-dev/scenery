@@ -690,3 +690,23 @@ async fn skill_revoke_racing_a_plugin_install_neither_deadlocks_nor_leaves_the_s
         .exists());
     cleanup(&state);
 }
+
+#[tokio::test]
+async fn mcp_install_fails_closed_when_the_revocation_list_cannot_be_read() {
+    let _home = FakeHome::new();
+    let state = new_state("revocation-check-error");
+    let reg = Arc::new(BackendRegistry::new());
+    let sid = Uuid::new_v4();
+    rusqlite::Connection::open(&state.db_path)
+        .unwrap()
+        .execute_batch("DROP TABLE artifact_revocations")
+        .unwrap();
+
+    run(install_mcp_event(sid, Some("1.0.0")), &state, &reg).await;
+
+    assert!(
+        !mcp_installed(&state, sid),
+        "an unreadable revocation list must block the install, not wave it through"
+    );
+    cleanup(&state);
+}
