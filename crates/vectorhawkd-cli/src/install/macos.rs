@@ -627,6 +627,36 @@ pub fn uninstall() -> Result<()> {
     Ok(())
 }
 
+/// Stop `brew services`' agent for this formula and remove its plist, so it
+/// neither keeps running nor comes back at the next login. This is what
+/// `brew services stop` does, done directly so it works without `brew` on
+/// PATH. Returns whether there was anything to stop.
+pub fn stop_brew_service() -> Result<bool> {
+    let home = dirs::home_dir().context("failed to resolve HOME directory")?;
+    let plist = home
+        .join("Library")
+        .join("LaunchAgents")
+        .join(BREW_PLIST_FILENAME);
+    let target = format!("{}/{BREW_SERVICE_LABEL}", domain_target(current_uid()));
+    let loaded = Command::new("launchctl")
+        .args(["print", &target])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if !loaded && !plist.exists() {
+        return Ok(false);
+    }
+    if loaded {
+        launchctl(&["bootout", &target]).context("failed to bootout the brew services agent")?;
+    }
+    if plist.exists() {
+        fs::remove_file(&plist)
+            .with_context(|| format!("failed to remove plist: {}", plist.display()))?;
+    }
+    Ok(true)
+}
+
 /// Stop and start the LaunchAgent in place.
 ///
 /// Uses `launchctl kickstart -k gui/<uid>/com.vectorhawk.agent`, which kills

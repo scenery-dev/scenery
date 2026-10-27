@@ -43,6 +43,8 @@ use super::{
 };
 
 const SERVICE_NAME: &str = "vectorhawk-agent.service";
+/// `brew services`' systemd user unit for this formula.
+const BREW_SERVICE_NAME: &str = "sh.brew.vectorhawk.service";
 const DESKTOP_FILENAME: &str = "vectorhawk.desktop";
 
 /// Return `~/.config/systemd/user/vectorhawk-agent.service`.
@@ -1066,6 +1068,26 @@ pub fn uninstall() -> Result<()> {
     } else {
         uninstall_desktop_fallback()
     }
+}
+
+/// Stop `brew services`' unit for this formula and remove its unit file, so
+/// it neither keeps running nor comes back at the next login. This is what
+/// `brew services stop` does, done directly so it works without `brew` on
+/// PATH. Returns whether there was anything to stop.
+pub fn stop_brew_service() -> Result<bool> {
+    let config = dirs::config_dir().context("failed to resolve XDG config directory")?;
+    let unit = config.join("systemd").join("user").join(BREW_SERVICE_NAME);
+    if !unit.exists() {
+        return Ok(false);
+    }
+    if systemctl_available() {
+        systemctl_user(&["disable", "--now", BREW_SERVICE_NAME])
+            .context("failed to stop the brew services unit")?;
+    }
+    fs::remove_file(&unit)
+        .with_context(|| format!("failed to remove unit file: {}", unit.display()))?;
+    let _ = systemctl_user(&["daemon-reload"]);
+    Ok(true)
 }
 
 fn uninstall_systemd() -> Result<()> {
