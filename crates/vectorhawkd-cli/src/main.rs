@@ -2474,7 +2474,7 @@ async fn cmd_skill_import(
 ) -> Result<()> {
     use vectorhawkd_core::{
         auth::load_tokens,
-        importer::import_local_skill_md_with_scan,
+        importer::{prepare_local_skill_md_import, ImportBlocked},
         scan::{HttpScanClient, NoOpScanClient, ScanClient},
         state::AppState,
     };
@@ -2493,12 +2493,14 @@ async fn cmd_skill_import(
             _ => Box::new(NoOpScanClient),
         };
 
-    let result = import_local_skill_md_with_scan(&path, Some(scan_client.as_ref()))
+    // Parse, validate and scan first; nothing is written until the verdict
+    // has been displayed and enforced.
+    let prepared = prepare_local_skill_md_import(&path, Some(scan_client.as_ref()))
         .with_context(|| format!("failed to import SKILL.md at {path}"))?;
 
     // ── Display scan verdict badge ────────────────────────────────────────────
 
-    if let Some(verdict) = &result.scan_verdict {
+    if let Some(verdict) = prepared.scan_verdict() {
         let reset = "\x1b[0m";
         let color = verdict.verdict.ansi_color();
         let label = verdict.verdict.badge_label();
@@ -2513,17 +2515,19 @@ async fn cmd_skill_import(
         }
 
         if verdict.requires_confirmation() && !confirm_risky {
-            anyhow::bail!(
-                "Import blocked: verdict is {:?}. \
-                 Review findings above and re-run with --confirm-risky to override.",
-                verdict.verdict
-            );
+            return Err(ImportBlocked {
+                verdict: verdict.clone(),
+            }
+            .into());
         }
     }
 
+    let bundle = prepared
+        .scaffold()
+        .with_context(|| format!("failed to import SKILL.md at {path}"))?;
+
     // ── Display success ───────────────────────────────────────────────────────
 
-    let bundle = &result.bundle;
     println!("Imported skill '{}'.", bundle.id);
     println!("Bundle created at: {}", bundle.output_dir);
     println!("Files written:");
@@ -2628,6 +2632,13 @@ fn maybe_enrich_skill_md(
 
     // Insert the additions before the closing `---` line of the frontmatter.
     let enriched = insert_before_closing_fence(&content, &additions);
+    // The import just wrote this file; never follow a symlink swapped in since.
+    if std::fs::symlink_metadata(skill_md_path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        anyhow::bail!("refusing to write through symlink {skill_md_path}");
+    }
     std::fs::write(skill_md_path, enriched)
         .with_context(|| format!("failed to write enriched SKILL.md at {skill_md_path}"))?;
 
