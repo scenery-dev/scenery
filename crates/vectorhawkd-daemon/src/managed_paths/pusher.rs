@@ -44,6 +44,7 @@ use std::{
     sync::Arc,
 };
 use tracing::{debug, info, warn};
+use vectorhawkd_core::atomic_file;
 use vectorhawkd_core::restore_journal::{JournalEntry, JournalOp, JournalSource, RestoreJournal};
 use vectorhawkd_core::state::AppState;
 use vectorhawkd_mcp::ownership;
@@ -785,12 +786,11 @@ where
 
     // Step 2: read current JSON (re-open by path so we always see the latest
     // rename, even if another writer swapped the file since we took the lock).
-    let (content, file_existed) = if path.exists() {
-        let c = fs::read_to_string(path)
-            .with_context(|| format!("pusher: failed to read: {}", path.display()))?;
-        (c, true)
+    let content = if path.exists() {
+        fs::read_to_string(path)
+            .with_context(|| format!("pusher: failed to read: {}", path.display()))?
     } else {
-        (String::new(), false)
+        String::new()
     };
 
     // Step 3: parse and mutate.
@@ -809,29 +809,11 @@ where
     let _: Value =
         serde_json::from_str(&new_content).context("pusher: serialised JSON did not round-trip")?;
 
-    // Step 4: write to a thread-unique temp file (unique name avoids two
-    // concurrent threads clobbering each other's temp file).
-    let thread_id = std::thread::current().id();
-    let tmp_name = format!(".claude.json.{thread_id:?}.tmp");
-    let tmp_path = parent_dir.join(tmp_name);
-    fs::write(&tmp_path, new_content.as_bytes())
-        .with_context(|| format!("pusher: failed to write tmp: {}", tmp_path.display()))?;
+    // Step 4: atomic replace, keeping the file's mode (0600 on first create).
+    atomic_file::write_atomic(path, new_content.as_bytes(), Some(0o600))
+        .with_context(|| format!("pusher: failed to replace {}", path.display()))?;
 
-    // Step 5: atomic rename.
-    fs::rename(&tmp_path, path).context("pusher: failed to rename tmp → ~/.claude.json")?;
-
-    // Set 0600 permissions on first create.
-    if !file_existed {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = fs::Permissions::from_mode(0o600);
-            fs::set_permissions(path, perms)
-                .context("pusher: failed to set 0600 permissions on ~/.claude.json")?;
-        }
-    }
-
-    // Step 6: release the lock.  `fs2` unlocks when the file handle drops.
+    // Step 5: release the lock.  `fs2` unlocks when the file handle drops.
     // Explicitly drop to make the release point clear.
     drop(lock_file);
 
