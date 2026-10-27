@@ -390,6 +390,31 @@ pub fn write_claude_code_entry(
     })
 }
 
+/// Point Claude Code's `vectorhawk` entry back at the stdio shim if it is
+/// the HTTP+OAuth entry for `mcp_http_port`. The daemon calls this when that
+/// pinned port is held by another process: Claude Code would otherwise send
+/// its local key and bearer token to whoever owns the port. Returns whether
+/// the entry was rewritten; any other entry shape is left alone.
+pub fn revert_claude_code_http_entry(
+    claude_json: &std::path::Path,
+    mcp_http_port: u16,
+) -> Result<bool> {
+    let url = read_vectorhawk_entry_url(claude_json, "mcpServers");
+    if read_vectorhawk_entry_type(claude_json, "mcpServers").as_deref() != Some("http")
+        || url.as_deref() != Some(format!("http://127.0.0.1:{mcp_http_port}/mcp").as_str())
+    {
+        return Ok(false);
+    }
+    write_mcp_entry(&ClientConfig {
+        name: "Claude Code".to_string(),
+        config_path: claude_json.to_path_buf(),
+        mcp_key: "mcpServers".to_string(),
+        already_configured: true,
+        format: ConfigFormat::Json,
+    })?;
+    Ok(true)
+}
+
 /// M9 spike finding: `~/.claude.json` was observed at mode 0664
 /// (group-readable) on Linux. `mcp setup` just wrote the H3 local key into
 /// this file as an OAuth header — a group/world-readable mode would hand
@@ -1356,6 +1381,17 @@ fn read_vectorhawk_entry_type(path: &std::path::Path, mcp_key: &str) -> Option<S
     json.get(mcp_key)?
         .get(MCP_SERVER_NAME)?
         .get("type")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Read the `url` of the `vectorhawk` entry out of a JSON client config.
+fn read_vectorhawk_entry_url(path: &std::path::Path, mcp_key: &str) -> Option<String> {
+    let text = fs::read_to_string(path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    json.get(mcp_key)?
+        .get(MCP_SERVER_NAME)?
+        .get("url")?
         .as_str()
         .map(str::to_string)
 }
@@ -2482,6 +2518,49 @@ mod tests {
             expected_command()
         );
         assert_eq!(json["mcpServers"]["other-tool"]["command"], "other");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // ── revert_claude_code_http_entry ──────────────────────────────────────────
+
+    #[test]
+    fn revert_claude_code_http_entry_only_rewrites_the_entry_for_that_port() {
+        let tmp = temp_root("revert-http-entry");
+        fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join(".claude.json");
+        let write = |entry: serde_json::Value| {
+            let root = serde_json::json!({
+                "mcpServers": {
+                    "vectorhawk": entry,
+                    "other": {"command": "other", "env": {"TOKEN": "secret"}}
+                }
+            });
+            fs::write(&path, serde_json::to_string(&root).unwrap()).unwrap();
+        };
+        let read = || -> serde_json::Value {
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap()
+        };
+
+        // HTTP entry for another port: left alone.
+        write(build_claude_code_http_entry(39141, 39200, "key"));
+        assert!(!with_fake_home(&tmp, || revert_claude_code_http_entry(&path, 39140)).unwrap());
+        assert_eq!(read()["mcpServers"]["vectorhawk"]["type"], "http");
+
+        // HTTP entry for this port: back to the stdio shim, key gone,
+        // other servers untouched.
+        write(build_claude_code_http_entry(39140, 39200, "key"));
+        assert!(with_fake_home(&tmp, || revert_claude_code_http_entry(&path, 39140)).unwrap());
+        let after = read();
+        assert_eq!(
+            after["mcpServers"]["vectorhawk"]["command"],
+            expected_command()
+        );
+        assert!(after["mcpServers"]["vectorhawk"].get("headers").is_none());
+        assert_eq!(after["mcpServers"]["other"]["env"]["TOKEN"], "secret");
+
+        // Already stdio: nothing to do.
+        assert!(!with_fake_home(&tmp, || revert_claude_code_http_entry(&path, 39140)).unwrap());
 
         let _ = fs::remove_dir_all(&tmp);
     }
