@@ -143,12 +143,9 @@ pub async fn run(opts: UninstallOpts) -> Result<()> {
     // ── 5. Remove managed skills/plugins VH pushed into ~/.claude. ──
     remove_managed_artifacts(&plan, &mut report);
 
-    // ── 6. Sign out of every registry and drop the local secrets. ──
+    // ── 6. Deprovision this device, revoke every session server side, and
+    //       drop the local secrets. ──
     sign_out_everywhere(&opts.registry_url, &mut report).await;
-    // TODO(backend): POST /devices/{id}/deprovision so IT's audit log records the
-    // offboarding and the gateway drops this device's brokered credential grants,
-    // and revoke the refresh token server-side (portal refresh tokens are
-    // stateless today, so a copy taken before uninstall stays valid).
 
     // ── 7. Optional hard purge of local state. ──
     if opts.purge {
@@ -195,10 +192,18 @@ async fn sign_out_everywhere(registry_url: &str, report: &mut RestoreReport) {
     use vectorhawkd_core::auth::{clear_tokens, load_all_tokens};
     use vectorhawkd_core::{secret_file, state::AppState};
 
+    deprovision_this_device(registry_url, report).await;
     if let Err(e) = crate::cmd_auth_logout(registry_url).await {
         report
             .warnings
-            .push(format!("could not log out / deprovision cleanly: {e:#}"));
+            .push(format!("could not log out cleanly: {e:#}"));
+    }
+    // Every other registry this machine signed in to: revoke that session
+    // server side too before its tokens are dropped below.
+    if let Ok(state) = AppState::bootstrap() {
+        for tokens in load_all_tokens(&state).unwrap_or_default() {
+            crate::revoke_session(&state, &tokens.registry_url, "family").await;
+        }
     }
     let result = AppState::bootstrap().and_then(|state| {
         for tokens in load_all_tokens(&state)? {
@@ -217,6 +222,51 @@ async fn sign_out_everywhere(registry_url: &str, report: &mut RestoreReport) {
             .push(format!("could not clear stored credentials: {e:#}"));
     }
     delete_keychain_items();
+}
+
+/// Offboard this device on `registry_url`: `POST /api/devices/{id}/deprovision`,
+/// which revokes its sessions and brokered gateway grants and records the
+/// offboarding in IT's audit log. Refreshes an expired access token first.
+/// Skipped when the machine never paired or holds no token. A failure is a
+/// report warning: uninstall still clears everything locally.
+async fn deprovision_this_device(registry_url: &str, report: &mut RestoreReport) {
+    use vectorhawkd_core::auth::{load_tokens, save_tokens, AuthClient};
+    use vectorhawkd_core::state::AppState;
+
+    let Ok(state) = AppState::bootstrap() else {
+        return;
+    };
+    let Some(device_id) = state
+        .get_sync_state("device_id")
+        .ok()
+        .flatten()
+        .filter(|id| !id.is_empty())
+    else {
+        return;
+    };
+    let Some(tokens) = load_tokens(&state, registry_url).ok().flatten() else {
+        return;
+    };
+    let url = registry_url.to_string();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let client = AuthClient::new(url.as_str());
+        let mut access_token = tokens.access_token;
+        if AuthClient::needs_refresh(&access_token) && !tokens.refresh_token.is_empty() {
+            let fresh = client.refresh(&tokens.refresh_token)?;
+            save_tokens(&state, &url, &fresh.access_token, &fresh.refresh_token)?;
+            access_token = fresh.access_token;
+        }
+        client.deprovision_device(&access_token, &device_id)
+    })
+    .await;
+    let failure = match result {
+        Ok(Ok(())) => return,
+        Ok(Err(e)) => format!("{e:#}"),
+        Err(e) => e.to_string(),
+    };
+    report.warnings.push(format!(
+        "could not deprovision this device on {registry_url}: {failure}"
+    ));
 }
 
 /// What we intend to do, computed read-only up front.
@@ -959,6 +1009,83 @@ mod tests {
     /// Uninstall must leave no VectorHawk secret behind: the tokens for
     /// every registry this machine signed in to (not just the configured
     /// one) and the H3 local key.
+    /// Uninstall deprovisions the paired device (refreshing an expired access
+    /// token first) and revokes the session server side, then clears the
+    /// local device identity so a reinstall pairs as a fresh device.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn sign_out_everywhere_deprovisions_the_device_and_revokes_the_session() {
+        use vectorhawkd_core::auth::{load_all_tokens, save_tokens};
+
+        let _guard = HOME_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = temp_dir("sign-out-deprovision");
+        let original_home = std::env::var_os("HOME");
+        let original_keychain = std::env::var_os("VECTORHAWK_DISABLE_KEYCHAIN");
+        std::env::set_var("HOME", &tmp);
+        std::env::set_var("VECTORHAWK_DISABLE_KEYCHAIN", "1");
+
+        let mut server = mockito::Server::new_async().await;
+        let url = server.url();
+        let refresh = server
+            .mock("POST", "/portal/auth/refresh")
+            .with_status(200)
+            .with_body(
+                r#"{"access_token":"fresh-acc","refresh_token":"fresh-ref","token_type":"bearer"}"#,
+            )
+            .create_async()
+            .await;
+        let deprovision = server
+            .mock("POST", "/api/devices/dev-9/deprovision")
+            .match_header("authorization", "Bearer fresh-acc")
+            .with_status(200)
+            .with_body("{}")
+            .create_async()
+            .await;
+        let revoke = server
+            .mock("POST", "/portal/auth/revoke")
+            .match_body(mockito::Matcher::Json(serde_json::json!({
+                "refresh_token": "fresh-ref",
+                "scope": "family"
+            })))
+            .with_status(200)
+            .with_body("{}")
+            .create_async()
+            .await;
+
+        let mut report = RestoreReport::default();
+        let outcome: anyhow::Result<(usize, Option<String>)> = async {
+            let state = AppState::bootstrap()?;
+            save_tokens(&state, &url, "expired-acc", "old-ref")?;
+            state.set_sync_state("device_id", "dev-9")?;
+
+            sign_out_everywhere(&url, &mut report).await;
+
+            Ok((
+                load_all_tokens(&state)?.len(),
+                state.get_sync_state("device_id")?,
+            ))
+        }
+        .await;
+
+        match original_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match original_keychain {
+            Some(v) => std::env::set_var("VECTORHAWK_DISABLE_KEYCHAIN", v),
+            None => std::env::remove_var("VECTORHAWK_DISABLE_KEYCHAIN"),
+        }
+        let _ = fs::remove_dir_all(&tmp);
+
+        let (remaining, device_id) = outcome.expect("test body should succeed");
+        refresh.assert_async().await;
+        deprovision.assert_async().await;
+        revoke.assert_async().await;
+        assert_eq!(remaining, 0);
+        assert_eq!(device_id, None, "a reinstall must pair as a fresh device");
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    }
+
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn sign_out_everywhere_clears_every_registry_and_the_local_key() {
