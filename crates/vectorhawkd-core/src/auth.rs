@@ -348,6 +348,51 @@ impl AuthClient {
         resp.json().context("failed to deserialize user info")
     }
 
+    /// Revoke the sign-in session `refresh_token` belongs to, server side:
+    /// `POST /portal/auth/revoke`. `scope` is `"family"` (this session) or
+    /// `"device"` (every session bound to its device). The backend answers
+    /// 200 even for a dead token; any failure here is the caller's to treat
+    /// as best-effort, since the local tokens are cleared regardless.
+    pub fn revoke(&self, refresh_token: &str, scope: &str) -> Result<()> {
+        let url = format!("{}/portal/auth/revoke", self.base_url.trim_end_matches('/'));
+        let resp = self
+            .http
+            .post(&url)
+            .json(&serde_json::json!({ "refresh_token": refresh_token, "scope": scope }))
+            .send()
+            .with_context(|| format!("failed to reach registry at {url}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().unwrap_or_default();
+            anyhow::bail!("session revoke failed (HTTP {status}): {body}");
+        }
+        Ok(())
+    }
+
+    /// Offboard this device: `POST /api/devices/{device_id}/deprovision`.
+    /// Revokes the device's sessions and brokered gateway grants and records
+    /// the offboarding in IT's audit log, keeping the device row (unlike
+    /// `DELETE /devices/{id}`). Repeat calls succeed.
+    pub fn deprovision_device(&self, access_token: &str, device_id: &str) -> Result<()> {
+        let url = format!(
+            "{}/api/devices/{device_id}/deprovision",
+            self.base_url.trim_end_matches('/')
+        );
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(access_token)
+            .json(&serde_json::json!({ "reason": "vectorhawk uninstall" }))
+            .send()
+            .with_context(|| format!("failed to reach registry at {url}"))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().unwrap_or_default();
+            anyhow::bail!("device deprovision failed (HTTP {status}): {body}");
+        }
+        Ok(())
+    }
+
     /// Determine if the access token needs to be refreshed.
     ///
     /// Decodes the JWT payload without signature validation (we trust the
@@ -1164,6 +1209,44 @@ mod tests {
         fn drop(&mut self) {
             std::env::set_var("VECTORHAWK_DISABLE_KEYCHAIN", "1");
         }
+    }
+
+    #[test]
+    fn revoke_posts_the_refresh_token_and_scope() {
+        let mut server = Server::new();
+        let m = server
+            .mock("POST", "/portal/auth/revoke")
+            .match_body(mockito::Matcher::Json(serde_json::json!({
+                "refresh_token": "rt-1",
+                "scope": "family"
+            })))
+            .with_status(200)
+            .with_body(r#"{"revoked":true,"families_revoked":1,"device_id":null}"#)
+            .create();
+        AuthClient::new(server.url())
+            .revoke("rt-1", "family")
+            .unwrap();
+        m.assert();
+    }
+
+    #[test]
+    fn deprovision_device_posts_with_bearer_and_reports_failure() {
+        let mut server = Server::new();
+        let ok = server
+            .mock("POST", "/api/devices/dev-1/deprovision")
+            .match_header("authorization", "Bearer acc-1")
+            .with_status(200)
+            .with_body("{}")
+            .create();
+        let client = AuthClient::new(server.url());
+        client.deprovision_device("acc-1", "dev-1").unwrap();
+        ok.assert();
+
+        server
+            .mock("POST", "/api/devices/dev-2/deprovision")
+            .with_status(404)
+            .create();
+        assert!(client.deprovision_device("acc-1", "dev-2").is_err());
     }
 
     #[test]
