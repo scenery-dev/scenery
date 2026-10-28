@@ -4524,6 +4524,7 @@ async fn cmd_auth_logout(registry_url: &str) -> Result<()> {
     use vectorhawkd_core::{auth::clear_tokens, state::AppState};
 
     let state = AppState::bootstrap().context("failed to bootstrap state")?;
+    revoke_session(&state, registry_url, "family").await;
     clear_tokens(&state, registry_url).context("failed to clear auth tokens")?;
     // M6: also clear device_id/device_uuid/mcp_user_id — otherwise a
     // different user logging in afterward (via `auth pair` or via the MCP
@@ -4537,6 +4538,39 @@ async fn cmd_auth_logout(registry_url: &str) -> Result<()> {
     }
     println!("Logged out from {registry_url}.");
     Ok(())
+}
+
+/// Best-effort server-side revoke of the stored session for `registry_url`
+/// (`scope`: `"family"` or `"device"`), so a copy of the refresh token taken
+/// earlier stops working too. Skipped for a PAT, which has no session to
+/// revoke. A failure is printed, never fatal: the local tokens are cleared
+/// either way.
+async fn revoke_session(
+    state: &vectorhawkd_core::state::AppState,
+    registry_url: &str,
+    scope: &'static str,
+) {
+    use vectorhawkd_core::auth::{load_tokens, AuthClient};
+
+    let Some(tokens) = load_tokens(state, registry_url).ok().flatten() else {
+        return;
+    };
+    if tokens.refresh_token.is_empty() || tokens.access_token.starts_with("vh_pat_") {
+        return;
+    }
+    // Built inside spawn_blocking: reqwest's blocking client can't be built
+    // or dropped on an async thread.
+    let url = registry_url.to_string();
+    let refresh_token = tokens.refresh_token;
+    match tokio::task::spawn_blocking(move || AuthClient::new(url).revoke(&refresh_token, scope))
+        .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            eprintln!("warning: could not revoke the session on {registry_url}: {e:#}")
+        }
+        Err(e) => eprintln!("warning: session revoke task failed: {e}"),
+    }
 }
 
 // ── auth status ───────────────────────────────────────────────────────────────
