@@ -130,7 +130,7 @@ SHIM_SIZE=$(cat "${REPO_ROOT}/target/m0-shim-size.txt" 2>/dev/null || echo "unkn
 
 echo ""
 echo "AC2+AC3: running m0_acceptance integration test..."
-if cargo test --release -p vectorhawkd-daemon --test m0_acceptance -- --include-ignored --nocapture 2>&1; then
+if cargo test --release -p scenery-daemon --test m0_acceptance -- --include-ignored --nocapture 2>&1; then
     record "PASS" "AC2: daemon boots + socket" "m0_acceptance test passed"
     record "PASS" "AC3: shim initialize+tools/list+5x tools/call" "m0_acceptance test passed"
 else
@@ -138,7 +138,7 @@ else
     # If the test binary doesn't exist yet (Streams 3/4/5 not merged) the cargo
     # invocation itself will fail.  Distinguish "test failed" from "no test yet".
     if ! ls "${REPO_ROOT}/target/release/deps/m0_acceptance"* >/dev/null 2>&1 && \
-       ! cargo test --release -p vectorhawkd-daemon --test m0_acceptance -- --list 2>/dev/null | grep -q m0_acceptance; then
+       ! cargo test --release -p scenery-daemon --test m0_acceptance -- --list 2>/dev/null | grep -q m0_acceptance; then
         record "SKIP" "AC2: daemon boots + socket" "m0_acceptance test binary not compiled (Streams 3/4/5 not merged)"
         record "SKIP" "AC3: shim initialize+tools/list+5x tools/call" "m0_acceptance test binary not compiled"
     else
@@ -149,12 +149,12 @@ fi
 
 echo ""
 echo "AC4: running m0_daemon_kill integration test..."
-if cargo test --release -p vectorhawkd-daemon --test m0_daemon_kill -- --include-ignored --nocapture 2>&1; then
+if cargo test --release -p scenery-daemon --test m0_daemon_kill -- --include-ignored --nocapture 2>&1; then
     record "PASS" "AC4: daemon-kill shim returns daemon-required error <=3 s" "m0_daemon_kill test passed"
 else
     EXIT=$?
     if ! ls "${REPO_ROOT}/target/release/deps/m0_daemon_kill"* >/dev/null 2>&1 && \
-       ! cargo test --release -p vectorhawkd-daemon --test m0_daemon_kill -- --list 2>/dev/null | grep -q m0_daemon_kill; then
+       ! cargo test --release -p scenery-daemon --test m0_daemon_kill -- --list 2>/dev/null | grep -q m0_daemon_kill; then
         record "SKIP" "AC4: daemon-kill shim returns daemon-required error <=3 s" "m0_daemon_kill test binary not compiled"
     else
         record "FAIL" "AC4: daemon-kill shim returns daemon-required error <=3 s" "m0_daemon_kill test failed (exit ${EXIT})"
@@ -182,7 +182,7 @@ else
     # AC6 can be verified by inspecting the setup module for the expected strings.
     # This is explicitly documented in CLAUDE.md as "M0 just validates the wire
     # format hasn't changed" — the CLI doesn't need to actually write configs.
-    SETUP_SRC="${REPO_ROOT}/crates/vectorhawkd-mcp/src/setup.rs"
+    SETUP_SRC="${REPO_ROOT}/crates/scenery-mcp/src/setup.rs"
     if [[ -f "${SETUP_SRC}" ]]; then
         if grep -q '"vectorhawk"' "${SETUP_SRC}" && grep -q '"mcp"' "${SETUP_SRC}" && grep -q '"serve"' "${SETUP_SRC}"; then
             AC6_PASS=1

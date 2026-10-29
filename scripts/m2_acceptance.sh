@@ -93,7 +93,7 @@ if [[ "${OS}" != "Darwin" ]]; then
         'AC1: vectorhawk daemon install (macOS)' \
         "not macOS — skipped (N/A on ${OS})"
 else
-    if cargo test --release -p vectorhawkd-cli --test m2_install_macos \
+    if cargo test --release -p scenery-cli --test m2_install_macos \
             -- --include-ignored 2>&1 | grep -q "test result: ok. 1 passed"; then
         record "PASS" \
             'AC1: vectorhawk daemon install (macOS)' \
@@ -120,7 +120,7 @@ else
             'AC2: vectorhawk daemon install (Linux)' \
             "systemctl --user not available — skipped"
     else
-        if cargo test --release -p vectorhawkd-cli --test m2_install_linux \
+        if cargo test --release -p scenery-cli --test m2_install_linux \
                 -- --include-ignored 2>&1 | grep -q "test result: ok. 1 passed"; then
             record "PASS" \
                 'AC2: vectorhawk daemon install (Linux)' \
@@ -176,7 +176,7 @@ esac
 # ── AC5: mcp setup integration — source-grep for ensure_installed wiring ─────
 
 echo "AC5: mcp setup integration (ensure_installed wired) ..."
-MAIN_RS="${REPO_ROOT}/crates/vectorhawkd-cli/src/main.rs"
+MAIN_RS="${REPO_ROOT}/crates/scenery-cli/src/main.rs"
 if grep -q "ensure_installed" "${MAIN_RS}" \
    && grep -q "install::status" "${MAIN_RS}" \
    && grep -qE "cmd_mcp_setup|Mcp.*Setup" "${MAIN_RS}"; then

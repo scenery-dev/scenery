@@ -27,12 +27,12 @@ See [`../context/RUN1_DAEMON_PIVOT_DECISION.md`](../context/RUN1_DAEMON_PIVOT_DE
 
 ```
 crates/
-├── vectorhawkd-manifest/   library — skill bundle types, manifest parsing
-├── vectorhawkd-core/       library — state, installer, registry client, policy, executor
-├── vectorhawkd-mcp/        library — MCP protocol, aggregator, backend trait
-├── vectorhawkd-daemon/     binary — vectorhawkd long-running agent
-├── vectorhawkd-shim/       binary — stdio↔socket relay with in-process fallback
-└── vectorhawkd-cli/        binary — vectorhawk user CLI (skill, mcp, daemon, doctor commands)
+├── scenery-manifest/   library — skill bundle types, manifest parsing
+├── scenery-core/       library — state, installer, registry client, policy, executor
+├── scenery-mcp/        library — MCP protocol, aggregator, backend trait
+├── scenery-daemon/     binary — vectorhawkd long-running agent
+├── scenery-shim/       binary — stdio↔socket relay with in-process fallback
+└── scenery-cli/        binary — vectorhawk user CLI (skill, mcp, daemon, doctor commands)
 ```
 
 ## Binaries
@@ -65,7 +65,7 @@ vectorhawk skill publish my-skill/ --registry-url https://app.scenery.dev
 ```
 
 See [`docs/AUTHORING.md`](docs/AUTHORING.md) for the full authoring guide and
-[`crates/vectorhawkd-manifest/schemas/skill_md_frontmatter.json`](crates/vectorhawkd-manifest/schemas/skill_md_frontmatter.json)
+[`crates/scenery-manifest/schemas/skill_md_frontmatter.json`](crates/scenery-manifest/schemas/skill_md_frontmatter.json)
 for the JSON Schema.
 
 Example skills are in [`examples/skills/`](examples/skills/):
@@ -135,7 +135,7 @@ git push origin v1.0.1
 ```
 
 Each release attaches per-target tarballs named `vectorhawk-<version>-<triple>.tar.gz`, each containing
-`vectorhawk`, `vectorhawkd`, `vectorhawkd-shim`, `LICENSE`, and `README.md`. A SHA256 checksum file
+`vectorhawk`, `vectorhawkd`, `scenery-shim`, `LICENSE`, and `README.md`. A SHA256 checksum file
 (`vectorhawk-<version>-<triple>.tar.gz.sha256`) is attached alongside each tarball.
 
 Pre-release tags (e.g. `v1.0.1-rc.0`) are marked as pre-releases on GitHub. Stable tags produce
