@@ -124,9 +124,9 @@ echo "==> Building vectorhawk (release) for platform: $PLATFORM"
 cd "$REPO_ROOT"
 
 if [[ -n "$TARGET" ]]; then
-  cargo build --release -p vectorhawkd-cli --target "$TARGET"
+  cargo build --release -p scenery-cli --target "$TARGET"
 else
-  cargo build --release -p vectorhawkd-cli
+  cargo build --release -p scenery-cli
 fi
 
 BINARY="$(binary_path "$TARGET")"

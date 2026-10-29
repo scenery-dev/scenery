@@ -6,7 +6,7 @@
 #   bash scripts/measure_daemon_rss.sh
 #
 # Prerequisites:
-#   cargo build --workspace --release  (or --release -p vectorhawkd-daemon)
+#   cargo build --workspace --release  (or --release -p scenery-daemon)
 #
 # Exit codes:
 #   0  — RSS is within budget (<=50 MB)

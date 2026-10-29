@@ -35,9 +35,9 @@ gh project view 1 --owner scenery-dev --web
 
 - Internal / code / repo: `vectorhawkd`
 - Public / marketing / user-facing docs: "the VectorHawk runner" or "the runner"
-- Single shipped binary: `vectorhawk` (from `vectorhawkd-cli`) — what users actually type.
+- Single shipped binary: `vectorhawk` (from `scenery-cli`) — what users actually type.
   - `vectorhawk daemon run` starts the long-running daemon (previously a standalone `vectorhawkd` binary).
-  - `vectorhawk mcp serve` is the MCP relay/shim (previously a standalone `vectorhawkd-shim` binary).
+  - `vectorhawk mcp serve` is the MCP relay/shim (previously a standalone `scenery-shim` binary).
   - `vectorhawkd` is the repo/workspace name only, not a binary name.
 
 ## Architecture (M0 target)
@@ -62,12 +62,12 @@ AI client  --stdio MCP JSON-RPC-->  vectorhawk mcp serve  (shim, ~5 MB RSS)
 
 ```
 crates/
-├── vectorhawkd-manifest/   library — manifest types, ports skillrunner-manifest
-├── vectorhawkd-core/       library — state, installer, registry, policy, executor (ports skillrunner-core)
-├── vectorhawkd-mcp/        library — MCP protocol, aggregator, Backend trait (ports skillrunner-mcp protocol/tools/aggregator/sampling/setup)
-├── vectorhawkd-daemon/     library — daemon entry point (vectorhawkd_daemon::run_daemon); reused by vectorhawk CLI via `daemon run`
-├── vectorhawkd-shim/       library — stdio↔socket relay entry point (vectorhawkd_shim::run_shim); reused by vectorhawk CLI via `mcp serve`
-└── vectorhawkd-cli/        binary — vectorhawk (the only shipped binary; embeds daemon + shim via `daemon run` / `mcp serve` subcommands)
+├── scenery-manifest/   library — manifest types, ports skillrunner-manifest
+├── scenery-core/       library — state, installer, registry, policy, executor (ports skillrunner-core)
+├── scenery-mcp/        library — MCP protocol, aggregator, Backend trait (ports skillrunner-mcp protocol/tools/aggregator/sampling/setup)
+├── scenery-daemon/     library — daemon entry point (scenery_daemon::run_daemon); reused by vectorhawk CLI via `daemon run`
+├── scenery-shim/       library — stdio↔socket relay entry point (scenery_shim::run_shim); reused by vectorhawk CLI via `mcp serve`
+└── scenery-cli/        binary — vectorhawk (the only shipped binary; embeds daemon + shim via `daemon run` / `mcp serve` subcommands)
 ```
 
 ## Build & dev
@@ -76,7 +76,7 @@ crates/
 cargo build
 cargo build --release
 cargo test
-cargo test -p vectorhawkd-core
+cargo test -p scenery-core
 cargo clippy
 cargo fmt
 ```
@@ -100,11 +100,11 @@ Before writing code:
 ## Source for porting
 
 Existing code at `../skillrunner/crates/`:
-- `skillrunner-manifest/` → `vectorhawkd-manifest/` (rename only)
-- `skillrunner-core/` → `vectorhawkd-core/` (rename only; SQLite paths change `SkillClub/SkillRunner/` → `VectorHawk/`)
-- `skillrunner-mcp/protocol.rs`, `tools.rs`, `aggregator.rs`, `sampling.rs`, `setup.rs` → `vectorhawkd-mcp/`
-- `skillrunner-mcp/server.rs` → split: dispatch loop into `vectorhawkd-mcp` as a `Server<B: Backend>` generic; daemon uses `SocketBackend`-equivalent + real backend; shim uses `SocketBackend` (relay) with `EmbeddedBackend` fallback
-- `skillrunner-cli/` → `vectorhawkd-cli/` (rename + new `mcp serve` becomes the shim, new `daemon run/install/uninstall` subcommands)
+- `skillrunner-manifest/` → `scenery-manifest/` (rename only)
+- `skillrunner-core/` → `scenery-core/` (rename only; SQLite paths change `SkillClub/SkillRunner/` → `VectorHawk/`)
+- `skillrunner-mcp/protocol.rs`, `tools.rs`, `aggregator.rs`, `sampling.rs`, `setup.rs` → `scenery-mcp/`
+- `skillrunner-mcp/server.rs` → split: dispatch loop into `scenery-mcp` as a `Server<B: Backend>` generic; daemon uses `SocketBackend`-equivalent + real backend; shim uses `SocketBackend` (relay) with `EmbeddedBackend` fallback
+- `skillrunner-cli/` → `scenery-cli/` (rename + new `mcp serve` becomes the shim, new `daemon run/install/uninstall` subcommands)
 
 ## What is NOT in M0 scope
 

@@ -1,0 +1,554 @@
+use camino::Utf8Path;
+use scenery_manifest::SkillPackage;
+
+/// The severity level of a single check result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckLevel {
+    /// Check passed with no issues.
+    Pass,
+    /// Check found a potential issue but does not block publishing.
+    Warn,
+    /// Check found a definitive problem that must be fixed.
+    Fail,
+}
+
+#[derive(Debug)]
+pub struct CheckResult {
+    pub name: String,
+    pub level: CheckLevel,
+    pub detail: Option<String>,
+    /// Legacy compat: callers that only care about pass/fail.
+    pub passed: bool,
+}
+
+#[derive(Debug)]
+pub struct ValidationReport {
+    pub checks: Vec<CheckResult>,
+}
+
+impl ValidationReport {
+    /// Returns `true` only if every check is `Pass` or `Warn`.
+    /// A single `Fail` makes this return `false`.
+    pub fn all_passed(&self) -> bool {
+        self.checks.iter().all(|c| c.level != CheckLevel::Fail)
+    }
+
+    /// Returns the number of checks that failed.
+    pub fn fail_count(&self) -> usize {
+        self.checks
+            .iter()
+            .filter(|c| c.level == CheckLevel::Fail)
+            .count()
+    }
+
+    /// Returns the number of checks that warned.
+    pub fn warn_count(&self) -> usize {
+        self.checks
+            .iter()
+            .filter(|c| c.level == CheckLevel::Warn)
+            .count()
+    }
+}
+
+/// Run all validation checks against an unpacked skill bundle directory.
+///
+/// Checks (in order):
+/// 1. Manifest parses, required fields present, referenced files exist,
+///    workflow parses, and workflow prompt refs resolve.
+/// 2. Description must not be a TODO placeholder.
+/// 3. Workflow step count and prompt binding summary.
+/// 4. Input schema (if present) is valid JSON Schema.
+/// 5. Output schema (if present) is valid JSON Schema.
+/// 6. Triggers warning — absence doesn't block, but skills without triggers
+///    won't surface in /skill-search.
+///
+/// All checks are always run; the caller receives the full report.
+pub fn validate_bundle(path: &Utf8Path) -> ValidationReport {
+    let mut checks = Vec::new();
+
+    let pkg = match SkillPackage::load_from_dir(path) {
+        Ok(pkg) => {
+            // Build a concise manifest summary for the pass detail.
+            let detail = format!(
+                "{} v{} (publisher: {})",
+                pkg.manifest.id, pkg.manifest.version, pkg.manifest.publisher
+            );
+            checks.push(pass("manifest", &detail));
+            Some(pkg)
+        }
+        Err(e) => {
+            checks.push(fail("manifest", &e.to_string()));
+            None::<SkillPackage>
+        }
+    };
+
+    let pkg = match pkg {
+        Some(p) => p,
+        None => return ValidationReport { checks },
+    };
+
+    // ── Description check ────────────────────────────────────────────────────
+
+    let desc = pkg.manifest.description.as_deref().unwrap_or("");
+    let desc_lower = desc.to_lowercase();
+    if desc_lower.starts_with("todo:") || desc_lower == "todo: describe what this skill does" {
+        checks.push(fail(
+            "description",
+            "description is still the TODO placeholder — update it before publishing",
+        ));
+    } else if desc.is_empty() {
+        checks.push(fail("description", "description is empty"));
+    } else {
+        // Show a truncated preview in the detail.
+        let preview = if desc.len() > 60 {
+            // Cut at the last char boundary at or before byte 59: slicing a
+            // multi-byte character in two panics, which aborts the daemon.
+            let mut end = 59;
+            while !desc.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("\"{}…\"", &desc[..end])
+        } else {
+            format!("\"{desc}\"")
+        };
+        checks.push(pass("description", &preview));
+    }
+
+    // ── Workflow check ───────────────────────────────────────────────────────
+
+    let step_count = pkg.workflow.steps.len();
+    let has_inline_prompt = pkg.workflow.steps.iter().any(|s| {
+        use scenery_manifest::{PromptSource, WorkflowStep};
+        match s {
+            WorkflowStep::Llm { prompt, .. } => matches!(prompt, PromptSource::Inline(_)),
+            _ => false,
+        }
+    });
+    let prompt_note = if has_inline_prompt {
+        "inline prompt"
+    } else {
+        "file prompt"
+    };
+    let workflow_detail = format!("{step_count} step(s), {prompt_note}, inputs bound");
+    checks.push(pass("workflow", &workflow_detail));
+
+    // ── Input schema check ───────────────────────────────────────────────────
+
+    if let Some(schema) = pkg.manifest.inputs_schema.as_ref() {
+        let required_fields = extract_required_fields(schema);
+        let label = if required_fields.is_empty() {
+            "input schema".to_string()
+        } else {
+            format!("input schema  required: [{required_fields}]")
+        };
+        match crate::schema_guard::compile_skill_schema(schema) {
+            Ok(_) => checks.push(pass("input schema", &{
+                if required_fields.is_empty() {
+                    "valid JSON Schema".to_string()
+                } else {
+                    format!("required: [{required_fields}]")
+                }
+            })),
+            Err(e) => checks.push(fail(&label, &format!("not valid JSON Schema: {e}"))),
+        }
+    } else {
+        checks.push(pass("input schema", "none declared (accepts any input)"));
+    }
+
+    // ── Output schema check ──────────────────────────────────────────────────
+
+    if let Some(schema) = pkg.manifest.outputs_schema.as_ref() {
+        match crate::schema_guard::compile_skill_schema(schema) {
+            Ok(_) => checks.push(pass("output schema", "valid JSON Schema")),
+            Err(e) => checks.push(fail(
+                "output schema",
+                &format!("not valid JSON Schema: {e}"),
+            )),
+        }
+    } else {
+        checks.push(pass("output schema", "none declared"));
+    }
+
+    // ── Workflow schema files check ──────────────────────────────────────────
+
+    let schema_files = crate::schema_guard::workflow_schema_files(&pkg);
+    if !schema_files.is_empty() {
+        let errors: Vec<String> = schema_files
+            .iter()
+            .filter_map(|rel| {
+                crate::schema_guard::compile_schema_file(&pkg.root, rel)
+                    .err()
+                    .map(|e| format!("{e:#}"))
+            })
+            .collect();
+        if errors.is_empty() {
+            checks.push(pass(
+                "workflow schemas",
+                &format!("{} valid schema file(s)", schema_files.len()),
+            ));
+        } else {
+            checks.push(fail("workflow schemas", &errors.join("; ")));
+        }
+    }
+
+    // ── Triggers check ───────────────────────────────────────────────────────
+
+    if pkg.manifest.triggers.is_empty() {
+        checks.push(warn(
+            "triggers",
+            "none — skill won't surface in /skill-search",
+        ));
+    } else {
+        let phrases = pkg
+            .manifest
+            .triggers
+            .iter()
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        checks.push(pass("triggers", &phrases));
+    }
+
+    ValidationReport { checks }
+}
+
+/// Extract the `required` field names from a JSON Schema object and format them
+/// as a comma-separated string.  Returns an empty string when the schema has no
+/// `required` array or it is empty.
+fn extract_required_fields(schema: &serde_json::Value) -> String {
+    schema
+        .get("required")
+        .and_then(|r| r.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default()
+}
+
+fn pass(name: &str, detail: &str) -> CheckResult {
+    CheckResult {
+        name: name.to_string(),
+        level: CheckLevel::Pass,
+        passed: true,
+        detail: Some(detail.to_string()),
+    }
+}
+
+fn warn(name: &str, detail: &str) -> CheckResult {
+    CheckResult {
+        name: name.to_string(),
+        level: CheckLevel::Warn,
+        passed: true,
+        detail: Some(detail.to_string()),
+    }
+}
+
+fn fail(name: &str, detail: &str) -> CheckResult {
+    CheckResult {
+        name: name.to_string(),
+        level: CheckLevel::Fail,
+        passed: false,
+        detail: Some(detail.to_string()),
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use camino::Utf8PathBuf;
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    fn temp_dir(label: &str) -> Utf8PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        Utf8PathBuf::from_path_buf(
+            std::env::temp_dir().join(format!("vh-validator-tests-{label}-{nanos}")),
+        )
+        .expect("temp path should be utf-8")
+    }
+
+    fn write_valid_bundle(root: &Utf8PathBuf) {
+        fs::create_dir_all(root.join("prompts")).expect("create prompts dir");
+        fs::write(
+            root.join("SKILL.md"),
+            "---\nname: Test Skill\ndescription: A test skill.\nmetadata:\n  vectorhawk:\n    version: 0.1.0\n    publisher: skillclub\n    permissions:\n      filesystem: none\n      network: none\n      clipboard: none\n    execution:\n      sandbox: strict\n      timeout_ms: 30000\n      memory_mb: 256\n    workflow_ref: ./workflow.yaml\n---\n\nDo the thing.\n",
+        )
+        .expect("write SKILL.md");
+        fs::write(
+            root.join("workflow.yaml"),
+            "name: test_skill\nsteps:\n  - id: run\n    type: llm\n    prompt: prompts/system.txt\n    inputs: {}\n",
+        )
+        .expect("write workflow.yaml");
+        fs::write(root.join("prompts/system.txt"), "Do the thing.").expect("write system.txt");
+    }
+
+    #[test]
+    fn validate_passes_for_well_formed_bundle() {
+        let dir = temp_dir("ok");
+        write_valid_bundle(&dir);
+
+        let report = validate_bundle(&dir);
+
+        assert!(
+            report.all_passed(),
+            "expected all checks to pass: {report:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_fails_manifest_check_when_skill_md_is_missing() {
+        let dir = temp_dir("no-skill-md");
+        fs::create_dir_all(&dir).expect("create dir");
+
+        let report = validate_bundle(&dir);
+
+        let manifest_check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "manifest")
+            .expect("manifest check must exist");
+        assert!(
+            manifest_check.level == CheckLevel::Fail,
+            "expected manifest check to fail"
+        );
+        assert!(!report.all_passed());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_reports_all_checks_even_when_some_fail() {
+        let dir = temp_dir("partial-fail");
+        fs::create_dir_all(dir.join("prompts")).expect("create prompts dir");
+        fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: Test Skill\ndescription: Test.\nmetadata:\n  vectorhawk:\n    execution:\n      sandbox: strict\n      timeout_ms: 30000\n      memory_mb: 256\n    schemas:\n      outputs:\n        type: 42\n    workflow_ref: ./workflow.yaml\n---\n\nDo the thing.\n",
+        )
+        .expect("write SKILL.md");
+        fs::write(
+            dir.join("workflow.yaml"),
+            "name: test_skill\nsteps:\n  - id: run\n    type: llm\n    prompt: prompts/system.txt\n    inputs: {}\n",
+        )
+        .expect("write workflow.yaml");
+        fs::write(dir.join("prompts/system.txt"), "Do the thing.").expect("write system.txt");
+
+        let report = validate_bundle(&dir);
+
+        let manifest_check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "manifest")
+            .expect("manifest check must exist");
+        assert!(
+            manifest_check.level == CheckLevel::Pass,
+            "manifest check should pass"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_warns_when_triggers_empty() {
+        let dir = temp_dir("no-triggers");
+        write_valid_bundle(&dir);
+
+        let report = validate_bundle(&dir);
+
+        let triggers_check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "triggers")
+            .expect("triggers check must exist");
+        assert_eq!(
+            triggers_check.level,
+            CheckLevel::Warn,
+            "missing triggers should produce a warning, not a failure"
+        );
+        assert!(
+            report.all_passed(),
+            "warning-only report should be considered passing"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_fails_with_todo_description() {
+        let dir = temp_dir("todo-desc");
+        fs::create_dir_all(dir.join("prompts")).expect("create prompts dir");
+        fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: Test Skill\ndescription: \"TODO: describe what this skill does\"\nmetadata:\n  vectorhawk:\n    version: 0.1.0\n    publisher: skillclub\n    permissions:\n      filesystem: none\n      network: none\n      clipboard: none\n    execution:\n      sandbox: strict\n      timeout_ms: 30000\n      memory_mb: 256\n    workflow_ref: ./workflow.yaml\n---\n\nDo the thing.\n",
+        )
+        .expect("write SKILL.md");
+        fs::write(
+            dir.join("workflow.yaml"),
+            "name: test_skill\nsteps:\n  - id: run\n    type: llm\n    prompt: prompts/system.txt\n    inputs: {}\n",
+        )
+        .expect("write workflow.yaml");
+        fs::write(dir.join("prompts/system.txt"), "Do the thing.").expect("write system.txt");
+
+        let report = validate_bundle(&dir);
+
+        let desc_check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "description")
+            .expect("description check must exist");
+        assert_eq!(
+            desc_check.level,
+            CheckLevel::Fail,
+            "TODO description should fail"
+        );
+        assert!(
+            !report.all_passed(),
+            "report with a failed check should not be considered passing"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_truncates_long_description_on_a_char_boundary() {
+        let dir = temp_dir("multibyte-desc");
+        write_valid_bundle(&dir);
+        // 58 ASCII bytes then a 2-byte 'é', so byte 59 falls inside it.
+        let desc = format!("{}é and more text after it", "a".repeat(58));
+        let skill_md = fs::read_to_string(dir.join("SKILL.md")).expect("read SKILL.md");
+        fs::write(
+            dir.join("SKILL.md"),
+            skill_md.replace(
+                "description: A test skill.",
+                &format!("description: {desc}"),
+            ),
+        )
+        .expect("write SKILL.md");
+
+        let report = validate_bundle(&dir);
+
+        let desc_check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "description")
+            .expect("description check must exist");
+        assert_eq!(desc_check.level, CheckLevel::Pass);
+        assert_eq!(
+            desc_check.detail.as_deref(),
+            Some(format!("\"{}…\"", "a".repeat(58)).as_str())
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── F21: reference-bearing / oversized schemas fail validation ──────────
+
+    use crate::schema_guard::tests::{deep_schema, fanout_schema};
+
+    fn with_schemas(dir: &Utf8PathBuf, inputs: &serde_json::Value, outputs: &serde_json::Value) {
+        let skill_md = fs::read_to_string(dir.join("SKILL.md")).expect("read SKILL.md");
+        fs::write(
+            dir.join("SKILL.md"),
+            skill_md.replace(
+                "    workflow_ref:",
+                &format!("    schemas:\n      inputs: {inputs}\n      outputs: {outputs}\n    workflow_ref:"),
+            ),
+        )
+        .expect("write SKILL.md");
+    }
+
+    fn check_level(report: &ValidationReport, name: &str) -> (CheckLevel, String) {
+        let c = report
+            .checks
+            .iter()
+            .find(|c| c.name.starts_with(name))
+            .unwrap_or_else(|| panic!("{name} check must exist: {report:?}"));
+        (c.level, c.detail.clone().unwrap_or_default())
+    }
+
+    #[test]
+    fn validate_fails_self_referential_input_schema() {
+        let dir = temp_dir("f21-in-ref");
+        write_valid_bundle(&dir);
+        with_schemas(
+            &dir,
+            &serde_json::json!({"$ref": "#"}),
+            &serde_json::json!({}),
+        );
+        let report = validate_bundle(&dir);
+        let (level, detail) = check_level(&report, "input schema");
+        assert_eq!(level, CheckLevel::Fail, "{report:?}");
+        assert!(detail.contains("$ref"), "{detail}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_fails_ref_fanout_and_over_deep_output_schema() {
+        for (label, schema, expect) in [
+            ("fanout", fanout_schema(40), "$ref"),
+            ("deep", deep_schema(40), "nested too deeply"),
+        ] {
+            let dir = temp_dir(&format!("f21-out-{label}"));
+            write_valid_bundle(&dir);
+            with_schemas(&dir, &serde_json::json!({"type": "object"}), &schema);
+            let report = validate_bundle(&dir);
+            let (level, detail) = check_level(&report, "output schema");
+            assert_eq!(level, CheckLevel::Fail, "{label}: {report:?}");
+            assert!(detail.contains(expect), "{label}: {detail}");
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn validate_fails_ref_in_workflow_schema_file() {
+        let dir = temp_dir("f21-wf-ref");
+        write_valid_bundle(&dir);
+        fs::create_dir_all(dir.join("schemas")).expect("mkdir");
+        fs::write(dir.join("schemas/out.json"), r##"{"$ref":"#"}"##).expect("write");
+        let wf = fs::read_to_string(dir.join("workflow.yaml")).expect("read wf");
+        fs::write(
+            dir.join("workflow.yaml"),
+            format!("{wf}    output_schema: schemas/out.json\n"),
+        )
+        .expect("write wf");
+        let report = validate_bundle(&dir);
+        let (level, detail) = check_level(&report, "workflow schemas");
+        assert_eq!(level, CheckLevel::Fail, "{report:?}");
+        assert!(detail.contains("$ref"), "{detail}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_passes_normal_schemas_and_schema_files() {
+        let dir = temp_dir("f21-normal");
+        write_valid_bundle(&dir);
+        with_schemas(
+            &dir,
+            &serde_json::json!({"type": "object", "required": ["q"], "properties": {"q": {"type": "string"}}}),
+            &serde_json::json!({"type": "object"}),
+        );
+        fs::create_dir_all(dir.join("schemas")).expect("mkdir");
+        fs::write(dir.join("schemas/out.json"), r#"{"type":"object"}"#).expect("write");
+        let wf = fs::read_to_string(dir.join("workflow.yaml")).expect("read wf");
+        fs::write(
+            dir.join("workflow.yaml"),
+            format!("{wf}    output_schema: schemas/out.json\n"),
+        )
+        .expect("write wf");
+        let report = validate_bundle(&dir);
+        assert!(report.all_passed(), "{report:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
