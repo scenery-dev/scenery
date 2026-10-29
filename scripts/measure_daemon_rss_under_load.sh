@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# measure_daemon_rss_under_load.sh — measure peak vectorhawkd RSS under the
+# measure_daemon_rss_under_load.sh — measure peak scenery RSS under the
 # M5 5-shim 1000-call stress load and verify it meets the <=100 MB budget.
 #
 # Usage:
@@ -18,27 +18,27 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DAEMON_BIN="${REPO_ROOT}/target/release/vectorhawk"
+DAEMON_BIN="${REPO_ROOT}/target/release/scenery"
 RSS_FILE="${REPO_ROOT}/target/m5-daemon-rss-under-load.txt"
 MAX_UNDER_LOAD_MB=100
 
 # ── Self-clean: kill stale daemon + remove socket (per 321ca06 pattern) ───────
 
-if pgrep -x vectorhawk > /dev/null 2>&1; then
-    echo "INFO: killing stale vectorhawk daemon process(es) before test"
-    pkill -x vectorhawk || true
+if pgrep -x scenery > /dev/null 2>&1; then
+    echo "INFO: killing stale scenery daemon process(es) before test"
+    pkill -x scenery || true
     sleep 1
 fi
 
 # Attempt to remove any stale socket.
 if [[ "$(uname -s)" == "Darwin" ]]; then
-    SOCK_PATH="${HOME}/Library/Application Support/VectorHawk/agent.sock"
+    SOCK_PATH="${HOME}/Library/Application Support/Scenery/agent.sock"
 else
     XDG_RT="${XDG_RUNTIME_DIR:-}"
     if [[ -n "${XDG_RT}" ]]; then
-        SOCK_PATH="${XDG_RT}/vectorhawk/agent.sock"
+        SOCK_PATH="${XDG_RT}/scenery/agent.sock"
     else
-        SOCK_PATH="${HOME}/.local/share/VectorHawk/agent.sock"
+        SOCK_PATH="${HOME}/.local/share/Scenery/agent.sock"
     fi
 fi
 

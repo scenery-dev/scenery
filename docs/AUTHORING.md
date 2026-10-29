@@ -1,6 +1,6 @@
-# VectorHawk Skill Authoring Guide
+# Scenery Skill Authoring Guide
 
-SKILL.md is the canonical authoring format for VectorHawk skills. A skill is a
+SKILL.md is the canonical authoring format for Scenery skills. A skill is a
 Markdown file with a YAML frontmatter block that defines metadata, permissions,
 and execution settings. The Markdown body becomes the system prompt.
 
@@ -8,16 +8,16 @@ and execution settings. The Markdown body becomes the system prompt.
 
 ```bash
 # Scaffold a new skill
-vectorhawk skill init my-skill
+scenery skill init my-skill
 
 # Edit the scaffold
 $EDITOR my-skill/SKILL.md
 
 # Validate before publishing
-vectorhawk skill validate my-skill/
+scenery skill validate my-skill/
 
 # Publish to the registry
-vectorhawk skill publish my-skill/ --registry-url https://app.vectorhawk.ai
+scenery skill publish my-skill/ --registry-url https://app.scenery.dev
 ```
 
 ## File Format
@@ -56,8 +56,8 @@ Your system prompt goes here.
 Semver 2.0 string. Defaults to `0.1.0`. Increment when publishing an update.
 
 ### `vh_publisher`
-Your publisher handle in the VectorHawk registry. Required for `skill publish`.
-Authenticate first with `vectorhawk auth login`.
+Your publisher handle in the Scenery registry. Required for `skill publish`.
+Authenticate first with `scenery auth login`.
 
 ### `vh_permissions`
 
@@ -176,7 +176,7 @@ If you have an existing skill bundle (a directory with `manifest.json`), convert
 it to SKILL.md format:
 
 ```bash
-vectorhawk skill convert ./my-legacy-bundle/
+scenery skill convert ./my-legacy-bundle/
 # writes ./my-legacy-bundle-skill-md/SKILL.md
 ```
 

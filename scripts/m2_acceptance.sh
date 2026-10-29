@@ -20,9 +20,9 @@
 # ============================================================================
 #
 # M2 acceptance criteria (from context/RUN1_M2_STREAMS.md):
-#   AC1: vectorhawk daemon install (macOS) — plist written, socket reachable in 5 s.
-#   AC2: vectorhawk daemon install (Linux) — unit written, socket reachable.
-#   AC3: vectorhawk daemon uninstall — clean teardown, no zombie process or socket.
+#   AC1: scenery daemon install (macOS) — plist written, socket reachable in 5 s.
+#   AC2: scenery daemon install (Linux) — unit written, socket reachable.
+#   AC3: scenery daemon uninstall — clean teardown, no zombie process or socket.
 #   AC4: Idempotent — running daemon install twice is a no-op, exits 0.
 #   AC5: mcp setup integration — ensure_installed wired before config write.
 #   AC6: doctor install state — reports install state with unit path.
@@ -32,16 +32,16 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CLI_BIN="${REPO_ROOT}/target/release/vectorhawk"
+CLI_BIN="${REPO_ROOT}/target/release/scenery"
 
 # Initial cleanup — required when chained from another gate. Kill any stale
 # daemon and remove a leftover socket so the gate starts from a clean state.
 case "$(uname -s)" in
-    Darwin) _M2_INIT_SOCK="${HOME}/Library/Application Support/VectorHawk/agent.sock" ;;
-    Linux)  _M2_INIT_SOCK="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/vectorhawk/agent.sock" ;;
-    *)      _M2_INIT_SOCK="${HOME}/.local/share/vectorhawk/agent.sock" ;;
+    Darwin) _M2_INIT_SOCK="${HOME}/Library/Application Support/Scenery/agent.sock" ;;
+    Linux)  _M2_INIT_SOCK="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/scenery/agent.sock" ;;
+    *)      _M2_INIT_SOCK="${HOME}/.local/share/scenery/agent.sock" ;;
 esac
-pkill -x vectorhawk 2>/dev/null || true
+pkill -x scenery 2>/dev/null || true
 rm -f "${_M2_INIT_SOCK}" 2>/dev/null || true
 unset _M2_INIT_SOCK
 
@@ -67,14 +67,14 @@ record() {
 }
 
 echo ""
-echo "VectorHawk M2 Acceptance Gate"
+echo "Scenery M2 Acceptance Gate"
 echo "=============================="
 echo ""
 
 # ── Preflight ─────────────────────────────────────────────────────────────────
 
 if [[ ! -x "${CLI_BIN}" ]]; then
-    echo "ERROR: vectorhawk binary not built: ${CLI_BIN}" >&2
+    echo "ERROR: scenery binary not built: ${CLI_BIN}" >&2
     echo "" >&2
     echo "Run: cargo build --workspace --release" >&2
     echo "" >&2
@@ -90,17 +90,17 @@ OS="$(uname -s)"
 echo "AC1: macOS install end-to-end ..."
 if [[ "${OS}" != "Darwin" ]]; then
     record "SKIP" \
-        'AC1: vectorhawk daemon install (macOS)' \
+        'AC1: scenery daemon install (macOS)' \
         "not macOS — skipped (N/A on ${OS})"
 else
     if cargo test --release -p scenery-cli --test m2_install_macos \
             -- --include-ignored 2>&1 | grep -q "test result: ok. 1 passed"; then
         record "PASS" \
-            'AC1: vectorhawk daemon install (macOS)' \
+            'AC1: scenery daemon install (macOS)' \
             "m2_install_macos test passed (plist + socket + 5 s timeout)"
     else
         record "FAIL" \
-            'AC1: vectorhawk daemon install (macOS)' \
+            'AC1: scenery daemon install (macOS)' \
             "m2_install_macos test failed — see cargo output above"
     fi
 fi
@@ -110,24 +110,24 @@ fi
 echo "AC2: Linux install end-to-end ..."
 if [[ "${OS}" != "Linux" ]]; then
     record "SKIP" \
-        'AC2: vectorhawk daemon install (Linux)' \
+        'AC2: scenery daemon install (Linux)' \
         "not Linux — skipped (N/A on ${OS})"
 else
     # Graceful skip if systemctl --user is not available.
     if ! command -v systemctl >/dev/null 2>&1 \
        || ! systemctl --user show-environment >/dev/null 2>&1; then
         record "SKIP" \
-            'AC2: vectorhawk daemon install (Linux)' \
+            'AC2: scenery daemon install (Linux)' \
             "systemctl --user not available — skipped"
     else
         if cargo test --release -p scenery-cli --test m2_install_linux \
                 -- --include-ignored 2>&1 | grep -q "test result: ok. 1 passed"; then
             record "PASS" \
-                'AC2: vectorhawk daemon install (Linux)' \
+                'AC2: scenery daemon install (Linux)' \
                 "m2_install_linux test passed (unit + socket + 5 s timeout)"
         else
             record "FAIL" \
-                'AC2: vectorhawk daemon install (Linux)' \
+                'AC2: scenery daemon install (Linux)' \
                 "m2_install_linux test failed — see cargo output above"
         fi
     fi

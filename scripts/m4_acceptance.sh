@@ -26,14 +26,14 @@
 #   AC4: M0 daemon-kill test asserts the new error contract.
 #   AC5: Repo-grep cleanliness — no "in-process fallback" / "embedded fallback"
 #        references in shim production code.
-#   AC6: `mcp setup` matrix unchanged (command=vectorhawk args=[mcp,serve]).
+#   AC6: `mcp setup` matrix unchanged (command=scenery args=[mcp,serve]).
 #   AC7: Acceptance gate (this script) covers the new contract.
 
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SHIM_BIN="${REPO_ROOT}/target/release/vectorhawk"
-CLI_BIN="${REPO_ROOT}/target/release/vectorhawk"
+SHIM_BIN="${REPO_ROOT}/target/release/scenery"
+CLI_BIN="${REPO_ROOT}/target/release/scenery"
 
 if [[ -t 1 ]]; then
     GREEN="\033[0;32m"; RED="\033[0;31m"; YELLOW="\033[0;33m"; RESET="\033[0m"
@@ -57,7 +57,7 @@ record() {
 }
 
 echo ""
-echo "VectorHawk M4 Acceptance Gate"
+echo "Scenery M4 Acceptance Gate"
 echo "=============================="
 echo ""
 
@@ -88,7 +88,7 @@ fi
 echo "AC1+AC2: shim emits daemon-required error when daemon is down ..."
 
 # Make absolutely sure no daemon is running so the test is deterministic.
-pkill -x vectorhawk >/dev/null 2>&1 || true
+pkill -x scenery >/dev/null 2>&1 || true
 sleep 0.3
 
 # Find a temp HOME so the shim can compute a socket path and find it absent.
@@ -188,11 +188,11 @@ fi
 echo "AC6: verifying mcp setup entry shape ..."
 if [[ -x "${CLI_BIN}" ]]; then
     SETUP_OUTPUT="$("${CLI_BIN}" mcp setup --dry-run 2>&1 || true)"
-    if [[ "${SETUP_OUTPUT}" == *'"vectorhawk"'* && \
+    if [[ "${SETUP_OUTPUT}" == *'"scenery"'* && \
           "${SETUP_OUTPUT}" == *'"mcp"'* && \
           "${SETUP_OUTPUT}" == *'"serve"'* ]]; then
         record "PASS" "AC6: mcp setup shape unchanged" \
-            "command=vectorhawk args=[mcp,serve]"
+            "command=scenery args=[mcp,serve]"
     else
         record "FAIL" "AC6: mcp setup shape unchanged" \
             "unexpected mcp setup output: ${SETUP_OUTPUT:0:200}"

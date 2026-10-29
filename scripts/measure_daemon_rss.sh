@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# measure_daemon_rss.sh — measure vectorhawkd idle RSS and verify it meets the
+# measure_daemon_rss.sh — measure scenery idle RSS and verify it meets the
 # M0 budget of <=50 MB.
 #
 # Usage:
@@ -18,23 +18,23 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DAEMON_BIN="${REPO_ROOT}/target/release/vectorhawk"
+DAEMON_BIN="${REPO_ROOT}/target/release/scenery"
 RSS_FILE="${REPO_ROOT}/target/m0-daemon-rss.txt"
 MAX_RSS_MB=50
 
 # ── Preflight: binary must be built ──────────────────────────────────────────
 
 if [[ ! -x "${DAEMON_BIN}" ]]; then
-    echo "ERROR: vectorhawk binary not built yet — run cargo build --workspace --release first" >&2
+    echo "ERROR: scenery binary not built yet — run cargo build --workspace --release first" >&2
     echo "  Expected: ${DAEMON_BIN}" >&2
     exit 1
 fi
 
 # ── Kill any stale daemon from a previous run ─────────────────────────────────
 
-if pgrep -x vectorhawk > /dev/null 2>&1; then
-    echo "INFO: killing stale vectorhawk daemon process(es) before measurement"
-    pkill -x vectorhawk || true
+if pgrep -x scenery > /dev/null 2>&1; then
+    echo "INFO: killing stale scenery daemon process(es) before measurement"
+    pkill -x scenery || true
     sleep 1
 fi
 

@@ -3,7 +3,7 @@
 #
 # Validates the release pipeline artifacts for Stream D1.1:
 #   AC1: .github/workflows/release.yml exists and is valid YAML
-#   AC4: vectorhawk --version returns the workspace version
+#   AC4: scenery --version returns the workspace version
 #   AC6: Uninstall paths are documented in README.md
 #   AC7: M4 regression gate passes
 #   AC8: This script (the gate itself) exits 0 on a healthy repo
@@ -49,7 +49,7 @@ record() {
 }
 
 echo ""
-echo "VectorHawk D1.1 Acceptance Gate"
+echo "Scenery D1.1 Acceptance Gate"
 echo "================================="
 echo ""
 
@@ -117,7 +117,7 @@ if [[ ${BUILD_STATUS} -ne 0 ]]; then
 else
     record "PASS" "AC1 (build): cargo build --workspace --release succeeded" ""
 
-    for BIN in vectorhawk; do
+    for BIN in scenery; do
         BIN_PATH="${REPO_ROOT}/target/release/${BIN}"
         if [[ -x "${BIN_PATH}" ]]; then
             record "PASS" "AC1 (build): binary exists: ${BIN}" "${BIN_PATH}"
@@ -128,25 +128,25 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# AC4: vectorhawk --version returns a version string matching Cargo.toml
+# AC4: scenery --version returns a version string matching Cargo.toml
 # ---------------------------------------------------------------------------
 
-echo "AC4: checking vectorhawk --version ..."
+echo "AC4: checking scenery --version ..."
 
-VECTORHAWK_BIN="${REPO_ROOT}/target/release/vectorhawk"
-if [[ -x "${VECTORHAWK_BIN}" ]]; then
-    VERSION_OUT="$("${VECTORHAWK_BIN}" --version 2>&1 || true)"
+SCENERY_BIN="${REPO_ROOT}/target/release/scenery"
+if [[ -x "${SCENERY_BIN}" ]]; then
+    VERSION_OUT="$("${SCENERY_BIN}" --version 2>&1 || true)"
     # Extract version from workspace Cargo.toml — the line `version = "x.y.z"` at top level.
     CARGO_VERSION="$(grep '^version = ' "${REPO_ROOT}/Cargo.toml" | head -1 | sed 's/version = "\(.*\)"/\1/')"
     if [[ "${VERSION_OUT}" == *"${CARGO_VERSION}"* ]]; then
-        record "PASS" "AC4: vectorhawk --version reports workspace version" \
+        record "PASS" "AC4: scenery --version reports workspace version" \
             "output: ${VERSION_OUT}, expected version: ${CARGO_VERSION}"
     else
-        record "FAIL" "AC4: vectorhawk --version reports workspace version" \
+        record "FAIL" "AC4: scenery --version reports workspace version" \
             "output: ${VERSION_OUT}, expected version: ${CARGO_VERSION}"
     fi
 else
-    record "FAIL" "AC4: vectorhawk --version" "binary not found, skipping"
+    record "FAIL" "AC4: scenery --version" "binary not found, skipping"
 fi
 
 # ---------------------------------------------------------------------------
@@ -169,15 +169,15 @@ case "${HOST_OS}:${HOST_ARCH}" in
 esac
 
 CARGO_VERSION="$(grep '^version = ' "${REPO_ROOT}/Cargo.toml" | head -1 | sed 's/version = "\(.*\)"/\1/')"
-EXPECTED_ARCHIVE="vectorhawk-${CARGO_VERSION}-${HOST_TRIPLE}.tar.gz"
+EXPECTED_ARCHIVE="scenery-${CARGO_VERSION}-${HOST_TRIPLE}.tar.gz"
 
 STAGING_DIR="$(mktemp -d)"
-PKG_DIR="${STAGING_DIR}/vectorhawk-${CARGO_VERSION}-${HOST_TRIPLE}"
+PKG_DIR="${STAGING_DIR}/scenery-${CARGO_VERSION}-${HOST_TRIPLE}"
 mkdir -p "${PKG_DIR}"
 
 FAKE_RELEASE_OK=1
 
-for BIN in vectorhawk; do
+for BIN in scenery; do
     if [[ -x "${REPO_ROOT}/target/release/${BIN}" ]]; then
         cp "${REPO_ROOT}/target/release/${BIN}" "${PKG_DIR}/"
     else
@@ -199,7 +199,7 @@ fi
 
 if [[ ${FAKE_RELEASE_OK} -eq 1 ]]; then
     ARCHIVE_PATH="${STAGING_DIR}/${EXPECTED_ARCHIVE}"
-    tar -czf "${ARCHIVE_PATH}" -C "${STAGING_DIR}" "vectorhawk-${CARGO_VERSION}-${HOST_TRIPLE}"
+    tar -czf "${ARCHIVE_PATH}" -C "${STAGING_DIR}" "scenery-${CARGO_VERSION}-${HOST_TRIPLE}"
 
     if [[ -f "${ARCHIVE_PATH}" ]]; then
         record "PASS" "AC1 (tarball): tarball created with correct name" \
@@ -210,9 +210,9 @@ if [[ ${FAKE_RELEASE_OK} -eq 1 ]]; then
 
     # Verify contents of the tarball.
     TARBALL_CONTENTS="$(tar -tzf "${ARCHIVE_PATH}" 2>/dev/null)"
-    PKG_PREFIX="vectorhawk-${CARGO_VERSION}-${HOST_TRIPLE}"
+    PKG_PREFIX="scenery-${CARGO_VERSION}-${HOST_TRIPLE}"
     ALL_OK=1
-    for EXPECTED_FILE in vectorhawk LICENSE README.md; do
+    for EXPECTED_FILE in scenery LICENSE README.md; do
         if echo "${TARBALL_CONTENTS}" | grep -q "${PKG_PREFIX}/${EXPECTED_FILE}$"; then
             true
         else
@@ -221,7 +221,7 @@ if [[ ${FAKE_RELEASE_OK} -eq 1 ]]; then
     done
     if [[ ${ALL_OK} -eq 1 ]]; then
         record "PASS" "AC1 (tarball): tarball contains required files" \
-            "vectorhawk, LICENSE, README.md"
+            "scenery, LICENSE, README.md"
     else
         record "FAIL" "AC1 (tarball): tarball contents" \
             "missing files; got: $(echo "${TARBALL_CONTENTS}" | tr '\n' ' ')"
@@ -280,7 +280,7 @@ echo "AC6: checking README.md for uninstall documentation ..."
 
 README="${REPO_ROOT}/README.md"
 if [[ -f "${README}" ]]; then
-    if grep -q 'rm -rf.*\.vectorhawk' "${README}" && \
+    if grep -q 'rm -f.*local/bin/scenery' "${README}" && \
        grep -qi 'brew uninstall' "${README}"; then
         record "PASS" "AC6: uninstall paths documented in README.md" \
             "curl uninstall (rm -rf) and brew uninstall both present"
@@ -418,9 +418,9 @@ else
 
     # Test 3: constructed tarball URL matches expected pattern for each triple
     for _TRIPLE in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu; do
-        _EXPECTED_URL="https://github.com/scenery-dev/sceneryd/releases/download/v0.1.0/vectorhawk-0.1.0-${_TRIPLE}.tar.gz"
+        _EXPECTED_URL="https://github.com/scenery-dev/scenery/releases/download/v0.1.0/scenery-0.1.0-${_TRIPLE}.tar.gz"
         _VERSION="${GREP_TAG#v}"
-        _CONSTRUCTED_URL="https://github.com/scenery-dev/sceneryd/releases/download/${GREP_TAG}/vectorhawk-${_VERSION}-${_TRIPLE}.tar.gz"
+        _CONSTRUCTED_URL="https://github.com/scenery-dev/scenery/releases/download/${GREP_TAG}/scenery-${_VERSION}-${_TRIPLE}.tar.gz"
         if [[ "${_CONSTRUCTED_URL}" == "${_EXPECTED_URL}" ]]; then
             record "PASS" "D1.2 (AC2): URL construction for ${_TRIPLE}" \
                 "${_CONSTRUCTED_URL}"
@@ -472,10 +472,10 @@ echo "D1.2 (AC5): idempotency — no double PATH writes ..."
 if [[ -f "${INSTALL_SH}" ]]; then
     _IDEMPOTENCY_TMPDIR="$(mktemp -d)"
     _TEST_RC="${_IDEMPOTENCY_TMPDIR}/.zshrc"
-    _TEST_BIN_DIR="${_IDEMPOTENCY_TMPDIR}/.vectorhawk/bin"
+    _TEST_BIN_DIR="${_IDEMPOTENCY_TMPDIR}/.scenery/bin"
     mkdir -p "${_TEST_BIN_DIR}"
     # Pre-seed the rc file with the PATH line as if a previous install added it.
-    printf '# Added by VectorHawk installer\nexport PATH="%s:$PATH"\n' \
+    printf '# Added by Scenery installer\nexport PATH="%s:$PATH"\n' \
         "${_TEST_BIN_DIR}" > "${_TEST_RC}"
 
     # Count occurrences of the install dir before (should be 1).
@@ -487,7 +487,7 @@ if [[ -f "${INSTALL_SH}" ]]; then
         _ALREADY_PRESENT=1
     fi
     if [[ "${_ALREADY_PRESENT}" -eq 0 ]]; then
-        printf '\n# Added by VectorHawk installer\nexport PATH="%s:$PATH"\n' \
+        printf '\n# Added by Scenery installer\nexport PATH="%s:$PATH"\n' \
             "${_TEST_BIN_DIR}" >> "${_TEST_RC}"
     fi
 
@@ -516,20 +516,19 @@ if [[ ! -f "${INSTALL_DOC}" ]]; then
 else
     record "PASS" "D1.2 (AC6): docs/install.md exists" ""
 
-    if grep -q 'rm -rf.*\.vectorhawk' "${INSTALL_DOC}"; then
+    if grep -q 'rm -f.*local/bin/scenery' "${INSTALL_DOC}"; then
         record "PASS" "D1.2 (AC6): uninstall instruction present in docs/install.md" ""
     else
         record "FAIL" "D1.2 (AC6): uninstall instruction present in docs/install.md" \
-            "rm -rf ~/.vectorhawk not found"
+            "rm of ~/.local/bin/scenery not found"
     fi
 
-    if grep -q 'VECTORHAWK_VERSION' "${INSTALL_DOC}" && \
-       grep -q 'VECTORHAWK_HOME' "${INSTALL_DOC}" && \
-       grep -q 'VECTORHAWK_NO_MODIFY_PATH' "${INSTALL_DOC}"; then
+    if grep -q 'SCENERY_VERSION' "${INSTALL_DOC}" && \
+       grep -q 'SCENERY_NO_MODIFY_PATH' "${INSTALL_DOC}"; then
         record "PASS" "D1.2 (AC6): override knobs documented in docs/install.md" ""
     else
         record "FAIL" "D1.2 (AC6): override knobs documented in docs/install.md" \
-            "one or more of VECTORHAWK_VERSION / VECTORHAWK_HOME / VECTORHAWK_NO_MODIFY_PATH missing"
+            "one or more of SCENERY_VERSION / SCENERY_NO_MODIFY_PATH missing"
     fi
 
     if grep -qi 'brew tap\|homebrew' "${INSTALL_DOC}"; then

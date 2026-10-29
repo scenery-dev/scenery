@@ -52,24 +52,24 @@ record() {
 }
 
 echo ""
-echo "VectorHawk M5 Acceptance Gate"
+echo "Scenery M5 Acceptance Gate"
 echo "=============================="
 echo ""
 
 # ── Initial cleanup — kill stale daemon + remove socket (321ca06 pattern) ────
 
-echo "Initial cleanup: killing any stale vectorhawk daemon and removing socket ..."
-pkill -x vectorhawk >/dev/null 2>&1 || true
+echo "Initial cleanup: killing any stale scenery daemon and removing socket ..."
+pkill -x scenery >/dev/null 2>&1 || true
 sleep 0.5
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
-    SOCK_PATH="${HOME}/Library/Application Support/VectorHawk/agent.sock"
+    SOCK_PATH="${HOME}/Library/Application Support/Scenery/agent.sock"
 else
     XDG_RT="${XDG_RUNTIME_DIR:-}"
     if [[ -n "${XDG_RT}" ]]; then
-        SOCK_PATH="${XDG_RT}/vectorhawk/agent.sock"
+        SOCK_PATH="${XDG_RT}/scenery/agent.sock"
     else
-        SOCK_PATH="${HOME}/.local/share/VectorHawk/agent.sock"
+        SOCK_PATH="${HOME}/.local/share/Scenery/agent.sock"
     fi
 fi
 
@@ -90,7 +90,7 @@ for gate in m0 m1 m2 m3 m4 d1; do
             "${gate}_acceptance.sh returned non-zero — re-run it directly for details"
     fi
     # Re-kill stale processes after each gate (each gate may leave a daemon running).
-    pkill -x vectorhawk >/dev/null 2>&1 || true
+    pkill -x scenery >/dev/null 2>&1 || true
     sleep 0.5
     rm -f "${SOCK_PATH}" 2>/dev/null || true
 done
@@ -104,12 +104,12 @@ else
     record "FAIL" "Build: release workspace" "cargo build --workspace --release FAILED"
 fi
 
-SHIM_BIN="${REPO_ROOT}/target/release/vectorhawk"
+SHIM_BIN="${REPO_ROOT}/target/release/scenery"
 
 # ── AC1: 5-shim 1000-call stress test ────────────────────────────────────────
 
 echo "AC1: m5_stress_multi_shim (5 shims, 1000 calls) ..."
-pkill -x vectorhawk >/dev/null 2>&1 || true
+pkill -x scenery >/dev/null 2>&1 || true
 sleep 0.3
 rm -f "${SOCK_PATH}" 2>/dev/null || true
 
@@ -124,14 +124,14 @@ else
 fi
 rm -f "${STRESS_OUT}"
 
-pkill -x vectorhawk >/dev/null 2>&1 || true
+pkill -x scenery >/dev/null 2>&1 || true
 sleep 0.3
 rm -f "${SOCK_PATH}" 2>/dev/null || true
 
 # ── AC2: mid-load kill test ───────────────────────────────────────────────────
 
 echo "AC2: m5_stress_kill (SIGKILL at 500 calls, -32001 contract) ..."
-pkill -x vectorhawk >/dev/null 2>&1 || true
+pkill -x scenery >/dev/null 2>&1 || true
 sleep 0.3
 rm -f "${SOCK_PATH}" 2>/dev/null || true
 
@@ -146,14 +146,14 @@ else
 fi
 rm -f "${KILL_OUT}"
 
-pkill -x vectorhawk >/dev/null 2>&1 || true
+pkill -x scenery >/dev/null 2>&1 || true
 sleep 0.3
 rm -f "${SOCK_PATH}" 2>/dev/null || true
 
 # ── AC3: idle RSS ─────────────────────────────────────────────────────────────
 
 echo "AC3: daemon idle RSS (<=50 MB) ..."
-pkill -x vectorhawk >/dev/null 2>&1 || true
+pkill -x scenery >/dev/null 2>&1 || true
 sleep 0.3
 rm -f "${SOCK_PATH}" 2>/dev/null || true
 
@@ -168,14 +168,14 @@ else
 fi
 rm -f "${IDLE_RSS_OUT}"
 
-pkill -x vectorhawk >/dev/null 2>&1 || true
+pkill -x scenery >/dev/null 2>&1 || true
 sleep 0.3
 rm -f "${SOCK_PATH}" 2>/dev/null || true
 
 # ── AC3: under-load RSS ───────────────────────────────────────────────────────
 
 echo "AC3: daemon under-load RSS (<=100 MB) via measure_daemon_rss_under_load.sh ..."
-pkill -x vectorhawk >/dev/null 2>&1 || true
+pkill -x scenery >/dev/null 2>&1 || true
 sleep 0.3
 rm -f "${SOCK_PATH}" 2>/dev/null || true
 
@@ -192,7 +192,7 @@ else
 fi
 rm -f "${UNDERLOAD_OUT}"
 
-pkill -x vectorhawk >/dev/null 2>&1 || true
+pkill -x scenery >/dev/null 2>&1 || true
 sleep 0.3
 rm -f "${SOCK_PATH}" 2>/dev/null || true
 

@@ -38,19 +38,19 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DAEMON_BIN="${REPO_ROOT}/target/release/vectorhawk"
-SHIM_BIN="${REPO_ROOT}/target/release/vectorhawk"
-CLI_BIN="${REPO_ROOT}/target/release/vectorhawk"
+DAEMON_BIN="${REPO_ROOT}/target/release/scenery"
+SHIM_BIN="${REPO_ROOT}/target/release/scenery"
+CLI_BIN="${REPO_ROOT}/target/release/scenery"
 
 # Initial cleanup — required when this script is chained from m4_acceptance.sh
 # (or any other gate) and a stale daemon from a previous step still holds the
 # socket. Each gate must be safe to run from a dirty starting state.
 case "$(uname -s)" in
-    Darwin) _M1_INIT_SOCK="${HOME}/Library/Application Support/VectorHawk/agent.sock" ;;
-    Linux)  _M1_INIT_SOCK="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/vectorhawk/agent.sock" ;;
-    *)      _M1_INIT_SOCK="${HOME}/.local/share/vectorhawk/agent.sock" ;;
+    Darwin) _M1_INIT_SOCK="${HOME}/Library/Application Support/Scenery/agent.sock" ;;
+    Linux)  _M1_INIT_SOCK="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/scenery/agent.sock" ;;
+    *)      _M1_INIT_SOCK="${HOME}/.local/share/scenery/agent.sock" ;;
 esac
-pkill -x vectorhawk 2>/dev/null || true
+pkill -x scenery 2>/dev/null || true
 rm -f "${_M1_INIT_SOCK}" 2>/dev/null || true
 unset _M1_INIT_SOCK
 
@@ -76,7 +76,7 @@ record() {
 }
 
 echo ""
-echo "VectorHawk M1 Acceptance Gate"
+echo "Scenery M1 Acceptance Gate"
 echo "=============================="
 echo ""
 
@@ -226,7 +226,7 @@ esac
 
 # ── AC9: CLI surface ─────────────────────────────────────────────────────────
 
-echo "AC9: vectorhawk CLI surface ..."
+echo "AC9: scenery CLI surface ..."
 HELP_OUT="$("${CLI_BIN}" --help 2>&1)"
 NEED=("doctor" "skill" "auth" "daemon" "mcp")
 MISSING=()
@@ -236,10 +236,10 @@ for cmd in "${NEED[@]}"; do
     fi
 done
 if [[ ${#MISSING[@]} -eq 0 ]]; then
-    record "PASS" 'AC9: vectorhawk CLI subcommands' \
+    record "PASS" 'AC9: scenery CLI subcommands' \
         "doctor + skill + auth + daemon + mcp all present"
 else
-    record "FAIL" 'AC9: vectorhawk CLI subcommands' \
+    record "FAIL" 'AC9: scenery CLI subcommands' \
         "missing: ${MISSING[*]}"
 fi
 
@@ -248,14 +248,14 @@ fi
 echo "AC10: compute budget (idle + load + shim size) ..."
 # Platform-aware socket path (mirrors AppState::socket_path() in scenery-core).
 case "$(uname)" in
-    Darwin) SOCKET_PATH="${HOME}/Library/Application Support/VectorHawk/agent.sock" ;;
-    Linux)  SOCKET_PATH="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/vectorhawk/agent.sock" ;;
-    *)      SOCKET_PATH="${HOME}/.local/share/vectorhawk/agent.sock" ;;
+    Darwin) SOCKET_PATH="${HOME}/Library/Application Support/Scenery/agent.sock" ;;
+    Linux)  SOCKET_PATH="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/scenery/agent.sock" ;;
+    *)      SOCKET_PATH="${HOME}/.local/share/scenery/agent.sock" ;;
 esac
 
 # Idle RSS: spawn daemon, wait, measure.
-if pgrep -x vectorhawk >/dev/null 2>&1; then
-    pkill -x vectorhawk 2>/dev/null || true
+if pgrep -x scenery >/dev/null 2>&1; then
+    pkill -x scenery 2>/dev/null || true
     sleep 1
 fi
 rm -f "${SOCKET_PATH}"
@@ -285,16 +285,16 @@ kill -TERM ${DAEMON_PID} 2>/dev/null || true
 wait ${DAEMON_PID} 2>/dev/null || true
 rm -f "${SOCKET_PATH}"
 
-VECTORHAWK_SIZE_BYTES="$(stat -f%z "${SHIM_BIN}" 2>/dev/null || stat -c%s "${SHIM_BIN}" 2>/dev/null)"
-VECTORHAWK_SIZE_MB=$((VECTORHAWK_SIZE_BYTES / 1048576))
+SCENERY_SIZE_BYTES="$(stat -f%z "${SHIM_BIN}" 2>/dev/null || stat -c%s "${SHIM_BIN}" 2>/dev/null)"
+SCENERY_SIZE_MB=$((SCENERY_SIZE_BYTES / 1048576))
 
 # The separate scenery-shim binary no longer exists; mcp serve is now a
-# subcommand of the unified vectorhawk binary. Idle/load RSS budgets still apply.
+# subcommand of the unified scenery binary. Idle/load RSS budgets still apply.
 # The <=6 MB shim-binary budget is informational only for the unified binary.
 if [[ "${IDLE_RSS_MB}" -le 50 ]] \
    && [[ "${LOAD_RSS_MB}" -le 100 ]]; then
     record "PASS" 'AC10: compute budget' \
-        "idle=${IDLE_RSS_MB}MB load=${LOAD_RSS_MB}MB vectorhawk=${VECTORHAWK_SIZE_MB}MB"
+        "idle=${IDLE_RSS_MB}MB load=${LOAD_RSS_MB}MB scenery=${SCENERY_SIZE_MB}MB"
 else
     record "FAIL" 'AC10: compute budget' \
         "idle=${IDLE_RSS_MB}MB (<=50) load=${LOAD_RSS_MB}MB (<=100)"
@@ -349,7 +349,7 @@ done
 echo ""
 echo "Daemon idle RSS: $(cat ${REPO_ROOT}/target/m1-daemon-idle-rss.txt 2>/dev/null || echo 'not measured')"
 echo "Daemon load RSS: $(cat ${REPO_ROOT}/target/m1-daemon-load-rss.txt 2>/dev/null || echo 'not measured')"
-echo "vectorhawk binary size: ${VECTORHAWK_SIZE_BYTES} bytes (${VECTORHAWK_SIZE_MB} MB)"
+echo "scenery binary size: ${SCENERY_SIZE_BYTES} bytes (${SCENERY_SIZE_MB} MB)"
 echo ""
 
 if [[ "${ALL_PASS}" -eq 1 ]]; then

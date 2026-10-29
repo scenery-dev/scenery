@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 #
-# VectorHawk standalone uninstaller — restores your system, no VectorHawk binary
-# required. Use this when `vectorhawk uninstall` won't run (binary missing or
-# broken) and you just want VectorHawk fully off the machine.
+# Scenery standalone uninstaller — restores your system, no Scenery binary
+# required. Use this when `scenery uninstall` won't run (binary missing or
+# broken) and you just want Scenery fully off the machine.
 #
 # It is path-based and reads the on-disk restore journal directly, so it needs
-# no running daemon. It mirrors the steps of the built-in `vectorhawk uninstall`
+# no running daemon. It mirrors the steps of the built-in `scenery uninstall`
 # and prints the same REMOVED / KEPT / RESTORED report.
 #
 # JSON handling works with either `jq` or `python3` (config stripping must
@@ -33,26 +33,26 @@ have() { command -v "$1" >/dev/null 2>&1; }
 
 # ── Platform paths ────────────────────────────────────────────────────────────
 if [[ "$(uname)" == "Darwin" ]]; then
-  DATA="$HOME/Library/Application Support/VectorHawk"
-  LOGS="$HOME/Library/Logs/VectorHawk"
-  PLIST="$HOME/Library/LaunchAgents/com.vectorhawk.agent.plist"
-  BREW_PLIST="$HOME/Library/LaunchAgents/homebrew.mxcl.vectorhawk.plist"
+  DATA="$HOME/Library/Application Support/Scenery"
+  LOGS="$HOME/Library/Logs/Scenery"
+  PLIST="$HOME/Library/LaunchAgents/com.scenery.agent.plist"
+  BREW_PLIST="$HOME/Library/LaunchAgents/homebrew.mxcl.scenery.plist"
 else
-  # The runner uses dirs::data_dir()/VectorHawk; Linux paths are
+  # The runner uses dirs::data_dir()/Scenery; Linux paths are
   # case-sensitive. Fall back to the lowercase spelling older copies of this
   # script assumed, in case something created it.
-  DATA="${XDG_DATA_HOME:-$HOME/.local/share}/VectorHawk"
-  [[ -d "$DATA" ]] || [[ ! -d "${DATA%/*}/vectorhawk" ]] || DATA="${DATA%/*}/vectorhawk"
+  DATA="${XDG_DATA_HOME:-$HOME/.local/share}/Scenery"
+  [[ -d "$DATA" ]] || [[ ! -d "${DATA%/*}/scenery" ]] || DATA="${DATA%/*}/scenery"
   LOGS="$DATA/logs"
-  UNIT="$HOME/.config/systemd/user/vectorhawk-agent.service"
-  BREW_UNIT="$HOME/.config/systemd/user/sh.brew.vectorhawk.service"
-  AUTOSTART="$HOME/.config/autostart/vectorhawk.desktop"
+  UNIT="$HOME/.config/systemd/user/scenery.service"
+  BREW_UNIT="$HOME/.config/systemd/user/sh.brew.scenery.service"
+  AUTOSTART="$HOME/.config/autostart/scenery.desktop"
 fi
 JOURNAL="$DATA/restore-journal.json"   # written by the runner (see journal card)
-STAMP="${VECTORHAWK_UNINSTALL_STAMP:-$(date +%Y%m%dT%H%M%S 2>/dev/null || echo latest)}"
-REPORT="$HOME/VectorHawk-uninstall-$STAMP.md"
+STAMP="${SCENERY_UNINSTALL_STAMP:-$(date +%Y%m%dT%H%M%S 2>/dev/null || echo latest)}"
+REPORT="$HOME/Scenery-uninstall-$STAMP.md"
 
-# Client configs VectorHawk may have written into.
+# Client configs Scenery may have written into.
 CLIENT_CONFIGS=(
   "$HOME/.claude.json"
   "$HOME/.cursor/mcp.json"
@@ -229,7 +229,7 @@ PYEOF
   fi
 }
 
-# Every key (slug AND detail.server_key, any source) VectorHawk ever wrote into
+# Every key (slug AND detail.server_key, any source) Scenery ever wrote into
 # a client config — used to tell VH-authored entries apart from the user's own
 # when computing the KEPT section.
 journal_all_keys() {
@@ -259,7 +259,7 @@ PYEOF
 }
 
 if [[ "$YES" -ne 1 ]]; then
-  echo "This will remove VectorHawk and restore your AI-client configs."
+  echo "This will remove Scenery and restore your AI-client configs."
   read -r -p "Proceed? [y/N] " ans
   [[ "$ans" =~ ^[Yy] ]] || { echo "Aborted."; exit 0; }
 fi
@@ -267,16 +267,16 @@ fi
 REMOVED=(); KEPT=(); RESTORED=(); WARN=()
 
 if [[ -f "$JOURNAL" ]] && ! have_json_tool; then
-  WARN+=("neither jq nor python3 is available — cannot read the restore journal or edit client configs; remove VectorHawk entries by hand")
+  WARN+=("neither jq nor python3 is available — cannot read the restore journal or edit client configs; remove Scenery entries by hand")
 elif [[ ! -f "$JOURNAL" ]]; then
-  WARN+=("no restore journal found — restore limited to what's already backed up on disk; only the literal \"vectorhawk\" key is treated as VectorHawk-authored")
+  WARN+=("no restore journal found — restore limited to what's already backed up on disk; only the literal \"scenery\" key is treated as Scenery-authored")
 fi
 
 # ── 1. Plan (read-only): compute KEPT before anything is mutated ──────────────
-# Any config key that's VectorHawk-authored (per the journal, any source) or is
-# the shim's own "vectorhawk" key is NOT a user tool; everything else present
+# Any config key that's Scenery-authored (per the journal, any source) or is
+# the shim's own "scenery" key is NOT a user tool; everything else present
 # is the user's own and gets reported as kept, untouched.
-VH_KEYS=("vectorhawk")
+VH_KEYS=("scenery")
 if have_json_tool; then
   while IFS= read -r k; do [[ -n "$k" ]] && VH_KEYS+=("$k"); done < <(journal_all_keys)
 fi
@@ -299,12 +299,12 @@ done
 # configs and re-saves refreshed tokens. That includes the `brew services`
 # one, which is what Homebrew installs actually run.
 if [[ "$(uname)" == "Darwin" ]]; then
-  for label in com.vectorhawk.agent homebrew.mxcl.vectorhawk; do
+  for label in com.scenery.agent homebrew.mxcl.scenery; do
     launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
   done
   rm -f "$PLIST" "$BREW_PLIST"
 else
-  for svc in vectorhawk-agent.service sh.brew.vectorhawk.service; do
+  for svc in scenery.service sh.brew.scenery.service; do
     systemctl --user disable --now "$svc" 2>/dev/null || true
   done
   rm -f "$UNIT" "$BREW_UNIT"
@@ -328,8 +328,8 @@ if have_json_tool; then
   done < <(journal_restore_rows)
 fi
 
-# ── 4. Strip VectorHawk entries from every client config ──────────────────────
-# Removes the "vectorhawk" shim key AND any brokered per-slug keys the runner
+# ── 4. Strip Scenery entries from every client config ──────────────────────
+# Removes the "scenery" shim key AND any brokered per-slug keys the runner
 # added. Uses jq if available, otherwise a python3 fallback — config stripping
 # must always happen, never silently skipped.
 BROKERED_KEYS=()
@@ -340,39 +340,39 @@ for cfg in "${CLIENT_CONFIGS[@]}"; do
   [[ -f "$cfg" ]] || continue
   key="$(mcp_key_for_config "$cfg")"
   if ! have_json_tool; then
-    WARN+=("no jq or python3 — leaving $cfg untouched; remove the \"vectorhawk\" entry by hand")
+    WARN+=("no jq or python3 — leaving $cfg untouched; remove the \"scenery\" entry by hand")
     continue
   fi
-  removed_here="$(edit_json_del_keys "$cfg" "$key" "vectorhawk" "${BROKERED_KEYS[@]+"${BROKERED_KEYS[@]}"}")" || {
-    WARN+=("could not parse/edit $cfg — remove the \"vectorhawk\" entry by hand")
+  removed_here="$(edit_json_del_keys "$cfg" "$key" "scenery" "${BROKERED_KEYS[@]+"${BROKERED_KEYS[@]}"}")" || {
+    WARN+=("could not parse/edit $cfg — remove the \"scenery\" entry by hand")
     continue
   }
   while IFS= read -r r; do
     [[ -z "$r" ]] && continue
-    if [[ "$r" == "vectorhawk" ]]; then
-      REMOVED+=("vectorhawk shim (from $(basename "$cfg"))")
+    if [[ "$r" == "scenery" ]]; then
+      REMOVED+=("scenery shim (from $(basename "$cfg"))")
     else
       REMOVED+=("$r (from $(basename "$cfg"))")
     fi
   done <<< "$removed_here"
 done
 
-# ── 5. Remove managed skills/plugins VectorHawk pushed into ~/.claude ─────────
+# ── 5. Remove managed skills/plugins Scenery pushed into ~/.claude ─────────
 for base in "$HOME/.claude/skills" "$HOME/.claude/plugins"; do
   [[ -d "$base" ]] || continue
   while IFS= read -r marker; do
     d="$(dirname "$marker")"; rm -rf "$d" && REMOVED+=("managed: $(basename "$d")")
-  done < <(find "$base" -maxdepth 2 -name '.vectorhawk-managed.json' 2>/dev/null)
+  done < <(find "$base" -maxdepth 2 -name '.scenery-managed.json' 2>/dev/null)
 done
 
 # ── 6. Sign out: drop every stored credential, with or without --purge ───────
-# Mirrors `vectorhawk uninstall`, which signs out of every registry. Tokens,
+# Mirrors `scenery uninstall`, which signs out of every registry. Tokens,
 # the PAT and the H3 local key live in $DATA/secrets (and, on macOS, the
 # keychain). Builds before 1.0.114 kept them in state.db, so clear that too;
 # secure_delete zeroes the deleted rows instead of leaving them on free pages.
 if [[ -d "$DATA/secrets" ]]; then
   if rm -rf "$DATA/secrets"; then
-    REMOVED+=("stored VectorHawk secrets ($DATA/secrets)")
+    REMOVED+=("stored Scenery secrets ($DATA/secrets)")
   else
     WARN+=("could not delete $DATA/secrets — delete it by hand")
   fi
@@ -383,7 +383,7 @@ DELETE FROM auth_tokens;
 DELETE FROM sync_state WHERE key IN ('mcp_local_key', 'device_id', 'device_uuid', 'mcp_user_id');"
 if [[ -f "$DB" ]]; then
   if have sqlite3 && sqlite3 "$DB" "$SIGNOUT_SQL" 2>/dev/null; then
-    REMOVED+=("stored VectorHawk sign-in tokens")
+    REMOVED+=("stored Scenery sign-in tokens")
   elif have python3 && python3 - "$DB" "$SIGNOUT_SQL" <<'PYEOF'
 import sqlite3, sys
 conn = sqlite3.connect(sys.argv[1])
@@ -391,7 +391,7 @@ conn.executescript(sys.argv[2])
 conn.close()
 PYEOF
   then
-    REMOVED+=("stored VectorHawk sign-in tokens")
+    REMOVED+=("stored Scenery sign-in tokens")
   else
     WARN+=("could not clear sign-in tokens from $DB — delete that file by hand")
   fi
@@ -399,7 +399,7 @@ fi
 # macOS keychain: one item per registry, and each call deletes only one.
 if have security; then
   for _ in $(seq 1 64); do
-    security delete-generic-password -s "com.vectorhawk.agent" >/dev/null 2>&1 || break
+    security delete-generic-password -s "com.scenery.agent" >/dev/null 2>&1 || break
   done
 fi
 
@@ -411,14 +411,14 @@ fi
 
 # ── 8. Write the restore report ───────────────────────────────────────────────
 {
-  echo "# VectorHawk uninstall — restore report"
+  echo "# Scenery uninstall — restore report"
   echo
   echo "## Removed completely"
-  echo "_Re-add these on your own configuration. VectorHawk's own sign-in tokens have been cleared from this machine._"
+  echo "_Re-add these on your own configuration. Scenery's own sign-in tokens have been cleared from this machine._"
   echo
   if [[ ${#REMOVED[@]} -eq 0 ]]; then echo "- (none)"; else printf -- '- %s\n' "${REMOVED[@]}"; fi
   echo
-  echo "## Kept (no longer managed by VectorHawk)"
+  echo "## Kept (no longer managed by Scenery)"
   echo "_Your own tools — left exactly as they were, just unregistered._"
   echo
   if [[ ${#KEPT[@]} -eq 0 ]]; then
@@ -426,7 +426,7 @@ fi
   else
     for entry in "${KEPT[@]}"; do
       name="${entry%%|*}"; loc="${entry##*|}"
-      echo "- **$name** ($loc) — your own server, left in place, no longer audited by VectorHawk"
+      echo "- **$name** ($loc) — your own server, left in place, no longer audited by Scenery"
     done
   fi
   echo
@@ -437,7 +437,7 @@ fi
 } > "$REPORT"
 
 echo
-echo "Done. VectorHawk removed."
+echo "Done. Scenery removed."
 echo "  Removed completely: ${#REMOVED[@]}   Kept (unregistered): ${#KEPT[@]}   Restored: ${#RESTORED[@]}"
 echo "Restore report: $REPORT"
 echo "Restart your AI client(s) to apply the change."

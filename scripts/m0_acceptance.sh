@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # m0_acceptance.sh — top-level M0 acceptance gate.
 #
-# Runs all six M0 acceptance checks from vectorhawkd/CLAUDE.md and emits a
+# Runs all six M0 acceptance checks from scenery/CLAUDE.md and emits a
 # structured pass/fail table.  Returns 0 only when every check passes.
 #
 # ============================================================================
@@ -23,29 +23,29 @@
 # do NOT run `cargo test` for these — use this gate script instead.
 # ============================================================================
 #
-# M0 acceptance criteria (from vectorhawkd/CLAUDE.md):
+# M0 acceptance criteria (from scenery/CLAUDE.md):
 #   AC1: Workspace builds (`cargo build` green).
-#   AC2: vectorhawkd daemon boots, listens on Unix socket, holds stub backend.
-#   AC3: vectorhawk mcp serve (shim) connects, relays initialize + tools/list
+#   AC2: scenery daemon boots, listens on Unix socket, holds stub backend.
+#   AC3: scenery mcp serve (shim) connects, relays initialize + tools/list
 #        + >=5 tools/call invocations.
 #   AC4: Killing daemon mid-session causes shim to surface a JSON-RPC error
 #        with the 'daemon' install hint (M4 contract; supersedes M0 fallback).
 #   AC5: Daemon idle RSS <=50 MB on macOS arm64.
-#   AC6: `mcp setup` entry shape is `command=vectorhawk args=[mcp, serve]`.
+#   AC6: `mcp setup` entry shape is `command=scenery args=[mcp, serve]`.
 
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CLI_BIN="${REPO_ROOT}/target/release/vectorhawk"
+CLI_BIN="${REPO_ROOT}/target/release/scenery"
 
 # Initial cleanup — required when chained from another gate. Each gate must
 # be safe to run from a dirty starting state (stale daemon / stale socket).
 case "$(uname -s)" in
-    Darwin) _M0_INIT_SOCK="${HOME}/Library/Application Support/VectorHawk/agent.sock" ;;
-    Linux)  _M0_INIT_SOCK="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/vectorhawk/agent.sock" ;;
-    *)      _M0_INIT_SOCK="${HOME}/.local/share/vectorhawk/agent.sock" ;;
+    Darwin) _M0_INIT_SOCK="${HOME}/Library/Application Support/Scenery/agent.sock" ;;
+    Linux)  _M0_INIT_SOCK="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/scenery/agent.sock" ;;
+    *)      _M0_INIT_SOCK="${HOME}/.local/share/scenery/agent.sock" ;;
 esac
-pkill -x vectorhawk 2>/dev/null || true
+pkill -x scenery 2>/dev/null || true
 rm -f "${_M0_INIT_SOCK}" 2>/dev/null || true
 unset _M0_INIT_SOCK
 
@@ -72,7 +72,7 @@ record() {
 }
 
 echo ""
-echo "VectorHawk M0 Acceptance Gate"
+echo "Scenery M0 Acceptance Gate"
 echo "=============================="
 echo ""
 
@@ -88,7 +88,7 @@ done
 
 if [[ "${BINARIES_MISSING}" -eq 1 ]]; then
     echo "" >&2
-    echo "ERROR: vectorhawk binary is missing." >&2
+    echo "ERROR: scenery binary is missing." >&2
     echo "       Run:  cargo build --workspace --release" >&2
     echo "       Then: bash scripts/m0_acceptance.sh" >&2
     echo "" >&2
@@ -172,7 +172,7 @@ if [[ -x "${CLI_BIN}" ]]; then
     # Capture output once to avoid SIGPIPE from `grep -q` closing the pipe early
     # under `set -o pipefail` (which would mark the CLI as having failed).
     SETUP_OUTPUT="$("${CLI_BIN}" mcp setup --dry-run 2>&1)"
-    if [[ "${SETUP_OUTPUT}" == *'"vectorhawk"'* && \
+    if [[ "${SETUP_OUTPUT}" == *'"scenery"'* && \
           "${SETUP_OUTPUT}" == *'"mcp"'* && \
           "${SETUP_OUTPUT}" == *'"serve"'* ]]; then
         AC6_PASS=1
@@ -184,16 +184,16 @@ else
     # format hasn't changed" — the CLI doesn't need to actually write configs.
     SETUP_SRC="${REPO_ROOT}/crates/scenery-mcp/src/setup.rs"
     if [[ -f "${SETUP_SRC}" ]]; then
-        if grep -q '"vectorhawk"' "${SETUP_SRC}" && grep -q '"mcp"' "${SETUP_SRC}" && grep -q '"serve"' "${SETUP_SRC}"; then
+        if grep -q '"scenery"' "${SETUP_SRC}" && grep -q '"mcp"' "${SETUP_SRC}" && grep -q '"serve"' "${SETUP_SRC}"; then
             AC6_PASS=1
         fi
     fi
 fi
 
 if [[ "${AC6_PASS}" -eq 1 ]]; then
-    record "PASS" 'AC6: mcp setup shape = command=vectorhawk args=[mcp,serve]' "entry shape verified"
+    record "PASS" 'AC6: mcp setup shape = command=scenery args=[mcp,serve]' "entry shape verified"
 else
-    record "FAIL" 'AC6: mcp setup shape = command=vectorhawk args=[mcp,serve]' "could not verify — check setup.rs or run vectorhawk mcp setup --dry-run"
+    record "FAIL" 'AC6: mcp setup shape = command=scenery args=[mcp,serve]' "could not verify — check setup.rs or run scenery mcp setup --dry-run"
 fi
 
 # ── Summary table ─────────────────────────────────────────────────────────────
@@ -223,7 +223,7 @@ for i in "${!RESULTS[@]}"; do
 done
 
 echo ""
-echo "Unified vectorhawk binary size: ${SHIM_SIZE} (informational)"
+echo "Unified scenery binary size: ${SHIM_SIZE} (informational)"
 echo ""
 
 if [[ "${OVERALL_PASS}" -eq 1 ]]; then
