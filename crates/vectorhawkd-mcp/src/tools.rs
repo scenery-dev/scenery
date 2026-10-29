@@ -1248,7 +1248,7 @@ pub fn handle_login_with_oauth(
                              ```\nssh -L {port}:localhost:{port} {hostname}\n```\
                              Then open the URL above. Keep the tunnel open until done.\n\n\
                              **Option B — Personal Access Token (easier for SSH):**\n\
-                             1. Open https://app.vectorhawk.ai/portal/settings\n\
+                             1. Open https://app.scenery.dev/portal/settings\n\
                              2. Create a token (starts with `vh_pat_`)\n\
                              3. Run: `vectorhawk auth token` and paste the token at the prompt"
                         )
@@ -2540,7 +2540,7 @@ fn derive_publisher_slug(display_name: &str) -> String {
 fn try_infer_publisher_id(state: &AppState, registry_url: Option<&str>) -> Option<String> {
     use vectorhawkd_core::auth::{load_tokens, AuthClient};
 
-    let url = registry_url.unwrap_or("https://app.vectorhawk.ai");
+    let url = registry_url.unwrap_or(vectorhawkd_core::DEFAULT_REGISTRY_URL);
     let tokens = load_tokens(state, url).ok().flatten()?;
     let client = AuthClient::new(url);
     let user_info = client.me(&tokens.access_token).ok()?;

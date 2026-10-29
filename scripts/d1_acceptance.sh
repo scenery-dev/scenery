@@ -418,9 +418,9 @@ else
 
     # Test 3: constructed tarball URL matches expected pattern for each triple
     for _TRIPLE in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu; do
-        _EXPECTED_URL="https://github.com/vectorhawk/vectorhawkd/releases/download/v0.1.0/vectorhawk-0.1.0-${_TRIPLE}.tar.gz"
+        _EXPECTED_URL="https://github.com/scenery-dev/sceneryd/releases/download/v0.1.0/vectorhawk-0.1.0-${_TRIPLE}.tar.gz"
         _VERSION="${GREP_TAG#v}"
-        _CONSTRUCTED_URL="https://github.com/vectorhawk/vectorhawkd/releases/download/${GREP_TAG}/vectorhawk-${_VERSION}-${_TRIPLE}.tar.gz"
+        _CONSTRUCTED_URL="https://github.com/scenery-dev/sceneryd/releases/download/${GREP_TAG}/vectorhawk-${_VERSION}-${_TRIPLE}.tar.gz"
         if [[ "${_CONSTRUCTED_URL}" == "${_EXPECTED_URL}" ]]; then
             record "PASS" "D1.2 (AC2): URL construction for ${_TRIPLE}" \
                 "${_CONSTRUCTED_URL}"

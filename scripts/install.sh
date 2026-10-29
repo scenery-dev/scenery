@@ -1,7 +1,7 @@
 #!/bin/sh
 # VectorHawk runner installer
-# Run with:  curl -fsSL https://install.vectorhawk.ai | sh
-# Or read first: curl -fsSL https://install.vectorhawk.ai | less
+# Run with:  curl -fsSL https://install.scenery.dev | sh
+# Or read first: curl -fsSL https://install.scenery.dev | less
 
 set -eu
 
@@ -53,7 +53,7 @@ case "${OS}:${ARCH}" in
     Linux:x86_64)   TRIPLE="x86_64-unknown-linux-gnu" ;;
     *)
         log_error "VectorHawk does not yet support ${OS}/${ARCH}."
-        log_error "See https://github.com/vectorhawk/vectorhawkd for supported platforms."
+        log_error "See https://github.com/scenery-dev/sceneryd for supported platforms."
         exit 1
         ;;
 esac
@@ -98,7 +98,7 @@ sha256_of() {
 # Resolve version
 # ---------------------------------------------------------------------------
 
-GITHUB_API="https://api.github.com/repos/vectorhawk/vectorhawkd/releases/latest"
+GITHUB_API="https://api.github.com/repos/scenery-dev/sceneryd/releases/latest"
 
 if [ -n "${VECTORHAWK_VERSION:-}" ]; then
     TAG="${VECTORHAWK_VERSION}"
@@ -120,7 +120,7 @@ fi
 log_verbose "Version: ${TAG} (${VERSION})"
 
 TARBALL="vectorhawk-${VERSION}-${TRIPLE}.tar.gz"
-TARBALL_URL="https://github.com/vectorhawk/vectorhawkd/releases/download/${TAG}/${TARBALL}"
+TARBALL_URL="https://github.com/scenery-dev/sceneryd/releases/download/${TAG}/${TARBALL}"
 
 # ---------------------------------------------------------------------------
 # Install location
@@ -181,7 +181,7 @@ fi
 
 _ACTUAL="$(sha256_of "${TMPDIR}/${TARBALL}" | tr '[:upper:]' '[:lower:]')" || {
     log_error "No SHA-256 tool (sha256sum, shasum, or openssl) found — cannot verify the download."
-    log_error "Install one and retry, or use Homebrew: brew tap vectorhawk/tap && brew trust vectorhawk/tap && brew install vectorhawk"
+    log_error "Install one and retry, or use Homebrew: brew tap scenery-dev/tap && brew trust scenery-dev/tap && brew install vectorhawk"
     exit 1
 }
 
@@ -306,7 +306,7 @@ version_at_least() {
 
 # A terminal is available if /dev/tty can actually be opened for reading —
 # NOT `[ -t 0 ]`. The documented install path is
-# `curl -fsSL https://install.vectorhawk.ai | sh`, where stdin IS the
+# `curl -fsSL https://install.scenery.dev | sh`, where stdin IS the
 # script being piped in, so `[ -t 0 ]` reads false even though a real
 # terminal is sitting right there controlling the process. Opening
 # /dev/tty directly is the only reliable check.

@@ -3,7 +3,7 @@
 ## Quick install
 
 ```sh
-curl -fsSL https://install.vectorhawk.ai | sh
+curl -fsSL https://install.scenery.dev | sh
 ```
 
 This script detects your platform, downloads the matching pre-built binary from the latest
@@ -40,13 +40,13 @@ Examples:
 
 ```sh
 # Install a specific version
-curl -fsSL https://install.vectorhawk.ai | VECTORHAWK_VERSION=v0.2.0 sh
+curl -fsSL https://install.scenery.dev | VECTORHAWK_VERSION=v0.2.0 sh
 
 # Install to a custom directory, no PATH prompt
-curl -fsSL https://install.vectorhawk.ai | VECTORHAWK_HOME=/opt/vectorhawk VECTORHAWK_NO_MODIFY_PATH=1 sh
+curl -fsSL https://install.scenery.dev | VECTORHAWK_HOME=/opt/vectorhawk VECTORHAWK_NO_MODIFY_PATH=1 sh
 
 # Verbose output to see what the script is doing
-curl -fsSL https://install.vectorhawk.ai | VECTORHAWK_VERBOSE=1 sh
+curl -fsSL https://install.scenery.dev | VECTORHAWK_VERBOSE=1 sh
 ```
 
 ## Idempotency
@@ -85,8 +85,8 @@ For Homebrew installs: `brew uninstall vectorhawk`
 A Homebrew tap is available as an alternative install path (D1.3):
 
 ```sh
-brew tap vectorhawk/tap
-brew trust vectorhawk/tap
+brew tap scenery-dev/tap
+brew trust scenery-dev/tap
 brew install vectorhawk
 brew services start vectorhawk
 vectorhawk mcp setup

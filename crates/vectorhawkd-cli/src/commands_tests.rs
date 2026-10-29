@@ -276,7 +276,7 @@ fn skill_update_with_id_parses() {
             assert_eq!(id.as_deref(), Some("my-skill"));
             assert!(!all);
             // Default URL is filled in from the arg default_value.
-            assert_eq!(registry_url.as_deref(), Some("https://app.vectorhawk.ai"));
+            assert_eq!(registry_url.as_deref(), Some("https://app.scenery.dev"));
         }
         other => panic!("expected Skill(Update), got {other:?}"),
     }
@@ -481,7 +481,7 @@ fn auth_login_parses() {
     use super::{AuthCommand, Command};
     match parse(&["auth", "login"]).command {
         Command::Auth(AuthCommand::Login { registry_url }) => {
-            assert_eq!(registry_url, "https://app.vectorhawk.ai");
+            assert_eq!(registry_url, "https://app.scenery.dev");
         }
         other => panic!("expected Auth(Login), got {other:?}"),
     }
