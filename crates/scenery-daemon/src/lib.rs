@@ -448,6 +448,27 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
         }
     }
 
+    // ── Native-content cleanup ────────────────────────────────────────────────
+    //
+    // Earlier builds adopted plugins from Anthropic's official marketplace
+    // (`external_plugins/`). Undo that bookkeeping before migration runs:
+    // remove our sidecars / marker rows / journal entries. Idempotent;
+    // never modifies plugin files. Failure is non-fatal.
+    if std::env::var("SCENERY_DISABLE_FILESYSTEM_RECONCILER").is_err() {
+        match managed_paths::native_cleanup::cleanup_native_markers(&state) {
+            Ok(r) if r.is_noop() => {}
+            Ok(r) => info!(
+                sidecars = r.sidecars_removed,
+                marker_rows = r.marker_rows_removed,
+                journal_entries = r.journal_entries_removed,
+                "managed_paths: native-marketplace cleanup complete"
+            ),
+            Err(e) => {
+                warn!(error = %e, "managed_paths: native-marketplace cleanup failed (non-fatal)")
+            }
+        }
+    }
+
     // ── F1: Managed-paths first-run migration ─────────────────────────────────
     //
     // Scans ~/.claude/skills/, ~/.claude/plugins/, and ~/.claude.json; migrates

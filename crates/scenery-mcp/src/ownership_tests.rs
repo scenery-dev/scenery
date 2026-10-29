@@ -104,14 +104,23 @@ fn anthropic_bundled_plugin_is_native() {
 }
 
 #[test]
-fn external_plugin_in_official_marketplace_is_custom() {
-    // Lives in the official marketplace, but external source + non-Anthropic author.
+fn external_plugin_in_official_marketplace_is_native() {
+    // Lives in the official marketplace: external source + non-Anthropic author
+    // makes no difference. The whole marketplace is off-limits.
     let entry = json!({
         "name": "42crunch-api-security-testing",
         "author": { "name": "42Crunch" },
         "source": { "source": "git-subdir", "url": "https://github.com/42Crunch-AI/x.git" },
     });
-    assert_eq!(classify_plugin_with(true, &entry, false), Origin::Custom);
+    assert_eq!(
+        classify_plugin_with(true, &entry, false),
+        Origin::AnthropicNative
+    );
+    // Even a stale Scenery marker does not make it ours.
+    assert_eq!(
+        classify_plugin_with(true, &entry, true),
+        Origin::AnthropicNative
+    );
 }
 
 #[test]
@@ -127,13 +136,13 @@ fn plugin_in_third_party_marketplace_is_custom() {
 }
 
 #[test]
-fn marker_wins_over_native_signals() {
+fn marker_makes_non_official_plugin_scenery_managed() {
     let entry = json!({
         "author": { "name": "Anthropic" },
         "source": "./plugins/x",
     });
     assert_eq!(
-        classify_plugin_with(true, &entry, true),
+        classify_plugin_with(false, &entry, true),
         Origin::SceneryManaged
     );
 }
@@ -141,7 +150,7 @@ fn marker_wins_over_native_signals() {
 // ── is_anthropic_native_in (mutation guard core) ────────────────────────────────
 
 #[test]
-fn native_path_protects_official_internal_plugins_tree() {
+fn native_path_protects_whole_official_marketplace() {
     let plugins = std::path::Path::new("/home/u/.claude/plugins");
     let install = "/home/u/.claude/plugins/marketplaces/claude-plugins-official";
     let mkts = marketplaces(&[("claude-plugins-official", official_entry(install))]);
@@ -151,11 +160,17 @@ fn native_path_protects_official_internal_plugins_tree() {
     );
     assert!(is_anthropic_native_in(internal, plugins, Some(&mkts)));
 
-    // external_plugins within the same official marketplace is adoptable, not native.
+    // external_plugins within the same official marketplace is ALSO native.
     let external = std::path::Path::new(
         "/home/u/.claude/plugins/marketplaces/claude-plugins-official/external_plugins/github",
     );
-    assert!(!is_anthropic_native_in(external, plugins, Some(&mkts)));
+    assert!(is_anthropic_native_in(external, plugins, Some(&mkts)));
+
+    // So is anything else in the clone (e.g. the sidecar we once wrote there).
+    let sidecar = std::path::Path::new(
+        "/home/u/.claude/plugins/marketplaces/claude-plugins-official/external_plugins/github/.scenery-managed.json",
+    );
+    assert!(is_anthropic_native_in(sidecar, plugins, Some(&mkts)));
 }
 
 #[test]
