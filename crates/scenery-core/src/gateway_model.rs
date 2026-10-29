@@ -7,7 +7,7 @@
 //! 2. If no token is present → return a user-friendly "not authenticated" error.
 //! 3. POST to `{base_url}/gateway/v1/inference` with `Authorization: Bearer {token}`.
 //! 4. On 401 → return an "auth token expired" error.
-//! 5. On success → parse `vh_tier`, `vh_provider`, `vh_cost_usd`, `usage`, and
+//! 5. On success → parse `scenery_tier`, `scenery_provider`, `scenery_cost_usd`, `usage`, and
 //!    `content[0].text` from the JSON response and map to `ModelResponse`.
 //!
 //! `GatewayModelClient` uses `reqwest::blocking`, so callers on a
@@ -49,11 +49,11 @@ struct UsageBlock {
 #[derive(Debug, Deserialize)]
 struct GatewayResponse {
     /// Routing tier — `"provider"`, `"internal"`, or `"local"`.
-    vh_tier: String,
+    scenery_tier: String,
     /// Provider or model name (used to fill `ModelSource`).
-    vh_provider: String,
+    scenery_provider: String,
     /// Cost of this call in USD. `0.0` for internal/local tiers.
-    vh_cost_usd: f64,
+    scenery_cost_usd: f64,
     /// Token usage.
     usage: UsageBlock,
     /// One or more content blocks. We read `content[0].text`.
@@ -156,7 +156,7 @@ impl ModelClient for GatewayModelClient {
             .map(|b| b.text)
             .unwrap_or_default();
 
-        let source = map_tier_to_source(&gw.vh_tier, &gw.vh_provider);
+        let source = map_tier_to_source(&gw.scenery_tier, &gw.scenery_provider);
 
         Ok(ModelResponse {
             text,
@@ -164,12 +164,12 @@ impl ModelClient for GatewayModelClient {
             completion_tokens: gw.usage.output_tokens,
             latency_ms,
             source,
-            cost_usd: gw.vh_cost_usd,
+            cost_usd: gw.scenery_cost_usd,
         })
     }
 }
 
-/// Map the gateway's `vh_tier` + `vh_provider` fields to a `ModelSource` variant.
+/// Map the gateway's `scenery_tier` + `scenery_provider` fields to a `ModelSource` variant.
 fn map_tier_to_source(tier: &str, provider: &str) -> ModelSource {
     match tier {
         "provider" => ModelSource::Provider(provider.to_string()),
@@ -178,7 +178,7 @@ fn map_tier_to_source(tier: &str, provider: &str) -> ModelSource {
         other => {
             tracing::warn!(
                 tier = other,
-                "unknown vh_tier from gateway; mapping to Provider"
+                "unknown scenery_tier from gateway; mapping to Provider"
             );
             ModelSource::Provider(provider.to_string())
         }

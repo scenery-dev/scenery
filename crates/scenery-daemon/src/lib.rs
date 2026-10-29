@@ -251,13 +251,13 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     // save it to state.db so the daemon can make authenticated registry calls
     // without a browser-based OAuth flow (openclaw, CI pipelines, etc.).
     if let Ok(pat) = std::env::var("SCENERY_TOKEN") {
-        if pat.starts_with("vh_pat_") {
+        if pat.starts_with("scn_pat_") {
             match scenery_core::auth::save_tokens(&state, &registry_url, &pat, &pat) {
                 Ok(()) => info!("SCENERY_TOKEN: PAT saved for {registry_url}"),
                 Err(e) => warn!(error = %e, "SCENERY_TOKEN: failed to save PAT to state DB"),
             }
         } else {
-            warn!("SCENERY_TOKEN is set but does not start with 'vh_pat_' — ignoring");
+            warn!("SCENERY_TOKEN is set but does not start with 'scn_pat_' — ignoring");
         }
     }
 

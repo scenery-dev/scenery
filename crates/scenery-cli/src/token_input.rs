@@ -1,6 +1,6 @@
 //! Personal Access Token input for `scenery auth token`.
 //!
-//! A `vh_pat_...` token is a long-lived registry credential, so it must
+//! A `scn_pat_...` token is a long-lived registry credential, so it must
 //! never travel on the command line: argv is readable by every local user
 //! (`ps`, `/proc/<pid>/cmdline`) for as long as the process runs, and it
 //! lands in shell history. `auth token` therefore takes no token argument
@@ -136,20 +136,20 @@ mod tests {
 
     #[test]
     fn piped_stdin_is_read_when_not_a_terminal() {
-        let result = resolve_token(false, line("vh_pat_piped\n"), unused());
-        assert_eq!(result, Ok("vh_pat_piped".to_string()));
+        let result = resolve_token(false, line("scn_pat_piped\n"), unused());
+        assert_eq!(result, Ok("scn_pat_piped".to_string()));
     }
 
     #[test]
     fn hidden_prompt_is_used_when_stdin_is_a_terminal() {
-        let result = resolve_token(true, unused(), line("vh_pat_typed\n"));
-        assert_eq!(result, Ok("vh_pat_typed".to_string()));
+        let result = resolve_token(true, unused(), line("scn_pat_typed\n"));
+        assert_eq!(result, Ok("scn_pat_typed".to_string()));
     }
 
     #[test]
     fn surrounding_whitespace_and_cr_are_trimmed() {
-        let result = resolve_token(false, line("  vh_pat_padded \r\n"), unused());
-        assert_eq!(result, Ok("vh_pat_padded".to_string()));
+        let result = resolve_token(false, line("  scn_pat_padded \r\n"), unused());
+        assert_eq!(result, Ok("scn_pat_padded".to_string()));
     }
 
     #[test]
