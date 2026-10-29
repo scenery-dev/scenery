@@ -246,6 +246,8 @@ fn render_plist(
     <string>{stderr_log}</string>
     <key>ProcessType</key>
     <string>Background</string>
+    <key>Umask</key>
+    <integer>63</integer>
 </dict>
 </plist>
 "#
@@ -835,6 +837,21 @@ mod tests {
             !plist.contains("StandardOutPath"),
             "StandardOutPath should be omitted — launchd does not rotate it \
              and nothing writes to stdout anymore, got:\n{plist}"
+        );
+    }
+
+    #[test]
+    fn plist_sets_owner_only_umask() {
+        let plist = render_plist(
+            Path::new("/opt/homebrew/bin/scenery"),
+            Path::new("/Users/test/Library/Logs/Scenery"),
+            None,
+        )
+        .unwrap();
+        // 63 decimal == 0o077
+        assert!(
+            plist.contains("<key>Umask</key>\n    <integer>63</integer>"),
+            "{plist}"
         );
     }
 
