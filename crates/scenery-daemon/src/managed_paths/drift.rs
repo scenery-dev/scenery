@@ -290,6 +290,14 @@ impl DriftScanner {
         let markers = list_markers(&conn)?;
         let mut out = Vec::with_capacity(markers.len());
         for marker in markers {
+            // Anthropic's official marketplace is never governed: a stale row
+            // pointing into it is neither scanned nor reported (the startup
+            // cleanup removes it).
+            if matches!(marker.kind.as_str(), "skill" | "plugin")
+                && ownership::is_anthropic_native_path(std::path::Path::new(&marker.path))
+            {
+                continue;
+            }
             out.push(classify(&marker));
         }
         Ok(out)

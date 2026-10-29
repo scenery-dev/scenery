@@ -217,9 +217,10 @@ pub fn author_is_anthropic(value: &Value) -> bool {
 /// on-disk directory for a marker check.
 ///
 /// Order of precedence:
-/// 1. A Scenery marker in `plugin_dir` → [`Origin::SceneryManaged`].
-/// 2. Official marketplace **and** relative source **and** Anthropic author →
-///    [`Origin::AnthropicNative`].
+/// 1. Anything in the official marketplace (`anthropics/claude-plugins-official`)
+///    → [`Origin::AnthropicNative`], regardless of source type, author, or any
+///    Scenery marker (a marker there is a stale artefact, never ownership).
+/// 2. A Scenery marker in `plugin_dir` → [`Origin::SceneryManaged`].
 /// 3. Otherwise → [`Origin::Custom`].
 pub fn classify_plugin(marketplace_name: &str, entry: &Value, plugin_dir: Option<&Path>) -> Origin {
     let marker_present = plugin_dir.map(is_scenery_managed).unwrap_or(false);
@@ -231,12 +232,14 @@ pub fn classify_plugin(marketplace_name: &str, entry: &Value, plugin_dir: Option
 }
 
 /// Pure classifier core — no filesystem access. See [`classify_plugin`].
-pub fn classify_plugin_with(is_official: bool, entry: &Value, marker_present: bool) -> Origin {
+pub fn classify_plugin_with(is_official: bool, _entry: &Value, marker_present: bool) -> Origin {
+    // Product rule: the WHOLE official marketplace is off-limits, including the
+    // third-party entries under `external_plugins/`.
+    if is_official {
+        return Origin::AnthropicNative;
+    }
     if marker_present {
         return Origin::SceneryManaged;
-    }
-    if is_official && plugin_source_is_relative(entry) && author_is_anthropic(entry) {
-        return Origin::AnthropicNative;
     }
     Origin::Custom
 }
@@ -244,7 +247,8 @@ pub fn classify_plugin_with(is_official: bool, entry: &Value, marker_present: bo
 // ── Anthropic-native path guard ─────────────────────────────────────────────────
 
 /// True if `path` lies within Anthropic's own protected first-party tree:
-/// the internal `plugins/` subtree of an official marketplace, or the
+/// anywhere under an official marketplace's `installLocation` (including its
+/// `external_plugins/`), or the
 /// `cache`/`data` plumbing dirs under `~/.claude/plugins/`.
 ///
 /// **Fail-safe:** if `known_marketplaces.json` cannot be read, any path under
@@ -278,18 +282,22 @@ pub fn is_anthropic_native_in(
 
     match marketplaces {
         Some(map) => {
-            for entry in map.values() {
+            for (name, entry) in map {
                 let is_official =
                     marketplace_repo(entry).map(|r| r == ANTHROPIC_OFFICIAL_REPO) == Some(true);
                 if !is_official {
                     continue;
                 }
+                // The WHOLE marketplace is protected, not just `plugins/`.
                 if let Some(loc) = marketplace_install_location(entry) {
-                    // Protect the internal `plugins/` subtree; `external_plugins/`
-                    // within the same marketplace is third-party and adoptable.
-                    if path.starts_with(loc.join("plugins")) {
+                    if path.starts_with(&loc) {
                         return true;
                     }
+                }
+                // Also guard the conventional clone dir in case `installLocation`
+                // is missing or differs.
+                if path.starts_with(marketplaces_dir.join(name)) {
+                    return true;
                 }
             }
             false

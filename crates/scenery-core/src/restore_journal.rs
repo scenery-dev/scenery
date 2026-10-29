@@ -314,6 +314,38 @@ impl RestoreJournal {
         Ok(entries)
     }
 
+    /// Remove every entry for which `pred` returns `true`, returning the
+    /// removed entries (oldest first). Takes the exclusive lock for the whole
+    /// read-modify-write; the file is rewritten only if something was removed.
+    ///
+    /// Used to drop entries that should never have been recorded (e.g. content
+    /// that turned out to be out of scope). It never touches the filesystem
+    /// targets the entries describe.
+    pub fn remove_where<F>(&self, pred: F) -> Result<Vec<JournalEntry>>
+    where
+        F: Fn(&JournalEntry) -> bool,
+    {
+        if !self.journal_path().as_std_path().exists() {
+            return Ok(Vec::new());
+        }
+        let lock_file = self.open_lock_file()?;
+        fs2::FileExt::lock_exclusive(&lock_file).with_context(|| {
+            format!(
+                "restore_journal: failed to acquire exclusive lock: {}",
+                self.lock_path()
+            )
+        })?;
+        let entries = self.read_entries_unlocked();
+        let (removed, kept): (Vec<_>, Vec<_>) = entries.into_iter().partition(|e| pred(e));
+        let result = if removed.is_empty() {
+            Ok(())
+        } else {
+            self.write_entries_unlocked(&kept)
+        };
+        drop(lock_file);
+        result.map(|()| removed)
+    }
+
     // ── internals ────────────────────────────────────────────────────────────
 
     fn open_lock_file(&self) -> Result<fs::File> {
