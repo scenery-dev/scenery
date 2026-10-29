@@ -127,7 +127,7 @@ for line in sys.stdin:
         let registry = BackendRegistry::new();
         // Non-namespaced tool — belongs to the skill layer.
         assert!(registry
-            .dispatch("vectorhawk_search", &serde_json::Value::Null)
+            .dispatch("scenery_search", &serde_json::Value::Null)
             .await
             .is_none());
     }

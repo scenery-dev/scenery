@@ -291,7 +291,7 @@ pub struct AuditEventPayload {
 
 // ── RegistryClient (HTTP implementation) ─────────────────────────────────────
 
-/// HTTP client for the VectorHawk registry.
+/// HTTP client for the Scenery registry.
 ///
 /// Handles policy lookup, artifact metadata, package downloads, and audit
 /// upload. Has no local state — use [`HttpPolicyClient`] for cached policy.
@@ -756,9 +756,9 @@ impl RegistryClient {
         publish_from_discovery_id: Option<&str>,
         duplicate_resolution: Option<&str>,
     ) -> Result<CompilePublishResponse> {
-        let token = self.get_auth_token().ok_or_else(|| {
-            anyhow::anyhow!("not authenticated; run `vectorhawk auth login` first")
-        })?;
+        let token = self
+            .get_auth_token()
+            .ok_or_else(|| anyhow::anyhow!("not authenticated; run `scenery auth login` first"))?;
 
         let base = self.base_url.trim_end_matches('/');
         let url = format!("{base}/portal/skills/compile");
@@ -842,9 +842,9 @@ impl RegistryClient {
         source_tar_gz_bytes: Vec<u8>,
         slug: &str,
     ) -> Result<AdoptPublishOutcome> {
-        let token = self.get_auth_token().ok_or_else(|| {
-            anyhow::anyhow!("not authenticated; run `vectorhawk auth login` first")
-        })?;
+        let token = self
+            .get_auth_token()
+            .ok_or_else(|| anyhow::anyhow!("not authenticated; run `scenery auth login` first"))?;
 
         let base = self.base_url.trim_end_matches('/');
         let url = format!("{base}/runner/skills/adopt-publish");
@@ -983,7 +983,7 @@ impl RegistryClient {
     pub fn runner_import_preview(&self, raw_input: &str) -> Result<ImportPreview> {
         let token = self.get_auth_token().ok_or_else(|| {
             anyhow::anyhow!(
-                "not authenticated; run `vectorhawk auth login` before using registry import"
+                "not authenticated; run `scenery auth login` before using registry import"
             )
         })?;
 
@@ -1006,7 +1006,7 @@ impl RegistryClient {
         if status == reqwest::StatusCode::UNAUTHORIZED {
             anyhow::bail!(
                 "registry returned 401 Unauthorized — your session has expired; \
-                 run `vectorhawk auth login` to refresh"
+                 run `scenery auth login` to refresh"
             );
         }
         if status == reqwest::StatusCode::FORBIDDEN {
@@ -1035,7 +1035,7 @@ impl RegistryClient {
     pub fn runner_import_submit(&self, preview: &ImportPreview) -> Result<ImportOutcome> {
         let token = self.get_auth_token().ok_or_else(|| {
             anyhow::anyhow!(
-                "not authenticated; run `vectorhawk auth login` before using registry import"
+                "not authenticated; run `scenery auth login` before using registry import"
             )
         })?;
 
@@ -1058,7 +1058,7 @@ impl RegistryClient {
         if status == reqwest::StatusCode::UNAUTHORIZED {
             anyhow::bail!(
                 "registry returned 401 Unauthorized — your session has expired; \
-                 run `vectorhawk auth login` to refresh"
+                 run `scenery auth login` to refresh"
             );
         }
         if status == reqwest::StatusCode::FORBIDDEN {
@@ -1093,7 +1093,7 @@ impl RegistryClient {
     pub fn import_preview(&self, input: &str) -> Result<serde_json::Value> {
         let token = self.get_auth_token().ok_or_else(|| {
             anyhow::anyhow!(
-                "not authenticated; run `vectorhawk auth login` before using import preview"
+                "not authenticated; run `scenery auth login` before using import preview"
             )
         })?;
 
@@ -1116,7 +1116,7 @@ impl RegistryClient {
         if status == reqwest::StatusCode::UNAUTHORIZED {
             anyhow::bail!(
                 "registry returned 401 Unauthorized — your session has expired; \
-                 run `vectorhawk auth login` to refresh"
+                 run `scenery auth login` to refresh"
             );
         }
         if status == reqwest::StatusCode::FORBIDDEN {
@@ -1143,7 +1143,7 @@ impl RegistryClient {
     pub fn import_submit(&self, input: &str) -> Result<serde_json::Value> {
         let token = self.get_auth_token().ok_or_else(|| {
             anyhow::anyhow!(
-                "not authenticated; run `vectorhawk auth login` before using import submit"
+                "not authenticated; run `scenery auth login` before using import submit"
             )
         })?;
 
@@ -1166,7 +1166,7 @@ impl RegistryClient {
         if status == reqwest::StatusCode::UNAUTHORIZED {
             anyhow::bail!(
                 "registry returned 401 Unauthorized — your session has expired; \
-                 run `vectorhawk auth login` to refresh"
+                 run `scenery auth login` to refresh"
             );
         }
         if status == reqwest::StatusCode::FORBIDDEN {
@@ -1784,7 +1784,7 @@ mod tests {
 
         let client = RegistryClient::new(server.url());
         // Simulates a logged-in runner: a portal JWT is stored, exactly as
-        // `vectorhawk auth login` leaves it via `set_auth`.
+        // `scenery auth login` leaves it via `set_auth`.
         client.set_auth("eyJhbGciOiJIUzI1NiJ9.portal-jwt.sig");
 
         let governance = client.fetch_preinstall_governance("my-skill").unwrap();

@@ -1,5 +1,5 @@
 //! Adopt-publish takeover — removes a skill's original discovered
-//! `source_path` (e.g. `~/.agents/skills/<slug>`) once a real VectorHawk
+//! `source_path` (e.g. `~/.agents/skills/<slug>`) once a real Scenery
 //! F2-managed copy of that skill is confirmed present on disk.
 //!
 //! # Why this exists
@@ -45,7 +45,7 @@
 //!
 //! # Source == destination
 //!
-//! Since the `~/.agents/skills` pivot, VectorHawk's canonical write location
+//! Since the `~/.agents/skills` pivot, Scenery's canonical write location
 //! is *also* one of the discoveries scan roots. A discovery found there has a
 //! `source_path` equal to `push_skill`'s destination, and removing it would
 //! destroy the managed copy instead of the thing it replaced. [`perform_if_pending`]
@@ -54,20 +54,20 @@
 //!
 //! # Killswitch
 //!
-//! Honors `VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER` like the rest of the F2
+//! Honors `SCENERY_DISABLE_FILESYSTEM_RECONCILER` like the rest of the F2
 //! pusher — set, this becomes a no-op.
 
 use anyhow::{Context, Result};
-use std::{fs, path::Path};
-use tracing::{debug, info};
 use scenery_core::{
     restore_journal::{new_backup_ts, JournalEntry, JournalOp, JournalSource, RestoreJournal},
     state::AppState,
 };
+use std::{fs, path::Path};
+use tracing::{debug, info};
 
 use super::pusher::managed_skill_present;
 
-const ENV_DISABLE: &str = "VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER";
+const ENV_DISABLE: &str = "SCENERY_DISABLE_FILESYSTEM_RECONCILER";
 
 fn reconciler_disabled() -> bool {
     std::env::var_os(ENV_DISABLE).is_some()
@@ -175,7 +175,7 @@ fn source_is_canonical_dest(slug: &str, source_path: &Path) -> bool {
 }
 
 /// Remove `path`, which may be a real directory, a regular file, or (per the
-/// shared contract) a symlink a pre-VectorHawk installer created at the
+/// shared contract) a symlink a pre-Scenery installer created at the
 /// discovered location.
 ///
 /// A symlink is unlinked directly rather than followed, so this never

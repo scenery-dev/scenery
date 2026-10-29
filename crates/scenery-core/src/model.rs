@@ -29,7 +29,7 @@ pub struct ModelRequest {
 pub enum ModelSource {
     /// A locally-running Ollama instance. Contains the resolved model name.
     Local(String),
-    /// An internally-hosted model (VectorHawk managed). Contains the model name.
+    /// An internally-hosted model (Scenery managed). Contains the model name.
     Internal(String),
     /// A third-party cloud provider routed through the gateway. Contains the provider name.
     Provider(String),

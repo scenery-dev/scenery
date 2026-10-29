@@ -8,19 +8,19 @@ use super::{oauth_metadata_matches_issuer, registry_serves_mcp_oauth};
 
 #[test]
 fn metadata_with_matching_issuer_is_accepted() {
-    let body = r#"{"issuer":"https://dev.vectorhawk.ai","token_endpoint":"https://dev.vectorhawk.ai/oauth/token"}"#;
+    let body = r#"{"issuer":"https://dev.scenery.dev","token_endpoint":"https://dev.scenery.dev/oauth/token"}"#;
     assert!(oauth_metadata_matches_issuer(
         body,
-        "https://dev.vectorhawk.ai"
+        "https://dev.scenery.dev"
     ));
 }
 
 #[test]
 fn issuer_comparison_ignores_a_trailing_slash_on_the_registry_url() {
-    let body = r#"{"issuer":"https://dev.vectorhawk.ai"}"#;
+    let body = r#"{"issuer":"https://dev.scenery.dev"}"#;
     assert!(oauth_metadata_matches_issuer(
         body,
-        "https://dev.vectorhawk.ai/"
+        "https://dev.scenery.dev/"
     ));
 }
 
@@ -29,7 +29,7 @@ fn metadata_for_a_different_issuer_is_rejected() {
     let body = r#"{"issuer":"https://evil.example"}"#;
     assert!(!oauth_metadata_matches_issuer(
         body,
-        "https://dev.vectorhawk.ai"
+        "https://dev.scenery.dev"
     ));
 }
 
@@ -37,11 +37,11 @@ fn metadata_for_a_different_issuer_is_rejected() {
 fn non_json_or_missing_issuer_is_rejected() {
     assert!(!oauth_metadata_matches_issuer(
         "<html>portal</html>",
-        "https://dev.vectorhawk.ai"
+        "https://dev.scenery.dev"
     ));
     assert!(!oauth_metadata_matches_issuer(
         r#"{"detail":"Not Found"}"#,
-        "https://dev.vectorhawk.ai"
+        "https://dev.scenery.dev"
     ));
 }
 

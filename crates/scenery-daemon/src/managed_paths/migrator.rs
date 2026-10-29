@@ -2,7 +2,7 @@
 //!
 //! For each `MigrationItem`:
 //! 1. Check the SQLite `managed_path_markers` table (path-keyed, canonicalised)
-//!    — if already tracked, skip. The `.vectorhawk-managed.json` file is never
+//!    — if already tracked, skip. The `.scenery-managed.json` file is never
 //!    trusted for this.
 //! 2. Back up original files to the run-scoped backup directory.
 //! 3. POST to `POST /portal/managed-paths/migrate` (single-item batch).
@@ -23,18 +23,18 @@ use super::{
 };
 use anyhow::{Context, Result};
 use rusqlite::Connection;
-use serde::{Deserialize, Serialize};
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
-use tracing::{debug, info, warn};
 use scenery_core::{
     auth::load_all_tokens,
     restore_journal::{JournalEntry, JournalOp, JournalSource, RestoreJournal},
     state::AppState,
 };
 use scenery_mcp::ownership;
+use serde::{Deserialize, Serialize};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
+use tracing::{debug, info, warn};
 
 // ── Backup manifest ───────────────────────────────────────────────────────────
 
@@ -164,9 +164,9 @@ pub async fn migrate_item(
         return Ok(false);
     }
 
-    // ── 0.5 / 1. Never re-adopt content VectorHawk already tracks ─────────────
+    // ── 0.5 / 1. Never re-adopt content Scenery already tracks ─────────────
     // Ownership comes from `managed_path_markers` alone (F13). The
-    // `.vectorhawk-managed.json` sidecar is attacker-controllable — any skill
+    // `.scenery-managed.json` sidecar is attacker-controllable — any skill
     // or plugin can ship one — so it is not consulted here.
     //
     // The lookup compares canonicalised paths. Since the pivot to
@@ -204,8 +204,8 @@ pub async fn migrate_item(
         })?;
 
     // ── 4. Write marker (replace-with-managed) ────────────────────────────────
-    // Writing the marker is how VectorHawk "replaces the local copy with a
-    // managed copy": the item becomes VectorHawk-owned in place, and the drift
+    // Writing the marker is how Scenery "replaces the local copy with a
+    // managed copy": the item becomes Scenery-owned in place, and the drift
     // reconciler governs it from here (keep-in-sync, quarantine, or kill).
     //
     // NOTE: fully destructive sole-source replacement for MCP servers (rewriting
@@ -239,7 +239,7 @@ pub async fn migrate_item(
                 &now_ts,
             ) {
                 // Non-fatal: SQLite row is the authoritative idempotency key.
-                warn!(slug = %item.slug, error = %e, "managed_paths: failed to write .vectorhawk-managed.json (non-fatal)");
+                warn!(slug = %item.slug, error = %e, "managed_paths: failed to write .scenery-managed.json (non-fatal)");
             }
         }
         ItemKind::Mcp => {
@@ -275,11 +275,11 @@ pub async fn migrate_item(
 
     // ── 5.5 Restore journal (source=native) ───────────────────────────────────
     // ONE ledger: F1 takeovers get a restore-journal entry too, alongside the
-    // legacy `.vectorhawk-backup/<ts>/manifest.json` this function has always
+    // legacy `.scenery-backup/<ts>/manifest.json` this function has always
     // written (kept as-is for `migrate rollback` backwards compat). Reuses
     // the SAME `backup_path` computed above — no second copy is made.
     //
-    // Skill/Plugin: the native dir gets a `.vectorhawk-managed.json` sidecar
+    // Skill/Plugin: the native dir gets a `.scenery-managed.json` sidecar
     // written into it in place, so this is a `file_replace` of that dir.
     // Mcp: no live rewrite happens yet (see the NOTE above) but the entry is
     // still recorded now — same `config_edit` vocabulary as `write_mcp_entry`
@@ -632,11 +632,11 @@ fn buffer_audit_event(
 
 // ── ~/.claude/skills → ~/.agents/skills one-shot migration ────────────────────
 
-/// One-shot migration: move VectorHawk-managed skills from
+/// One-shot migration: move Scenery-managed skills from
 /// `~/.claude/skills/<slug>/` to `~/.agents/skills/<slug>/` and leave a
 /// symlink behind for Claude Code.
 ///
-/// Only directories carrying a `.vectorhawk-managed.json` marker are touched —
+/// Only directories carrying a `.scenery-managed.json` marker are touched —
 /// user-authored skills in the same directory are left exactly as they are.
 /// Idempotent: already-migrated skills (the Claude path is a symlink) are
 /// skipped, so this is safe to run on every daemon start.
@@ -738,7 +738,7 @@ fn migrate_one_legacy_skill(
         return Ok(false);
     }
     // Not ours — user-authored skill. Never moved, linked, backed up or marked.
-    if !scenery_mcp::ownership::is_vectorhawk_managed(old_path) {
+    if !scenery_mcp::ownership::is_scenery_managed(old_path) {
         return Ok(false);
     }
 
@@ -769,7 +769,7 @@ fn migrate_one_legacy_skill(
     //     having touched nothing, so a copy-mode host does not mint a fresh
     //     backup on every daemon start;
     //   * diverged — backs the Claude-side content up to
-    //     `~/.claude/.vectorhawk-backup/<ts>/links/` (which `migrate rollback`
+    //     `~/.claude/.scenery-backup/<ts>/links/` (which `migrate rollback`
     //     deliberately does not list — manual recovery only) and replaces it
     //     with a link.
     //
@@ -821,7 +821,7 @@ fn rekey_skill_marker(conn: &Connection, old_path: &Path, new_path: &Path) -> Re
 
 /// Re-point every `kind='skill'` marker row still keyed under
 /// `~/.claude/skills/<slug>` onto a canonical counterpart that exists on disk
-/// **and is VectorHawk-managed**.
+/// **and is Scenery-managed**.
 ///
 /// Two conditions must both hold, and neither is sufficient alone:
 ///
@@ -829,7 +829,7 @@ fn rekey_skill_marker(conn: &Connection, old_path: &Path, new_path: &Path) -> Re
 ///     post-migration state) or nothing at all (the link was deleted). A real
 ///     directory still sitting there is deliberately left to the migration
 ///     loop, which is the only place that knows whether that content is ours.
-///   * The canonical directory carries a `.vectorhawk-managed.json` marker.
+///   * The canonical directory carries a `.scenery-managed.json` marker.
 ///     Slug collision is not proof of identity: a row for an F1-adopted *user*
 ///     skill whose directory the user deleted would otherwise be re-keyed onto
 ///     an unrelated same-slug directory, whose sha can never match the row's —
@@ -876,11 +876,11 @@ fn repair_stale_skill_markers(
             continue;
         }
         // Same slug is not the same skill. Only re-key onto content we own.
-        if !ownership::is_vectorhawk_managed(&new_path) {
+        if !ownership::is_scenery_managed(&new_path) {
             debug!(
                 from = %key,
                 candidate = %new_path.display(),
-                "migrator: canonical dir with this slug is not VectorHawk-managed — \
+                "migrator: canonical dir with this slug is not Scenery-managed — \
                  leaving the stale row for drift to retire"
             );
             continue;

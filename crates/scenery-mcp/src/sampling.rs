@@ -3,12 +3,12 @@ use crate::protocol::{
     SamplingCreateMessageResult, SamplingMessage,
 };
 use anyhow::{Context, Result};
+use scenery_core::model::{ModelClient, ModelRequest, ModelResponse, ModelSource};
+use scenery_manifest::ModelFallback;
 use std::io::{BufRead, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use scenery_core::model::{ModelClient, ModelRequest, ModelResponse, ModelSource};
-use scenery_manifest::ModelFallback;
 
 /// Shared I/O handle used by both the MCP server loop and the sampling client.
 ///
@@ -297,8 +297,8 @@ fn local_model_compatible(client: &dyn ModelClient, recommended: &[String]) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
     use scenery_core::model::MockModelClient;
+    use std::io::Cursor;
 
     #[test]
     fn sampling_client_sends_request_and_parses_response() {

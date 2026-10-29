@@ -1,10 +1,10 @@
-//! Linux systemd-user unit install/uninstall for the VectorHawk daemon.
+//! Linux systemd-user unit install/uninstall for the Scenery daemon.
 //!
 //! Primary path: systemd user unit at
-//! `~/.config/systemd/user/vectorhawk-agent.service`.
+//! `~/.config/systemd/user/scenery.service`.
 //!
-//! Durable log: `$XDG_DATA_HOME/VectorHawk/logs/vectorhawkd.log` (falls back
-//! to `~/.local/share/VectorHawk/logs/`) — INFO-level tracing output written
+//! Durable log: `$XDG_DATA_HOME/Scenery/logs/scenery.log` (falls back
+//! to `~/.local/share/Scenery/logs/`) — INFO-level tracing output written
 //! by an in-process size-bounded rotating appender (see
 //! `crates/scenery-cli/src/logging.rs`), ~50 MB total cap, identical to
 //! the macOS appender. The unit sets no `StandardOutput=`/`StandardError=`,
@@ -15,15 +15,15 @@
 //! flooding that shared cap.
 //!
 //! Fallback (no systemctl): XDG autostart desktop entry at
-//! `~/.config/autostart/vectorhawk.desktop` with a printed notice.
+//! `~/.config/autostart/scenery.desktop` with a printed notice.
 //!
 //! Install sequence (systemd path):
 //! 1. Write the .service unit.
 //! 2. `systemctl --user daemon-reload`
-//! 3. `systemctl --user enable --now vectorhawk-agent.service`
+//! 3. `systemctl --user enable --now scenery.service`
 //!
 //! Uninstall sequence (systemd path):
-//! 1. `systemctl --user disable --now vectorhawk-agent.service`
+//! 1. `systemctl --user disable --now scenery.service`
 //! 2. Remove the unit file.
 //! 3. `systemctl --user daemon-reload`
 //!
@@ -42,18 +42,18 @@ use super::{
     unit_is_healthy, wait_for_socket, InstallStatus, SystemdState, UnitFileState,
 };
 
-const SERVICE_NAME: &str = "vectorhawk-agent.service";
+const SERVICE_NAME: &str = "scenery.service";
 /// `brew services`' systemd user unit for this formula.
-const BREW_SERVICE_NAME: &str = "sh.brew.vectorhawk.service";
-const DESKTOP_FILENAME: &str = "vectorhawk.desktop";
+const BREW_SERVICE_NAME: &str = "sh.brew.scenery.service";
+const DESKTOP_FILENAME: &str = "scenery.desktop";
 
-/// Return `~/.config/systemd/user/vectorhawk-agent.service`.
+/// Return `~/.config/systemd/user/scenery.service`.
 fn unit_path() -> Result<std::path::PathBuf> {
     let config = dirs::config_dir().context("failed to resolve XDG config directory")?;
     Ok(config.join("systemd").join("user").join(SERVICE_NAME))
 }
 
-/// Return `~/.config/autostart/vectorhawk.desktop`.
+/// Return `~/.config/autostart/scenery.desktop`.
 fn desktop_path() -> Result<std::path::PathBuf> {
     let config = dirs::config_dir().context("failed to resolve XDG config directory")?;
     Ok(config.join("autostart").join(DESKTOP_FILENAME))
@@ -61,14 +61,14 @@ fn desktop_path() -> Result<std::path::PathBuf> {
 
 /// The env line's key, as it appears (unquoted) inside the systemd
 /// `Environment="KEY=value"` assignment.
-const REGISTRY_URL_ENV_KEY: &str = "VECTORHAWK_REGISTRY_URL";
+const REGISTRY_URL_ENV_KEY: &str = "SCENERY_REGISTRY_URL";
 
-/// Resolve the `VECTORHAWK_REGISTRY_URL` value to carry into a
+/// Resolve the `SCENERY_REGISTRY_URL` value to carry into a
 /// (re)rendered unit, so that installing/upgrading never silently re-homes
 /// a daemon that was pointed at a private registry.
 ///
 /// Resolution order:
-/// 1. `VECTORHAWK_REGISTRY_URL` from the process environment at install
+/// 1. `SCENERY_REGISTRY_URL` from the process environment at install
 ///    time, if set and non-empty — an explicit override always wins.
 /// 2. Otherwise, whatever value is already present in the unit file at
 ///    `existing_unit_path` — carried forward rather than dropped.
@@ -78,7 +78,7 @@ const REGISTRY_URL_ENV_KEY: &str = "VECTORHAWK_REGISTRY_URL";
 /// unit with no such line all mean "nothing to preserve" — never an error
 /// that would fail the install.
 fn resolve_registry_url_env(existing_unit_path: &std::path::Path) -> Option<String> {
-    if let Ok(v) = std::env::var("VECTORHAWK_REGISTRY_URL") {
+    if let Ok(v) = std::env::var("SCENERY_REGISTRY_URL") {
         if !v.is_empty() {
             return Some(v);
         }
@@ -86,7 +86,7 @@ fn resolve_registry_url_env(existing_unit_path: &std::path::Path) -> Option<Stri
     parse_registry_url_from_unit(existing_unit_path)
 }
 
-/// Tolerantly parse an `Environment="VECTORHAWK_REGISTRY_URL=<value>"` line
+/// Tolerantly parse an `Environment="SCENERY_REGISTRY_URL=<value>"` line
 /// out of an existing unit file. Returns `None` on any failure to read the
 /// file, or if no such line (with a non-empty value) is present.
 ///
@@ -164,7 +164,7 @@ fn systemd_unescape(s: &str) -> String {
 /// receives, as a per-unit backstop on top of journald's own vacuum cap.
 ///
 /// `registry_url`, when `Some`, is emitted as a quoted
-/// `Environment="VECTORHAWK_REGISTRY_URL=<value>"` line — see
+/// `Environment="SCENERY_REGISTRY_URL=<value>"` line — see
 /// [`resolve_registry_url_env`] for how the caller resolves it. Regenerating
 /// the unit without this would silently drop a private-registry pin on every
 /// install/upgrade (the Homebrew formula's `post_install` calls `daemon
@@ -193,7 +193,7 @@ fn render_unit(bin_path: &std::path::Path, registry_url: Option<&str>) -> Result
 
     Ok(format!(
         r#"[Unit]
-Description=VectorHawk daemon — governed AI platform agent
+Description=Scenery daemon — governed AI platform agent
 After=network.target
 
 [Service]
@@ -221,8 +221,8 @@ fn render_desktop(bin_path: &std::path::Path) -> Result<String> {
     Ok(format!(
         r#"[Desktop Entry]
 Type=Application
-Name=VectorHawk Agent
-Comment=VectorHawk daemon — governed AI platform agent
+Name=Scenery Agent
+Comment=Scenery daemon — governed AI platform agent
 Exec={bin_str} daemon run --foreground
 Hidden=false
 NoDisplay=false
@@ -459,8 +459,8 @@ fn describe_state(state: Option<SystemdState>) -> &'static str {
     }
 }
 
-/// Scan `/proc` for VectorHawk daemon processes running **outside** the
-/// `vectorhawk-agent.service` cgroup, verify each one with the exact same
+/// Scan `/proc` for Scenery daemon processes running **outside** the
+/// `scenery.service` cgroup, verify each one with the exact same
 /// rules as daemon startup's automatic takeover
 /// (`scenery_daemon::daemon_takeover::verify_pid`), and take over only
 /// the ones verified stale.
@@ -505,7 +505,7 @@ fn reap_stray_daemons() {
     // signal available at all — any other matching `/proc` pid can only be
     // verified stale via its on-disk executable (`exe_replaced_or_deleted`).
     let xdg = xdg_runtime_dir();
-    let xdg_sock = format!("{xdg}/vectorhawk/agent.sock");
+    let xdg_sock = format!("{xdg}/scenery/agent.sock");
     let (socket_peer, socket_version) =
         camino::Utf8PathBuf::from_path_buf(std::path::PathBuf::from(&xdg_sock))
             .ok()
@@ -535,7 +535,7 @@ fn reap_stray_daemons() {
         // Positional argv match (see `cmdline_is_daemon_run`'s doc comment)
         // — not a substring test. A prior substring-based version of this
         // check killed an innocent shell whose command line happened to
-        // mention "vectorhawk", "daemon" and "/run/user/1000/bus" as
+        // mention "scenery", "daemon" and "/run/user/1000/bus" as
         // unrelated tokens.
         if !cmdline_is_daemon_run(&raw_cmdline) {
             continue;
@@ -572,7 +572,7 @@ fn reap_stray_daemons() {
             }
             scenery_daemon::daemon_takeover::Verdict::TakeOver { pid, reason } => {
                 println!(
-                    "Stopping a VectorHawk daemon running outside systemd (pid {pid}, \
+                    "Stopping a Scenery daemon running outside systemd (pid {pid}, \
                      {reason:?}) so the service can take ownership."
                 );
                 let result = take_over_verified_pid(pid);
@@ -585,8 +585,8 @@ fn reap_stray_daemons() {
 // ── Competing-service-manager detection ──────────────────────────────────────
 //
 // `brew services` loads its own systemd user unit for this formula —
-// `sh.brew.vectorhawk.service`, written to the same `~/.config/systemd/user/`
-// directory as our own `vectorhawk-agent.service`. Two such units both
+// `sh.brew.scenery.service`, written to the same `~/.config/systemd/user/`
+// directory as our own `scenery.service`. Two such units both
 // `Restart=always` against the same single-instance socket lock
 // (`daemon.lock`) is a permanent crash-restart loop for whichever one loses
 // the acquire race. See `scenery_cli::install::find_other_owning_daemon_unit`
@@ -594,7 +594,7 @@ fn reap_stray_daemons() {
 // file reads and `systemctl` calls.
 
 /// Scan every other `*.service` file in the systemd user unit directory
-/// (i.e. not `SERVICE_NAME`) for one that runs `vectorhawk daemon run` and
+/// (i.e. not `SERVICE_NAME`) for one that runs `scenery daemon run` and
 /// **owns** the daemon (`Active`, or installed+enabled — see
 /// [`find_other_owning_daemon_unit`]'s doc comment for exactly what
 /// "owns" means and why enabled-but-momentarily-inactive counts). Returns
@@ -687,7 +687,7 @@ fn unit_file_state_from_show_output(output: &str) -> UnitFileState {
 /// can't be determined, or it turns out to be our own unit after all.
 fn socket_peer_other_unit_name() -> Option<String> {
     let xdg = xdg_runtime_dir();
-    let xdg_sock = format!("{xdg}/vectorhawk/agent.sock");
+    let xdg_sock = format!("{xdg}/scenery/agent.sock");
     let path = camino::Utf8PathBuf::from_path_buf(std::path::PathBuf::from(&xdg_sock)).ok()?;
 
     let (peer, _version) = scenery_daemon::peer_handshake::connect_and_probe(
@@ -713,7 +713,7 @@ fn daemon_already_managed_by_other_unit() -> Option<String> {
     scan_unit_files_for_other_daemon_run().or_else(socket_peer_other_unit_name)
 }
 
-/// Disable, stop, and remove our own `vectorhawk-agent.service`, because the
+/// Disable, stop, and remove our own `scenery.service`, because the
 /// daemon is confirmed managed elsewhere. Only touches our own unit — never
 /// the competing one. A no-op when there's nothing of ours to clean up.
 fn self_heal_remove_our_unit(unit: &std::path::Path) -> Result<()> {
@@ -748,12 +748,12 @@ fn self_heal_remove_our_unit(unit: &std::path::Path) -> Result<()> {
 pub(super) fn reconcile_competing_manager() -> Result<bool> {
     let unit = unit_path().context("failed to resolve unit path")?;
     let xdg = xdg_runtime_dir();
-    let xdg_sock = format!("{xdg}/vectorhawk/agent.sock");
+    let xdg_sock = format!("{xdg}/scenery/agent.sock");
     let Some(other) = daemon_already_managed_by_other_unit() else {
         return Ok(false);
     };
     println!(
-        "VectorHawk daemon is managed by a different systemd unit ({other}); not \
+        "Scenery daemon is managed by a different systemd unit ({other}); not \
          installing {SERVICE_NAME}."
     );
     self_heal_remove_our_unit(&unit)?;
@@ -768,9 +768,7 @@ pub(super) fn reconcile_competing_manager() -> Result<bool> {
         match systemctl_user(&["start", &other]) {
             Ok(()) => {
                 if wait_for_socket(&xdg_sock, std::time::Duration::from_secs(10)) {
-                    println!(
-                        "{other} is now running and the VectorHawk daemon socket is reachable."
-                    );
+                    println!("{other} is now running and the Scenery daemon socket is reachable.");
                 } else {
                     println!(
                         "Started {other}, but the daemon socket did not become reachable \
@@ -816,13 +814,13 @@ fn install_systemd(bin_path: &std::path::Path) -> Result<()> {
     // reads (the socket path is needed now, before it's otherwise computed
     // below for the post-restart wait).
     let xdg = xdg_runtime_dir();
-    let xdg_sock = format!("{xdg}/vectorhawk/agent.sock");
+    let xdg_sock = format!("{xdg}/scenery/agent.sock");
 
     // ── Competing-manager guard — must run before anything else below, and ───
     // ── regardless of whether the socket happens to be reachable right now ───
     // If a *different* systemd user unit (most commonly `brew services`'
-    // `sh.brew.vectorhawk.service`) owns the daemon, writing and enabling our
-    // own `vectorhawk-agent.service` on top of it is exactly the bug this
+    // `sh.brew.scenery.service`) owns the daemon, writing and enabling our
+    // own `scenery.service` on top of it is exactly the bug this
     // guard exists to prevent: both units carry `Restart=always` against the
     // same single-instance socket lock (`daemon.lock`), so whichever loses
     // the acquire race can never win it, exits 1, and systemd restarts it
@@ -880,9 +878,7 @@ fn install_systemd(bin_path: &std::path::Path) -> Result<()> {
                 // else about this install needs repairing. Best-effort;
                 // never turns a healthy no-op into a failure.
                 reap_stray_daemons();
-                println!(
-                    "VectorHawk daemon is already installed and up to date — no changes made."
-                );
+                println!("Scenery daemon is already installed and up to date — no changes made.");
                 return Ok(());
             }
             if exe_stale && pre_check_state == Some(SystemdState::Active) && pre_check_socket_up {
@@ -893,18 +889,18 @@ fn install_systemd(bin_path: &std::path::Path) -> Result<()> {
                 // auto-restart wording here would mislead a user checking
                 // why an install that used to be a no-op now restarts.
                 println!(
-                    "VectorHawk daemon is running an outdated binary (upgraded on disk) — restarting."
+                    "Scenery daemon is running an outdated binary (upgraded on disk) — restarting."
                 );
             } else {
                 println!(
-                    "VectorHawk daemon unit is installed but not running ({}) — repairing.",
+                    "Scenery daemon unit is installed but not running ({}) — repairing.",
                     describe_state(pre_check_state)
                 );
             }
             true
         } else {
             // Binary path changed (upgrade): fall through to rewrite + restart.
-            println!("VectorHawk daemon binary path changed — updating unit and restarting.");
+            println!("Scenery daemon binary path changed — updating unit and restarting.");
             true
         }
     } else {
@@ -918,7 +914,7 @@ fn install_systemd(bin_path: &std::path::Path) -> Result<()> {
     }
 
     // ── 2. Write unit file ────────────────────────────────────────────────────
-    // Resolve VECTORHAWK_REGISTRY_URL from the env or, failing that, from
+    // Resolve SCENERY_REGISTRY_URL from the env or, failing that, from
     // whatever the unit already had — before we overwrite it below.
     let registry_url = resolve_registry_url_env(&unit);
     let content =
@@ -938,7 +934,7 @@ fn install_systemd(bin_path: &std::path::Path) -> Result<()> {
          systemd user session for this user (no D-Bus session bus). On a \
          headless/server box, run `sudo loginctl enable-linger $USER` once \
          to start one at boot without a graphical login, then re-run \
-         `vectorhawk daemon install`",
+         `scenery daemon install`",
     )?;
 
     // `xdg` / `xdg_sock` were already computed above, before the idempotency
@@ -1001,7 +997,7 @@ fn install_systemd(bin_path: &std::path::Path) -> Result<()> {
         if started_via_systemd {
             println!("Systemd user unit enabled and started ({SERVICE_NAME}).");
         } else {
-            println!("VectorHawk daemon is running.");
+            println!("Scenery daemon is running.");
         }
     } else {
         // systemd did not bring the daemon up within the wait budget — surface
@@ -1017,7 +1013,7 @@ fn install_systemd(bin_path: &std::path::Path) -> Result<()> {
         // (`AutoRestart`), it wins `acquire_socket`'s race and makes the
         // crash loop permanent. Never spawn a competitor; just report.
         println!(
-            "VectorHawk daemon unit is installed and systemd reports it as \
+            "Scenery daemon unit is installed and systemd reports it as \
              {}, but the daemon socket did not come up within 5s.\n\
              Diagnose with:\n  \
              XDG_RUNTIME_DIR={xdg} systemctl --user status {SERVICE_NAME}\n  \
@@ -1036,7 +1032,7 @@ fn install_desktop_fallback(bin_path: &std::path::Path) -> Result<()> {
 
     if desktop.exists() {
         println!(
-            "VectorHawk autostart entry already exists at {} — no changes made.",
+            "Scenery autostart entry already exists at {} — no changes made.",
             desktop.display()
         );
         return Ok(());
@@ -1054,7 +1050,7 @@ fn install_desktop_fallback(bin_path: &std::path::Path) -> Result<()> {
     println!("Notice: systemctl was not found — falling back to XDG autostart.");
     println!("Wrote autostart entry: {}", desktop.display());
     println!(
-        "The VectorHawk daemon will start at your next graphical login. \
+        "The Scenery daemon will start at your next graphical login. \
          To start it now, run: {} daemon run --foreground &",
         bin_path.display()
     );
@@ -1096,7 +1092,7 @@ fn uninstall_systemd() -> Result<()> {
     let unit_exists = unit.exists();
 
     if !enabled && !unit_exists {
-        println!("VectorHawk daemon is not installed — nothing to remove.");
+        println!("Scenery daemon is not installed — nothing to remove.");
         return Ok(());
     }
 
@@ -1117,7 +1113,7 @@ fn uninstall_systemd() -> Result<()> {
     // ── 3. daemon-reload ──────────────────────────────────────────────────────
     let _ = systemctl_user(&["daemon-reload"]);
 
-    println!("VectorHawk daemon uninstalled.");
+    println!("Scenery daemon uninstalled.");
     Ok(())
 }
 
@@ -1125,7 +1121,7 @@ fn uninstall_desktop_fallback() -> Result<()> {
     let desktop = desktop_path().context("failed to resolve desktop entry path")?;
 
     if !desktop.exists() {
-        println!("VectorHawk daemon is not installed — nothing to remove.");
+        println!("Scenery daemon is not installed — nothing to remove.");
         return Ok(());
     }
 
@@ -1133,7 +1129,7 @@ fn uninstall_desktop_fallback() -> Result<()> {
         .with_context(|| format!("failed to remove desktop entry: {}", desktop.display()))?;
 
     println!("Removed autostart entry: {}", desktop.display());
-    println!("VectorHawk daemon uninstalled.");
+    println!("Scenery daemon uninstalled.");
     Ok(())
 }
 
@@ -1143,7 +1139,7 @@ fn uninstall_desktop_fallback() -> Result<()> {
 pub fn restart() -> Result<()> {
     if !systemctl_available() {
         anyhow::bail!(
-            "vectorhawk daemon restart requires systemd. On systems without \
+            "scenery daemon restart requires systemd. On systems without \
              systemctl, log out and back in (or kill the running process) to \
              restart the daemon."
         );
@@ -1159,7 +1155,7 @@ pub fn restart() -> Result<()> {
         anyhow::bail!("systemctl --user restart failed: {stderr}");
     }
 
-    println!("VectorHawk daemon restarted.");
+    println!("Scenery daemon restarted.");
     Ok(())
 }
 
@@ -1199,8 +1195,7 @@ mod tests {
     // still reaches journald.
     #[test]
     fn unit_sets_rust_log_info() {
-        let unit =
-            render_unit(Path::new("/home/linuxbrew/.linuxbrew/bin/vectorhawk"), None).unwrap();
+        let unit = render_unit(Path::new("/home/linuxbrew/.linuxbrew/bin/scenery"), None).unwrap();
         assert!(
             unit.contains(r#"Environment="RUST_LOG=info""#),
             "expected RUST_LOG=info in the unit, got:\n{unit}"
@@ -1209,8 +1204,7 @@ mod tests {
 
     #[test]
     fn unit_sets_log_rate_limit() {
-        let unit =
-            render_unit(Path::new("/home/linuxbrew/.linuxbrew/bin/vectorhawk"), None).unwrap();
+        let unit = render_unit(Path::new("/home/linuxbrew/.linuxbrew/bin/scenery"), None).unwrap();
         assert!(
             unit.contains("LogRateLimitIntervalSec=") && unit.contains("LogRateLimitBurst="),
             "expected a journald rate-limit backstop in the unit, got:\n{unit}"
@@ -1221,27 +1215,26 @@ mod tests {
     //
     // `render_unit` used to emit a fixed template carrying only PATH and
     // RUST_LOG, so regenerating the unit on every install/upgrade silently
-    // dropped any VECTORHAWK_REGISTRY_URL the unit previously had.
+    // dropped any SCENERY_REGISTRY_URL the unit previously had.
 
     #[test]
     fn render_unit_emits_registry_url_when_given() {
         let unit = render_unit(
-            Path::new("/home/linuxbrew/.linuxbrew/bin/vectorhawk"),
-            Some("https://dev.vectorhawk.ai"),
+            Path::new("/home/linuxbrew/.linuxbrew/bin/scenery"),
+            Some("https://dev.scenery.dev"),
         )
         .unwrap();
         assert!(
-            unit.contains(r#"Environment="VECTORHAWK_REGISTRY_URL=https://dev.vectorhawk.ai""#),
+            unit.contains(r#"Environment="SCENERY_REGISTRY_URL=https://dev.scenery.dev""#),
             "expected registry URL env line in the unit, got:\n{unit}"
         );
     }
 
     #[test]
     fn render_unit_omits_registry_url_when_none() {
-        let unit =
-            render_unit(Path::new("/home/linuxbrew/.linuxbrew/bin/vectorhawk"), None).unwrap();
+        let unit = render_unit(Path::new("/home/linuxbrew/.linuxbrew/bin/scenery"), None).unwrap();
         assert!(
-            !unit.contains("VECTORHAWK_REGISTRY_URL"),
+            !unit.contains("SCENERY_REGISTRY_URL"),
             "expected no registry URL line, got:\n{unit}"
         );
     }
@@ -1259,13 +1252,13 @@ mod tests {
     #[test]
     fn render_unit_escapes_quote_in_registry_url_and_does_not_break_the_next_directive() {
         let unit = render_unit(
-            Path::new("/home/linuxbrew/.linuxbrew/bin/vectorhawk"),
+            Path::new("/home/linuxbrew/.linuxbrew/bin/scenery"),
             Some(r#"https://registry.example.com/"injected"#),
         )
         .unwrap();
         assert!(
             unit.contains(
-                r#"Environment="VECTORHAWK_REGISTRY_URL=https://registry.example.com/\"injected""#
+                r#"Environment="SCENERY_REGISTRY_URL=https://registry.example.com/\"injected""#
             ),
             "expected the '\"' to be escaped as '\\\"', got:\n{unit}"
         );
@@ -1275,7 +1268,7 @@ mod tests {
         // quoted value into the rest of the unit.
         assert!(
             unit.contains(
-                "ExecStart=/home/linuxbrew/.linuxbrew/bin/vectorhawk daemon run --foreground\n"
+                "ExecStart=/home/linuxbrew/.linuxbrew/bin/scenery daemon run --foreground\n"
             ),
             "ExecStart must be untouched and on its own line, got:\n{unit}"
         );
@@ -1290,7 +1283,7 @@ mod tests {
         let _env = RegistryUrlEnv::unset();
         let original = r#"https://registry.example.com/"injected\path"#;
         let rendered = render_unit(
-            Path::new("/home/linuxbrew/.linuxbrew/bin/vectorhawk"),
+            Path::new("/home/linuxbrew/.linuxbrew/bin/scenery"),
             Some(original),
         )
         .unwrap();
@@ -1308,7 +1301,7 @@ mod tests {
         let _ = std::fs::remove_file(&unit_path);
     }
 
-    /// Serializes tests below that mutate `VECTORHAWK_REGISTRY_URL` in the
+    /// Serializes tests below that mutate `SCENERY_REGISTRY_URL` in the
     /// process environment — `cargo test` runs tests in the same process by
     /// default, so unguarded env mutation here would race other tests in
     /// this module (mirrors the `KeychainOff` pattern used elsewhere in this
@@ -1321,18 +1314,18 @@ mod tests {
     impl RegistryUrlEnv {
         fn set(value: &str) -> Self {
             let guard = REGISTRY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            std::env::set_var("VECTORHAWK_REGISTRY_URL", value);
+            std::env::set_var("SCENERY_REGISTRY_URL", value);
             RegistryUrlEnv { _guard: guard }
         }
         fn unset() -> Self {
             let guard = REGISTRY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            std::env::remove_var("VECTORHAWK_REGISTRY_URL");
+            std::env::remove_var("SCENERY_REGISTRY_URL");
             RegistryUrlEnv { _guard: guard }
         }
     }
     impl Drop for RegistryUrlEnv {
         fn drop(&mut self) {
-            std::env::remove_var("VECTORHAWK_REGISTRY_URL");
+            std::env::remove_var("SCENERY_REGISTRY_URL");
         }
     }
 
@@ -1350,7 +1343,7 @@ mod tests {
         let unit_path = temp_unit_path("env-wins");
         std::fs::write(
             &unit_path,
-            "Environment=\"VECTORHAWK_REGISTRY_URL=https://old.example.com\"\n",
+            "Environment=\"SCENERY_REGISTRY_URL=https://old.example.com\"\n",
         )
         .unwrap();
 
@@ -1369,12 +1362,12 @@ mod tests {
         let unit_path = temp_unit_path("fallback");
         std::fs::write(
             &unit_path,
-            "[Service]\nEnvironment=\"VECTORHAWK_REGISTRY_URL=https://dev.vectorhawk.ai\"\nExecStart=/x daemon run\n",
+            "[Service]\nEnvironment=\"SCENERY_REGISTRY_URL=https://dev.scenery.dev\"\nExecStart=/x daemon run\n",
         )
         .unwrap();
 
         let resolved = resolve_registry_url_env(&unit_path);
-        assert_eq!(resolved.as_deref(), Some("https://dev.vectorhawk.ai"));
+        assert_eq!(resolved.as_deref(), Some("https://dev.scenery.dev"));
 
         let _ = std::fs::remove_file(&unit_path);
     }

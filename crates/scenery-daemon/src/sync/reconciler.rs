@@ -163,7 +163,7 @@ pub fn spawn(
         // reconciler falls back to the default production URL.
         // (The SSE config already has it — in a future refactor we'd pass it
         //  through SyncConfig.  For now we default to production.)
-        std::env::var("VECTORHAWK_REGISTRY_URL")
+        std::env::var("SCENERY_REGISTRY_URL")
             .ok()
             .unwrap_or_else(|| scenery_core::DEFAULT_REGISTRY_URL.to_string())
     };
@@ -1060,7 +1060,7 @@ fn spawn_install_plugin(
 /// Install a governed plugin as a self-contained Claude Code plugin: ensure each
 /// bundled skill is present in local state (downloading if needed — without a
 /// standalone native-skill push), assemble the bundle, and register/enable it in
-/// the local `vectorhawk` marketplace.
+/// the local `scenery` marketplace.
 #[allow(clippy::too_many_arguments)]
 async fn handle_install_plugin(
     installation_id: Uuid,
@@ -1261,7 +1261,7 @@ async fn do_install_plugin(
 
     // 1b. Imported plugins carry their whole source tree in the registry
     //     (components) — fetch and write it verbatim. Empty for
-    //     VectorHawk-published plugins, which bundle registry skills above.
+    //     Scenery-published plugins, which bundle registry skills above.
     //     A private (not yet published) import is served only to its owner,
     //     so the fetch identifies the runner.
     let st = Arc::clone(state);
@@ -1301,7 +1301,7 @@ async fn do_install_plugin(
     tokio::task::spawn_blocking(move || crate::managed_paths::install_plugin_bundle(&bundle))
         .await
         .context("plugin: marketplace write task panicked")?
-        .context("plugin: failed to write plugin into vectorhawk marketplace")?;
+        .context("plugin: failed to write plugin into scenery marketplace")?;
 
     // 3. Close the race with a skill revoke that landed after a skill passed
     //    its gate above: the revoke may have looked for plugins carrying the
@@ -1345,7 +1345,7 @@ struct ImportedPluginContent {
 }
 
 /// Fetch an imported plugin's mirrored source tree from the registry.
-/// Empty when the plugin has no inline files (VectorHawk-published) or the
+/// Empty when the plugin has no inline files (Scenery-published) or the
 /// fetch fails — the install is best-effort and still lists the plugin.
 /// `access_token` is sent when non-empty: private plugins are served only to
 /// their owner, org-published ones to anyone.
@@ -1540,7 +1540,7 @@ fn spawn_purge_plugin(
 ///    race-safe against a concurrent install. A version-scoped revoke only
 ///    tears down what is (or, for an unpinned MCP server, may be) that
 ///    version, so revoke and reinstall of another version do not flap.
-///    For a skill it then strips it from every plugin VectorHawk bundled
+///    For a skill it then strips it from every plugin Scenery bundled
 ///    it into (per the plugin bundled-skills record), after releasing the
 ///    skill lock — see the lock order on [`SkillLockMap`];
 /// 3. emits a `<artifact_type>_revoked` audit event through the runner
@@ -1693,7 +1693,7 @@ fn spawn_revoke(
         // order could deadlock.
         drop(guard);
 
-        // A revoked skill must also leave every plugin VectorHawk bundled it
+        // A revoked skill must also leave every plugin Scenery bundled it
         // into earlier. Only plugins whose bundled-skills record lists this
         // skill (at the revoked version, when scoped) are touched — never an
         // imported plugin's own same-named folder or a plugin from another
@@ -1995,13 +1995,13 @@ async fn handle_install_mcp(
 
             // F2: Push a per-server entry to ~/.claude.json so Claude Code's
             // native /mcp UI lists it.  The aggregator entry (above) stays for
-            // existing users who point their AI client at the vectorhawk shim;
+            // existing users who point their AI client at the scenery shim;
             // the per-server entry is additional.
             let slug = crate::mcp_server_slug(&mcp_server_name);
             if let Some(p) = pusher {
                 // gateway_url present -> credential-brokered via the gateway proxy;
                 // absent -> directly-configured from server_config. Both are
-                // VectorHawk-only artifacts for restore-journal purposes.
+                // Scenery-only artifacts for restore-journal purposes.
                 let brokered = gateway_url.is_some();
                 if let Err(e) = p.push_mcp(&slug, Some(&installation_id.to_string()), brokered) {
                     warn!(
@@ -2834,7 +2834,7 @@ fn collect_referenced_files(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
         };
 
         // Skip SKILL.md (written separately) and the marker file.
-        if name == "SKILL.md" || name == ".vectorhawk-managed.json" {
+        if name == "SKILL.md" || name == ".scenery-managed.json" {
             continue;
         }
 
@@ -2856,7 +2856,7 @@ fn collect_referenced_files(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
 
 /// Return true if `managed_path_markers` has a `kind='skill'` row for this slug.
 ///
-/// The F2 marker is the canonical signal "VectorHawk already owns this skill's
+/// The F2 marker is the canonical signal "Scenery already owns this skill's
 /// `~/.claude/skills/<slug>/` directory" — for example because F1 migrated it
 /// from local disk. In that case the registry has no artifact to download.
 async fn marker_present_for_slug(state: &Arc<AppState>, slug: &str) -> bool {
@@ -2881,7 +2881,7 @@ async fn marker_present_for_slug(state: &Arc<AppState>, slug: &str) -> bool {
 /// Check whether skill content is locally accessible on this device.
 ///
 /// Returns `true` if either:
-/// - VectorHawk's versioned layout has an `active/` entry for the skill
+/// - Scenery's versioned layout has an `active/` entry for the skill
 ///   (`<root>/skills/{id}/active/`), or
 /// - Claude Code's native skills directory holds the skill
 ///   (`~/.claude/skills/{id}/`).
@@ -2890,7 +2890,7 @@ async fn marker_present_for_slug(state: &Arc<AppState>, slug: &str) -> bool {
 /// `installed` (content present) or fail terminally (genuinely absent).
 /// Returns `false` on any I/O error, treating absence as false.
 async fn check_local_skill_content(state: &Arc<AppState>, skill_id: &str) -> bool {
-    // VectorHawk versioned layout — active symlink points at the installed version.
+    // Scenery versioned layout — active symlink points at the installed version.
     let active_dir = state.root_dir.join("skills").join(skill_id).join("active");
     if active_dir.exists() {
         return true;
@@ -3745,7 +3745,7 @@ pub(crate) struct PluginDiff {
 /// locked handler actually uninstalls it, and `state == "removed"` is queued
 /// into `silent_purges` (no event — the backend already knows, exactly like
 /// the MCP diff's `"removed"` arm). `list_governed_plugins` only ever
-/// returns entries registered under the `vectorhawk` marketplace, so a
+/// returns entries registered under the `scenery` marketplace, so a
 /// plugin the user installed manually from elsewhere is never touched by
 /// this diff.
 async fn build_derived_plugin_events(records: Vec<PluginInstallationRecord>) -> PluginDiff {

@@ -58,7 +58,7 @@ fn read_file_marker_returns_none_when_absent() {
 #[test]
 fn read_file_marker_tolerates_malformed_json() {
     let dir = tempfile::tempdir().unwrap();
-    let marker_path = dir.path().join(".vectorhawk-managed.json");
+    let marker_path = dir.path().join(".scenery-managed.json");
     std::fs::write(&marker_path, b"{not valid json{{").unwrap();
     // Should return None without propagating an error.
     let result = read_file_marker(dir.path()).unwrap();
@@ -70,7 +70,7 @@ fn write_and_read_file_marker_version_mismatch_tolerated() {
     let dir = tempfile::tempdir().unwrap();
     // Write a marker with an unexpected version — should still deserialise.
     let content = r#"{"marker_version":99,"installation_id":null,"source_sha256":"aabbcc","migrated_at":"2026-01-01T00:00:00Z"}"#;
-    std::fs::write(dir.path().join(".vectorhawk-managed.json"), content).unwrap();
+    std::fs::write(dir.path().join(".scenery-managed.json"), content).unwrap();
     let marker = read_file_marker(dir.path()).unwrap().unwrap();
     assert_eq!(marker.marker_version, 99);
 }

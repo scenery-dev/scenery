@@ -1,10 +1,10 @@
 use anyhow::{bail, Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
-use std::{fs, io::Write as IoWrite};
 use scenery_manifest::PluginPackage;
+use std::{fs, io::Write as IoWrite};
 use zip::{write::SimpleFileOptions, ZipWriter};
 
-/// Export a VectorHawk plugin to the Claude Code plugin format.
+/// Export a Scenery plugin to the Claude Code plugin format.
 ///
 /// Creates `{output_dir}/{manifest.id}/` containing:
 /// - `.claude-plugin/plugin.json`
@@ -139,7 +139,7 @@ pub fn export_claude_code(plugin_dir: &Utf8Path, output_dir: &Utf8Path) -> Resul
     Ok(dest)
 }
 
-/// Export a VectorHawk plugin to the .mcpb (MCP Bundle / Desktop Extension) archive format.
+/// Export a Scenery plugin to the .mcpb (MCP Bundle / Desktop Extension) archive format.
 ///
 /// The plugin must have exactly one MCP server declared. The resulting ZIP archive
 /// contains `manifest.json` describing the server — this is the wire format consumed
@@ -237,7 +237,7 @@ mod tests {
         fs::create_dir_all(&skill_dir).unwrap();
         fs::write(
             skill_dir.join("SKILL.md"),
-            "---\nname: My Skill\ndescription: Does the thing\nmetadata:\n  vectorhawk:\n    version: 0.1.0\n    publisher: test\n    permissions:\n      filesystem: none\n      network: none\n      clipboard: none\n    execution:\n      sandbox: strict\n      timeout_ms: 30000\n      memory_mb: 512\n    workflow_ref: workflow.yaml\n---\n\n# My Skill\n\nYou are a helpful assistant.\n",
+            "---\nname: My Skill\ndescription: Does the thing\nmetadata:\n  scenery:\n    version: 0.1.0\n    publisher: test\n    permissions:\n      filesystem: none\n      network: none\n      clipboard: none\n    execution:\n      sandbox: strict\n      timeout_ms: 30000\n      memory_mb: 512\n    workflow_ref: workflow.yaml\n---\n\n# My Skill\n\nYou are a helpful assistant.\n",
         )
         .unwrap();
         fs::write(skill_dir.join("workflow.yaml"), "name: test\nsteps: []").unwrap();

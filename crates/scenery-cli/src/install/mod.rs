@@ -28,7 +28,7 @@ pub mod linux;
 /// install on behalf of a service account. Those are legitimate; this var
 /// lets them opt out of the gate explicitly rather than silently disabling
 /// it.
-pub const ALLOW_HOME_MISMATCH_ENV: &str = "VH_ALLOW_HOME_MISMATCH";
+pub const ALLOW_HOME_MISMATCH_ENV: &str = "SCN_ALLOW_HOME_MISMATCH";
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -76,7 +76,7 @@ pub fn install() -> Result<()> {
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     anyhow::bail!(
-        "vectorhawk daemon install is not yet supported on this platform \
+        "scenery daemon install is not yet supported on this platform \
          (macOS and Linux only)"
     )
 }
@@ -93,13 +93,13 @@ pub fn uninstall() -> Result<()> {
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     anyhow::bail!(
-        "vectorhawk daemon uninstall is not yet supported on this platform \
+        "scenery daemon uninstall is not yet supported on this platform \
          (macOS and Linux only)"
     )
 }
 
 /// Stop and deregister `brew services`' own unit for this formula
-/// (`homebrew.mxcl.vectorhawk` / `sh.brew.vectorhawk.service`), which
+/// (`homebrew.mxcl.scenery` / `sh.brew.scenery.service`), which
 /// [`uninstall`] does not touch. Returns whether there was anything to stop.
 pub fn stop_brew_service() -> Result<bool> {
     #[cfg(target_os = "macos")]
@@ -124,7 +124,7 @@ pub fn restart() -> Result<()> {
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     anyhow::bail!(
-        "vectorhawk daemon restart is not yet supported on this platform \
+        "scenery daemon restart is not yet supported on this platform \
          (macOS and Linux only)"
     )
 }
@@ -309,8 +309,8 @@ fn check_home_not_overridden() -> Result<()> {
 /// Return the binary path that should be written into the auto-start unit.
 ///
 /// When the current executable lives inside a Homebrew Cellar directory (e.g.
-/// `/opt/homebrew/Cellar/vectorhawk/1.0.45/bin/vectorhawk` or
-/// `/home/linuxbrew/.linuxbrew/Cellar/vectorhawk/1.0.45/bin/vectorhawk`),
+/// `/opt/homebrew/Cellar/scenery/1.0.45/bin/scenery` or
+/// `/home/linuxbrew/.linuxbrew/Cellar/scenery/1.0.45/bin/scenery`),
 /// rewrite to the unversioned symlink directory so that `brew upgrade`
 /// automatically picks up the new binary without re-running `daemon install`.
 ///
@@ -381,7 +381,7 @@ pub(crate) fn wait_for_socket(socket_path: &str, timeout: std::time::Duration) -
 // ── it — `linux.rs` is `#[cfg(target_os = "linux")]` and does not compile on ──
 // ── the macOS host this is developed on). ──────────────────────────────────
 
-/// Coarse state of the `vectorhawk-agent.service` systemd user unit, as read
+/// Coarse state of the `scenery.service` systemd user unit, as read
 /// from `systemctl --user show <unit> -p ActiveState -p SubState`.
 ///
 /// `AutoRestart` is its own variant (not folded into `Activating`) because it
@@ -410,10 +410,10 @@ pub(crate) enum SystemdState {
 
 /// Given the raw contents of `/proc/<pid>/cgroup`, report whether that
 /// process belongs to the named systemd unit (e.g.
-/// `"vectorhawk-agent.service"`).
+/// `"scenery.service"`).
 ///
 /// Handles the cgroup v2 single-line shape:
-/// `0::/user.slice/user-1000.slice/user@1000.service/app.slice/vectorhawk-agent.service`
+/// `0::/user.slice/user-1000.slice/user@1000.service/app.slice/scenery.service`
 /// as well as cgroup v1's multi-line `N:controller:/path` form. A unit name
 /// only counts as a match when it is a **complete path segment** (bounded by
 /// `/` or end-of-line) — a plain substring search would be fooled by, e.g.,
@@ -428,10 +428,10 @@ pub(crate) fn cgroup_is_service(cgroup_file_contents: &str, service_name: &str) 
 
 // ── Competing-service-manager detection (pure; shared by both platform ───────
 // ── installers, same reason as the block above: `mcp setup`/`daemon install` ─
-// ── must never write and enable `vectorhawk-agent.service` (or the macOS ────
+// ── must never write and enable `scenery.service` (or the macOS ────
 // ── LaunchAgent) when a *different* service-manager entry — most commonly ───
-// ── `brew services` (`sh.brew.vectorhawk.service` on Linux, ────────────────
-// ── `homebrew.mxcl.vectorhawk` on macOS) — is already running a healthy ─────
+// ── `brew services` (`sh.brew.scenery.service` on Linux, ────────────────
+// ── `homebrew.mxcl.scenery` on macOS) — is already running a healthy ─────
 // ── daemon. Two such units both `Restart=always`/`KeepAlive: true` on the ───
 // ── same single-instance socket lock is a permanent crash-restart loop for ──
 // ── whichever one loses the race: it can never acquire the lock, so it ──────
@@ -456,7 +456,7 @@ pub(crate) fn cgroup_is_service(cgroup_file_contents: &str, service_name: &str) 
 /// this extracts whichever unit the process actually belongs to, so a caller
 /// can compare it against "is this unit ours?" without knowing the other
 /// unit's name in advance — exactly what's needed to recognize an unknown
-/// competing manager (e.g. `sh.brew.vectorhawk.service`) rather than only a
+/// competing manager (e.g. `sh.brew.scenery.service`) rather than only a
 /// specific one.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn cgroup_owning_service(cgroup_file_contents: &str) -> Option<String> {
@@ -471,19 +471,19 @@ pub(crate) fn cgroup_owning_service(cgroup_file_contents: &str) -> Option<String
 }
 
 /// Given the raw value of a systemd unit's `ExecStart=` directive (e.g.
-/// `/home/linuxbrew/.linuxbrew/opt/vectorhawk/bin/vectorhawk daemon run
-/// --foreground`), report whether it runs `vectorhawk daemon run`.
+/// `/home/linuxbrew/.linuxbrew/opt/scenery/bin/scenery daemon run
+/// --foreground`), report whether it runs `scenery daemon run`.
 ///
 /// Matches **positionally** on the whitespace-split command line, mirroring
 /// [`cmdline_is_daemon_run`]'s argv-position matching and for the same
 /// reason: the first token's file-name component must be exactly
-/// `vectorhawk`, the second exactly `daemon`, the third exactly `run`.
+/// `scenery`, the second exactly `daemon`, the third exactly `run`.
 /// Trailing args (`--foreground`, etc.) are ignored. This deliberately
 /// excludes `daemon install`/`daemon restart` (a competing *installer*
 /// invocation, not a competing *running* daemon) and tolerates both a bare
 /// name and an absolute path in the first token.
 ///
-/// A plain substring search (`contains("vectorhawk") && contains("daemon")
+/// A plain substring search (`contains("scenery") && contains("daemon")
 /// && contains("run")`) would be fooled by an unrelated unit whose
 /// `ExecStart` happens to mention those words in some other order or
 /// position — the same class of bug `cmdline_is_daemon_run`'s doc comment
@@ -502,7 +502,7 @@ pub(crate) fn exec_start_is_daemon_run(exec_start: &str) -> bool {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or(argv0);
-    if argv0_name != "vectorhawk" {
+    if argv0_name != "scenery" {
         return false;
     }
     tokens.next() == Some("daemon") && tokens.next() == Some("run")
@@ -511,7 +511,7 @@ pub(crate) fn exec_start_is_daemon_run(exec_start: &str) -> bool {
 /// Split an `ExecStart=` value into argv the way systemd does for the cases
 /// we care about: whitespace separates words, and single or double quotes
 /// group a word (and are removed). `brew services` quotes every element,
-/// e.g. `"/home/linuxbrew/.../vectorhawk" "daemon" "run" "--foreground"`.
+/// e.g. `"/home/linuxbrew/.../scenery" "daemon" "run" "--foreground"`.
 /// A leading exec prefix stays attached to the first word, as in systemd.
 fn split_exec_start(exec_start: &str) -> Vec<String> {
     let mut words = Vec::new();
@@ -633,7 +633,7 @@ pub(crate) fn unit_file_state_counts_as_owner(state: UnitFileState) -> bool {
 /// Pure decision: among `candidates` — every other `*.service` file found in
 /// the systemd user directory (`(unit_name, raw_file_contents)`), gathered
 /// by the caller via plain file reads, **not** including `our_unit_name` —
-/// find the first one that (a) runs `vectorhawk daemon run` per its
+/// find the first one that (a) runs `scenery daemon run` per its
 /// `ExecStart=` directive and (b) **owns** the daemon per the
 /// caller-injected `unit_info_of` lookup (real implementation:
 /// `systemctl --user show -p ActiveState -p SubState -p UnitFileState
@@ -662,7 +662,7 @@ pub(crate) fn unit_file_state_counts_as_owner(state: UnitFileState) -> bool {
 ///
 /// A unit that is both `Disabled`/`Masked` *and* not `Active` genuinely owns
 /// nothing — that is exactly the box that still needs
-/// `vectorhawk-agent.service` to make the daemon run at all, not one where
+/// `scenery.service` to make the daemon run at all, not one where
 /// something else already has it covered.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn find_other_owning_daemon_unit<F>(
@@ -711,7 +711,7 @@ pub(crate) fn should_start_other_unit(other_active: Option<SystemdState>) -> boo
 }
 
 /// Pure decision: should the installer remove its *own* auto-start unit
-/// (`vectorhawk-agent.service` / `com.vectorhawk.agent.plist`)?
+/// (`scenery.service` / `com.scenery.agent.plist`)?
 ///
 /// Only when the daemon is confirmed managed elsewhere (`managed_elsewhere`)
 /// AND our own unit actually has something to remove (it exists on disk, or
@@ -729,24 +729,24 @@ pub(crate) fn should_remove_our_unit(
 }
 
 /// Given the raw, NUL-separated `/proc/<pid>/cmdline` bytes of a process,
-/// report whether it is a `vectorhawk daemon run` invocation (with or
+/// report whether it is a `scenery daemon run` invocation (with or
 /// without trailing args such as `--foreground`).
 ///
 /// Matches **positionally on argv**, not by substring: `argv[0]`'s basename
-/// must be exactly `vectorhawk` (argv[0] may be a bare name or an absolute
-/// path, e.g. `/home/linuxbrew/.linuxbrew/bin/vectorhawk`), `argv[1]` must
+/// must be exactly `scenery` (argv[0] may be a bare name or an absolute
+/// path, e.g. `/home/linuxbrew/.linuxbrew/bin/scenery`), `argv[1]` must
 /// be exactly `daemon`, and `argv[2]` must be exactly `run`. Trailing args
 /// are ignored.
 ///
 /// This is a hard requirement, not a style preference: an earlier version
 /// of both `reap_stray_daemons` and `kill_daemon_process` matched by
-/// substring against the whole cmdline blob (`contains("vectorhawk") &&
+/// substring against the whole cmdline blob (`contains("scenery") &&
 /// contains("daemon") && contains("run"/"foreground")`), and that killed an
 /// innocent process during live verification — a `bash -c …` shell whose
-/// command line happened to mention `vectorhawk`, `daemon`, and
+/// command line happened to mention `scenery`, `daemon`, and
 /// `/run/user/1000/bus` nowhere near each other. Positional argv matching
 /// cannot be fooled by unrelated tokens elsewhere on the line, and it also
-/// naturally excludes `vectorhawk daemon install`/`restart` (the CLI
+/// naturally excludes `scenery daemon install`/`restart` (the CLI
 /// invocation doing the reaping/killing itself), since `argv[2]` there is
 /// `install`/`restart`, not `run`.
 ///
@@ -786,10 +786,10 @@ pub(crate) use scenery_daemon::daemon_takeover::cmdline_is_daemon_run;
 ///
 /// **Caller trap, pinned by test below:** the rendered unit's `ExecStart`
 /// holds the *unversioned* Homebrew symlink (`resolve_daemon_bin_path`'s
-/// rewrite target, e.g. `/home/linuxbrew/.linuxbrew/bin/vectorhawk`), while
+/// rewrite target, e.g. `/home/linuxbrew/.linuxbrew/bin/scenery`), while
 /// `/proc/<pid>/exe` is a magic symlink the kernel always resolves through
 /// to the *real* target (e.g.
-/// `…/Cellar/vectorhawk/1.0.92/bin/vectorhawk`). Comparing `ExecStart`'s raw
+/// `…/Cellar/scenery/1.0.92/bin/scenery`). Comparing `ExecStart`'s raw
 /// text against `exe_target` would therefore mismatch on **every** healthy
 /// install — the unversioned symlink text is never equal to what
 /// `/proc/.../exe` reports, healthy or not — and turn this into a restart
@@ -848,7 +848,7 @@ pub(crate) fn daemon_socket_path() -> String {
     #[cfg(target_os = "linux")]
     {
         if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
-            let base = std::path::PathBuf::from(runtime).join("vectorhawk");
+            let base = std::path::PathBuf::from(runtime).join("scenery");
             if let Some(s) = base.join("agent.sock").to_str() {
                 return s.to_string();
             }
@@ -857,13 +857,13 @@ pub(crate) fn daemon_socket_path() -> String {
 
     // macOS and Linux fallback: socket lives alongside state.db
     if let Some(data_dir) = dirs::data_dir() {
-        if let Some(s) = data_dir.join("VectorHawk").join("agent.sock").to_str() {
+        if let Some(s) = data_dir.join("Scenery").join("agent.sock").to_str() {
             return s.to_string();
         }
     }
 
     // Last resort (will not work, but is a valid path string).
-    "~/.local/share/VectorHawk/agent.sock".to_string()
+    "~/.local/share/Scenery/agent.sock".to_string()
 }
 
 /// Execute a [`scenery_daemon::daemon_takeover::Verdict::TakeOver`]
@@ -932,12 +932,12 @@ pub(crate) fn reap_stray_daemon_via_socket(socket_path: &str) -> bool {
 
     match verdict {
         scenery_daemon::daemon_takeover::Verdict::Refuse(reason) => {
-            println!("Not touching the process holding the VectorHawk daemon socket: {reason}.");
+            println!("Not touching the process holding the Scenery daemon socket: {reason}.");
             false
         }
         scenery_daemon::daemon_takeover::Verdict::TakeOver { pid, reason } => {
             println!(
-                "Stopping a verified stale VectorHawk daemon (pid {pid}, {reason:?}) so \
+                "Stopping a verified stale Scenery daemon (pid {pid}, {reason:?}) so \
                  this install can take ownership of the socket."
             );
             let result = take_over_verified_pid(pid);
@@ -984,7 +984,7 @@ mod tests {
     fn home_genuine_mismatch_is_overridden() {
         // The live Homebrew post_install repro.
         assert!(home_is_overridden(
-            Some("/var/tmp/s-7l6HKUXr/vectorhawk-postinstall-abc"),
+            Some("/var/tmp/s-7l6HKUXr/scenery-postinstall-abc"),
             Some("/home/spaceghost")
         ));
     }
@@ -1017,25 +1017,25 @@ mod tests {
     #[test]
     fn cgroup_v2_single_line_matches_our_unit() {
         let contents =
-            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/vectorhawk-agent.service\n";
-        assert!(cgroup_is_service(contents, "vectorhawk-agent.service"));
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/scenery.service\n";
+        assert!(cgroup_is_service(contents, "scenery.service"));
     }
 
     #[test]
     fn cgroup_v1_multi_line_matches_our_unit() {
         let contents = "\
-12:pids:/user.slice/user-1000.slice/user@1000.service/app.slice/vectorhawk-agent.service
-11:memory:/user.slice/user-1000.slice/user@1000.service/app.slice/vectorhawk-agent.service
-1:name=systemd:/user.slice/user-1000.slice/user@1000.service/app.slice/vectorhawk-agent.service
+12:pids:/user.slice/user-1000.slice/user@1000.service/app.slice/scenery.service
+11:memory:/user.slice/user-1000.slice/user@1000.service/app.slice/scenery.service
+1:name=systemd:/user.slice/user-1000.slice/user@1000.service/app.slice/scenery.service
 ";
-        assert!(cgroup_is_service(contents, "vectorhawk-agent.service"));
+        assert!(cgroup_is_service(contents, "scenery.service"));
     }
 
     #[test]
     fn cgroup_of_a_different_unit_does_not_match() {
         let contents =
             "0::/user.slice/user-1000.slice/user@1000.service/app.slice/some-other.service\n";
-        assert!(!cgroup_is_service(contents, "vectorhawk-agent.service"));
+        assert!(!cgroup_is_service(contents, "scenery.service"));
     }
 
     #[test]
@@ -1043,62 +1043,62 @@ mod tests {
         // e.g. a stray spawned directly in the login session scope, not a
         // systemd unit at all.
         let contents = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-org.gnome.Terminal.slice/vte-spawn-abc.scope\n";
-        assert!(!cgroup_is_service(contents, "vectorhawk-agent.service"));
+        assert!(!cgroup_is_service(contents, "scenery.service"));
     }
 
     #[test]
     fn cgroup_substring_inside_an_unrelated_segment_does_not_match() {
         // The unit name appears only as *infix text* inside a longer, unrelated
         // path segment — must not be treated as a match.
-        let contents = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/not-vectorhawk-agent.service-backup.scope\n";
-        assert!(!cgroup_is_service(contents, "vectorhawk-agent.service"));
+        let contents = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/not-scenery.service-backup.scope\n";
+        assert!(!cgroup_is_service(contents, "scenery.service"));
     }
 
     // ── cmdline_is_daemon_run ───────────────────────────────────────────────
     //
     // Regression coverage for the live incident: substring matching against
     // the raw cmdline blob killed an innocent `bash -c …` shell whose
-    // command line happened to contain "vectorhawk", "daemon", and
+    // command line happened to contain "scenery", "daemon", and
     // "/run/user/1000/bus" as unrelated tokens.
 
     #[test]
     fn does_not_match_the_shell_that_actually_got_killed() {
         // The real false positive: a bash process whose full command line
-        // mentions "vectorhawk", "daemon" and "/run/user/1000/bus" as
+        // mentions "scenery", "daemon" and "/run/user/1000/bus" as
         // separate, unrelated substrings — none of them in argv[0..3]
         // position.
-        let cmdline = b"bash\0-c\0echo vectorhawk daemon status > /run/user/1000/bus\0".to_vec();
+        let cmdline = b"bash\0-c\0echo scenery daemon status > /run/user/1000/bus\0".to_vec();
         assert!(!cmdline_is_daemon_run(&cmdline));
     }
 
     #[test]
     fn matches_absolute_path_daemon_run_with_foreground_flag() {
         let cmdline =
-            b"/home/linuxbrew/.linuxbrew/bin/vectorhawk\0daemon\0run\0--foreground\0".to_vec();
+            b"/home/linuxbrew/.linuxbrew/bin/scenery\0daemon\0run\0--foreground\0".to_vec();
         assert!(cmdline_is_daemon_run(&cmdline));
     }
 
     #[test]
     fn matches_bare_name_daemon_run_with_no_trailing_args() {
-        let cmdline = b"vectorhawk\0daemon\0run\0".to_vec();
+        let cmdline = b"scenery\0daemon\0run\0".to_vec();
         assert!(cmdline_is_daemon_run(&cmdline));
     }
 
     #[test]
     fn does_not_match_daemon_install_the_installing_process_itself() {
-        let cmdline = b"vectorhawk\0daemon\0install\0".to_vec();
+        let cmdline = b"scenery\0daemon\0install\0".to_vec();
         assert!(!cmdline_is_daemon_run(&cmdline));
     }
 
     #[test]
     fn does_not_match_daemon_restart() {
-        let cmdline = b"vectorhawk\0daemon\0restart\0".to_vec();
+        let cmdline = b"scenery\0daemon\0restart\0".to_vec();
         assert!(!cmdline_is_daemon_run(&cmdline));
     }
 
     #[test]
     fn does_not_match_similarly_named_binaries() {
-        for argv0 in ["not-vectorhawk", "vectorhawkd", "vectorhawk-old"] {
+        for argv0 in ["not-scenery", "sceneryd", "scenery-old", "scn-old"] {
             let cmdline = format!("{argv0}\0daemon\0run\0").into_bytes();
             assert!(
                 !cmdline_is_daemon_run(&cmdline),
@@ -1111,10 +1111,10 @@ mod tests {
     fn empty_malformed_or_short_cmdlines_do_not_match_and_do_not_panic() {
         let cases: &[&[u8]] = &[
             b"",
-            b"vectorhawk\0",
-            b"vectorhawk\0daemon\0",
+            b"scenery\0",
+            b"scenery\0daemon\0",
             b"\0\0\0",
-            b"vectorhawk",
+            b"scenery",
         ];
         for raw in cases {
             assert!(!cmdline_is_daemon_run(raw), "raw={raw:?}");
@@ -1191,18 +1191,17 @@ mod tests {
 
     #[test]
     fn deleted_marker_is_always_stale_regardless_of_canonical_expected() {
-        let exe_target =
-            "/home/linuxbrew/.linuxbrew/Cellar/vectorhawk/1.0.91/bin/vectorhawk (deleted)";
+        let exe_target = "/home/linuxbrew/.linuxbrew/Cellar/scenery/1.0.91/bin/scenery (deleted)";
         assert!(exe_is_stale(exe_target, None));
         assert!(exe_is_stale(
             exe_target,
-            Some("/home/linuxbrew/.linuxbrew/Cellar/vectorhawk/1.0.92/bin/vectorhawk")
+            Some("/home/linuxbrew/.linuxbrew/Cellar/scenery/1.0.92/bin/scenery")
         ));
     }
 
     #[test]
     fn healthy_install_canonical_expected_equals_exe_target_is_not_stale() {
-        let path = "/home/linuxbrew/.linuxbrew/Cellar/vectorhawk/1.0.92/bin/vectorhawk";
+        let path = "/home/linuxbrew/.linuxbrew/Cellar/scenery/1.0.92/bin/scenery";
         assert!(!exe_is_stale(path, Some(path)));
     }
 
@@ -1211,9 +1210,8 @@ mod tests {
         // Homebrew does not always clean up the old Cellar directory
         // immediately, so the link can point at a still-present old-version
         // path with no "(deleted)" marker at all.
-        let exe_target = "/home/linuxbrew/.linuxbrew/Cellar/vectorhawk/1.0.91/bin/vectorhawk";
-        let canonical_expected =
-            "/home/linuxbrew/.linuxbrew/Cellar/vectorhawk/1.0.92/bin/vectorhawk";
+        let exe_target = "/home/linuxbrew/.linuxbrew/Cellar/scenery/1.0.91/bin/scenery";
+        let canonical_expected = "/home/linuxbrew/.linuxbrew/Cellar/scenery/1.0.92/bin/scenery";
         assert!(exe_is_stale(exe_target, Some(canonical_expected)));
     }
 
@@ -1222,7 +1220,7 @@ mod tests {
         // Cannot determine the expected path (e.g. canonicalize failed) —
         // must not force a restart on a guess, even though exe_target here
         // looks like an old version.
-        let exe_target = "/home/linuxbrew/.linuxbrew/Cellar/vectorhawk/1.0.91/bin/vectorhawk";
+        let exe_target = "/home/linuxbrew/.linuxbrew/Cellar/scenery/1.0.91/bin/scenery";
         assert!(!exe_is_stale(exe_target, None));
     }
 
@@ -1233,8 +1231,8 @@ mod tests {
         // to the *real* Cellar target. Comparing the raw ExecStart text
         // against exe_target — the bug this test pins against — would
         // incorrectly report every healthy install as stale:
-        let raw_exec_start = "/home/linuxbrew/.linuxbrew/bin/vectorhawk";
-        let exe_target = "/home/linuxbrew/.linuxbrew/Cellar/vectorhawk/1.0.92/bin/vectorhawk";
+        let raw_exec_start = "/home/linuxbrew/.linuxbrew/bin/scenery";
+        let exe_target = "/home/linuxbrew/.linuxbrew/Cellar/scenery/1.0.92/bin/scenery";
         assert!(
             exe_is_stale(exe_target, Some(raw_exec_start)),
             "sanity check: the raw ExecStart symlink text does not equal the \
@@ -1260,20 +1258,20 @@ mod tests {
     #[test]
     fn cgroup_owning_service_extracts_brew_unit() {
         let contents =
-            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/sh.brew.vectorhawk.service\n";
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/sh.brew.scenery.service\n";
         assert_eq!(
             cgroup_owning_service(contents),
-            Some("sh.brew.vectorhawk.service".to_string())
+            Some("sh.brew.scenery.service".to_string())
         );
     }
 
     #[test]
     fn cgroup_owning_service_extracts_our_own_unit() {
         let contents =
-            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/vectorhawk-agent.service\n";
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/scenery.service\n";
         assert_eq!(
             cgroup_owning_service(contents),
-            Some("vectorhawk-agent.service".to_string())
+            Some("scenery.service".to_string())
         );
     }
 
@@ -1303,13 +1301,13 @@ mod tests {
     #[test]
     fn exec_start_matches_brew_opt_path_with_foreground_flag() {
         assert!(exec_start_is_daemon_run(
-            "/home/linuxbrew/.linuxbrew/opt/vectorhawk/bin/vectorhawk daemon run --foreground"
+            "/home/linuxbrew/.linuxbrew/opt/scenery/bin/scenery daemon run --foreground"
         ));
     }
 
     #[test]
     fn exec_start_matches_bare_name_no_trailing_args() {
-        assert!(exec_start_is_daemon_run("vectorhawk daemon run"));
+        assert!(exec_start_is_daemon_run("scenery daemon run"));
     }
 
     /// The exact line `brew services` writes on Linux (verified on spaceghost
@@ -1319,46 +1317,46 @@ mod tests {
     #[test]
     fn exec_start_matches_brew_services_fully_quoted_line() {
         assert!(exec_start_is_daemon_run(
-            r#""/home/linuxbrew/.linuxbrew/opt/vectorhawk/bin/vectorhawk" "daemon" "run" "--foreground""#
+            r#""/home/linuxbrew/.linuxbrew/opt/scenery/bin/scenery" "daemon" "run" "--foreground""#
         ));
     }
 
     #[test]
     fn exec_start_matches_single_quoted_and_mixed_quoting() {
         assert!(exec_start_is_daemon_run(
-            "'/usr/local/bin/vectorhawk' daemon 'run'"
+            "'/usr/local/bin/scenery' daemon 'run'"
         ));
         assert!(exec_start_is_daemon_run(
-            r#""/opt/Vector Hawk/bin/vectorhawk" daemon run"#
+            r#""/opt/Vector Hawk/bin/scenery" daemon run"#
         ));
     }
 
     #[test]
     fn exec_start_matches_with_systemd_exec_prefixes() {
-        assert!(exec_start_is_daemon_run("-/usr/bin/vectorhawk daemon run"));
+        assert!(exec_start_is_daemon_run("-/usr/bin/scenery daemon run"));
         assert!(exec_start_is_daemon_run(
-            r#"+"/usr/bin/vectorhawk" "daemon" "run""#
+            r#"+"/usr/bin/scenery" "daemon" "run""#
         ));
     }
 
     #[test]
     fn exec_start_quoted_daemon_install_still_does_not_match() {
         assert!(!exec_start_is_daemon_run(
-            r#""/home/linuxbrew/.linuxbrew/bin/vectorhawk" "daemon" "install""#
+            r#""/home/linuxbrew/.linuxbrew/bin/scenery" "daemon" "install""#
         ));
     }
 
     #[test]
     fn exec_start_does_not_match_daemon_install() {
         assert!(!exec_start_is_daemon_run(
-            "/home/linuxbrew/.linuxbrew/bin/vectorhawk daemon install"
+            "/home/linuxbrew/.linuxbrew/bin/scenery daemon install"
         ));
     }
 
     #[test]
     fn exec_start_does_not_match_unrelated_command() {
         assert!(!exec_start_is_daemon_run(
-            "/bin/sh -c 'echo vectorhawk daemon run'"
+            "/bin/sh -c 'echo scenery daemon run'"
         ));
     }
 
@@ -1371,10 +1369,10 @@ mod tests {
 
     #[test]
     fn parse_exec_start_extracts_the_value() {
-        let unit = "[Unit]\nDescription=x\n\n[Service]\nExecStart=/opt/vectorhawk/bin/vectorhawk daemon run --foreground\nRestart=always\n";
+        let unit = "[Unit]\nDescription=x\n\n[Service]\nExecStart=/opt/scenery/bin/scenery daemon run --foreground\nRestart=always\n";
         assert_eq!(
             parse_exec_start_from_unit_file(unit),
-            Some("/opt/vectorhawk/bin/vectorhawk daemon run --foreground".to_string())
+            Some("/opt/scenery/bin/scenery daemon run --foreground".to_string())
         );
     }
 
@@ -1439,9 +1437,9 @@ mod tests {
     // ── find_other_owning_daemon_unit ───────────────────────────────────────
     //
     // Original regression this pins: spaceghost, 2026-10-13. `brew services`
-    // owns `sh.brew.vectorhawk.service`, healthy and Active; `mcp setup`
+    // owns `sh.brew.scenery.service`, healthy and Active; `mcp setup`
     // must recognize it and never install/enable a second, competing
-    // `vectorhawk-agent.service` that can never win the single-instance
+    // `scenery.service` that can never win the single-instance
     // socket lock and crash-loops forever.
     //
     // Follow-on regression (also pinned here): spaceghost, brew upgrade
@@ -1458,15 +1456,14 @@ mod tests {
     #[test]
     fn active_brew_unit_is_the_owner() {
         let candidates = vec![(
-            "sh.brew.vectorhawk.service".to_string(),
-            "[Service]\nExecStart=/home/linuxbrew/.linuxbrew/opt/vectorhawk/bin/vectorhawk daemon run --foreground\n".to_string(),
+            "sh.brew.scenery.service".to_string(),
+            "[Service]\nExecStart=/home/linuxbrew/.linuxbrew/opt/scenery/bin/scenery daemon run --foreground\n".to_string(),
         )];
-        let result =
-            find_other_owning_daemon_unit("vectorhawk-agent.service", &candidates, |name| {
-                assert_eq!(name, "sh.brew.vectorhawk.service");
-                (Some(SystemdState::Active), UnitFileState::Enabled)
-            });
-        assert_eq!(result, Some("sh.brew.vectorhawk.service".to_string()));
+        let result = find_other_owning_daemon_unit("scenery.service", &candidates, |name| {
+            assert_eq!(name, "sh.brew.scenery.service");
+            (Some(SystemdState::Active), UnitFileState::Enabled)
+        });
+        assert_eq!(result, Some("sh.brew.scenery.service".to_string()));
     }
 
     #[test]
@@ -1476,13 +1473,13 @@ mod tests {
         // recognized as the owner so our unit self-heals away rather than
         // standing as a permanent duplicate.
         let candidates = vec![(
-            "sh.brew.vectorhawk.service".to_string(),
-            "[Service]\nExecStart=/home/linuxbrew/.linuxbrew/opt/vectorhawk/bin/vectorhawk daemon run --foreground\n".to_string(),
+            "sh.brew.scenery.service".to_string(),
+            "[Service]\nExecStart=/home/linuxbrew/.linuxbrew/opt/scenery/bin/scenery daemon run --foreground\n".to_string(),
         )];
-        let result = find_other_owning_daemon_unit("vectorhawk-agent.service", &candidates, |_| {
+        let result = find_other_owning_daemon_unit("scenery.service", &candidates, |_| {
             (Some(SystemdState::Inactive), UnitFileState::Enabled)
         });
-        assert_eq!(result, Some("sh.brew.vectorhawk.service".to_string()));
+        assert_eq!(result, Some("sh.brew.scenery.service".to_string()));
     }
 
     #[test]
@@ -1491,11 +1488,10 @@ mod tests {
         // that is exactly the box where our own unit is legitimately
         // needed, so it must not be suppressed.
         let candidates = vec![(
-            "sh.brew.vectorhawk.service".to_string(),
-            "[Service]\nExecStart=/opt/vectorhawk/bin/vectorhawk daemon run --foreground\n"
-                .to_string(),
+            "sh.brew.scenery.service".to_string(),
+            "[Service]\nExecStart=/opt/scenery/bin/scenery daemon run --foreground\n".to_string(),
         )];
-        let result = find_other_owning_daemon_unit("vectorhawk-agent.service", &candidates, |_| {
+        let result = find_other_owning_daemon_unit("scenery.service", &candidates, |_| {
             (Some(SystemdState::Inactive), UnitFileState::Disabled)
         });
         assert_eq!(result, None);
@@ -1504,11 +1500,10 @@ mod tests {
     #[test]
     fn masked_matching_unit_is_not_the_owner() {
         let candidates = vec![(
-            "sh.brew.vectorhawk.service".to_string(),
-            "[Service]\nExecStart=/opt/vectorhawk/bin/vectorhawk daemon run --foreground\n"
-                .to_string(),
+            "sh.brew.scenery.service".to_string(),
+            "[Service]\nExecStart=/opt/scenery/bin/scenery daemon run --foreground\n".to_string(),
         )];
-        let result = find_other_owning_daemon_unit("vectorhawk-agent.service", &candidates, |_| {
+        let result = find_other_owning_daemon_unit("scenery.service", &candidates, |_| {
             (Some(SystemdState::Inactive), UnitFileState::Masked)
         });
         assert_eq!(result, None);
@@ -1525,14 +1520,13 @@ mod tests {
             None,
         ] {
             let candidates = vec![(
-                "sh.brew.vectorhawk.service".to_string(),
-                "[Service]\nExecStart=/opt/vectorhawk/bin/vectorhawk daemon run --foreground\n"
+                "sh.brew.scenery.service".to_string(),
+                "[Service]\nExecStart=/opt/scenery/bin/scenery daemon run --foreground\n"
                     .to_string(),
             )];
-            let result =
-                find_other_owning_daemon_unit("vectorhawk-agent.service", &candidates, |_| {
-                    (state, UnitFileState::Other)
-                });
+            let result = find_other_owning_daemon_unit("scenery.service", &candidates, |_| {
+                (state, UnitFileState::Other)
+            });
             assert_eq!(
                 result, None,
                 "state={state:?} with no enabled unit-file-state must not be treated as managed"
@@ -1543,11 +1537,10 @@ mod tests {
     #[test]
     fn ignores_our_own_unit_name_even_if_it_matches() {
         let candidates = vec![(
-            "vectorhawk-agent.service".to_string(),
-            "[Service]\nExecStart=/opt/vectorhawk/bin/vectorhawk daemon run --foreground\n"
-                .to_string(),
+            "scenery.service".to_string(),
+            "[Service]\nExecStart=/opt/scenery/bin/scenery daemon run --foreground\n".to_string(),
         )];
-        let result = find_other_owning_daemon_unit("vectorhawk-agent.service", &candidates, |_| {
+        let result = find_other_owning_daemon_unit("scenery.service", &candidates, |_| {
             panic!("unit_info_of must never be consulted for our own unit")
         });
         assert_eq!(result, None);
@@ -1559,7 +1552,7 @@ mod tests {
             "some-other-app.service".to_string(),
             "[Service]\nExecStart=/usr/bin/some-other-app --flag\n".to_string(),
         )];
-        let result = find_other_owning_daemon_unit("vectorhawk-agent.service", &candidates, |_| {
+        let result = find_other_owning_daemon_unit("scenery.service", &candidates, |_| {
             (Some(SystemdState::Active), UnitFileState::Enabled)
         });
         assert_eq!(result, None);
@@ -1567,7 +1560,7 @@ mod tests {
 
     #[test]
     fn empty_candidate_list_is_none() {
-        let result = find_other_owning_daemon_unit("vectorhawk-agent.service", &[], |_| {
+        let result = find_other_owning_daemon_unit("scenery.service", &[], |_| {
             panic!("unit_info_of must never be called with no candidates")
         });
         assert_eq!(result, None);

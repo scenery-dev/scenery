@@ -6,7 +6,7 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "VectorHawk runner — MCP protocol, aggregator, and Backend trait"
+description = "Scenery runner — MCP protocol, aggregator, and Backend trait"
 
 # Feature gates for binary size control.
 #
@@ -48,7 +48,7 @@ uuid = { workspace = true, optional = true }
 # Not needed by anything the shim's stdio relay path calls.
 jsonc-parser = { version = "0.33", default-features = false, features = ["cst", "serde"], optional = true }
 # Format-preserving TOML editor — used only by `setup::write_mcp_entry_toml` /
-# `remove_mcp_entry_toml` / `read_vectorhawk_command_toml`, Codex CLI's
+# `remove_mcp_entry_toml` / `read_scenery_command_toml`, Codex CLI's
 # `~/.codex/config.toml` writer (Codex config is TOML, every other client's
 # is JSON). Not needed by anything the shim's stdio relay path calls.
 toml_edit = { version = "0.25", optional = true }

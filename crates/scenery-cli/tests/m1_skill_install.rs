@@ -1,4 +1,4 @@
-//! Integration tests for the new `vectorhawk skill install <SKILL_REF>` shape.
+//! Integration tests for the new `scenery skill install <SKILL_REF>` shape.
 //!
 //! Tests the skill_ref detection heuristic (local path vs registry ID) and the
 //! local-install and registry-install paths end-to-end.
@@ -35,8 +35,8 @@ fn write_skill_bundle(root: &Utf8PathBuf, name_suffix: &str, version: &str) {
         format!(
             concat!(
                 "---\nname: Test Skill {name_suffix}\ndescription: A test skill.\n",
-                "metadata:\n  vectorhawk:\n",
-                "    version: {version}\n    publisher: skillclub\n",
+                "metadata:\n  scenery:\n",
+                "    version: {version}\n    publisher: scenery\n",
                 "    permissions:\n      filesystem: none\n      network: none\n      clipboard: none\n",
                 "    execution:\n      sandbox: strict\n      timeout_ms: 30000\n      memory_mb: 256\n",
                 "    workflow_ref: ./workflow.yaml\n---\n\nDo the thing.\n"

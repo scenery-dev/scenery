@@ -1,7 +1,6 @@
-//! VectorHawk runner — skill manifest and bundle types.
+//! Scenery runner — skill manifest and bundle types.
 //!
-//! Ports the data layer from `skillrunner-manifest`. Pure data; no I/O beyond
-//! reading files passed in by the caller.
+//! Pure data layer; no I/O beyond reading files passed in by the caller.
 
 use camino::{Utf8Path, Utf8PathBuf};
 use semver::Version;
@@ -558,7 +557,7 @@ mod tests {
 
         fs::write(
             root.join("SKILL.md"),
-            "---\nname: Contract Compare\ndescription: Compare two contracts and summarize changes.\nlicense: MIT\nmetadata:\n  vectorhawk:\n    version: 0.1.0\n    publisher: forge\n    permissions:\n      filesystem: read-only\n      network: none\n      clipboard: none\n    execution:\n      sandbox: strict\n      timeout_ms: 90000\n      memory_mb: 1024\n    workflow_ref: ./workflow.yaml\n    schemas:\n      inputs:\n        type: object\n      outputs:\n        type: object\n---\n\nCompare the contracts.\n",
+            "---\nname: Contract Compare\ndescription: Compare two contracts and summarize changes.\nlicense: MIT\nmetadata:\n  scenery:\n    version: 0.1.0\n    publisher: forge\n    permissions:\n      filesystem: read-only\n      network: none\n      clipboard: none\n    execution:\n      sandbox: strict\n      timeout_ms: 90000\n      memory_mb: 1024\n    workflow_ref: ./workflow.yaml\n    schemas:\n      inputs:\n        type: object\n      outputs:\n        type: object\n---\n\nCompare the contracts.\n",
         )
         .expect("SKILL.md should be written");
         fs::write(
@@ -1013,7 +1012,7 @@ steps:
         fs::create_dir_all(root).expect("root dir should be created");
         fs::write(
             root.join("SKILL.md"),
-            "---\nname: hello-world\ndescription: A greeter skill.\nmetadata:\n  vectorhawk:\n    version: 0.1.0\n    publisher: test\n---\n\nYou are a greeter.\n",
+            "---\nname: hello-world\ndescription: A greeter skill.\nmetadata:\n  scenery:\n    version: 0.1.0\n    publisher: test\n---\n\nYou are a greeter.\n",
         )
         .expect("SKILL.md should be written");
     }
@@ -1027,9 +1026,9 @@ steps:
 name: passage-analyzer
 description: Analyzes a passage and summarizes it.
 metadata:
-  vectorhawk:
+  scenery:
     version: 1.0.0
-    publisher: vectorhawk
+    publisher: scenery
     permissions:
       network: none
       filesystem: read-only
@@ -1141,7 +1140,7 @@ You are an expert text analyst.
         match err {
             ManifestError::Invalid(msg) => {
                 assert!(
-                    msg.contains("metadata.vectorhawk") || msg.contains("vh_unknown_extension"),
+                    msg.contains("metadata.scenery") || msg.contains("vh_unknown_extension"),
                     "error should reference the migration path or field name, got: {msg}"
                 );
             }
@@ -1159,7 +1158,7 @@ You are an expert text analyst.
         // don't need prompts/p.md to actually exist for this test.
         fs::write(
             root.join("SKILL.md"),
-            "---\nname: bad\ndescription: Test.\nlicense: MIT\nmetadata:\n  vectorhawk:\n    workflow:\n      - {id: step1, type: llm, prompt: prompts/p.md}\n    workflow_ref: ./workflow.yaml\n---\n\nPrompt.\n",
+            "---\nname: bad\ndescription: Test.\nlicense: MIT\nmetadata:\n  scenery:\n    workflow:\n      - {id: step1, type: llm, prompt: prompts/p.md}\n    workflow_ref: ./workflow.yaml\n---\n\nPrompt.\n",
         )
         .expect("SKILL.md should be written");
 
@@ -1179,9 +1178,10 @@ You are an expert text analyst.
     #[test]
     fn skill_md_real_minimal_example_loads() {
         // Load the AUTH1a real example skill from the examples directory.
-        let root = Utf8PathBuf::from(
-            "/Users/shadowduck/code/skillclub/skillrunner/examples/skills/skill-md-minimal",
-        );
+        let root = Utf8PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/skills/skill-md-minimal"
+        ));
         if !root.exists() {
             return; // Skip if running in a context without the examples directory.
         }
@@ -1193,9 +1193,10 @@ You are an expert text analyst.
     #[test]
     fn skill_md_real_complex_example_loads() {
         // Load the AUTH1a complex example (has vh_workflow_ref and vh_schemas).
-        let root = Utf8PathBuf::from(
-            "/Users/shadowduck/code/skillclub/skillrunner/examples/skills/skill-md-complex",
-        );
+        let root = Utf8PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/skills/skill-md-complex"
+        ));
         if !root.exists() {
             return;
         }

@@ -15,16 +15,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use camino::Utf8PathBuf;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
-use serde::Serialize;
-use tokio::{
-    net::TcpListener,
-    sync::{broadcast, Notify},
-};
 use scenery_core::state::AppState;
 use scenery_mcp::{
     aggregator::{BackendEntry, BackendRegistry, BackendTransport, ToolDefinition, ToolVisibility},
     backend::RealBackend,
     protocol::JsonRpcRequest,
+};
+use serde::Serialize;
+use tokio::{
+    net::TcpListener,
+    sync::{broadcast, Notify},
 };
 
 use super::DaemonContext;
@@ -83,9 +83,9 @@ impl TokenOpts {
     fn valid(issuer: &str) -> Self {
         TokenOpts {
             sub: "user-1".to_string(),
-            aud: "urn:vectorhawk:local-mcp".to_string(),
+            aud: "urn:scenery:local-mcp".to_string(),
             iss: issuer.to_string(),
-            client_id: "vectorhawk-claude-code".to_string(),
+            client_id: "scenery-claude-code".to_string(),
             scope: "mcp offline_access".to_string(),
             jti: uuid::Uuid::new_v4().to_string(),
             exp_offset: 600,
@@ -219,12 +219,12 @@ fn http_client() -> reqwest::Client {
         .expect("client")
 }
 
-/// `X-VectorHawk-Local-Key` header name, matching
+/// `X-Scenery-Local-Key` header name, matching
 /// `super::LOCAL_KEY_HEADER` — redeclared here (rather than reaching into
 /// the private const) so tests exercise the real wire header name a client
 /// would actually send, the same way `reqwest::header::HOST`/`ORIGIN` are
 /// used as real header values elsewhere in this file.
-const LOCAL_KEY_HEADER: &str = "x-vectorhawk-local-key";
+const LOCAL_KEY_HEADER: &str = "x-scenery-local-key";
 
 // ── Hardening ─────────────────────────────────────────────────────────────
 
@@ -317,13 +317,13 @@ async fn post_mcp_oversize_body_is_rejected() {
 #[tokio::test]
 async fn prm_body_matches_contract_exactly_on_both_paths() {
     let state = make_test_state();
-    let ctx = make_ctx("https://dev.vectorhawk.ai", state);
+    let ctx = make_ctx("https://dev.scenery.dev", state);
     let (base, local_key) = start_test_listener(ctx).await;
     let port: u16 = base.rsplit(':').next().unwrap().parse().unwrap();
 
     let expected = serde_json::json!({
         "resource": format!("http://127.0.0.1:{port}/mcp"),
-        "authorization_servers": ["https://dev.vectorhawk.ai"],
+        "authorization_servers": ["https://dev.scenery.dev"],
         "scopes_supported": ["mcp"],
         "bearer_methods_supported": ["header"],
     });
@@ -585,7 +585,7 @@ async fn mcp_round_trip_initialize_list_call() {
     assert_eq!(init_resp.status(), 200);
     let init_body: serde_json::Value = init_resp.json().await.unwrap();
     assert_eq!(init_body["result"]["protocolVersion"], "2024-11-05");
-    assert_eq!(init_body["result"]["serverInfo"]["name"], "vectorhawkd");
+    assert_eq!(init_body["result"]["serverInfo"]["name"], "scenery");
 
     let list_resp = post_mcp(
         &base,
@@ -986,7 +986,7 @@ async fn post_mcp_local_key_header_matches_case_insensitively() {
     let resp = http_client()
         .post(format!("{base}/mcp"))
         .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .header("X-Vectorhawk-LOCAL-key", &local_key)
+        .header("X-Scenery-LOCAL-key", &local_key)
         .bearer_auth(&token)
         .json(&initialize_request())
         .send()
@@ -1014,7 +1014,7 @@ async fn logout_then_login_as_different_user_succeeds_without_sub_mismatch() {
     let resp = post_mcp(&base, &local_key, Some(&user_1_token), initialize_request()).await;
     assert_eq!(resp.status(), 200, "user-1 should work before logout");
 
-    // `vectorhawk auth logout` calls exactly this (plus clear_tokens, not
+    // `scenery auth logout` calls exactly this (plus clear_tokens, not
     // exercised by this daemon-level test).
     state.clear_device_session().expect("clear_device_session");
 
@@ -1057,7 +1057,7 @@ async fn logout_then_login_as_different_user_succeeds_without_sub_mismatch() {
 // ── M9: issuer must be https:// unless explicitly overridden ────────────
 
 /// Serializes tests that mutate the process-global
-/// `VECTORHAWK_MCP_HTTP_ALLOW_INSECURE_ISSUER` env var.
+/// `SCENERY_MCP_HTTP_ALLOW_INSECURE_ISSUER` env var.
 static MCP_HTTP_ISSUER_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[tokio::test]
@@ -1065,10 +1065,10 @@ async fn check_issuer_scheme_requires_https_without_override() {
     let _guard = MCP_HTTP_ISSUER_ENV_MUTEX
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    std::env::remove_var("VECTORHAWK_MCP_HTTP_ALLOW_INSECURE_ISSUER");
+    std::env::remove_var("SCENERY_MCP_HTTP_ALLOW_INSECURE_ISSUER");
 
-    assert!(super::check_issuer_scheme("https://dev.vectorhawk.ai"));
-    assert!(!super::check_issuer_scheme("http://dev.vectorhawk.ai"));
+    assert!(super::check_issuer_scheme("https://dev.scenery.dev"));
+    assert!(!super::check_issuer_scheme("http://dev.scenery.dev"));
 }
 
 #[tokio::test]
@@ -1076,9 +1076,9 @@ async fn check_issuer_scheme_allows_insecure_with_override_env() {
     let _guard = MCP_HTTP_ISSUER_ENV_MUTEX
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    std::env::set_var("VECTORHAWK_MCP_HTTP_ALLOW_INSECURE_ISSUER", "1");
+    std::env::set_var("SCENERY_MCP_HTTP_ALLOW_INSECURE_ISSUER", "1");
     let allowed = super::check_issuer_scheme("http://127.0.0.1:1234");
-    std::env::remove_var("VECTORHAWK_MCP_HTTP_ALLOW_INSECURE_ISSUER");
+    std::env::remove_var("SCENERY_MCP_HTTP_ALLOW_INSECURE_ISSUER");
     assert!(
         allowed,
         "the explicit dev override must allow a non-https issuer"
@@ -1099,7 +1099,7 @@ async fn start_listener_refuses_insecure_issuer_and_binds_nothing() {
     let _guard = MCP_HTTP_ISSUER_ENV_MUTEX
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    std::env::remove_var("VECTORHAWK_MCP_HTTP_ALLOW_INSECURE_ISSUER");
+    std::env::remove_var("SCENERY_MCP_HTTP_ALLOW_INSECURE_ISSUER");
 
     let state = make_test_state();
     // make_ctx's registry_url is plain http:// — M9 must refuse to start.
@@ -1173,7 +1173,7 @@ async fn pinned_port_held_by_another_process_fails_closed() {
     let claude_json = home.path().join(".claude.json");
     let root = serde_json::json!({
         "mcpServers": {
-            "vectorhawk": scenery_mcp::setup::build_claude_code_http_entry(squatted, 39200, &old_key)
+            "scenery": scenery_mcp::setup::build_claude_code_http_entry(squatted, 39200, &old_key)
         }
     });
     std::fs::write(&claude_json, serde_json::to_string(&root).unwrap()).unwrap();
@@ -1201,7 +1201,7 @@ async fn pinned_port_held_by_another_process_fails_closed() {
 
     let after: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&claude_json).unwrap()).unwrap();
-    let entry = &after["mcpServers"]["vectorhawk"];
+    let entry = &after["mcpServers"]["scenery"];
     assert!(
         entry.get("type").is_none() && entry.get("headers").is_none(),
         "{entry}"

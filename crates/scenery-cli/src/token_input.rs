@@ -1,4 +1,4 @@
-//! Personal Access Token input for `vectorhawk auth token`.
+//! Personal Access Token input for `scenery auth token`.
 //!
 //! A `vh_pat_...` token is a long-lived registry credential, so it must
 //! never travel on the command line: argv is readable by every local user
@@ -7,7 +7,7 @@
 //! and reads the token from:
 //!
 //! - **stdin, when stdin is not a terminal** — the headless / CI path, e.g.
-//!   `vectorhawk auth token < pat.txt`.
+//!   `scenery auth token < pat.txt`.
 //! - **a hidden prompt, when stdin is a terminal** — terminal echo is turned
 //!   off while the token is typed or pasted (Unix).
 //!
@@ -18,9 +18,9 @@
 use std::io::{self, BufRead, IsTerminal, Write};
 
 fn no_token_error() -> String {
-    "no Personal Access Token was provided — run `vectorhawk auth token` and \
+    "no Personal Access Token was provided — run `scenery auth token` and \
      paste it at the prompt, or pipe it in on stdin \
-     (`vectorhawk auth token < pat.txt`)"
+     (`scenery auth token < pat.txt`)"
         .to_string()
 }
 
@@ -155,7 +155,7 @@ mod tests {
     #[test]
     fn empty_input_is_an_error() {
         let err = resolve_token(true, unused(), line("   \n")).expect_err("empty must fail");
-        assert!(err.contains("vectorhawk auth token < pat.txt"), "{err}");
+        assert!(err.contains("scenery auth token < pat.txt"), "{err}");
     }
 
     #[test]

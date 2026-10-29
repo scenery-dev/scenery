@@ -2,8 +2,6 @@
 //! extended with `model_source` and `cost_usd` columns.
 
 use camino::Utf8PathBuf;
-use std::fs;
-use std::time::{SystemTime, UNIX_EPOCH};
 use scenery_core::{
     executor::run_skill,
     installer::{install_unpacked_skill, InstallMode},
@@ -13,6 +11,8 @@ use scenery_core::{
     state::AppState,
 };
 use scenery_manifest::SkillPackage;
+use std::fs;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn temp_root(label: &str) -> Utf8PathBuf {
     let nanos = SystemTime::now()
@@ -30,9 +30,9 @@ fn write_skill_bundle(root: &Utf8PathBuf) {
         "name: Test Skill\n",
         "description: A test skill for M6.\n",
         "metadata:\n",
-        "  vectorhawk:\n",
+        "  scenery:\n",
         "    version: 0.1.0\n",
-        "    publisher: skillclub\n",
+        "    publisher: scenery\n",
         "    permissions:\n",
         "      filesystem: none\n",
         "      network: none\n",

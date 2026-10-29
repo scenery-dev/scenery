@@ -1,6 +1,6 @@
 //! Structural guard for skill-supplied JSON Schemas (F21).
 //!
-//! Skill bundles carry JSON Schemas (`metadata.vectorhawk.schemas.inputs` /
+//! Skill bundles carry JSON Schemas (`metadata.scenery.schemas.inputs` /
 //! `outputs`, plus the schema files named by workflow `llm.output_schema` and
 //! `validate.schema` steps). They come from publishers, local paths and
 //! imported plugins, so they are untrusted.
@@ -19,8 +19,8 @@
 
 use anyhow::{Context, Result};
 use camino::Utf8Path;
-use serde_json::Value;
 use scenery_manifest::{SkillPackage, WorkflowStep};
+use serde_json::Value;
 
 /// Maximum number of JSON values (objects, arrays, scalars, counted
 /// individually) in one skill schema.
@@ -193,7 +193,7 @@ pub(crate) mod tests {
         let exe = std::env::current_exe().expect("current test exe");
         let mut child = std::process::Command::new(exe)
             .args([child_test, "--exact", "--ignored", "--test-threads=1"])
-            .env("VH_SCHEMA_GUARD_CHILD", "1")
+            .env("SCN_SCHEMA_GUARD_CHILD", "1")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
             .spawn()
@@ -224,7 +224,7 @@ pub(crate) mod tests {
     /// Child tests are `#[ignore]`d so a normal run skips them; they only do
     /// their work when launched by [`run_isolated`].
     pub(crate) fn is_child() -> bool {
-        std::env::var_os("VH_SCHEMA_GUARD_CHILD").is_some()
+        std::env::var_os("SCN_SCHEMA_GUARD_CHILD").is_some()
     }
 
     #[test]

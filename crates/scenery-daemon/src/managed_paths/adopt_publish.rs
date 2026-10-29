@@ -2,7 +2,7 @@
 //!
 //! Uploads the discovered SKILL.md tree through the org's normal scan/
 //! approval gate (`POST /runner/skills/adopt-publish`) and, once a real
-//! registry artifact exists, installs the VectorHawk-managed copy and takes
+//! registry artifact exists, installs the Scenery-managed copy and takes
 //! over from the original discovered `source_path`.
 //!
 //! # Outcomes (see `context/adopt-publish-contract.md`)
@@ -34,21 +34,21 @@
 //!
 //! # Killswitch
 //!
-//! Honors `VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER` — set, this is a no-op.
+//! Honors `SCENERY_DISABLE_FILESYSTEM_RECONCILER` — set, this is a no-op.
 
 use anyhow::{Context, Result};
-use std::{path::PathBuf, sync::Arc};
-use tracing::{info, warn};
-use uuid::Uuid;
 use scenery_core::{
     registry::{AdoptPublishOutcome, RegistryClient},
     state::AppState,
 };
+use std::{path::PathBuf, sync::Arc};
+use tracing::{info, warn};
+use uuid::Uuid;
 
 use super::publish::{build_tar_gz, load_token_for_registry};
 use super::pusher::ManagedPathsPusher;
 
-const ENV_DISABLE: &str = "VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER";
+const ENV_DISABLE: &str = "SCENERY_DISABLE_FILESYSTEM_RECONCILER";
 
 fn reconciler_disabled() -> bool {
     std::env::var_os(ENV_DISABLE).is_some()

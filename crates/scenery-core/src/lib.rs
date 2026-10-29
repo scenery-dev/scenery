@@ -1,8 +1,7 @@
-//! VectorHawk runner — core app logic.
+//! Scenery runner — core app logic.
 //!
-//! Ported from `skillrunner-core`. The app-support directory is renamed from
-//! `SkillClub/SkillRunner/` to `VectorHawk/` (macOS: `~/Library/Application
-//! Support/VectorHawk/`; Linux: `$XDG_DATA_HOME/vectorhawk/`).
+//! The app-support directory is `Scenery/` (macOS: `~/Library/Application
+//! Support/Scenery/`; Linux: `$XDG_DATA_HOME/scenery/`).
 //!
 //! # M0 scope
 //!
@@ -18,7 +17,7 @@
 //! none of these are needed by the M0 daemon or shim. They will be ported in M1
 //! once the daemon/shim socket protocol is validated end-to-end.
 
-/// Default registry base URL used when no `--registry-url` / `VECTORHAWK_REGISTRY_URL` is set.
+/// Default registry base URL used when no `--registry-url` / `SCENERY_REGISTRY_URL` is set.
 pub const DEFAULT_REGISTRY_URL: &str = "https://app.scenery.dev";
 
 pub mod app;
@@ -34,7 +33,7 @@ pub mod revocation;
 pub mod secret_file;
 pub mod state;
 
-// M1 modules — ported from skillrunner-core
+// M1 modules
 pub mod auth;
 pub mod executor;
 pub mod gateway_model;

@@ -1,11 +1,11 @@
-//! Pairing-code resolution for `vectorhawk auth pair`.
+//! Pairing-code resolution for `scenery auth pair`.
 //!
 //! The positional `code` argument is optional. When it's absent, the code
 //! is resolved in a fixed order:
 //!
 //! 1. **Explicit CLI argument** — if given, wins unconditionally and
 //!    behaves exactly as before this module existed.
-//! 2. **`VH_PAIR_CODE` env var**, if set and non-empty. This is the
+//! 2. **`SCN_PAIR_CODE` env var**, if set and non-empty. This is the
 //!    unattended path for MDM / Intune / Jamf rollouts — it must work with
 //!    no terminal at all, so it's used without prompting.
 //! 3. **Interactive prompt**, if a terminal is available.
@@ -23,7 +23,7 @@ use std::io::{self, BufRead, Write};
 
 /// Env var for the unattended pairing path (MDM / Intune / Jamf rollouts).
 /// Read without prompting when set and non-empty.
-pub const PAIR_CODE_ENV: &str = "VH_PAIR_CODE";
+pub const PAIR_CODE_ENV: &str = "SCN_PAIR_CODE";
 
 /// Bounded re-prompt count on empty input: 2 retries, 3 attempts total.
 /// Never loop forever — this runs inside install scripts.
@@ -42,11 +42,11 @@ fn clean(raw: &str) -> String {
 fn no_code_error(reason: &str) -> String {
     format!(
         "no pairing code given and {reason} — pass it as an argument \
-         (`vectorhawk auth pair <code>`) or set {PAIR_CODE_ENV}"
+         (`scenery auth pair <code>`) or set {PAIR_CODE_ENV}"
     )
 }
 
-/// Resolve the pairing code to use for `vectorhawk auth pair`.
+/// Resolve the pairing code to use for `scenery auth pair`.
 ///
 /// `read_line` is called once per prompt attempt (only when `explicit` is
 /// `None`, `env_value` is absent/empty, and `terminal_available` is `true`)
@@ -73,7 +73,7 @@ where
         return Ok(code.to_string());
     }
 
-    // 2. VH_PAIR_CODE — the unattended path. Used without prompting.
+    // 2. SCN_PAIR_CODE — the unattended path. Used without prompting.
     if let Some(env) = env_value {
         let trimmed = clean(env);
         if !trimmed.is_empty() {
@@ -160,7 +160,7 @@ fn read_one_line<R: BufRead>(reader: &mut R) -> io::Result<Option<String>> {
 }
 
 /// Real entry point used by `cmd_auth_pair`: wires OS terminal detection and
-/// the `VH_PAIR_CODE` env var to [`resolve_pair_code`].
+/// the `SCN_PAIR_CODE` env var to [`resolve_pair_code`].
 pub fn resolve_pair_code_live(explicit: Option<&str>) -> Result<String, String> {
     let env_value = std::env::var(PAIR_CODE_ENV).ok();
     let (terminal_available, read_line) = detect_terminal();
@@ -203,7 +203,7 @@ mod tests {
 
     #[test]
     fn env_used_without_prompting_even_when_terminal_available() {
-        // VH_PAIR_CODE must work with no terminal at all, and shouldn't
+        // SCN_PAIR_CODE must work with no terminal at all, and shouldn't
         // require one either — it's used without prompting regardless.
         let result = resolve_pair_code(None, Some("VH-ENV1"), true, scripted_reader(vec![]));
         assert_eq!(result, Ok("VH-ENV1".to_string()));
@@ -220,11 +220,11 @@ mod tests {
         let result = resolve_pair_code(None, None, false, scripted_reader(vec![]));
         let err = result.expect_err("expected an error with no terminal available");
         assert!(
-            err.contains("vectorhawk auth pair <code>"),
+            err.contains("scenery auth pair <code>"),
             "error should name the argument escape: {err}"
         );
         assert!(
-            err.contains("VH_PAIR_CODE"),
+            err.contains("SCN_PAIR_CODE"),
             "error should name the env var escape: {err}"
         );
         assert!(
@@ -240,8 +240,8 @@ mod tests {
         let result =
             resolve_pair_code(None, None, true, scripted_reader(vec!["\n", "   \n", "\n"]));
         let err = result.expect_err("expected an error after exhausting empty-input attempts");
-        assert!(err.contains("vectorhawk auth pair <code>"), "{err}");
-        assert!(err.contains("VH_PAIR_CODE"), "{err}");
+        assert!(err.contains("scenery auth pair <code>"), "{err}");
+        assert!(err.contains("SCN_PAIR_CODE"), "{err}");
     }
 
     #[test]

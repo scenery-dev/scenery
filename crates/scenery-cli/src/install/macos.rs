@@ -1,10 +1,10 @@
-//! macOS LaunchAgent install/uninstall for the VectorHawk daemon.
+//! macOS LaunchAgent install/uninstall for the Scenery daemon.
 //!
-//! Plist path:   `~/Library/LaunchAgents/com.vectorhawk.agent.plist`
-//! Crash log:    `~/Library/Logs/VectorHawk/stderr.log` (StandardErrorPath —
+//! Plist path:   `~/Library/LaunchAgents/com.scenery.agent.plist`
+//! Crash log:    `~/Library/Logs/Scenery/stderr.log` (StandardErrorPath —
 //!               launchd does NOT rotate this, so it carries panic/early-
 //!               startup output only, never the durable daemon log)
-//! Durable log:  `~/Library/Application Support/VectorHawk/logs/vectorhawkd.log`
+//! Durable log:  `~/Library/Application Support/Scenery/logs/scenery.log`
 //!               — INFO-level tracing output, written by an in-process
 //!               size-bounded rotating appender (see
 //!               `crates/scenery-cli/src/logging.rs`), ~50 MB total cap.
@@ -14,14 +14,14 @@
 //!
 //! Install sequence:
 //! 1. Write plist with the current binary path.
-//! 2. Create `~/Library/Logs/VectorHawk/` (LaunchAgent will fail to start if
+//! 2. Create `~/Library/Logs/Scenery/` (LaunchAgent will fail to start if
 //!    the log dir does not exist).
 //! 3. `launchctl bootstrap gui/<uid> <plist>` — loads and starts the agent.
-//! 4. `launchctl enable gui/<uid>/com.vectorhawk.agent` — persists across
+//! 4. `launchctl enable gui/<uid>/com.scenery.agent` — persists across
 //!    reboots even if the agent crashes during first run.
 //!
 //! Uninstall sequence:
-//! 1. `launchctl bootout gui/<uid>/com.vectorhawk.agent` — stops + unloads.
+//! 1. `launchctl bootout gui/<uid>/com.scenery.agent` — stops + unloads.
 //! 2. Remove the plist file.
 
 use anyhow::{Context, Result};
@@ -32,17 +32,17 @@ use super::{
     InstallStatus,
 };
 
-const LABEL: &str = "com.vectorhawk.agent";
-const PLIST_FILENAME: &str = "com.vectorhawk.agent.plist";
+const LABEL: &str = "com.scenery.agent";
+const PLIST_FILENAME: &str = "com.scenery.agent.plist";
 
 /// `brew services`' launchd label for this formula — `homebrew.mxcl.<name>`
 /// is Homebrew's fixed naming convention, not something we control.
-const BREW_SERVICE_LABEL: &str = "homebrew.mxcl.vectorhawk";
+const BREW_SERVICE_LABEL: &str = "homebrew.mxcl.scenery";
 /// `brew services`' plist filename, written to the same
 /// `~/Library/LaunchAgents/` directory as our own agent.
-const BREW_PLIST_FILENAME: &str = "homebrew.mxcl.vectorhawk.plist";
+const BREW_PLIST_FILENAME: &str = "homebrew.mxcl.scenery.plist";
 
-/// Return `~/Library/LaunchAgents/com.vectorhawk.agent.plist`.
+/// Return `~/Library/LaunchAgents/com.scenery.agent.plist`.
 fn plist_path() -> Result<std::path::PathBuf> {
     let home = dirs::home_dir().context("failed to resolve HOME directory")?;
     Ok(home
@@ -51,10 +51,10 @@ fn plist_path() -> Result<std::path::PathBuf> {
         .join(PLIST_FILENAME))
 }
 
-/// Return `~/Library/Logs/VectorHawk/`.
+/// Return `~/Library/Logs/Scenery/`.
 fn log_dir() -> Result<std::path::PathBuf> {
     let home = dirs::home_dir().context("failed to resolve HOME directory")?;
-    Ok(home.join("Library").join("Logs").join("VectorHawk"))
+    Ok(home.join("Library").join("Logs").join("Scenery"))
 }
 
 /// Return the numeric UNIX user-ID of the current process.
@@ -63,7 +63,7 @@ fn current_uid() -> u32 {
     unsafe { libc::getuid() }
 }
 
-/// Build the service target string: `gui/<uid>/com.vectorhawk.agent`.
+/// Build the service target string: `gui/<uid>/com.scenery.agent`.
 fn service_target(uid: u32) -> String {
     format!("gui/{uid}/{LABEL}")
 }
@@ -73,9 +73,9 @@ fn domain_target(uid: u32) -> String {
     format!("gui/{uid}")
 }
 
-/// The `VECTORHAWK_REGISTRY_URL` env var name, as it appears (unquoted)
+/// The `SCENERY_REGISTRY_URL` env var name, as it appears (unquoted)
 /// inside the plist's `EnvironmentVariables` dict.
-const REGISTRY_URL_ENV_KEY: &str = "VECTORHAWK_REGISTRY_URL";
+const REGISTRY_URL_ENV_KEY: &str = "SCENERY_REGISTRY_URL";
 
 /// Escape a string for safe interpolation into plist XML text content (and,
 /// defensively, into attribute position — this plist has none today, but a
@@ -115,7 +115,7 @@ fn xml_unescape(s: &str) -> String {
         .replace("&amp;", "&")
 }
 
-/// Resolve the `VECTORHAWK_REGISTRY_URL` value to carry into a
+/// Resolve the `SCENERY_REGISTRY_URL` value to carry into a
 /// (re)rendered plist, so that installing/upgrading never silently re-homes
 /// a daemon that was pointed at a private registry. Mirrors
 /// `install::linux::resolve_registry_url_env` — see that doc comment for
@@ -123,7 +123,7 @@ fn xml_unescape(s: &str) -> String {
 /// `daemon install` on every upgrade, not just first install).
 ///
 /// Resolution order:
-/// 1. `VECTORHAWK_REGISTRY_URL` from the process environment at install
+/// 1. `SCENERY_REGISTRY_URL` from the process environment at install
 ///    time, if set and non-empty.
 /// 2. Otherwise, whatever value is already present in the plist at
 ///    `existing_plist_path` — carried forward rather than dropped.
@@ -133,7 +133,7 @@ fn xml_unescape(s: &str) -> String {
 /// no such key all mean "nothing to preserve", never an error that fails
 /// the install.
 fn resolve_registry_url_env(existing_plist_path: &std::path::Path) -> Option<String> {
-    if let Ok(v) = std::env::var("VECTORHAWK_REGISTRY_URL") {
+    if let Ok(v) = std::env::var("SCENERY_REGISTRY_URL") {
         if !v.is_empty() {
             return Some(v);
         }
@@ -141,7 +141,7 @@ fn resolve_registry_url_env(existing_plist_path: &std::path::Path) -> Option<Str
     parse_registry_url_from_plist(existing_plist_path)
 }
 
-/// Tolerantly parse a `<key>VECTORHAWK_REGISTRY_URL</key><string>...</string>`
+/// Tolerantly parse a `<key>SCENERY_REGISTRY_URL</key><string>...</string>`
 /// pair out of an existing plist file. Returns `None` on any failure to
 /// read the file, or if no such key (with a non-empty value) is present.
 ///
@@ -169,14 +169,14 @@ fn parse_registry_url_from_plist(path: &std::path::Path) -> Option<String> {
 /// card — override-able by re-running with a different `RUST_LOG` in the
 /// environment before `daemon install`, or by editing the plist). The
 /// durable log destination is NOT `StandardOutPath`/`StandardErrorPath`:
-/// `vectorhawk daemon run` initializes its own size-bounded rotating file
+/// `scenery daemon run` initializes its own size-bounded rotating file
 /// appender under the state directory (see `logging.rs`), so `StandardOutPath`
 /// is omitted entirely (nothing writes to stdout) and `StandardErrorPath`
 /// carries only panic/early-startup crash output — launchd doesn't rotate
 /// it, but crashes are rare relative to INFO-volume logging.
 ///
 /// `registry_url`, when `Some`, is emitted as an extra
-/// `VECTORHAWK_REGISTRY_URL` key/string pair in `EnvironmentVariables` —
+/// `SCENERY_REGISTRY_URL` key/string pair in `EnvironmentVariables` —
 /// see [`resolve_registry_url_env`] for how the caller resolves it.
 ///
 /// `KeepAlive` is the plain boolean `true`, not the
@@ -215,7 +215,7 @@ fn render_plist(
     };
 
     // The daemon subcommand that keeps the daemon running in the foreground.
-    // `vectorhawk daemon run --foreground` delegates to `run_daemon()`.
+    // `scenery daemon run --foreground` delegates to `run_daemon()`.
     Ok(format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -285,9 +285,9 @@ fn service_is_loaded(uid: u32) -> bool {
 // ── Competing-service-manager detection (brew services) ─────────────────────
 //
 // `brew services` loads its own LaunchAgent for this formula
-// (`homebrew.mxcl.vectorhawk`, plist at
-// `~/Library/LaunchAgents/homebrew.mxcl.vectorhawk.plist`) — a completely
-// separate launchd job from ours (`com.vectorhawk.agent`). Both carry
+// (`homebrew.mxcl.scenery`, plist at
+// `~/Library/LaunchAgents/homebrew.mxcl.scenery.plist`) — a completely
+// separate launchd job from ours (`com.scenery.agent`). Both carry
 // `KeepAlive: true` against the same single-instance socket lock
 // (`daemon.lock`): whichever loses the race can never acquire it, exits
 // non-zero, and launchd restarts it right back — forever. `daemon install`
@@ -295,7 +295,7 @@ fn service_is_loaded(uid: u32) -> bool {
 // healthy brew-managed daemon and skip installing/enabling our own agent
 // entirely, rather than relying on bootout/bootstrap races to sort it out.
 
-/// Return `~/Library/LaunchAgents/homebrew.mxcl.vectorhawk.plist`.
+/// Return `~/Library/LaunchAgents/homebrew.mxcl.scenery.plist`.
 fn brew_plist_path() -> Result<std::path::PathBuf> {
     let home = dirs::home_dir().context("failed to resolve HOME directory")?;
     Ok(home
@@ -305,7 +305,7 @@ fn brew_plist_path() -> Result<std::path::PathBuf> {
 }
 
 /// Check whether `brew services`' launchd job is currently loaded, via
-/// `launchctl print gui/<uid>/homebrew.mxcl.vectorhawk`.
+/// `launchctl print gui/<uid>/homebrew.mxcl.scenery`.
 fn brew_service_is_loaded(uid: u32) -> bool {
     Command::new("launchctl")
         .args(["print", &format!("gui/{uid}/{BREW_SERVICE_LABEL}")])
@@ -319,7 +319,7 @@ fn brew_service_is_loaded(uid: u32) -> bool {
 /// Plist presence alone is the signal, deliberately not combined with
 /// "currently loaded" the way an earlier version of this function required.
 /// `brew services start` is what writes
-/// `~/Library/LaunchAgents/homebrew.mxcl.vectorhawk.plist`, and `brew
+/// `~/Library/LaunchAgents/homebrew.mxcl.scenery.plist`, and `brew
 /// services stop` is what removes it — Homebrew does not leave this file
 /// behind for any other reason, so its mere presence already means brew
 /// owns this daemon, independent of whether the job happens to be loaded or
@@ -330,7 +330,7 @@ fn brew_service_is_loaded(uid: u32) -> bool {
 /// cycles onto the new binary — the plist is untouched the whole time, but
 /// `launchctl print` can fail in that window. Gating ownership on "loaded"
 /// meant `daemon install` saw neither signal and proceeded to install our
-/// own competing `com.vectorhawk.agent`, exactly the bug this guard exists
+/// own competing `com.scenery.agent`, exactly the bug this guard exists
 /// to prevent. The caller (`install`) still checks loaded/running state
 /// separately — see [`brew_recovery_action`] — to decide whether brew's job
 /// needs a bootstrap or kickstart, but that is a *recovery* decision, not
@@ -412,7 +412,7 @@ pub(super) fn reconcile_competing_manager() -> Result<bool> {
         return Ok(false);
     }
     println!(
-        "VectorHawk daemon is managed by Homebrew services ({BREW_SERVICE_LABEL}); \
+        "Scenery daemon is managed by Homebrew services ({BREW_SERVICE_LABEL}); \
          not installing {LABEL}."
     );
     self_heal_remove_our_agent(&plist, uid)?;
@@ -485,11 +485,11 @@ pub fn install() -> Result<()> {
             .map(|s| bin_path.to_str().map(|b| s.contains(b)).unwrap_or(false))
             .unwrap_or(false);
         if plist_has_current_binary {
-            println!("VectorHawk daemon is already installed and up to date — no changes made.");
+            println!("Scenery daemon is already installed and up to date — no changes made.");
             return Ok(());
         }
         // Binary path changed (upgrade): fall through to rewrite + restart.
-        println!("VectorHawk daemon binary path changed — updating plist and restarting.");
+        println!("Scenery daemon binary path changed — updating plist and restarting.");
     }
 
     // ── 1. Ensure log directory exists ────────────────────────────────────────
@@ -503,7 +503,7 @@ pub fn install() -> Result<()> {
     }
 
     // ── 3. Write plist ────────────────────────────────────────────────────────
-    // Resolve VECTORHAWK_REGISTRY_URL from the env or, failing that, from
+    // Resolve SCENERY_REGISTRY_URL from the env or, failing that, from
     // whatever the plist already had — before we overwrite it below.
     let registry_url = resolve_registry_url_env(&plist);
     let plist_content = render_plist(&bin_path, &log_dir, registry_url.as_deref())
@@ -568,7 +568,7 @@ pub fn install() -> Result<()> {
     Ok(())
 }
 
-/// Disable, stop, and remove our own LaunchAgent (`com.vectorhawk.agent`),
+/// Disable, stop, and remove our own LaunchAgent (`com.scenery.agent`),
 /// because the daemon is confirmed managed elsewhere (`brew services`).
 ///
 /// Only touches our own plist/label — never `brew services`' job. A no-op
@@ -605,7 +605,7 @@ pub fn uninstall() -> Result<()> {
     let plist_exists = plist.exists();
 
     if !loaded && !plist_exists {
-        println!("VectorHawk daemon is not installed — nothing to remove.");
+        println!("Scenery daemon is not installed — nothing to remove.");
         return Ok(());
     }
 
@@ -623,7 +623,7 @@ pub fn uninstall() -> Result<()> {
         println!("Removed plist: {}", plist.display());
     }
 
-    println!("VectorHawk daemon uninstalled.");
+    println!("Scenery daemon uninstalled.");
     Ok(())
 }
 
@@ -659,7 +659,7 @@ pub fn stop_brew_service() -> Result<bool> {
 
 /// Stop and start the LaunchAgent in place.
 ///
-/// Uses `launchctl kickstart -k gui/<uid>/com.vectorhawk.agent`, which kills
+/// Uses `launchctl kickstart -k gui/<uid>/com.scenery.agent`, which kills
 /// the running process (if any) and starts a fresh one — equivalent to a
 /// restart without re-writing the plist. Returns an error if the service is
 /// not installed.
@@ -667,15 +667,13 @@ pub fn restart() -> Result<()> {
     let uid = current_uid();
 
     if !service_is_loaded(uid) {
-        anyhow::bail!(
-            "VectorHawk daemon is not installed — run `vectorhawk daemon install` first."
-        );
+        anyhow::bail!("Scenery daemon is not installed — run `scenery daemon install` first.");
     }
 
     launchctl(&["kickstart", "-k", &service_target(uid)])
         .context("failed to restart LaunchAgent")?;
 
-    println!("VectorHawk daemon restarted.");
+    println!("Scenery daemon restarted.");
     Ok(())
 }
 
@@ -708,9 +706,9 @@ mod tests {
     // ── brew_service_is_managing ─────────────────────────────────────────────
     //
     // Original regression coverage: spaceghost, 2026-10-13. `brew services`
-    // already owned a healthy daemon under `homebrew.mxcl.vectorhawk`;
+    // already owned a healthy daemon under `homebrew.mxcl.scenery`;
     // `mcp setup`'s `daemon install` step must recognize that and refuse to
-    // install/enable a second, competing `com.vectorhawk.agent` LaunchAgent
+    // install/enable a second, competing `com.scenery.agent` LaunchAgent
     // that can never win the single-instance socket lock.
     //
     // Follow-on fix (also covered here): ownership now follows from plist
@@ -774,14 +772,14 @@ mod tests {
         let argv = brew_recovery_argv(
             BrewRecoveryAction::Bootstrap,
             501,
-            "/Users/spaceghost/Library/LaunchAgents/homebrew.mxcl.vectorhawk.plist",
+            "/Users/spaceghost/Library/LaunchAgents/homebrew.mxcl.scenery.plist",
         );
         assert_eq!(
             argv,
             Some(vec![
                 "bootstrap".to_string(),
                 "gui/501".to_string(),
-                "/Users/spaceghost/Library/LaunchAgents/homebrew.mxcl.vectorhawk.plist".to_string(),
+                "/Users/spaceghost/Library/LaunchAgents/homebrew.mxcl.scenery.plist".to_string(),
             ])
         );
     }
@@ -793,7 +791,7 @@ mod tests {
             argv,
             Some(vec![
                 "kickstart".to_string(),
-                "gui/501/homebrew.mxcl.vectorhawk".to_string(),
+                "gui/501/homebrew.mxcl.scenery".to_string(),
             ])
         );
     }
@@ -814,8 +812,8 @@ mod tests {
     #[test]
     fn plist_sets_rust_log_info() {
         let plist = render_plist(
-            Path::new("/opt/homebrew/bin/vectorhawk"),
-            Path::new("/Users/test/Library/Logs/VectorHawk"),
+            Path::new("/opt/homebrew/bin/scenery"),
+            Path::new("/Users/test/Library/Logs/Scenery"),
             None,
         )
         .unwrap();
@@ -828,8 +826,8 @@ mod tests {
     #[test]
     fn plist_does_not_set_standard_out_path() {
         let plist = render_plist(
-            Path::new("/opt/homebrew/bin/vectorhawk"),
-            Path::new("/Users/test/Library/Logs/VectorHawk"),
+            Path::new("/opt/homebrew/bin/scenery"),
+            Path::new("/Users/test/Library/Logs/Scenery"),
             None,
         )
         .unwrap();
@@ -843,13 +841,13 @@ mod tests {
     #[test]
     fn plist_still_sets_standard_error_path_for_crash_output() {
         let plist = render_plist(
-            Path::new("/opt/homebrew/bin/vectorhawk"),
-            Path::new("/Users/test/Library/Logs/VectorHawk"),
+            Path::new("/opt/homebrew/bin/scenery"),
+            Path::new("/Users/test/Library/Logs/Scenery"),
             None,
         )
         .unwrap();
         assert!(
-            plist.contains("<key>StandardErrorPath</key>\n    <string>/Users/test/Library/Logs/VectorHawk/stderr.log</string>"),
+            plist.contains("<key>StandardErrorPath</key>\n    <string>/Users/test/Library/Logs/Scenery/stderr.log</string>"),
             "expected StandardErrorPath pointing at stderr.log for crash-only output, got:\n{plist}"
         );
     }
@@ -858,20 +856,20 @@ mod tests {
     //
     // `render_plist` used to emit a fixed EnvironmentVariables dict carrying
     // only PATH and RUST_LOG, so regenerating the plist on every
-    // install/upgrade silently dropped any VECTORHAWK_REGISTRY_URL the
+    // install/upgrade silently dropped any SCENERY_REGISTRY_URL the
     // plist previously had.
 
     #[test]
     fn render_plist_emits_registry_url_when_given() {
         let plist = render_plist(
-            Path::new("/opt/homebrew/bin/vectorhawk"),
-            Path::new("/Users/test/Library/Logs/VectorHawk"),
-            Some("https://dev.vectorhawk.ai"),
+            Path::new("/opt/homebrew/bin/scenery"),
+            Path::new("/Users/test/Library/Logs/Scenery"),
+            Some("https://dev.scenery.dev"),
         )
         .unwrap();
         assert!(
             plist.contains(
-                "<key>VECTORHAWK_REGISTRY_URL</key>\n        <string>https://dev.vectorhawk.ai</string>"
+                "<key>SCENERY_REGISTRY_URL</key>\n        <string>https://dev.scenery.dev</string>"
             ),
             "expected registry URL key/string pair in the plist, got:\n{plist}"
         );
@@ -880,13 +878,13 @@ mod tests {
     #[test]
     fn render_plist_omits_registry_url_when_none() {
         let plist = render_plist(
-            Path::new("/opt/homebrew/bin/vectorhawk"),
-            Path::new("/Users/test/Library/Logs/VectorHawk"),
+            Path::new("/opt/homebrew/bin/scenery"),
+            Path::new("/Users/test/Library/Logs/Scenery"),
             None,
         )
         .unwrap();
         assert!(
-            !plist.contains("VECTORHAWK_REGISTRY_URL"),
+            !plist.contains("SCENERY_REGISTRY_URL"),
             "expected no registry URL key, got:\n{plist}"
         );
     }
@@ -907,8 +905,8 @@ mod tests {
     #[test]
     fn render_plist_escapes_ampersand_in_registry_url() {
         let plist = render_plist(
-            Path::new("/opt/homebrew/bin/vectorhawk"),
-            Path::new("/Users/test/Library/Logs/VectorHawk"),
+            Path::new("/opt/homebrew/bin/scenery"),
+            Path::new("/Users/test/Library/Logs/Scenery"),
             Some("https://registry.example.com/api?token=abc&user=x"),
         )
         .unwrap();
@@ -928,8 +926,8 @@ mod tests {
         // Contrived but exercises the same code path as `&` — a value that
         // would otherwise inject a bogus XML tag.
         let plist = render_plist(
-            Path::new("/opt/homebrew/bin/vectorhawk"),
-            Path::new("/Users/test/Library/Logs/VectorHawk"),
+            Path::new("/opt/homebrew/bin/scenery"),
+            Path::new("/Users/test/Library/Logs/Scenery"),
             Some("https://example.com/<bogus>"),
         )
         .unwrap();
@@ -952,8 +950,8 @@ mod tests {
         let _env = RegistryUrlEnv::unset();
         let original = "https://registry.example.com/api?token=abc&user=x";
         let rendered = render_plist(
-            Path::new("/opt/homebrew/bin/vectorhawk"),
-            Path::new("/Users/test/Library/Logs/VectorHawk"),
+            Path::new("/opt/homebrew/bin/scenery"),
+            Path::new("/Users/test/Library/Logs/Scenery"),
             Some(original),
         )
         .unwrap();
@@ -971,7 +969,7 @@ mod tests {
         let _ = std::fs::remove_file(&plist_path);
     }
 
-    /// Serializes tests below that mutate `VECTORHAWK_REGISTRY_URL` in the
+    /// Serializes tests below that mutate `SCENERY_REGISTRY_URL` in the
     /// process environment — `cargo test` runs tests in the same process by
     /// default, so unguarded env mutation here would race other tests in
     /// this module (mirrors the `KeychainOff` pattern used elsewhere in
@@ -985,18 +983,18 @@ mod tests {
     impl RegistryUrlEnv {
         fn set(value: &str) -> Self {
             let guard = REGISTRY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            std::env::set_var("VECTORHAWK_REGISTRY_URL", value);
+            std::env::set_var("SCENERY_REGISTRY_URL", value);
             RegistryUrlEnv { _guard: guard }
         }
         fn unset() -> Self {
             let guard = REGISTRY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            std::env::remove_var("VECTORHAWK_REGISTRY_URL");
+            std::env::remove_var("SCENERY_REGISTRY_URL");
             RegistryUrlEnv { _guard: guard }
         }
     }
     impl Drop for RegistryUrlEnv {
         fn drop(&mut self) {
-            std::env::remove_var("VECTORHAWK_REGISTRY_URL");
+            std::env::remove_var("SCENERY_REGISTRY_URL");
         }
     }
 
@@ -1014,7 +1012,7 @@ mod tests {
         let plist_path = temp_plist_path("env-wins");
         std::fs::write(
             &plist_path,
-            "<key>VECTORHAWK_REGISTRY_URL</key>\n<string>https://old.example.com</string>\n",
+            "<key>SCENERY_REGISTRY_URL</key>\n<string>https://old.example.com</string>\n",
         )
         .unwrap();
 
@@ -1033,12 +1031,12 @@ mod tests {
         let plist_path = temp_plist_path("fallback");
         std::fs::write(
             &plist_path,
-            "<dict>\n<key>PATH</key>\n<string>/bin</string>\n<key>VECTORHAWK_REGISTRY_URL</key>\n<string>https://dev.vectorhawk.ai</string>\n</dict>\n",
+            "<dict>\n<key>PATH</key>\n<string>/bin</string>\n<key>SCENERY_REGISTRY_URL</key>\n<string>https://dev.scenery.dev</string>\n</dict>\n",
         )
         .unwrap();
 
         let resolved = resolve_registry_url_env(&plist_path);
-        assert_eq!(resolved.as_deref(), Some("https://dev.vectorhawk.ai"));
+        assert_eq!(resolved.as_deref(), Some("https://dev.scenery.dev"));
 
         let _ = std::fs::remove_file(&plist_path);
     }

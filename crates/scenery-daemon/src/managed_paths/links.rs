@@ -1,6 +1,6 @@
 //! Directory link management for multi-client skill surfacing.
 //!
-//! VectorHawk writes each managed skill exactly once, as a real directory
+//! Scenery writes each managed skill exactly once, as a real directory
 //! under `~/.agents/skills/<slug>/`. Cursor, Codex, and Gemini CLI all scan
 //! that path natively. Claude Code does not, so it gets a directory symlink
 //! at `~/.claude/skills/<slug>` pointing at the canonical directory.
@@ -27,9 +27,9 @@
 //! the link-integrity path.
 
 use anyhow::{bail, Context, Result};
+use scenery_mcp::ownership;
 use std::fs;
 use std::path::Path;
-use scenery_mcp::ownership;
 
 /// How a link target was materialised.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,10 +48,10 @@ pub enum LinkMode {
 /// fallback whose content already matches `canonical` — that returns
 /// [`LinkMode::Copy`] having touched nothing. Only a link pointing elsewhere,
 /// or a copy that has actually diverged, is replaced; such a directory is moved
-/// into `~/.claude/.vectorhawk-backup/<ts>/links/` before removal, so the
+/// into `~/.claude/.scenery-backup/<ts>/links/` before removal, so the
 /// replacement is always recoverable — see [`backup_and_remove`].
 ///
-/// Ownership of a real directory is decided by the `.vectorhawk-managed.json`
+/// Ownership of a real directory is decided by the `.scenery-managed.json`
 /// marker the pusher writes into the canonical directory (which `copy_tree`
 /// necessarily carries along). Refuses to touch a real directory that is not
 /// ours — that is user content.
@@ -74,10 +74,10 @@ pub fn link_dir(canonical: &Path, link_path: &Path) -> Result<LinkMode> {
             )
         })?;
     } else if link_path.exists() {
-        if !ownership::is_vectorhawk_managed(link_path) {
+        if !ownership::is_scenery_managed(link_path) {
             bail!(
                 "links: refusing to replace a real directory at {} — \
-                 not VectorHawk-managed",
+                 not Scenery-managed",
                 link_path.display()
             );
         }
@@ -106,7 +106,7 @@ pub fn link_dir(canonical: &Path, link_path: &Path) -> Result<LinkMode> {
         // call stays idempotent and heals into a symlink if possible.
         //
         // The backup is what makes this recoverable: the marker proves
-        // VectorHawk *wrote* the directory, but not that its current content
+        // Scenery *wrote* the directory, but not that its current content
         // is still reproducible — a restored backup or a hand-customised
         // skill dir carries the marker too. Every other destructive path in
         // this codebase has a ledger behind it (the migrator backs up before
@@ -140,7 +140,7 @@ pub fn link_dir(canonical: &Path, link_path: &Path) -> Result<LinkMode> {
 ///
 /// This is the exact inverse of [`link_dir`] and applies the **same ownership
 /// rule**: a real directory here is removed only when it carries the
-/// `.vectorhawk-managed.json` marker. The two disagreeing is a data-loss bug —
+/// `.scenery-managed.json` marker. The two disagreeing is a data-loss bug —
 /// `link_dir` refuses to replace an unmarked real directory because it is user
 /// content, and drift can legitimately report that same directory as
 /// `link_replaced`, after which a policy-driven `remove_skill` calls straight
@@ -148,7 +148,7 @@ pub fn link_dir(canonical: &Path, link_path: &Path) -> Result<LinkMode> {
 /// directory intact; the canonical copy is still removed by `remove_skill`.
 ///
 /// A marked directory is a `LinkMode::Copy` materialisation of ours, but the
-/// marker proves only that VectorHawk *wrote* it — not that its current
+/// marker proves only that Scenery *wrote* it — not that its current
 /// content is still reproducible (a restored backup or hand-edited copy
 /// carries the marker too). So it goes through [`backup_and_remove`] like
 /// every other destructive step on this path, not `remove_dir_all`.
@@ -159,10 +159,10 @@ pub fn unlink_dir(link_path: &Path) -> Result<()> {
         fs::remove_file(link_path)
             .with_context(|| format!("links: failed to remove link: {}", link_path.display()))?;
     } else if link_path.is_dir() {
-        if !ownership::is_vectorhawk_managed(link_path) {
+        if !ownership::is_scenery_managed(link_path) {
             bail!(
                 "links: refusing to remove a real directory at {} — \
-                 not VectorHawk-managed",
+                 not Scenery-managed",
                 link_path.display()
             );
         }
@@ -334,11 +334,11 @@ fn symlink_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
 }
 
 /// Move `dir` into a timestamped run directory under
-/// `~/.claude/.vectorhawk-backup/<ts>/links/<name>`, then ensure `dir` is gone.
+/// `~/.claude/.scenery-backup/<ts>/links/<name>`, then ensure `dir` is gone.
 ///
 /// Uses the same backup root and `%Y-%m-%dT%H%M%SZ` run-directory convention as
 /// the F1 migrator (`managed_paths::migrate_existing`), so recovered content
-/// sits alongside every other VectorHawk backup rather than in a new location
+/// sits alongside every other Scenery backup rather than in a new location
 /// of its own. No `manifest.json` is written, so `rollback::list_backups`
 /// deliberately skips these runs — `migrate rollback` restores *takeovers* of
 /// user content, and re-materialising a link's stale copy over the canonical
@@ -363,7 +363,7 @@ fn backup_and_remove(dir: &Path) -> Result<()> {
     let ts = chrono::Utc::now().format("%Y-%m-%dT%H%M%SZ").to_string();
     let backup_root = home
         .join(".claude")
-        .join(".vectorhawk-backup")
+        .join(".scenery-backup")
         .join(&ts)
         .join("links");
 

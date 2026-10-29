@@ -1,7 +1,7 @@
 //! F-Tier2: Report-only discovery for non-canonical skill roots.
 //!
 //! Scans extra roots (`~/.agents/skills/`, `~/.pi/agent/skills/`, and any
-//! paths in `VECTORHAWK_EXTRA_SKILL_ROOTS`) for skills that are NOT already
+//! paths in `SCENERY_EXTRA_SKILL_ROOTS`) for skills that are NOT already
 //! verifiably managed (exact path + hash in `managed_path_markers`; F13).
 //! Found items are POSTed to the backend in a single batch so the portal can
 //! present them to the user for optional adoption.
@@ -13,7 +13,7 @@
 //! # MCP discoveries (runner task R2)
 //!
 //! Runner task R1 (`super::mcp_discovery`) built a read-only scanner for
-//! shadow MCP servers configured in AI clients outside VectorHawk governance,
+//! shadow MCP servers configured in AI clients outside Scenery governance,
 //! but stopped short of reporting them — this module is where that happens.
 //! [`run_once`] now calls both scans — [`collect_discoveries`] for skills and
 //! [`mcp_discovery::collect_mcp_discoveries`] for MCP entries, merged via
@@ -40,17 +40,19 @@
 //!
 //! ## Killswitch
 //!
-//! Setting `VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER=1` makes `run_once` a
+//! Setting `SCENERY_DISABLE_FILESYSTEM_RECONCILER=1` makes `run_once` a
 //! no-op.
 //!
 //! ## Cadence
 //!
 //! Runs periodically (default 300 s). Override with
-//! `VECTORHAWK_DISCOVERIES_INTERVAL_SECS`. The killswitch is checked inside
+//! `SCENERY_DISCOVERIES_INTERVAL_SECS`. The killswitch is checked inside
 //! `run_once` on every tick, so the loop itself need not duplicate the check.
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
+use scenery_core::{auth::load_all_tokens, state::AppState};
+use scenery_mcp::setup::ClientConfig;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
@@ -61,15 +63,13 @@ use std::{
 };
 use tokio::{sync::Notify, time::interval};
 use tracing::{debug, info, warn};
-use scenery_core::{auth::load_all_tokens, state::AppState};
-use scenery_mcp::setup::ClientConfig;
 
 use super::marker::{db_ownership, DbOwnership};
 use super::mcp_discovery;
 
-const ENV_DISABLE: &str = "VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER";
-const ENV_EXTRA_ROOTS: &str = "VECTORHAWK_EXTRA_SKILL_ROOTS";
-const ENV_INTERVAL: &str = "VECTORHAWK_DISCOVERIES_INTERVAL_SECS";
+const ENV_DISABLE: &str = "SCENERY_DISABLE_FILESYSTEM_RECONCILER";
+const ENV_EXTRA_ROOTS: &str = "SCENERY_EXTRA_SKILL_ROOTS";
+const ENV_INTERVAL: &str = "SCENERY_DISCOVERIES_INTERVAL_SECS";
 const DEFAULT_INTERVAL_SECS: u64 = 300;
 
 /// Minimum elapsed time between kick-triggered scans. A kick that arrives
@@ -88,7 +88,7 @@ pub struct DiscoveryItem {
     pub canonical_hash: String,
     /// Kind-specific metadata. `None` for ordinary skill items;
     /// `{"suspicious": true, "suspicious_reason": ...}` for a skill that
-    /// claims to be VectorHawk-managed but fails the DB check (see
+    /// claims to be Scenery-managed but fails the DB check (see
     /// [`collect_discoveries`]); `Some(...)` for `kind="mcp"` items, holding
     /// the JSON-serialized, already-allowlisted
     /// [`super::mcp_discovery::McpDiscoveryDetail`] — see
@@ -124,14 +124,14 @@ impl DiscoveriesScanner {
     ///
     /// Wakes on two signals:
     /// - A periodic ticker (default 300 s, override via
-    ///   `VECTORHAWK_DISCOVERIES_INTERVAL_SECS`). Ticker fires always trigger a
+    ///   `SCENERY_DISCOVERIES_INTERVAL_SECS`). Ticker fires always trigger a
     ///   scan.
     /// - A `kick` notification (fired when the MCP shim's `initialize` handshake
     ///   succeeds). Kicks are debounced: if a kick arrives within `KICK_DEBOUNCE`
     ///   (10 s) of the previous scan it is silently dropped. This prevents a burst
     ///   of rapid reconnects from triggering multiple concurrent scans.
     ///
-    /// The killswitch (`VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER`) is checked
+    /// The killswitch (`SCENERY_DISABLE_FILESYSTEM_RECONCILER`) is checked
     /// inside `run_once` on every iteration.
     pub fn spawn_loop(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
         let kick = Arc::clone(&self.kick);
@@ -205,7 +205,7 @@ pub fn should_skip_debounced_kick(trigger_is_kick: bool, elapsed: Duration) -> b
 /// killswitch is active).
 pub async fn run_once(state: Arc<AppState>, registry_url: String) -> Result<usize> {
     if reconciler_disabled() {
-        debug!("discoveries: VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER set — skipping");
+        debug!("discoveries: SCENERY_DISABLE_FILESYSTEM_RECONCILER set — skipping");
         return Ok(0);
     }
 
@@ -257,7 +257,7 @@ pub async fn run_once(state: Arc<AppState>, registry_url: String) -> Result<usiz
 /// Build the list of extra roots to scan for *unmanaged* skills.
 ///
 /// Always includes `~/.agents/skills/` (if it exists) — note this is now also
-/// VectorHawk's own canonical write location, so the scan filters out
+/// Scenery's own canonical write location, so the scan filters out
 /// directories with a matching `managed_path_markers` row (path + hash).
 ///
 /// Also always includes `~/.pi/agent/skills/` — Pi (the pi coding agent,
@@ -269,7 +269,7 @@ pub async fn run_once(state: Arc<AppState>, registry_url: String) -> Result<usiz
 /// reported. `collect_discoveries` skips roots that don't exist, so this is
 /// a no-op scan on machines without Pi installed.
 ///
-/// Also includes any paths from `VECTORHAWK_EXTRA_SKILL_ROOTS`.
+/// Also includes any paths from `SCENERY_EXTRA_SKILL_ROOTS`.
 pub fn extra_roots() -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = Vec::new();
 
@@ -293,11 +293,11 @@ pub fn extra_roots() -> Vec<PathBuf> {
 // ── Scan ──────────────────────────────────────────────────────────────────────
 
 /// Scan all `roots`, skip roots that do not exist, and return every skill that
-/// is not *verifiably* VectorHawk-managed.
+/// is not *verifiably* Scenery-managed.
 ///
 /// F13: "managed" means a `managed_path_markers` row of `kind='skill'` at this
 /// exact canonical path whose hash matches the on-disk SKILL.md — never a
-/// slug match, and never the `.vectorhawk-managed.json` file (which any skill
+/// slug match, and never the `.scenery-managed.json` file (which any skill
 /// author can ship). Items that look managed but fail that check are reported
 /// with a `detail.suspicious_reason`:
 ///
@@ -330,17 +330,15 @@ pub fn collect_discoveries(roots: &[PathBuf], state: &AppState) -> Vec<Discovery
                             continue;
                         }
                         DbOwnership::HashMismatch => Some("managed_hash_mismatch"),
-                        DbOwnership::Untracked => {
-                            scenery_mcp::ownership::is_vectorhawk_managed(path)
-                                .then_some("unverified_managed_marker")
-                        }
+                        DbOwnership::Untracked => scenery_mcp::ownership::is_scenery_managed(path)
+                            .then_some("unverified_managed_marker"),
                     };
                     if let Some(reason) = reason {
                         warn!(
                             slug = %item.slug,
                             path = %item.source_path,
                             reason,
-                            "discoveries: skill claims to be VectorHawk-managed but is not verifiable — reporting as suspicious"
+                            "discoveries: skill claims to be Scenery-managed but is not verifiable — reporting as suspicious"
                         );
                         item.detail = Some(serde_json::json!({
                             "suspicious": true,
@@ -432,7 +430,7 @@ fn scan_root(root: &Path) -> Result<Vec<DiscoveryItem>> {
         }
 
         // No ownership decision here (F13): `~/.agents/skills/` is also
-        // VectorHawk's own write location, but a `.vectorhawk-managed.json`
+        // Scenery's own write location, but a `.scenery-managed.json`
         // file proves nothing — `collect_discoveries` checks the DB row.
 
         let slug = match path.file_name().and_then(|n| n.to_str()) {
@@ -572,7 +570,7 @@ fn hex_sha256(bytes: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// Parse the scan interval from `VECTORHAWK_DISCOVERIES_INTERVAL_SECS`.
+/// Parse the scan interval from `SCENERY_DISCOVERIES_INTERVAL_SECS`.
 /// Falls back to `DEFAULT_INTERVAL_SECS` (300) for any invalid or zero value.
 fn parse_interval_secs() -> u64 {
     match std::env::var(ENV_INTERVAL) {
@@ -611,9 +609,9 @@ mod tests {
 
     use super::*;
     use crate::managed_paths::ENV_MUTEX;
-    use std::fs;
     use scenery_core::state::AppState;
     use scenery_mcp::setup::ConfigFormat;
+    use std::fs;
 
     /// Bootstrap a minimal AppState in a temp dir. Returns both the state and
     /// the `TempDir` guard so the caller keeps the dir alive.
@@ -703,18 +701,18 @@ mod tests {
     #[test]
     fn skips_root_that_does_not_exist() {
         let (state, _guard) = temp_state();
-        let phantom = PathBuf::from("/tmp/vectorhawk-discoveries-phantom-root-xyzzy-9999");
+        let phantom = PathBuf::from("/tmp/scenery-discoveries-phantom-root-xyzzy-9999");
 
         // Must not panic, must return empty vec.
         let items = collect_discoveries(&[phantom], &state);
         assert!(items.is_empty());
     }
 
-    // ── 4. Respects VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER ─────────────────
+    // ── 4. Respects SCENERY_DISABLE_FILESYSTEM_RECONCILER ─────────────────
 
     #[test]
     fn respects_disable_env_var() {
-        // This mutates the process-global VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER
+        // This mutates the process-global SCENERY_DISABLE_FILESYSTEM_RECONCILER
         // env var, which other tests (e.g. adopt_publish's) read indirectly via
         // `reconciler_disabled()` — take the shared cross-file mutex so this
         // window can't be observed mid-test by an unrelated thread.
@@ -882,7 +880,7 @@ mod tests {
 
     fn forge_marker(dir: &Path) {
         fs::write(
-            dir.join(".vectorhawk-managed.json"),
+            dir.join(".scenery-managed.json"),
             br#"{"marker_version":1,"installation_id":null,"source_sha256":"abc","migrated_at":"2026-01-01T00:00:00Z"}"#,
         )
         .unwrap();
@@ -1029,12 +1027,8 @@ mod tests {
         };
 
         let (state, _guard) = temp_state();
-        let items = collect_all_discoveries(
-            &[skill_root],
-            &[client],
-            &state,
-            "https://app.vectorhawk.ai",
-        );
+        let items =
+            collect_all_discoveries(&[skill_root], &[client], &state, "https://app.scenery.dev");
 
         assert_eq!(
             items.len(),
@@ -1111,7 +1105,7 @@ mod tests {
         };
 
         let (state, _guard) = temp_state();
-        let items = collect_all_discoveries(&[], &[client], &state, "https://app.vectorhawk.ai");
+        let items = collect_all_discoveries(&[], &[client], &state, "https://app.scenery.dev");
         assert_eq!(items.len(), 2, "both leaky-mcp and remote-leaky reported");
 
         // Build the exact upload payload shape post_discoveries serializes.

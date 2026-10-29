@@ -33,12 +33,12 @@ fn install_plugin_bundle_writes_full_state() {
     let result = install_plugin_bundle(&bundle());
 
     let h = fake_home.path();
-    let mp = h.join(".claude/plugins/marketplaces/vectorhawk");
+    let mp = h.join(".claude/plugins/marketplaces/scenery");
     let plugin_json = mp.join("plugins/superpowers/.claude-plugin/plugin.json");
     let skill_md = mp.join("plugins/superpowers/skills/tdd/SKILL.md");
     let mkt = mp.join(".claude-plugin/marketplace.json");
     let cache =
-        h.join(".claude/plugins/cache/vectorhawk/superpowers/5.0.7/.claude-plugin/plugin.json");
+        h.join(".claude/plugins/cache/scenery/superpowers/5.0.7/.claude-plugin/plugin.json");
     let known = h.join(".claude/plugins/known_marketplaces.json");
     let installed = h.join(".claude/plugins/installed_plugins.json");
     let settings = h.join(".claude/settings.json");
@@ -58,12 +58,12 @@ fn install_plugin_bundle_writes_full_state() {
         .iter()
         .any(|p| p["name"] == "superpowers");
     let cache_ok = cache.exists();
-    let known_ok = read(&known)["vectorhawk"]["source"]["source"] == "directory";
-    let installed_ok = read(&installed)["plugins"]["superpowers@vectorhawk"][0]["scope"] == "user"
+    let known_ok = read(&known)["scenery"]["source"]["source"] == "directory";
+    let installed_ok = read(&installed)["plugins"]["superpowers@scenery"][0]["scope"] == "user"
         && read(&installed)["version"] == 2;
-    let enabled_ok = read(&settings)["enabledPlugins"]["superpowers@vectorhawk"] == true;
+    let enabled_ok = read(&settings)["enabledPlugins"]["superpowers@scenery"] == true;
     let extra_mkt_ok =
-        read(&settings)["extraKnownMarketplaces"]["vectorhawk"]["source"]["source"] == "directory";
+        read(&settings)["extraKnownMarketplaces"]["scenery"]["source"]["source"] == "directory";
 
     if let Some(v) = prev.clone() {
         std::env::set_var("HOME", v);
@@ -77,7 +77,7 @@ fn install_plugin_bundle_writes_full_state() {
     assert!(bundled_skill_prompt, "skill sibling file bundled");
     assert!(mkt_lists, "marketplace.json lists the plugin");
     assert!(cache_ok, "plugin copied into cache");
-    assert!(known_ok, "known_marketplaces has vectorhawk dir source");
+    assert!(known_ok, "known_marketplaces has scenery dir source");
     assert!(
         installed_ok,
         "installed_plugins v2 has the plugin under user scope"
@@ -126,16 +126,16 @@ fn install_plugin_bundle_writes_imported_file_tree_verbatim() {
     let result = install_plugin_bundle(&b);
 
     let h = fake_home.path();
-    let src = h.join(".claude/plugins/marketplaces/vectorhawk/plugins/caveman");
+    let src = h.join(".claude/plugins/marketplaces/scenery/plugins/caveman");
     let pj_ok = src.join(".claude-plugin/plugin.json").exists();
     let cmd_ok = std::fs::read(src.join("commands/caveman.toml")).unwrap() == b"prompt = 'ugh'";
     let agent_ok = src.join("agents/cavecrew-builder.md").exists();
     let skill_ok = src.join("skills/caveman/SKILL.md").exists();
     let cache_ok = h
-        .join(".claude/plugins/cache/vectorhawk/caveman/0.1.0/commands/caveman.toml")
+        .join(".claude/plugins/cache/scenery/caveman/0.1.0/commands/caveman.toml")
         .exists();
     let traversal_blocked = !h
-        .join(".claude/plugins/marketplaces/vectorhawk/evil.sh")
+        .join(".claude/plugins/marketplaces/scenery/evil.sh")
         .exists()
         && !h.join(".claude/plugins/marketplaces/evil.sh").exists();
 
@@ -195,9 +195,9 @@ fn install_plugin_bundle_keeps_executable_files_executable() {
             .map(|m| m.permissions().mode())
             .unwrap_or(0)
     };
-    let src_hook = mode(".claude/plugins/marketplaces/vectorhawk/plugins/hooky/hooks/check.sh");
-    let cache_hook = mode(".claude/plugins/cache/vectorhawk/hooky/1.0.0/hooks/check.sh");
-    let readme = mode(".claude/plugins/marketplaces/vectorhawk/plugins/hooky/README.md");
+    let src_hook = mode(".claude/plugins/marketplaces/scenery/plugins/hooky/hooks/check.sh");
+    let cache_hook = mode(".claude/plugins/cache/scenery/hooky/1.0.0/hooks/check.sh");
+    let readme = mode(".claude/plugins/marketplaces/scenery/plugins/hooky/README.md");
 
     if let Some(v) = prev {
         std::env::set_var("HOME", v);
@@ -254,13 +254,11 @@ fn install_then_uninstall_is_clean_and_preserves_other_marketplaces() {
         serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(p).unwrap()).unwrap()
     };
     let plugin_dir_gone = !h
-        .join(".claude/plugins/marketplaces/vectorhawk/plugins/superpowers")
+        .join(".claude/plugins/marketplaces/scenery/plugins/superpowers")
         .exists();
-    let cache_gone = !h
-        .join(".claude/plugins/cache/vectorhawk/superpowers")
-        .exists();
+    let cache_gone = !h.join(".claude/plugins/cache/scenery/superpowers").exists();
     let s = read(&settings);
-    let enabled_removed = s["enabledPlugins"].get("superpowers@vectorhawk").is_none();
+    let enabled_removed = s["enabledPlugins"].get("superpowers@scenery").is_none();
     let foreign_enabled_kept = s["enabledPlugins"]["other@official"] == true;
     let theme_kept = s["theme"] == "dark";
     let foreign_mkt_kept = read(&known)["official"]["source"]["source"] == "github";
@@ -296,7 +294,7 @@ fn install_plugin_bundle_refuses_traversal_in_version_or_slug() {
     std::fs::create_dir_all(&victim).unwrap();
     std::fs::write(victim.join("keep.txt"), b"precious").unwrap();
     // An earlier version is cached, so `<slug>/<version>` resolves on disk.
-    std::fs::create_dir_all(h.join(".claude/plugins/cache/vectorhawk/superpowers/5.0.6")).unwrap();
+    std::fs::create_dir_all(h.join(".claude/plugins/cache/scenery/superpowers/5.0.6")).unwrap();
 
     let mut bad_version = bundle();
     bad_version.version = "../../../../../victim".to_string();
@@ -309,7 +307,7 @@ fn install_plugin_bundle_refuses_traversal_in_version_or_slug() {
     let victim_kept = std::fs::read(victim.join("keep.txt")).ok() == Some(b"precious".to_vec());
     let nothing_copied_into_victim = !victim.join(".claude-plugin").exists();
     let no_source_written = !h
-        .join(".claude/plugins/marketplaces/vectorhawk/plugins/superpowers")
+        .join(".claude/plugins/marketplaces/scenery/plugins/superpowers")
         .exists();
 
     if let Some(v) = prev {
@@ -349,10 +347,10 @@ fn uninstall_plugin_bundle_refuses_traversal_in_slug() {
         .collect();
 
     let source_kept = h
-        .join(".claude/plugins/marketplaces/vectorhawk/plugins/superpowers/.claude-plugin/plugin.json")
+        .join(".claude/plugins/marketplaces/scenery/plugins/superpowers/.claude-plugin/plugin.json")
         .exists();
     let cache_kept = h
-        .join(".claude/plugins/cache/vectorhawk/superpowers/5.0.7")
+        .join(".claude/plugins/cache/scenery/superpowers/5.0.7")
         .exists();
 
     if let Some(v) = prev {

@@ -1,7 +1,7 @@
 //! Revocation coverage for plugin-bundled skills (F6) and version-scoped
 //! revocations (F15).
 //!
-//! F6: a skill bundled in a VectorHawk-published plugin used to be downloaded
+//! F6: a skill bundled in a Scenery-published plugin used to be downloaded
 //! and bundled with no revocation check, and a plugin installed *before* the
 //! skill was revoked kept carrying it. F15: plugin and MCP install gates
 //! passed no version, so a version-scoped revoke never blocked anything, and
@@ -9,7 +9,7 @@
 //!
 //! Every test points `$HOME` at a temp dir (the plugin marketplace lives
 //! under `~/.claude/plugins`) and uses a temp state root. The daemon test
-//! binary already forces `VECTORHAWK_DISABLE_KEYCHAIN=1` via its ctor.
+//! binary already forces `SCENERY_DISABLE_KEYCHAIN=1` via its ctor.
 #![allow(clippy::unwrap_used)]
 
 use std::path::{Path, PathBuf};
@@ -54,13 +54,13 @@ impl FakeHome {
 
     fn plugin_src(&self, slug: &str) -> PathBuf {
         self.path()
-            .join(".claude/plugins/marketplaces/vectorhawk/plugins")
+            .join(".claude/plugins/marketplaces/scenery/plugins")
             .join(slug)
     }
 
     fn plugin_cache(&self, slug: &str, version: &str) -> PathBuf {
         self.path()
-            .join(".claude/plugins/cache/vectorhawk")
+            .join(".claude/plugins/cache/scenery")
             .join(slug)
             .join(version)
     }
@@ -139,7 +139,7 @@ fn install_plugin_event(slug: &str, version: &str, skills: Vec<PluginSkillRef>) 
         plugin_name: slug.to_string(),
         description: "test plugin".to_string(),
         version: version.to_string(),
-        author: "VectorHawk".to_string(),
+        author: "Scenery".to_string(),
         skills,
     }
 }
@@ -411,7 +411,7 @@ fn snapshot_reinstalls_a_governed_plugin_with_no_bundled_skill_record() {
         &installed,
         serde_json::to_vec(&serde_json::json!({
             "version": 2,
-            "plugins": { "legacy@vectorhawk": [{ "scope": "user", "version": "1.0.0" }] }
+            "plugins": { "legacy@scenery": [{ "scope": "user", "version": "1.0.0" }] }
         }))
         .unwrap(),
     )
@@ -424,7 +424,7 @@ fn snapshot_reinstalls_a_governed_plugin_with_no_bundled_skill_record() {
             plugin_name: "legacy".to_string(),
             description: String::new(),
             version: "1.0.0".to_string(),
-            author: "VectorHawk".to_string(),
+            author: "Scenery".to_string(),
             skills: vec![skill_ref("evil", "1.0.0")],
             state: "installed".to_string(),
         }]);
