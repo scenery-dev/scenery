@@ -18,6 +18,23 @@ metadata:
       - classify alert
       - draft incident report
       - assess production impact
+    model:
+      min_params_b: 7
+      recommended:
+        - llama3.1:8b
+      fallback: mcp_sampling
+    schemas:
+      inputs:
+        type: object
+        required: [alert]
+        properties:
+          alert: {type: string}
+          logs: {type: string}
+      outputs:
+        type: object
+        properties:
+          severity: {type: string}
+          report: {type: string}
     workflow_ref: ./workflow.yaml
 ---
 

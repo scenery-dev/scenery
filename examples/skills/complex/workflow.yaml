@@ -3,3 +3,6 @@ steps:
   - id: triage
     type: llm
     prompt: prompts/system.txt
+  - id: draft_report
+    type: llm
+    prompt: prompts/system.txt
