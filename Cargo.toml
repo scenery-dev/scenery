@@ -15,7 +15,7 @@ edition = "2021"
 rust-version = "1.75"
 authors = ["VectorHawk"]
 license = "Apache-2.0"
-repository = "https://github.com/vectorhawk/vectorhawkd"
+repository = "https://github.com/scenery-dev/sceneryd"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "rt", "macros", "io-util", "net", "fs", "time", "sync", "signal", "process"] }

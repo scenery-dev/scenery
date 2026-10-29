@@ -165,7 +165,7 @@ pub fn spawn(
         //  through SyncConfig.  For now we default to production.)
         std::env::var("VECTORHAWK_REGISTRY_URL")
             .ok()
-            .unwrap_or_else(|| "https://app.vectorhawk.ai".to_string())
+            .unwrap_or_else(|| vectorhawkd_core::DEFAULT_REGISTRY_URL.to_string())
     };
 
     // Note: we do NOT cache the access_token here.  The SSE client may refresh

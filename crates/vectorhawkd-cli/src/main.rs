@@ -33,6 +33,7 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use vectorhawkd_core::DEFAULT_REGISTRY_URL;
 
 mod commands_migrate;
 mod install;
@@ -165,7 +166,7 @@ pub enum SkillCommand {
         #[arg(
             long,
             env = "VECTORHAWK_REGISTRY_URL",
-            default_value = "https://app.vectorhawk.ai"
+            default_value = DEFAULT_REGISTRY_URL
         )]
         registry_url: Option<String>,
     },
@@ -283,7 +284,7 @@ pub enum SkillCommand {
         #[arg(
             long,
             env = "VECTORHAWK_REGISTRY_URL",
-            default_value = "https://app.vectorhawk.ai"
+            default_value = DEFAULT_REGISTRY_URL
         )]
         registry_url: Option<String>,
     },
@@ -308,7 +309,7 @@ pub enum SkillCommand {
         #[arg(
             long,
             env = "VECTORHAWK_REGISTRY_URL",
-            default_value = "https://app.vectorhawk.ai"
+            default_value = DEFAULT_REGISTRY_URL
         )]
         registry_url: Option<String>,
     },
@@ -353,7 +354,7 @@ pub enum AuthCommand {
         #[arg(
             long,
             env = "VECTORHAWK_REGISTRY_URL",
-            default_value = "https://app.vectorhawk.ai"
+            default_value = DEFAULT_REGISTRY_URL
         )]
         registry_url: String,
     },
@@ -364,7 +365,7 @@ pub enum AuthCommand {
         #[arg(
             long,
             env = "VECTORHAWK_REGISTRY_URL",
-            default_value = "https://app.vectorhawk.ai"
+            default_value = DEFAULT_REGISTRY_URL
         )]
         registry_url: String,
     },
@@ -375,7 +376,7 @@ pub enum AuthCommand {
         #[arg(
             long,
             env = "VECTORHAWK_REGISTRY_URL",
-            default_value = "https://app.vectorhawk.ai"
+            default_value = DEFAULT_REGISTRY_URL
         )]
         registry_url: String,
     },
@@ -395,7 +396,7 @@ pub enum AuthCommand {
         #[arg(
             long,
             env = "VECTORHAWK_REGISTRY_URL",
-            default_value = "https://app.vectorhawk.ai"
+            default_value = DEFAULT_REGISTRY_URL
         )]
         registry_url: String,
     },
@@ -423,7 +424,7 @@ pub enum AuthCommand {
         #[arg(
             long,
             env = "VECTORHAWK_REGISTRY_URL",
-            default_value = "https://app.vectorhawk.ai"
+            default_value = DEFAULT_REGISTRY_URL
         )]
         registry_url: String,
     },
@@ -566,7 +567,7 @@ pub enum PluginCommand {
         #[arg(
             long,
             env = "VECTORHAWK_REGISTRY_URL",
-            default_value = "https://app.vectorhawk.ai"
+            default_value = DEFAULT_REGISTRY_URL
         )]
         registry_url: String,
 
@@ -590,7 +591,7 @@ pub enum PluginCommand {
         #[arg(
             long,
             env = "VECTORHAWK_REGISTRY_URL",
-            default_value = "https://app.vectorhawk.ai"
+            default_value = DEFAULT_REGISTRY_URL
         )]
         registry_url: Option<String>,
     },
@@ -810,8 +811,7 @@ async fn run(cli: Cli) -> Result<()> {
                 purge,
                 dry_run,
                 report_dir,
-                registry_url: registry_url
-                    .unwrap_or_else(|| "https://app.vectorhawk.ai".to_string()),
+                registry_url: registry_url.unwrap_or_else(|| DEFAULT_REGISTRY_URL.to_string()),
             })
             .await
         }
@@ -847,7 +847,7 @@ async fn cmd_doctor(registry_url: Option<&str>) -> Result<()> {
             );
 
             // Extended doctor fields (M1.5): registry, audit queue, last sync.
-            let effective_registry = registry_url.unwrap_or("https://app.vectorhawk.ai");
+            let effective_registry = registry_url.unwrap_or(DEFAULT_REGISTRY_URL);
             let reachability = probe_registry(effective_registry).await;
             println!("Registry URL:    {effective_registry}");
             println!("Registry:        {reachability}");
@@ -1514,7 +1514,7 @@ async fn cmd_skill_list() -> Result<()> {
 
     // Attempt registry update check — skip silently if offline.
     // We use the default registry URL; for now `skill list` doesn't take --registry-url.
-    let update_hints = fetch_update_hints_for_list(&state, "https://app.vectorhawk.ai").await;
+    let update_hints = fetch_update_hints_for_list(&state, DEFAULT_REGISTRY_URL).await;
 
     println!(
         "{:<30} {:<12} {:<12} INSTALLED AT",
@@ -1602,7 +1602,7 @@ async fn fetch_update_hints_for_list(
 async fn cmd_skill_search(query: &str, registry_url: Option<&str>) -> Result<()> {
     use vectorhawkd_core::{auth::load_tokens, registry::RegistryClient, state::AppState};
 
-    let url = registry_url.unwrap_or("https://app.vectorhawk.ai");
+    let url = registry_url.unwrap_or(DEFAULT_REGISTRY_URL);
 
     let state = AppState::bootstrap().context("failed to bootstrap state")?;
     let tokens = load_tokens(&state, url)
@@ -1760,7 +1760,7 @@ async fn cmd_skill_install(
         // Audit is emitted inside the helpers below so the correct source
         // label is recorded regardless of which path fires (desired-state,
         // cli-registry direct, or desired-state's inner direct fallback).
-        let url = registry_url.unwrap_or("https://app.vectorhawk.ai");
+        let url = registry_url.unwrap_or(DEFAULT_REGISTRY_URL);
 
         // Check if the daemon has registered this device.  If not, fall through
         // to direct install so the CLI remains usable without the daemon.
@@ -2482,7 +2482,7 @@ async fn cmd_skill_import(
     // Attempt to build a scan client when we have both a registry URL and a
     // valid auth token. Fall back to the NoOp client (prints nothing, no HTTP
     // call) when either is missing — keeps the import path clean even offline.
-    let effective_registry = registry_url.unwrap_or("https://app.vectorhawk.ai");
+    let effective_registry = registry_url.unwrap_or(DEFAULT_REGISTRY_URL);
     let state = AppState::bootstrap().context("failed to bootstrap state")?;
 
     let scan_client: Box<dyn ScanClient> =
@@ -3105,7 +3105,7 @@ async fn cmd_skill_author(
         .unwrap_or_else(|| camino::Utf8PathBuf::from("."));
 
     // Try to infer publisher from logged-in account.
-    let effective_registry = registry_url.unwrap_or("https://app.vectorhawk.ai");
+    let effective_registry = registry_url.unwrap_or(DEFAULT_REGISTRY_URL);
     let publisher_id = try_infer_publisher_id(effective_registry)
         .await
         .unwrap_or_else(|| "YOUR_PUBLISHER_ID".to_string());
@@ -3119,7 +3119,7 @@ async fn cmd_skill_author(
         let publisher_note = if publisher_id == "YOUR_PUBLISHER_ID" {
             " and publisher ID".to_string()
         } else {
-            format!(" (publisher: {publisher_id} — verify at app.vectorhawk.ai/portal)")
+            format!(" (publisher: {publisher_id} — verify at app.scenery.dev/portal)")
         };
         println!(
             "  1. Edit {}/{}/SKILL.md — fill in description{}",
@@ -4022,7 +4022,7 @@ async fn cmd_skill_update(id: Option<&str>, all: bool, registry_url: Option<&str
     }
 
     let state = AppState::bootstrap().context("failed to bootstrap state")?;
-    let url = registry_url.unwrap_or("https://app.vectorhawk.ai");
+    let url = registry_url.unwrap_or(DEFAULT_REGISTRY_URL);
 
     // Collect the list of (skill_id, installed_version) pairs to process.
     let targets: Vec<(String, String)> = if all {
@@ -4374,7 +4374,7 @@ async fn cmd_auth_login(registry_url: &str) -> Result<()> {
         println!("  Keep the tunnel open until login completes.");
         println!();
         println!("Option B — Personal Access Token (no tunnel needed):");
-        println!("  1. Open https://app.vectorhawk.ai/portal/settings in your browser.");
+        println!("  1. Open https://app.scenery.dev/portal/settings in your browser.");
         println!("  2. Create a token (starts with vh_pat_...).");
         println!("  3. Run:  vectorhawk auth token   (paste the token at the prompt)");
         println!();
@@ -5609,7 +5609,7 @@ async fn cmd_mcp_sync() -> Result<()> {
     // been invisible to anything else in this process.
     state.seed_block_third_party_from_sync_state();
     let registry_url = std::env::var("VECTORHAWK_REGISTRY_URL")
-        .unwrap_or_else(|_| "https://app.vectorhawk.ai".to_string());
+        .unwrap_or_else(|_| DEFAULT_REGISTRY_URL.to_string());
 
     let registry = Arc::new(RegistryClient::new(&registry_url));
     let audit = Arc::new(SqliteAuditBuffer::new(Arc::clone(&registry), &state));
@@ -5895,7 +5895,7 @@ async fn cmd_skill_uninstall(id: &str, registry_url: Option<&str>) -> Result<()>
     // reinstall the skill on the next SSE sync tick.
     match &info.installation_id {
         Some(iid) if !iid.is_empty() => {
-            let url = registry_url.unwrap_or("https://app.vectorhawk.ai");
+            let url = registry_url.unwrap_or(DEFAULT_REGISTRY_URL);
             match deactivate_backend_installation(iid, url, &state).await {
                 Ok(()) => {
                     println!(
@@ -6137,7 +6137,7 @@ async fn cmd_plugin_uninstall(slug: &str, registry_url: Option<&str>) -> Result<
     );
 
     // Managed-install coordination.
-    let url = registry_url.unwrap_or("https://app.vectorhawk.ai");
+    let url = registry_url.unwrap_or(DEFAULT_REGISTRY_URL);
     match &installation_id {
         Some(iid) if !iid.is_empty() => {
             match deactivate_backend_plugin_installation(iid, url, &state).await {

@@ -13,6 +13,7 @@
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use vectorhawkd_core::state::AppState;
+use vectorhawkd_core::DEFAULT_REGISTRY_URL;
 use vectorhawkd_daemon::managed_paths::{list_backups, rollback};
 
 // ── CLI types ─────────────────────────────────────────────────────────────────
@@ -46,7 +47,7 @@ pub enum MigrateCommand {
         #[arg(
             long,
             env = "VECTORHAWK_REGISTRY_URL",
-            default_value = "https://app.vectorhawk.ai"
+            default_value = DEFAULT_REGISTRY_URL
         )]
         registry_url: String,
     },
