@@ -243,7 +243,7 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
         .registry_url
         .clone()
         .or_else(|| std::env::var("VECTORHAWK_REGISTRY_URL").ok())
-        .unwrap_or_else(|| "https://app.vectorhawk.ai".to_string());
+        .unwrap_or_else(|| vectorhawkd_core::DEFAULT_REGISTRY_URL.to_string());
 
     info!(registry_url, "connecting to registry");
 

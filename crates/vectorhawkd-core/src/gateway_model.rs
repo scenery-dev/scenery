@@ -77,7 +77,7 @@ impl GatewayModelClient {
     /// Create a new client pointing at `base_url`.
     ///
     /// `base_url` should not have a trailing slash, e.g.
-    /// `"https://app.vectorhawk.ai"`.
+    /// `"https://app.scenery.dev"`.
     pub fn new(base_url: impl Into<String>, state: Arc<AppState>) -> Self {
         let http = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(120))

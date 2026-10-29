@@ -18,6 +18,9 @@
 //! none of these are needed by the M0 daemon or shim. They will be ported in M1
 //! once the daemon/shim socket protocol is validated end-to-end.
 
+/// Default registry base URL used when no `--registry-url` / `VECTORHAWK_REGISTRY_URL` is set.
+pub const DEFAULT_REGISTRY_URL: &str = "https://app.scenery.dev";
+
 pub mod app;
 pub mod atomic_file;
 pub mod audit;

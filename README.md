@@ -61,7 +61,7 @@ vectorhawk skill init my-skill
 vectorhawk skill validate my-skill/
 
 # Publish to the registry
-vectorhawk skill publish my-skill/ --registry-url https://app.vectorhawk.ai
+vectorhawk skill publish my-skill/ --registry-url https://app.scenery.dev
 ```
 
 See [`docs/AUTHORING.md`](docs/AUTHORING.md) for the full authoring guide and
@@ -83,8 +83,8 @@ v1.0.0. See [`../context/IMPLEMENTATION_PLAN_v3.md`](../context/IMPLEMENTATION_P
 ### Homebrew (macOS)
 
 ```bash
-brew tap vectorhawk/tap
-brew trust vectorhawk/tap
+brew tap scenery-dev/tap
+brew trust scenery-dev/tap
 brew install vectorhawk
 brew services start vectorhawk
 vectorhawk mcp setup
@@ -103,7 +103,7 @@ selects the correct binary for your architecture automatically.
 A curl-install script is available for Linux x86_64:
 
 ```bash
-curl -fsSL https://install.vectorhawk.ai | sh
+curl -fsSL https://install.scenery.dev | sh
 ```
 
 This script requires EC2 distribution infrastructure to be live before it is broadly advertised.

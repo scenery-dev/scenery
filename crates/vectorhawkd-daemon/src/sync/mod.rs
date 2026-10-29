@@ -27,7 +27,7 @@ use crate::managed_paths::ManagedPathsPusher;
 /// Configuration for the sync subsystem.
 #[derive(Clone)]
 pub struct SyncConfig {
-    /// Registry base URL (e.g. `https://app.vectorhawk.ai`).
+    /// Registry base URL (e.g. `https://app.scenery.dev`).
     pub registry_url: String,
     /// Bearer token for the SSE connection.  Refreshed on 401.
     pub token: String,
