@@ -190,11 +190,40 @@ pub fn uninstall_skill(state: &AppState, skill_id: &str) -> Result<Option<String
         [skill_id],
     )?;
 
-    // ~/.claude/skills/<id> is owned by the F2 pusher; the installer does not
-    // unlink it here. The reconciler's deactivate / purge handler invokes
-    // `ManagedPathsPusher::remove_skill` for that side.
+    // `~/.agents/skills/<id>` (+ its `.scenery-managed.json` marker, the
+    // `managed_path_markers` row) and the `~/.claude/skills/<id>` link are the
+    // F2 pusher's projection of this install. The pusher lives in the daemon
+    // crate (which depends on this one), so it registers its remover via
+    // [`register_skill_projection_remover`]. Leaving the projection behind
+    // keeps the skill visible to Claude Code and lets the reconciler's phantom
+    // check resurrect it as an "adopted from local path" install.
+    //
+    // Non-fatal: the pusher refuses to touch anything lacking our marker
+    // (user content at the same slug), and that must not fail the uninstall.
+    if let Some(remover) = SKILL_PROJECTION_REMOVER.get() {
+        if let Err(e) = remover(state, skill_id) {
+            tracing::warn!(
+                skill_id,
+                error = %e,
+                "uninstall: could not remove the native skill projection (non-fatal)"
+            );
+        }
+    }
 
     Ok(Some(active_version))
+}
+
+/// Signature of the callback that removes a skill's native-directory
+/// projection (`~/.agents/skills/<slug>` + `~/.claude/skills/<slug>`).
+pub type SkillProjectionRemover = fn(&AppState, &str) -> Result<()>;
+
+static SKILL_PROJECTION_REMOVER: std::sync::OnceLock<SkillProjectionRemover> =
+    std::sync::OnceLock::new();
+
+/// Register the projection remover invoked by [`uninstall_skill`]. First
+/// registration wins; repeated calls are no-ops.
+pub fn register_skill_projection_remover(remover: SkillProjectionRemover) {
+    let _ = SKILL_PROJECTION_REMOVER.set(remover);
 }
 
 /// Deactivate an installed skill because the registry reports it unpublished

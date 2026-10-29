@@ -622,6 +622,11 @@ fn is_daemon_foreground(command: &Command) -> bool {
 fn main() {
     let cli = Cli::parse();
 
+    // `skill uninstall`, the MCP `scenery_uninstall` tool and registry-sync
+    // cleanup all go through `installer::uninstall_skill`, which must also
+    // remove the native-dir projection owned by the daemon crate's pusher.
+    scenery_daemon::managed_paths::register_core_hooks();
+
     // See `logging.rs` for why the daemon gets its own profile (INFO,
     // size-bounded rotating file) instead of the interactive-CLI default
     // (WARN, stderr). `RUST_LOG` overrides either default.
@@ -5859,6 +5864,27 @@ async fn cmd_skill_uninstall(id: &str, registry_url: Option<&str>) -> Result<()>
     let info = match row {
         Some(r) => r,
         None => {
+            // No install row, but an earlier runner's uninstall may have left
+            // our native projection (marker row + ~/.agents/skills/<id> +
+            // ~/.claude/skills/<id> link) behind. Clean that up rather than
+            // telling the user there is nothing to do while Claude Code still
+            // sees the skill.
+            let has_leftover: bool = conn
+                .query_row(
+                    "SELECT 1 FROM managed_path_markers WHERE kind = 'skill' AND slug = ?1 LIMIT 1",
+                    [id],
+                    |_| Ok(true),
+                )
+                .optional()
+                .context("failed to query managed_path_markers")?
+                .unwrap_or(false);
+            if has_leftover {
+                scenery_daemon::managed_paths::ManagedPathsPusher::new(&state)
+                    .remove_skill(id)
+                    .with_context(|| format!("failed to remove leftover files for '{id}'"))?;
+                println!("Removed leftover managed files for skill '{id}'.");
+                return Ok(());
+            }
             anyhow::bail!("skill '{id}' is not installed");
         }
     };

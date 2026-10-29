@@ -1157,3 +1157,74 @@ fn unpack_cskill_archive_still_unpacks_regular_entries() {
 
     cleanup(&root);
 }
+
+// ── No F2 resurrection after uninstall ───────────────────────────────────────
+
+/// A leftover F2 marker (no pending adopt takeover) must NOT make a real
+/// registry version look phantom; the pending-takeover adopt flow still does.
+#[tokio::test]
+async fn f2_marker_alone_is_not_phantom_but_pending_takeover_is() {
+    let root = temp_root("phantom-guard");
+    let state = std::sync::Arc::new(AppState::bootstrap_in(root.clone()).unwrap());
+    {
+        let conn = Connection::open(&state.db_path).unwrap();
+        conn.execute(
+            "INSERT INTO managed_path_markers (path, kind, slug, source_sha256, migrated_at) \
+             VALUES ('/x/demo', 'skill', 'demo', 'h', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+    }
+    assert!(
+        !super::is_phantom_artifact(None, "0.1.1", &state, "demo").await,
+        "leftover marker must not resurrect an uninstalled registry skill"
+    );
+    assert!(super::is_phantom_artifact(None, "0.0.0", &state, "demo").await);
+    assert!(super::is_phantom_artifact(Some("migrated:local"), "1.0.0", &state, "demo").await);
+
+    state
+        .record_pending_adopt_takeover("demo", "/orig/demo")
+        .unwrap();
+    assert!(
+        super::is_phantom_artifact(None, "1.0.0", &state, "demo").await,
+        "marker + pending adopt takeover is the legitimate phantom case"
+    );
+    cleanup(&root);
+}
+
+/// End to end: install + push + uninstall leaves nothing the phantom check
+/// (marker row or local content) could latch onto.
+#[tokio::test]
+async fn nothing_for_phantom_check_remains_after_uninstall() {
+    let root = temp_root("phantom-after-uninstall");
+    let state = std::sync::Arc::new(AppState::bootstrap_in(root.clone()).unwrap());
+    {
+        let conn = Connection::open(&state.db_path).unwrap();
+        seed_skill(&conn, "demo", "0.1.0", false);
+    }
+    let marker_gone = {
+        let st = state.clone();
+        tokio::task::spawn_blocking(move || {
+            with_fake_home(|_home| {
+                crate::managed_paths::register_core_hooks();
+                crate::managed_paths::ManagedPathsPusher::new(&st)
+                    .push_skill("demo", Some("i"), b"---\nname: demo\n---\n", &[])
+                    .unwrap();
+                scenery_core::installer::uninstall_skill(&st, "demo").unwrap();
+                let conn = Connection::open(&st.db_path).unwrap();
+                let n: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM managed_path_markers WHERE slug='demo'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                n == 0
+            })
+        })
+        .await
+        .unwrap()
+    };
+    assert!(marker_gone, "uninstall must delete the F2 marker row");
+    cleanup(&root);
+}
