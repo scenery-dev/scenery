@@ -2621,9 +2621,7 @@ async fn do_install(
     // If skill content is locally accessible: report `installed` (no download).
     // If skill content is absent: fail terminally with a clear, actionable
     // message.  `handle_install` sees `PhantomArtifactError` and skips the retry.
-    let is_phantom = source == Some("migrated:local")
-        || version == "0.0.0"
-        || marker_present_for_slug(&state_clone, &skill_id).await;
+    let is_phantom = is_phantom_artifact(source, &version, &state_clone, &skill_id).await;
 
     if is_phantom {
         let content_present = check_local_skill_content(&state_clone, &skill_id).await;
@@ -2873,6 +2871,44 @@ async fn marker_present_for_slug(state: &Arc<AppState>, slug: &str) -> bool {
             |r| r.get(0),
         );
         row.is_ok()
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// Decide whether an `Install` event targets a phantom (byte-less) artifact.
+///
+/// Signals, in priority order: explicit `source == "migrated:local"`, the
+/// `"0.0.0"` version sentinel, and — for older backends — the F2 marker.
+///
+/// The F2 marker alone is deliberately NOT enough: it only means "Scenery put
+/// a copy on this disk", which is equally true of a skill the user installed
+/// from the registry and then uninstalled (leftover marker, e.g. from a runner
+/// that did not clean up the native dir). Treating that as phantom reports the
+/// skill `installed` without downloading anything, so the backend records an
+/// "adopted from a local path" install with no artifact and every later
+/// registry install of the slug fails. The marker therefore only counts while
+/// an adopt-publish takeover is pending for the slug (the one flow that
+/// legitimately has a marked local copy before the real artifact lands).
+async fn is_phantom_artifact(
+    source: Option<&str>,
+    version: &str,
+    state: &Arc<AppState>,
+    skill_id: &str,
+) -> bool {
+    if source == Some("migrated:local") || version == "0.0.0" {
+        return true;
+    }
+    if !marker_present_for_slug(state, skill_id).await {
+        return false;
+    }
+    let state_clone = Arc::clone(state);
+    let slug = skill_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        matches!(
+            state_clone.pending_adopt_takeover_source(&slug),
+            Ok(Some(_))
+        )
     })
     .await
     .unwrap_or(false)

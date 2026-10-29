@@ -75,6 +75,16 @@ pub use plugin_marketplace::{
     PluginBundle,
 };
 pub use pusher::{push_missing_active_skills, ManagedPathsPusher};
+
+/// Wire the F2 pusher into `scenery_core::installer::uninstall_skill`, so every
+/// uninstall path (CLI, MCP `scenery_uninstall`, registry-sync cleanup) also
+/// removes the native `~/.agents/skills/<slug>` dir and the
+/// `~/.claude/skills/<slug>` link. Idempotent; call once at process start.
+pub fn register_core_hooks() {
+    scenery_core::installer::register_skill_projection_remover(|state, slug| {
+        ManagedPathsPusher::new(state).remove_skill(slug)
+    });
+}
 pub use rollback::{list_backups, rollback, BackupSummary, RollbackReport};
 pub use scanner::MigrationItem;
 
@@ -286,3 +296,7 @@ mod mod_tests;
 #[cfg(test)]
 #[path = "links_tests.rs"]
 mod links_tests;
+
+#[cfg(test)]
+#[path = "uninstall_hook_tests.rs"]
+mod uninstall_hook_tests;
