@@ -1,6 +1,6 @@
 {
-  "url": "https://api.github.com/repos/scenery-dev/sceneryd/releases/12345678",
-  "assets_url": "https://api.github.com/repos/scenery-dev/sceneryd/releases/12345678/assets",
+  "url": "https://api.github.com/repos/scenery-dev/scenery/releases/12345678",
+  "assets_url": "https://api.github.com/repos/scenery-dev/scenery/releases/12345678/assets",
   "tag_name": "v0.1.0",
   "name": "v0.1.0",
   "prerelease": false,
@@ -8,53 +8,53 @@
   "published_at": "2026-04-30T00:00:00Z",
   "assets": [
     {
-      "url": "https://api.github.com/repos/scenery-dev/sceneryd/releases/assets/100001",
-      "name": "vectorhawk-0.1.0-aarch64-apple-darwin.tar.gz",
+      "url": "https://api.github.com/repos/scenery-dev/scenery/releases/assets/100001",
+      "name": "scenery-0.1.0-aarch64-apple-darwin.tar.gz",
       "content_type": "application/gzip",
       "state": "uploaded",
       "size": 5242880,
-      "browser_download_url": "https://github.com/scenery-dev/sceneryd/releases/download/v0.1.0/vectorhawk-0.1.0-aarch64-apple-darwin.tar.gz"
+      "browser_download_url": "https://github.com/scenery-dev/scenery/releases/download/v0.1.0/scenery-0.1.0-aarch64-apple-darwin.tar.gz"
     },
     {
-      "url": "https://api.github.com/repos/scenery-dev/sceneryd/releases/assets/100002",
-      "name": "vectorhawk-0.1.0-aarch64-apple-darwin.tar.gz.sha256",
+      "url": "https://api.github.com/repos/scenery-dev/scenery/releases/assets/100002",
+      "name": "scenery-0.1.0-aarch64-apple-darwin.tar.gz.sha256",
       "content_type": "text/plain",
       "state": "uploaded",
       "size": 89,
-      "browser_download_url": "https://github.com/scenery-dev/sceneryd/releases/download/v0.1.0/vectorhawk-0.1.0-aarch64-apple-darwin.tar.gz.sha256"
+      "browser_download_url": "https://github.com/scenery-dev/scenery/releases/download/v0.1.0/scenery-0.1.0-aarch64-apple-darwin.tar.gz.sha256"
     },
     {
-      "url": "https://api.github.com/repos/scenery-dev/sceneryd/releases/assets/100003",
-      "name": "vectorhawk-0.1.0-x86_64-apple-darwin.tar.gz",
+      "url": "https://api.github.com/repos/scenery-dev/scenery/releases/assets/100003",
+      "name": "scenery-0.1.0-x86_64-apple-darwin.tar.gz",
       "content_type": "application/gzip",
       "state": "uploaded",
       "size": 5242880,
-      "browser_download_url": "https://github.com/scenery-dev/sceneryd/releases/download/v0.1.0/vectorhawk-0.1.0-x86_64-apple-darwin.tar.gz"
+      "browser_download_url": "https://github.com/scenery-dev/scenery/releases/download/v0.1.0/scenery-0.1.0-x86_64-apple-darwin.tar.gz"
     },
     {
-      "url": "https://api.github.com/repos/scenery-dev/sceneryd/releases/assets/100004",
-      "name": "vectorhawk-0.1.0-x86_64-apple-darwin.tar.gz.sha256",
+      "url": "https://api.github.com/repos/scenery-dev/scenery/releases/assets/100004",
+      "name": "scenery-0.1.0-x86_64-apple-darwin.tar.gz.sha256",
       "content_type": "text/plain",
       "state": "uploaded",
       "size": 89,
-      "browser_download_url": "https://github.com/scenery-dev/sceneryd/releases/download/v0.1.0/vectorhawk-0.1.0-x86_64-apple-darwin.tar.gz.sha256"
+      "browser_download_url": "https://github.com/scenery-dev/scenery/releases/download/v0.1.0/scenery-0.1.0-x86_64-apple-darwin.tar.gz.sha256"
     },
     {
-      "url": "https://api.github.com/repos/scenery-dev/sceneryd/releases/assets/100005",
-      "name": "vectorhawk-0.1.0-x86_64-unknown-linux-gnu.tar.gz",
+      "url": "https://api.github.com/repos/scenery-dev/scenery/releases/assets/100005",
+      "name": "scenery-0.1.0-x86_64-unknown-linux-gnu.tar.gz",
       "content_type": "application/gzip",
       "state": "uploaded",
       "size": 5242880,
-      "browser_download_url": "https://github.com/scenery-dev/sceneryd/releases/download/v0.1.0/vectorhawk-0.1.0-x86_64-unknown-linux-gnu.tar.gz"
+      "browser_download_url": "https://github.com/scenery-dev/scenery/releases/download/v0.1.0/scenery-0.1.0-x86_64-unknown-linux-gnu.tar.gz"
     },
     {
-      "url": "https://api.github.com/repos/scenery-dev/sceneryd/releases/assets/100006",
-      "name": "vectorhawk-0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256",
+      "url": "https://api.github.com/repos/scenery-dev/scenery/releases/assets/100006",
+      "name": "scenery-0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256",
       "content_type": "text/plain",
       "state": "uploaded",
       "size": 89,
-      "browser_download_url": "https://github.com/scenery-dev/sceneryd/releases/download/v0.1.0/vectorhawk-0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256"
+      "browser_download_url": "https://github.com/scenery-dev/scenery/releases/download/v0.1.0/scenery-0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256"
     }
   ],
-  "body": "VectorHawk runner v0.1.0 release."
+  "body": "Scenery runner v0.1.0 release."
 }
