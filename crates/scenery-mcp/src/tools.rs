@@ -1,15 +1,14 @@
-//! Tool dispatch for the VectorHawk MCP server.
+//! Tool dispatch for the Scenery MCP server.
 //!
-//! Ported from `skillrunner-mcp::tools`. All `skillclub_*` user-visible tool
-//! names are renamed to `vectorhawk_*`.
+//! All user-visible tool names are `scenery_*`.
 //!
 //! # Out-of-scope tools (not ported — deferred phases)
 //!
-//! - `skillclub_author` / `_author_confirm` (AUTH2)
-//! - `skillclub_publish` / `_update` (registry write ops, M1.4)
-//! - `skillclub_plugin_*` (PL phases)
-//! - `skillclub_rate` (RAT1)
-//! - `skillclub_scan` (SEC3)
+//! - `scenery_author` / `_author_confirm` (AUTH2)
+//! - `scenery_publish` / `_update` (registry write ops, M1.4)
+//! - `scenery_plugin_*` (PL phases)
+//! - `scenery_rate` (RAT1)
+//! - `scenery_scan` (SEC3)
 //!
 //! # RegistryClient methods added (M1.4 must reconcile)
 //!
@@ -31,12 +30,6 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use rusqlite::Connection;
-use semver::Version;
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
-use tracing::debug;
 use scenery_core::{
     auth::{self, AuthClient},
     executor::{run_skill, RunResult},
@@ -54,6 +47,12 @@ use scenery_core::{
     validator::validate_bundle,
 };
 use scenery_manifest::SkillPackage;
+use semver::Version;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use tracing::debug;
 
 /// How long a cached update-check result is considered fresh before re-check.
 const UPDATE_CHECK_TTL: Duration = Duration::from_secs(600); // 10 minutes
@@ -83,21 +82,21 @@ const GOVERNANCE_FOOTER: &str = "\n\n---\nTo add new MCP servers, use /mcp-reque
 
 /// Builds the list of MCP tool definitions from installed skills + management tools.
 ///
-/// The vectorhawk_* management tools (search/install/uninstall/etc.) are
+/// The scenery_* management tools (search/install/uninstall/etc.) are
 /// hidden by default because users now manage skills + MCP servers via the
 /// portal — the management tools clutter the AI client's tool list. Set
-/// `VECTORHAWK_EXPOSE_BUILTIN_TOOLS=1` to surface them for CLI-style
+/// `SCENERY_EXPOSE_BUILTIN_TOOLS=1` to surface them for CLI-style
 /// workflows.
 ///
 /// `native_skills_dir` is the skills folder the connected client loads
-/// natively (see [`native_skills_dir`]); skills with a VectorHawk copy there
+/// natively (see [`native_skills_dir`]); skills with a Scenery copy there
 /// are left out so each appears once.
 pub fn build_tool_list(
     state: &AppState,
     registry_url: &Option<String>,
     native_skills_dir: Option<&Path>,
 ) -> Vec<ToolDefinition> {
-    let expose = std::env::var("VECTORHAWK_EXPOSE_BUILTIN_TOOLS")
+    let expose = std::env::var("SCENERY_EXPOSE_BUILTIN_TOOLS")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     build_tool_list_inner(state, registry_url, expose, native_skills_dir)
@@ -148,8 +147,8 @@ fn build_tool_list_inner(
     // and there is no way to authenticate over MCP (chicken-and-egg).
     if registry_url.is_some() && !logged_in {
         tools.push(ToolDefinition {
-            name: "vectorhawk_login".to_string(),
-            description: "Log in to the VectorHawk registry to unlock searching, installing, \
+            name: "scenery_login".to_string(),
+            description: "Log in to the Scenery registry to unlock searching, installing, \
                 and governance features. Opens a browser-based OAuth login flow."
                 .to_string(),
             input_schema: serde_json::json!({
@@ -169,9 +168,9 @@ fn build_tool_list_inner(
         return tools;
     }
 
-    // Management tools — opt-in via VECTORHAWK_EXPOSE_BUILTIN_TOOLS.
+    // Management tools — opt-in via SCENERY_EXPOSE_BUILTIN_TOOLS.
     tools.push(ToolDefinition {
-        name: "vectorhawk_list".to_string(),
+        name: "scenery_list".to_string(),
         description:
             "List all installed skills available to the user. Use this when the user asks \
             'what skills do I have', 'what tools are available', or 'what can you do'. \
@@ -185,8 +184,8 @@ fn build_tool_list_inner(
     });
 
     tools.push(ToolDefinition {
-        name: "vectorhawk_validate".to_string(),
-        description: "Validate a VectorHawk skill bundle directory. Checks manifest, workflow, \
+        name: "scenery_validate".to_string(),
+        description: "Validate a Scenery skill bundle directory. Checks manifest, workflow, \
             schemas, and file references."
             .to_string(),
         input_schema: serde_json::json!({
@@ -203,8 +202,8 @@ fn build_tool_list_inner(
 
     // Install is always available — supports both local paths and registry IDs
     tools.push(ToolDefinition {
-        name: "vectorhawk_install".to_string(),
-        description: "Install a skill from a local path or from the VectorHawk registry by its ID."
+        name: "scenery_install".to_string(),
+        description: "Install a skill from a local path or from the Scenery registry by its ID."
             .to_string(),
         input_schema: serde_json::json!({
             "type": "object",
@@ -227,8 +226,8 @@ fn build_tool_list_inner(
     });
 
     tools.push(ToolDefinition {
-        name: "vectorhawk_info".to_string(),
-        description: "Show detailed information about an installed VectorHawk skill.".to_string(),
+        name: "scenery_info".to_string(),
+        description: "Show detailed information about an installed Scenery skill.".to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
@@ -242,8 +241,8 @@ fn build_tool_list_inner(
     });
 
     tools.push(ToolDefinition {
-        name: "vectorhawk_uninstall".to_string(),
-        description: "Uninstall an installed VectorHawk skill by its ID. Removes skill files and database records.".to_string(),
+        name: "scenery_uninstall".to_string(),
+        description: "Uninstall an installed Scenery skill by its ID. Removes skill files and database records.".to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
@@ -259,7 +258,7 @@ fn build_tool_list_inner(
     // Update is available whenever a registry URL is configured.
     if registry_url.is_some() {
         tools.push(ToolDefinition {
-            name: "vectorhawk_update".to_string(),
+            name: "scenery_update".to_string(),
             description: "Update an installed skill to the latest version from the registry. \
                 Call this after being notified that a newer version is available."
                 .to_string(),
@@ -277,7 +276,7 @@ fn build_tool_list_inner(
     }
 
     tools.push(ToolDefinition {
-        name: "vectorhawk_import".to_string(),
+        name: "scenery_import".to_string(),
         description: "Import an external skill or MCP server into your organization's governed \
             catalog. Pass a GitHub URL, npm package name (e.g. '@modelcontextprotocol/server-slack'), \
             or marketplace URL. Use action='preview' first to see what will be imported (this also \
@@ -313,7 +312,7 @@ fn build_tool_list_inner(
     // MCP Governance tools — only shown when logged in
     if logged_in {
         tools.push(ToolDefinition {
-            name: "vectorhawk_mcp_catalog".to_string(),
+            name: "scenery_mcp_catalog".to_string(),
             description: "Browse approved MCP servers in your organisation's catalog. Shows \
                 available servers with their status, version pins, and credential notes."
                 .to_string(),
@@ -325,7 +324,7 @@ fn build_tool_list_inner(
         });
 
         tools.push(ToolDefinition {
-            name: "vectorhawk_mcp_request".to_string(),
+            name: "scenery_mcp_request".to_string(),
             description: "Request access to a new MCP server. In trust mode the request is \
                 auto-approved. In catalog-only mode, known servers are auto-approved. In strict \
                 mode the request goes to IT for review."
@@ -347,7 +346,7 @@ fn build_tool_list_inner(
         });
 
         tools.push(ToolDefinition {
-            name: "vectorhawk_mcp_status".to_string(),
+            name: "scenery_mcp_status".to_string(),
             description: "Check the status of your MCP server access requests.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -357,10 +356,10 @@ fn build_tool_list_inner(
         });
 
         tools.push(ToolDefinition {
-            name: "vectorhawk_mcp_install".to_string(),
-            description: "Activate an approved MCP server through VectorHawk's governance system. \
+            name: "scenery_mcp_install".to_string(),
+            description: "Activate an approved MCP server through Scenery's governance system. \
                 Forces an immediate sync with the registry and makes the server's tools available \
-                right away. The server must already be approved via vectorhawk_mcp_request."
+                right away. The server must already be approved via scenery_mcp_request."
                 .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -375,8 +374,8 @@ fn build_tool_list_inner(
         });
 
         tools.push(ToolDefinition {
-            name: "vectorhawk_mcp_uninstall".to_string(),
-            description: "Remove a governed MCP server from VectorHawk. Deactivates the server \
+            name: "scenery_mcp_uninstall".to_string(),
+            description: "Remove a governed MCP server from Scenery. Deactivates the server \
                 and removes its tools immediately."
                 .to_string(),
             input_schema: serde_json::json!({
@@ -395,8 +394,8 @@ fn build_tool_list_inner(
     // Registry tools requiring authentication
     if logged_in {
         tools.push(ToolDefinition {
-            name: "vectorhawk_logout".to_string(),
-            description: "Log out of the VectorHawk registry. Clears stored authentication tokens."
+            name: "scenery_logout".to_string(),
+            description: "Log out of the Scenery registry. Clears stored authentication tokens."
                 .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -409,8 +408,8 @@ fn build_tool_list_inner(
     // Search and scan — public endpoints, no auth required
     if registry_url.is_some() {
         tools.push(ToolDefinition {
-            name: "vectorhawk_search".to_string(),
-            description: "Search the VectorHawk skill registry for skills that can be installed. \
+            name: "scenery_search".to_string(),
+            description: "Search the Scenery skill registry for skills that can be installed. \
                 Requires a search query — ask the user what they're looking for if none is provided."
                 .to_string(),
             input_schema: serde_json::json!({
@@ -426,9 +425,9 @@ fn build_tool_list_inner(
         });
 
         tools.push(ToolDefinition {
-            name: "vectorhawk_scan".to_string(),
+            name: "scenery_scan".to_string(),
             description: "Scan arbitrary content (SKILL.md, MCP JSON config, or package name) \
-                for security threats using VectorHawk's AI scanner. Returns a verdict with \
+                for security threats using Scenery's AI scanner. Returns a verdict with \
                 color-coded severity and findings. Use this before importing or installing \
                 untrusted content."
                 .to_string(),
@@ -452,8 +451,8 @@ fn build_tool_list_inner(
 
     // Plugin export/import tools — always available (local operations, no auth required)
     tools.push(ToolDefinition {
-        name: "vectorhawk_plugin_export".to_string(),
-        description: "Export a VectorHawk plugin to Claude Code plugin or .mcpb Desktop Extension \
+        name: "scenery_plugin_export".to_string(),
+        description: "Export a Scenery plugin to Claude Code plugin or .mcpb Desktop Extension \
             format for distribution. Use 'mcpb' to produce a ZIP archive for Claude Desktop \
             one-click install with enterprise allowlist support."
             .to_string(),
@@ -462,7 +461,7 @@ fn build_tool_list_inner(
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Path to the VectorHawk plugin directory"
+                    "description": "Path to the Scenery plugin directory"
                 },
                 "format": {
                     "type": "string",
@@ -479,9 +478,9 @@ fn build_tool_list_inner(
     });
 
     tools.push(ToolDefinition {
-        name: "vectorhawk_plugin_import".to_string(),
+        name: "scenery_plugin_import".to_string(),
         description: "Import a Claude Code plugin directory or .mcpb Desktop Extension into \
-            VectorHawk plugin format. Auto-detects the external format and converts it."
+            Scenery plugin format. Auto-detects the external format and converts it."
             .to_string(),
         input_schema: serde_json::json!({
             "type": "object",
@@ -501,8 +500,8 @@ fn build_tool_list_inner(
 
     // AUTH2c: skill authoring tools — always available (local operations)
     tools.push(ToolDefinition {
-        name: "vectorhawk_author".to_string(),
-        description: "Author a new VectorHawk skill from a name and system prompt. \
+        name: "scenery_author".to_string(),
+        description: "Author a new Scenery skill from a name and system prompt. \
             In interactive mode (default) returns recommendations for you to review. \
             Pass mode='accept_suggestions' to apply recommendations automatically. \
             Pass mode='skip_metadata' to scaffold immediately with defaults."
@@ -542,9 +541,9 @@ fn build_tool_list_inner(
     });
 
     tools.push(ToolDefinition {
-        name: "vectorhawk_author_confirm".to_string(),
+        name: "scenery_author_confirm".to_string(),
         description: "Confirm and scaffold a skill after reviewing recommendations from \
-            vectorhawk_author. Provide the final values to create the SKILL.md."
+            scenery_author. Provide the final values to create the SKILL.md."
             .to_string(),
         input_schema: serde_json::json!({
             "type": "object",
@@ -609,14 +608,14 @@ fn build_tool_list_inner(
 /// # Invariant: never enumerates the filesystem
 ///
 /// This is strictly DB-bound — it reads only `installed_skills` (skills that
-/// VectorHawk itself installed and tracks). It never scans `~/.claude/skills/`
-/// or `~/.claude/plugins/`, so Anthropic-native content (which VectorHawk never
-/// records in `installed_skills`) can never be surfaced as a VectorHawk tool.
+/// Scenery itself installed and tracks). It never scans `~/.claude/skills/`
+/// or `~/.claude/plugins/`, so Anthropic-native content (which Scenery never
+/// records in `installed_skills`) can never be surfaced as a Scenery tool.
 /// Do not add a filesystem walk here; native-vs-managed classification lives in
 /// [`crate::ownership`] and adoption goes through the daemon reconciler.
 ///
 /// With `native_skills_dir`, skills the client already has natively are
-/// left out: those with a VectorHawk-managed folder (our marker) holding a
+/// left out: those with a Scenery-managed folder (our marker) holding a
 /// SKILL.md there. Anything else (push
 /// or link failed, the user's own folder of that name, a deleted link) keeps
 /// the tool, since it is then the only way to reach the skill.
@@ -651,7 +650,7 @@ fn skill_tools_from_db(
 }
 
 fn has_native_copy(dir: &Path) -> bool {
-    dir.join("SKILL.md").is_file() && crate::ownership::is_vectorhawk_managed(dir)
+    dir.join("SKILL.md").is_file() && crate::ownership::is_scenery_managed(dir)
 }
 
 /// Convert a single installed skill into an MCP tool definition.
@@ -662,7 +661,7 @@ fn skill_to_tool(skill_id: &str, active_path: &str) -> Result<ToolDefinition> {
         .manifest
         .description
         .clone()
-        .unwrap_or_else(|| format!("VectorHawk skill: {}", pkg.manifest.name));
+        .unwrap_or_else(|| format!("Scenery skill: {}", pkg.manifest.name));
 
     let versioned_desc = format!("{} (v{})", base_desc, pkg.manifest.version);
 
@@ -769,26 +768,26 @@ pub fn handle_tool_call(
     let mut skill_run_model_source: Option<String> = None;
 
     let result = match name {
-        "vectorhawk_list" => handle_list(state),
-        "vectorhawk_search" => handle_search(arguments, registry_url),
-        "vectorhawk_install" => handle_install(arguments, state, registry_url),
-        "vectorhawk_info" => handle_info(arguments, state),
-        "vectorhawk_validate" => handle_validate(arguments),
-        "vectorhawk_import" => handle_import(arguments, state, registry_url),
-        "vectorhawk_scan" => handle_scan(arguments, state, registry_url),
-        "vectorhawk_login" => handle_login(arguments, state, registry_url, aggregator),
-        "vectorhawk_logout" => handle_logout(state, registry_url),
-        "vectorhawk_mcp_catalog" => handle_mcp_catalog(state, registry_url),
-        "vectorhawk_mcp_request" => handle_mcp_request(arguments, state, registry_url),
-        "vectorhawk_mcp_status" => handle_mcp_status(state, registry_url),
-        "vectorhawk_mcp_install" => handle_mcp_install(arguments, state, registry_url, aggregator),
-        "vectorhawk_mcp_uninstall" => handle_mcp_uninstall(arguments, registry_url, aggregator),
-        "vectorhawk_uninstall" => handle_uninstall(arguments, state),
-        "vectorhawk_update" => handle_update(arguments, state, registry_url),
-        "vectorhawk_plugin_export" => handle_plugin_export(arguments),
-        "vectorhawk_plugin_import" => handle_plugin_import(arguments),
-        "vectorhawk_author" => handle_author(arguments, state, registry_url.as_deref()),
-        "vectorhawk_author_confirm" => {
+        "scenery_list" => handle_list(state),
+        "scenery_search" => handle_search(arguments, registry_url),
+        "scenery_install" => handle_install(arguments, state, registry_url),
+        "scenery_info" => handle_info(arguments, state),
+        "scenery_validate" => handle_validate(arguments),
+        "scenery_import" => handle_import(arguments, state, registry_url),
+        "scenery_scan" => handle_scan(arguments, state, registry_url),
+        "scenery_login" => handle_login(arguments, state, registry_url, aggregator),
+        "scenery_logout" => handle_logout(state, registry_url),
+        "scenery_mcp_catalog" => handle_mcp_catalog(state, registry_url),
+        "scenery_mcp_request" => handle_mcp_request(arguments, state, registry_url),
+        "scenery_mcp_status" => handle_mcp_status(state, registry_url),
+        "scenery_mcp_install" => handle_mcp_install(arguments, state, registry_url, aggregator),
+        "scenery_mcp_uninstall" => handle_mcp_uninstall(arguments, registry_url, aggregator),
+        "scenery_uninstall" => handle_uninstall(arguments, state),
+        "scenery_update" => handle_update(arguments, state, registry_url),
+        "scenery_plugin_export" => handle_plugin_export(arguments),
+        "scenery_plugin_import" => handle_plugin_import(arguments),
+        "scenery_author" => handle_author(arguments, state, registry_url.as_deref()),
+        "scenery_author_confirm" => {
             handle_author_confirm(arguments, state, registry_url.as_deref())
         }
         _ => handle_skill_run(
@@ -804,7 +803,7 @@ pub fn handle_tool_call(
     };
 
     // Buffer audit event (best-effort, non-blocking for the caller)
-    if !name.starts_with("vectorhawk_list") && !name.starts_with("vectorhawk_info") {
+    if !name.starts_with("scenery_list") && !name.starts_with("scenery_info") {
         // Task 9: surface model_source (e.g. "local:llama3.1:8b") on the
         // tool_called audit event for skill runs, so IT can see local
         // inference rows in audit even when the gateway — which normally
@@ -863,9 +862,9 @@ fn handle_list(state: &AppState) -> ToolCallResult {
     if skills.is_empty() {
         ToolCallResult::success(
             "No skills installed.\n\nTo get started:\n\
-             - Use vectorhawk_search to browse the registry\n\
-             - Use vectorhawk_install with a local path to install a bundle\n\
-             - Use vectorhawk_import to import an external skill or MCP server"
+             - Use scenery_search to browse the registry\n\
+             - Use scenery_install with a local path to install a bundle\n\
+             - Use scenery_import to import an external skill or MCP server"
                 .to_string(),
         )
     } else {
@@ -1097,7 +1096,7 @@ fn try_refresh_auth(
 fn auth_elicitation_prompt(registry_url: &str) -> ToolCallResult {
     ToolCallResult::error_result(format!(
         "Authentication required.\n\n\
-        Use the `vectorhawk_login` tool to authenticate.\n\
+        Use the `scenery_login` tool to authenticate.\n\
         Registry: {registry_url}\n\n\
         After logging in, retry this command."
     ))
@@ -1117,7 +1116,7 @@ fn auth_elicitation_prompt(registry_url: &str) -> ToolCallResult {
 /// `backend_registry`, when present, has its `notify_tokens_saved` hook fired
 /// once the background task above finishes saving tokens — this is how the
 /// daemon registers the device and starts sync for the MCP-tool login path,
-/// mirroring what `auth/reload` already does for `vectorhawk auth login`.
+/// mirroring what `auth/reload` already does for `scenery auth login`.
 /// `None` in the shim, which never sets a hook (see `BackendRegistry`).
 pub fn handle_login_with_oauth(
     arguments: &serde_json::Value,
@@ -1146,7 +1145,7 @@ pub fn handle_login_with_oauth(
         .flatten()
         .is_some()
     {
-        return ToolCallResult::success("Already logged in to VectorHawk. No action needed.");
+        return ToolCallResult::success("Already logged in to Scenery. No action needed.");
     }
 
     // `AuthClient::new` eagerly builds a `reqwest::blocking::Client`.
@@ -1157,7 +1156,7 @@ pub fn handle_login_with_oauth(
     // closure — the dedicated blocking-pool thread that runs on does not have
     // Tokio's "blocking forbidden" flag set, so constructing (and later
     // dropping) the client here is safe. Both production call sites already
-    // do this (`RealBackend::call_tool`'s `vectorhawk_login` intercept and the
+    // do this (`RealBackend::call_tool`'s `scenery_login` intercept and the
     // `handle_tool_call` dispatch it shares with every other management tool,
     // both in `backend.rs`); tests must do the same (see `tools::tests`).
     let auth_client = AuthClient::new(&registry_url);
@@ -1186,7 +1185,7 @@ pub fn handle_login_with_oauth(
                             Some(c) => c,
                             None => {
                                 tracing::warn!(
-                                    "vectorhawk_login: OAuth callback timed out or daemon shut down"
+                                    "scenery_login: OAuth callback timed out or daemon shut down"
                                 );
                                 return;
                             }
@@ -1207,7 +1206,7 @@ pub fn handle_login_with_oauth(
 
                         match result {
                             Ok(Ok(())) => {
-                                tracing::info!("vectorhawk_login: PKCE complete, tokens saved");
+                                tracing::info!("scenery_login: PKCE complete, tokens saved");
                                 // R1: register the device / start sync now that
                                 // fresh tokens exist, same as the CLI's
                                 // `auth/reload` path. `notify_tokens_saved` is a
@@ -1219,11 +1218,11 @@ pub fn handle_login_with_oauth(
                             }
                             Ok(Err(e)) => tracing::warn!(
                                 error = %e,
-                                "vectorhawk_login: token exchange/save failed"
+                                "scenery_login: token exchange/save failed"
                             ),
                             Err(e) => tracing::warn!(
                                 error = %e,
-                                "vectorhawk_login: background task panicked"
+                                "scenery_login: background task panicked"
                             ),
                         }
                     });
@@ -1250,7 +1249,7 @@ pub fn handle_login_with_oauth(
                              **Option B — Personal Access Token (easier for SSH):**\n\
                              1. Open https://app.scenery.dev/portal/settings\n\
                              2. Create a token (starts with `vh_pat_`)\n\
-                             3. Run: `vectorhawk auth token` and paste the token at the prompt"
+                             3. Run: `scenery auth token` and paste the token at the prompt"
                         )
                     };
                     #[cfg(not(target_os = "linux"))]
@@ -1258,8 +1257,8 @@ pub fn handle_login_with_oauth(
 
                     ToolCallResult::success(format!(
                         "Open this URL in your browser to log in:\n{}{ssh_note}\n\n\
-                         After logging in, VectorHawk will automatically complete \
-                         authentication. The `vectorhawk_login` tool will no longer \
+                         After logging in, Scenery will automatically complete \
+                         authentication. The `scenery_login` tool will no longer \
                          appear once you are logged in.",
                         initiation.auth_url
                     ))
@@ -1274,7 +1273,7 @@ pub fn handle_login_with_oauth(
                     "Open this URL in your browser to log in:\n{}\n\n\
                      Note: automatic completion is unavailable (daemon not running or \
                      OAuth listener failed to bind). After logging in, restart the \
-                     VectorHawk daemon.",
+                     Scenery daemon.",
                     initiation.auth_url
                 )),
                 Err(e) => ToolCallResult::error_result(format!("Failed to initiate login: {e}")),
@@ -1307,7 +1306,7 @@ fn handle_logout(state: &AppState, server_registry_url: &Option<String>) -> Tool
 
 // ── MCP import handler ────────────────────────────────────────────────────────
 
-/// Import action variant parsed from the `action` field of a `vectorhawk_import` call.
+/// Import action variant parsed from the `action` field of a `scenery_import` call.
 #[derive(Debug, PartialEq, Eq)]
 enum ImportAction {
     Preview,
@@ -1497,7 +1496,7 @@ fn format_duplicate_conflict(err_str: &str) -> ToolCallResult {
     ToolCallResult::error_result(text)
 }
 
-// ── vectorhawk_scan handler ───────────────────────────────────────────────────
+// ── scenery_scan handler ───────────────────────────────────────────────────
 
 fn handle_scan(
     arguments: &serde_json::Value,
@@ -1665,7 +1664,7 @@ fn format_duplicate_match(dup: &serde_json::Value) -> String {
         text.push_str(&format!("\n    {msg}"));
     }
     text.push_str(
-        "\n    Resolve with vectorhawk_import(confirm=true, duplicate_resolution=\
+        "\n    Resolve with scenery_import(confirm=true, duplicate_resolution=\
          \"use_existing|new_version|fork|force\").",
     );
     text
@@ -1760,7 +1759,7 @@ fn handle_mcp_catalog(state: &AppState, registry_url: &Option<String>) -> ToolCa
             if formatted.is_empty() {
                 ToolCallResult::success(format!(
                     "No approved MCP servers in catalog (approval mode: {}).\n\
-                     Ask your IT admin to add servers via the VectorHawk admin portal.{}",
+                     Ask your IT admin to add servers via the Scenery admin portal.{}",
                     resp.approval_mode, GOVERNANCE_FOOTER
                 ))
             } else {
@@ -1846,13 +1845,13 @@ fn handle_mcp_request(
     match req_status {
         "approved" => ToolCallResult::success(format!(
             "Request for '{server_name}' was approved! \
-             Use `vectorhawk_mcp_install` with server_name '{server_name}' to activate it now."
+             Use `scenery_mcp_install` with server_name '{server_name}' to activate it now."
         )),
         "pending" => ToolCallResult::success(format!(
             "Request for '{server_name}' has been submitted and is pending IT review.\n\n\
-             Your admin will review it in the VectorHawk portal. \
-             Run `vectorhawk_mcp_status` to check on it later, then use \
-             `vectorhawk_mcp_install` to activate it once approved."
+             Your admin will review it in the Scenery portal. \
+             Run `scenery_mcp_status` to check on it later, then use \
+             `scenery_mcp_install` to activate it once approved."
         )),
         _ => ToolCallResult::success(format!("Request submitted with status: {req_status}")),
     }
@@ -1973,14 +1972,14 @@ pub fn handle_mcp_install(
                     tools.join(", ")
                 };
                 ToolCallResult::success(format!(
-                    "MCP server '{server_name}' is approved and will be activated by VectorHawk governance.\n\nTools: {tool_list}"
+                    "MCP server '{server_name}' is approved and will be activated by Scenery governance.\n\nTools: {tool_list}"
                 ))
             } else {
                 ToolCallResult::error_result(format!(
                     "Server '{server_name}' is not in the approved server list. \
                      It may be pending approval, blocked, or not yet requested.\n\n\
-                     Use vectorhawk_mcp_request to request access, then retry \
-                     vectorhawk_mcp_install after approval."
+                     Use scenery_mcp_request to request access, then retry \
+                     scenery_mcp_install after approval."
                 ))
             }
         }
@@ -2022,7 +2021,7 @@ pub fn handle_mcp_uninstall(
         ))
     } else {
         ToolCallResult::error_result(format!(
-            "No active MCP server found with name '{server_name}'. Use vectorhawk_mcp_status to see your servers."
+            "No active MCP server found with name '{server_name}'. Use scenery_mcp_status to see your servers."
         ))
     }
 }
@@ -2199,7 +2198,7 @@ fn handle_skill_run(
                 let reason = reason_raw.trim();
                 return ToolCallResult::error_result(format!(
                     "\u{26d4} Skill '{skill_id}' is blocked: {reason}\n\n\
-                     If this skill was recently unpublished, run `vectorhawk_list` to review your skills.\n\
+                     If this skill was recently unpublished, run `scenery_list` to review your skills.\n\
                      If you believe this is an error, contact your administrator."
                 ));
             }
@@ -2287,7 +2286,7 @@ fn maybe_build_update_prompt(skill_id: &str, cache: &UpdateCheckCache) -> Option
     Some(ToolCallResult::error_result(format!(
         "Update available for '{skill_id}' (v{latest} in registry).\n\n\
          Would you like to update before running? Options:\n\
-         1. Call vectorhawk_install(skill_id=\"{skill_id}\") to install v{latest}, then retry.\n\
+         1. Call scenery_install(skill_id=\"{skill_id}\") to install v{latest}, then retry.\n\
          2. Call this skill again with skip_update_check=true to run the current version."
     )))
 }
@@ -2376,8 +2375,8 @@ fn handle_plugin_import(arguments: &serde_json::Value) -> ToolCallResult {
                 "format": format_label,
                 "output_path": p.as_str(),
                 "next_steps": format!(
-                    "Plugin converted to VectorHawk format at '{p}'.\n\
-                     Next: run 'vectorhawk plugin validate {p}' to validate the bundle."
+                    "Plugin converted to Scenery format at '{p}'.\n\
+                     Next: run 'scenery plugin validate {p}' to validate the bundle."
                 ),
             });
             ToolCallResult::success(
@@ -2389,12 +2388,12 @@ fn handle_plugin_import(arguments: &serde_json::Value) -> ToolCallResult {
     }
 }
 
-// ── skillclub_author / skillclub_author_confirm handlers ─────────────────────
+// ── scenery_author / scenery_author_confirm handlers ─────────────────────
 
 /// Derive a skill directory name and display name from a raw skill ID or name.
 ///
 /// Converts spaces to hyphens and lowercases the result so the directory
-/// matches the convention used by `vectorhawk skill init`.
+/// matches the convention used by `scenery skill init`.
 fn normalize_skill_id(raw: &str) -> String {
     raw.to_lowercase()
         .split_whitespace()
@@ -2478,7 +2477,7 @@ fn scaffold_skill_md(params: SkillMdParams<'_>) -> Result<String> {
     fs::create_dir(&skill_dir)
         .with_context(|| format!("failed to create directory '{skill_dir}'"))?;
 
-    // Produce the triggers YAML block nested under metadata.vectorhawk.
+    // Produce the triggers YAML block nested under metadata.scenery.
     let triggers_yaml = if triggers.is_empty() {
         String::new()
     } else {
@@ -2490,7 +2489,7 @@ fn scaffold_skill_md(params: SkillMdParams<'_>) -> Result<String> {
         format!("    triggers:\n{items}\n")
     };
 
-    // Produce the model recommended list (6-space indent: inside metadata.vectorhawk.model).
+    // Produce the model recommended list (6-space indent: inside metadata.scenery.model).
     let recommended_yaml = recommended_models
         .iter()
         .map(|m| format!("      - {m}"))
@@ -2501,7 +2500,7 @@ fn scaffold_skill_md(params: SkillMdParams<'_>) -> Result<String> {
     let body_block = indent_block(system_prompt, 12);
     let skill_md = format!(
         "---\nname: {skill_id}\ndescription: \"TODO: describe what this skill does\"\nlicense: MIT\n\
-         metadata:\n  vectorhawk:\n    version: 0.1.0\n    publisher: {publisher_id}\n\
+         metadata:\n  scenery:\n    version: 0.1.0\n    publisher: {publisher_id}\n\
          {triggers_yaml}\
          \n    permissions:\n      network: {network}\n      filesystem: {filesystem}\n      clipboard: {clipboard}\n\
          \n    execution:\n      timeout_ms: {timeout_ms}\n      memory_mb: {memory_mb}\n      sandbox: {sandbox}\n\
@@ -2628,7 +2627,7 @@ fn handle_author(
             }) {
                 Ok(path) => ToolCallResult::success(format!(
                     "Skill '{skill_id}' created at {path}/SKILL.md\n\
-                     Next: vectorhawk skill validate {path}/"
+                     Next: scenery skill validate {path}/"
                 )),
                 Err(e) => ToolCallResult::error_result(format!("Failed to scaffold skill: {e}")),
             }
@@ -2680,7 +2679,7 @@ fn handle_author(
                          - Offline model: {model_primary} ({fallback_note})\n\
                          - Timeout: {}\n\
                          - Sandbox: {}{publisher_note}\n\
-                         Next: vectorhawk skill validate {path}/",
+                         Next: scenery skill validate {path}/",
                         rec.permissions.network,
                         rec.permissions.filesystem,
                         format_duration_ms(rec.execution.timeout_ms),
@@ -2749,7 +2748,7 @@ fn handle_author(
                     }
                 },
                 "confidence": confidence_str,
-                "message": "Recommendations ready. Review the summary above and call vectorhawk_author_confirm with your final values, or pass mode: accept_suggestions to apply these directly."
+                "message": "Recommendations ready. Review the summary above and call scenery_author_confirm with your final values, or pass mode: accept_suggestions to apply these directly."
             });
 
             match serde_json::to_string_pretty(&payload) {
@@ -2874,7 +2873,7 @@ fn handle_author_confirm(
     }) {
         Ok(path) => ToolCallResult::success(format!(
             "Skill '{normalized_id}' created at {path}/SKILL.md\n\
-             Next: vectorhawk skill validate {path}/"
+             Next: scenery skill validate {path}/"
         )),
         Err(e) => ToolCallResult::error_result(format!("Failed to scaffold skill: {e}")),
     }
@@ -2886,9 +2885,9 @@ fn handle_author_confirm(
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+    use scenery_core::installer::install_unpacked_skill;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
-    use scenery_core::installer::install_unpacked_skill;
 
     fn temp_root(label: &str) -> camino::Utf8PathBuf {
         let nanos = SystemTime::now()
@@ -2959,7 +2958,7 @@ mod tests {
         fs::create_dir_all(root.join("prompts")).unwrap();
         fs::write(
             root.join("SKILL.md"),
-            "---\nname: Test Skill\ndescription: A test skill for MCP testing\nmetadata:\n  vectorhawk:\n    version: 0.1.0\n    publisher: vectorhawk\n    permissions:\n      network: none\n      filesystem: none\n      clipboard: none\n    execution:\n      sandbox: strict\n      timeout_ms: 30000\n      memory_mb: 256\n    schemas:\n      inputs:\n        type: object\n        properties:\n          query:\n            type: string\n        required:\n          - query\n      outputs:\n        type: object\n    workflow_ref: workflow.yaml\n---\n\nDo the thing.\n",
+            "---\nname: Test Skill\ndescription: A test skill for MCP testing\nmetadata:\n  scenery:\n    version: 0.1.0\n    publisher: scenery\n    permissions:\n      network: none\n      filesystem: none\n      clipboard: none\n    execution:\n      sandbox: strict\n      timeout_ms: 30000\n      memory_mb: 256\n    schemas:\n      inputs:\n        type: object\n        properties:\n          query:\n            type: string\n        required:\n          - query\n      outputs:\n        type: object\n    workflow_ref: workflow.yaml\n---\n\nDo the thing.\n",
         )
         .unwrap();
         fs::write(
@@ -2993,7 +2992,7 @@ mod tests {
     /// applied to every test that needs them.
     #[ctor::ctor]
     fn disable_real_keychain_for_tests() {
-        std::env::set_var("VECTORHAWK_DISABLE_KEYCHAIN", "1");
+        std::env::set_var("SCENERY_DISABLE_KEYCHAIN", "1");
     }
 
     /// Regression guard for the safety net itself — see the identical test
@@ -3001,7 +3000,7 @@ mod tests {
     #[test]
     fn real_keychain_is_disabled_for_this_test_binary() {
         assert_eq!(
-            std::env::var("VECTORHAWK_DISABLE_KEYCHAIN").as_deref(),
+            std::env::var("SCENERY_DISABLE_KEYCHAIN").as_deref(),
             Ok("1"),
             "disable_real_keychain_for_tests' #[ctor] must run before any test in this binary"
         );
@@ -3025,11 +3024,11 @@ mod tests {
         let tools = build_tool_list_with_builtins(&state, &Some(url));
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
 
-        assert!(names.contains(&"vectorhawk_list"));
-        assert!(names.contains(&"vectorhawk_search"));
-        assert!(names.contains(&"vectorhawk_install"));
-        assert!(names.contains(&"vectorhawk_info"));
-        assert!(names.contains(&"vectorhawk_validate"));
+        assert!(names.contains(&"scenery_list"));
+        assert!(names.contains(&"scenery_search"));
+        assert!(names.contains(&"scenery_install"));
+        assert!(names.contains(&"scenery_info"));
+        assert!(names.contains(&"scenery_validate"));
 
         let _ = fs::remove_dir_all(&state_root);
     }
@@ -3042,11 +3041,11 @@ mod tests {
         let tools = build_tool_list_with_builtins(&state, &None);
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
 
-        assert!(names.contains(&"vectorhawk_list"));
-        assert!(names.contains(&"vectorhawk_validate"));
-        assert!(names.contains(&"vectorhawk_install"));
-        assert!(!names.contains(&"vectorhawk_search"));
-        assert!(!names.contains(&"vectorhawk_logout"));
+        assert!(names.contains(&"scenery_list"));
+        assert!(names.contains(&"scenery_validate"));
+        assert!(names.contains(&"scenery_install"));
+        assert!(!names.contains(&"scenery_search"));
+        assert!(!names.contains(&"scenery_logout"));
 
         let _ = fs::remove_dir_all(&state_root);
     }
@@ -3062,15 +3061,15 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
 
         assert!(
-            names.contains(&"vectorhawk_search"),
+            names.contains(&"scenery_search"),
             "search should appear without login"
         );
         assert!(
-            names.contains(&"vectorhawk_login"),
+            names.contains(&"scenery_login"),
             "login should appear when not logged in"
         );
         assert!(
-            !names.contains(&"vectorhawk_logout"),
+            !names.contains(&"scenery_logout"),
             "logout should not appear when not logged in"
         );
 
@@ -3079,8 +3078,8 @@ mod tests {
 
     #[test]
     fn login_exposed_without_builtins_when_logged_out() {
-        // Regression: vectorhawk_login must surface even when builtin management
-        // tools are gated off (VECTORHAWK_EXPOSE_BUILTIN_TOOLS unset), otherwise
+        // Regression: scenery_login must surface even when builtin management
+        // tools are gated off (SCENERY_EXPOSE_BUILTIN_TOOLS unset), otherwise
         // a fresh unauthenticated runner exposes zero tools and cannot log in.
         let state_root = temp_root("tool-list-login-no-builtins");
         let state = AppState::bootstrap_in(state_root.clone()).unwrap();
@@ -3090,11 +3089,11 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
 
         assert!(
-            names.contains(&"vectorhawk_login"),
+            names.contains(&"scenery_login"),
             "login must appear when logged out even with builtins off: {names:?}"
         );
         assert!(
-            !names.contains(&"vectorhawk_list"),
+            !names.contains(&"scenery_list"),
             "builtin management tools must remain gated off: {names:?}"
         );
 
@@ -3161,12 +3160,12 @@ mod tests {
         fs::write(dir.join("SKILL.md"), "the user's own skill").unwrap();
         assert!(lists_skill(native_dir));
 
-        // VectorHawk's copy is there: Claude Code has it natively.
+        // Scenery's copy is there: Claude Code has it natively.
         fs::write(dir.join(crate::ownership::MANAGED_MARKER_FILENAME), "{}").unwrap();
         assert!(!lists_skill(native_dir));
         assert!(build_tool_list_inner(&state, &url, false, native_dir)
             .iter()
-            .any(|t| t.name == "vectorhawk_login"));
+            .any(|t| t.name == "scenery_login"));
 
         // Clients without native skills always get the tool.
         assert!(lists_skill(None));
@@ -3328,7 +3327,7 @@ mod tests {
             .mock("GET", "/portal/skills/test-skill")
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(r#"{"skill_id":"test-skill","name":"Test Skill","latest_version":"0.1.0","publisher_name":"vectorhawk","description":"A test skill."}"#)
+            .with_body(r#"{"skill_id":"test-skill","name":"Test Skill","latest_version":"0.1.0","publisher_name":"scenery","description":"A test skill."}"#)
             .create();
 
         let _meta_mock = server
@@ -3450,7 +3449,7 @@ mod tests {
         let _ = fs::remove_dir_all(&state_root);
     }
 
-    // ── R1: device registration on the vectorhawk_login MCP-tool path ───────
+    // ── R1: device registration on the scenery_login MCP-tool path ───────
     //
     // These exercise `handle_login_with_oauth`'s `backend_registry` hook: a
     // successful PKCE completion must fire `TokensSavedHook::on_tokens_saved`
@@ -3532,7 +3531,7 @@ mod tests {
 
         // Production only ever calls `handle_login_with_oauth` from inside a
         // `tokio::task::spawn_blocking` closure (see `RealBackend::call_tool`'s
-        // `vectorhawk_login` intercept and the `handle_tool_call` dispatch it
+        // `scenery_login` intercept and the `handle_tool_call` dispatch it
         // shares with every other management tool, both in backend.rs) —
         // required because the function constructs a blocking
         // `reqwest::blocking::Client`. Mirror that here rather than calling it
@@ -4171,7 +4170,7 @@ mod tests {
         let policy = scenery_core::policy::MockPolicyClient::new();
 
         let result = handle_tool_call(
-            "vectorhawk_validate",
+            "scenery_validate",
             &serde_json::json!({}),
             &state,
             &policy,
@@ -4181,7 +4180,7 @@ mod tests {
             None,
             None,
         );
-        // vectorhawk_validate with no args is expected to error, but the
+        // scenery_validate with no args is expected to error, but the
         // audit event should still be buffered without a fabricated
         // model_source.
         let _ = result;
@@ -4255,12 +4254,12 @@ mod tests {
         let tools = build_tool_list_with_builtins(&state, &None);
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert!(
-            names.contains(&"vectorhawk_plugin_export"),
-            "tool list should include vectorhawk_plugin_export"
+            names.contains(&"scenery_plugin_export"),
+            "tool list should include scenery_plugin_export"
         );
         assert!(
-            names.contains(&"vectorhawk_plugin_import"),
-            "tool list should include vectorhawk_plugin_import"
+            names.contains(&"scenery_plugin_import"),
+            "tool list should include scenery_plugin_import"
         );
         let _ = fs::remove_dir_all(&state_root);
     }
@@ -4376,7 +4375,7 @@ mod tests {
 
         let policy = scenery_core::policy::MockPolicyClient::new();
         let result = handle_tool_call(
-            "vectorhawk_list",
+            "scenery_list",
             &serde_json::json!({"_rating_reply": "thumbs up"}),
             &state,
             &policy,

@@ -48,7 +48,7 @@ fn parses_snapshot_event() {
 fn parses_snapshot_event_with_empty_mcp_installations_as_some_empty() {
     // A present-but-empty "mcp_installations": [] (what the current backend
     // sends for a device with zero MCP installs — see
-    // vectorhawk-backend/backend/app/routers/portal_sync.py _get_mcp_snapshot,
+    // scenery-backend/backend/app/routers/portal_sync.py _get_mcp_snapshot,
     // which always includes the key) must parse to `Some(vec![])`, not
     // `None`. The two have different meanings to the reconciler: `None`
     // means "old backend, no data, leave existing installs alone"; `Some(
@@ -77,7 +77,7 @@ fn parses_snapshot_event_with_deleted_server_tombstone() {
     // hard-deleted (admin delete): mcp_server_name/package_source are
     // empty strings, auth_type is "none", gateway fields are null, and
     // state is "deactivated" — see _get_mcp_snapshot's tombstone branch in
-    // vectorhawk-backend/backend/app/routers/portal_sync.py. The runner must
+    // scenery-backend/backend/app/routers/portal_sync.py. The runner must
     // parse this without erroring; the reconciler resolves the real
     // aggregator key from its OWN local row (not from this tombstone's
     // empty name) before tearing the server down.
@@ -129,7 +129,7 @@ fn parses_snapshot_event_with_plugin_installations() {
                 "plugin_name": "Superpowers",
                 "description": "Core skills library",
                 "version": "5.0.7",
-                "author": "VectorHawk",
+                "author": "Scenery",
                 "skills": [{"skill_id": "tdd", "version": "1.0.0"}],
                 "state": "desired"
             }
@@ -146,7 +146,7 @@ fn parses_snapshot_event_with_plugin_installations() {
             assert_eq!(p.plugin_slug, "superpowers");
             assert_eq!(p.plugin_name, "Superpowers");
             assert_eq!(p.version, "5.0.7");
-            assert_eq!(p.author, "VectorHawk");
+            assert_eq!(p.author, "Scenery");
             assert_eq!(p.state, "desired");
             assert_eq!(p.skills.len(), 1);
             assert_eq!(p.skills[0].skill_id, "tdd");

@@ -1,10 +1,10 @@
 use crate::scan::{ScanClient, ScanVerdict};
 use anyhow::{Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
+use scenery_manifest::to_skill_id;
 use serde::Deserialize;
 use std::fs;
 use tracing::warn;
-use scenery_manifest::to_skill_id;
 
 /// Files written when scaffolding a bundle from a SKILL.md.
 #[derive(Debug)]
@@ -377,7 +377,7 @@ fn build_skill_md(display_name: &str, fm: &SkillMdFrontmatter, body: &str) -> St
     let publisher = fm.publisher.as_deref().unwrap_or("local");
 
     format!(
-        "---\nname: {display_name}\ndescription: {description}\nmetadata:\n  vectorhawk:\n    version: 0.1.0\n    publisher: {publisher}\n    permissions:\n      network: none\n      filesystem: none\n      clipboard: none\n    execution:\n      sandbox: strict\n      timeout_ms: 120000\n      memory_mb: 512\n    workflow_ref: workflow.yaml\n---\n\n{body}\n"
+        "---\nname: {display_name}\ndescription: {description}\nmetadata:\n  scenery:\n    version: 0.1.0\n    publisher: {publisher}\n    permissions:\n      network: none\n      filesystem: none\n      clipboard: none\n    execution:\n      sandbox: strict\n      timeout_ms: 120000\n      memory_mb: 512\n    workflow_ref: workflow.yaml\n---\n\n{body}\n"
     )
 }
 

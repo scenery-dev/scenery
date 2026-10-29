@@ -3,9 +3,9 @@
 //! # Overview
 //!
 //! Validates M2 acceptance criteria 1, 3, and 4 on Linux:
-//! - AC2: `vectorhawk daemon install` writes the systemd user unit and daemon
+//! - AC2: `scenery daemon install` writes the systemd user unit and daemon
 //!   is reachable on the socket.
-//! - AC3: `vectorhawk daemon uninstall` stops the agent and removes the unit.
+//! - AC3: `scenery daemon uninstall` stops the agent and removes the unit.
 //! - AC4: Running `daemon install` twice is idempotent (exits 0 both times).
 //!
 //! # Running
@@ -48,19 +48,16 @@ fn release_bin(name: &str) -> PathBuf {
 
 fn unit_path() -> PathBuf {
     let config = dirs::config_dir().expect("XDG config dir must be resolvable on Linux");
-    config
-        .join("systemd")
-        .join("user")
-        .join("vectorhawk-agent.service")
+    config.join("systemd").join("user").join("scenery.service")
 }
 
 fn socket_path() -> PathBuf {
     // Mirrors install::mod.rs daemon_socket_path() for Linux.
     if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
-        return PathBuf::from(runtime).join("vectorhawk").join("agent.sock");
+        return PathBuf::from(runtime).join("scenery").join("agent.sock");
     }
     let data_dir = dirs::data_dir().expect("dirs::data_dir() must succeed");
-    data_dir.join("VectorHawk").join("agent.sock")
+    data_dir.join("Scenery").join("agent.sock")
 }
 
 /// Returns true if `systemctl --user show-environment` exits 0.
@@ -85,12 +82,12 @@ fn wait_for_path(path: &Path, expect_present: bool, timeout: Duration) -> bool {
     false
 }
 
-/// Run `vectorhawk <args>` and return the exit status.
+/// Run `scenery <args>` and return the exit status.
 fn run_cli(cli_bin: &Path, args: &[&str]) -> std::process::ExitStatus {
     Command::new(cli_bin)
         .args(args)
         .status()
-        .unwrap_or_else(|e| panic!("failed to spawn vectorhawk {args:?}: {e}"))
+        .unwrap_or_else(|e| panic!("failed to spawn scenery {args:?}: {e}"))
 }
 
 // ── Main test ─────────────────────────────────────────────────────────────────
@@ -107,10 +104,10 @@ fn run_cli(cli_bin: &Path, args: &[&str]) -> std::process::ExitStatus {
 #[ignore = "requires pre-built release binaries + Linux with systemctl --user — \
             run cargo build --workspace --release first"]
 fn m2_install_uninstall_linux_end_to_end() {
-    let cli_bin = release_bin("vectorhawk");
+    let cli_bin = release_bin("scenery");
     assert!(
         cli_bin.exists(),
-        "vectorhawk binary not found at {cli_bin:?} — run cargo build --workspace --release"
+        "scenery binary not found at {cli_bin:?} — run cargo build --workspace --release"
     );
 
     // ── Graceful skip if systemctl --user is unavailable ──────────────────────
@@ -134,7 +131,7 @@ fn m2_install_uninstall_linux_end_to_end() {
     let status = run_cli(&cli_bin, &["daemon", "install"]);
     assert!(
         status.success(),
-        "vectorhawk daemon install exited non-zero: {status}"
+        "scenery daemon install exited non-zero: {status}"
     );
 
     // ── Step 3: unit file exists ──────────────────────────────────────────────
@@ -158,7 +155,7 @@ fn m2_install_uninstall_linux_end_to_end() {
     let status2 = run_cli(&cli_bin, &["daemon", "install"]);
     assert!(
         status2.success(),
-        "vectorhawk daemon install (second run) exited non-zero: {status2}"
+        "scenery daemon install (second run) exited non-zero: {status2}"
     );
 
     // Socket must still be reachable after the idempotent install.
@@ -169,7 +166,7 @@ fn m2_install_uninstall_linux_end_to_end() {
     let status3 = run_cli(&cli_bin, &["daemon", "uninstall"]);
     assert!(
         status3.success(),
-        "vectorhawk daemon uninstall exited non-zero: {status3}"
+        "scenery daemon uninstall exited non-zero: {status3}"
     );
 
     // ── Step 8: unit file is gone ─────────────────────────────────────────────

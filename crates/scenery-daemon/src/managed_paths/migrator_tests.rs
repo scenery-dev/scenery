@@ -2,8 +2,8 @@
 
 use super::*;
 use crate::managed_paths::ENV_MUTEX;
-use std::fs;
 use scenery_core::state::AppState;
+use std::fs;
 
 /// Bootstrap a minimal AppState (with the F1 managed_path_markers table) in a
 /// temp dir and return it alongside the TempDir guard so it is not dropped.
@@ -124,10 +124,10 @@ async fn migrate_item_idempotent_second_run_is_noop() {
     assert!(!result, "already-marked item should return false");
 }
 
-// ── Replace-with-managed: adoption marks the item as VectorHawk-managed ─────────
+// ── Replace-with-managed: adoption marks the item as Scenery-managed ─────────
 
 /// B3: adopting a custom skill takes local ownership — it writes the
-/// `.vectorhawk-managed.json` marker in place (the "managed copy") and a DB
+/// `.scenery-managed.json` marker in place (the "managed copy") and a DB
 /// marker row, so the drift reconciler now governs it. Runs offline: with no
 /// auth token the backend POST is skipped, but ownership is still taken.
 #[tokio::test]
@@ -152,8 +152,8 @@ async fn migrate_item_marks_adopted_skill_as_managed() {
         "adopted skill must carry the managed marker"
     );
     assert!(
-        scenery_mcp::ownership::is_vectorhawk_managed(&item.source_path),
-        "adopted skill dir must classify as VectorHawk-managed"
+        scenery_mcp::ownership::is_scenery_managed(&item.source_path),
+        "adopted skill dir must classify as Scenery-managed"
     );
 
     // DB marker row present (authoritative idempotency key).
@@ -197,7 +197,7 @@ fn row_count(state: &AppState) -> i64 {
     .unwrap()
 }
 
-/// F13: a `.vectorhawk-managed.json` file is attacker-controllable, so a skill
+/// F13: a `.scenery-managed.json` file is attacker-controllable, so a skill
 /// that ships one but has no `managed_path_markers` row is NOT ours and must
 /// be adopted (and so reported) like any other user skill.
 #[tokio::test]
@@ -264,7 +264,7 @@ async fn migrate_item_adopts_plugin_with_forged_marker_and_no_row() {
 /// The production self-adoption shape: the DB row is keyed on the canonical
 /// `~/.agents/skills/<slug>` dir and the scanner hands back the
 /// `~/.claude/skills/<slug>` symlink. Matching on the canonicalised path keeps
-/// VectorHawk from re-adopting its own skill — without trusting the marker.
+/// Scenery from re-adopting its own skill — without trusting the marker.
 #[tokio::test]
 async fn migrate_item_skips_symlink_to_db_tracked_canonical_skill() {
     let tmp = tempfile::tempdir().unwrap();
@@ -439,7 +439,7 @@ async fn post_migrate_strips_non_allowlisted_payload_fields() {
 // ── Restore journal (ONE ledger) ────────────────────────────────────────────
 
 /// F1 takeovers must also land in the unified restore journal, source=native,
-/// pointing at the SAME backup the legacy `.vectorhawk-backup/` manifest uses
+/// pointing at the SAME backup the legacy `.scenery-backup/` manifest uses
 /// — not a second copy.
 #[tokio::test]
 async fn migrate_item_appends_native_restore_journal_entry_for_skill() {
@@ -484,7 +484,7 @@ async fn migrate_item_appends_native_restore_journal_entry_for_skill() {
             .join("journal-skill")
             .to_string_lossy()
             .to_string(),
-        "restore journal must point at the SAME .vectorhawk-backup/ location, not a new copy"
+        "restore journal must point at the SAME .scenery-backup/ location, not a new copy"
     );
     assert!(
         std::path::Path::new(backup_path).join("SKILL.md").exists(),
@@ -587,7 +587,7 @@ fn migrates_managed_skill_from_claude_to_agents_and_relinks() {
     let old = fake_home.path().join(".claude/skills/demo");
     std::fs::create_dir_all(&old).unwrap();
     std::fs::write(old.join("SKILL.md"), b"---\nname: demo\n---\n").unwrap();
-    std::fs::write(old.join(".vectorhawk-managed.json"), br#"{"marker_version":1,"installation_id":null,"source_sha256":"abc","migrated_at":"2026-01-01T00:00:00Z"}"#).unwrap();
+    std::fs::write(old.join(".scenery-managed.json"), br#"{"marker_version":1,"installation_id":null,"source_sha256":"abc","migrated_at":"2026-01-01T00:00:00Z"}"#).unwrap();
 
     // An unmanaged, user-authored skill that must be left completely alone.
     let user_skill = fake_home.path().join(".claude/skills/mine");
@@ -676,7 +676,7 @@ fn markers_conn() -> rusqlite::Connection {
     conn
 }
 
-/// Create a VectorHawk-managed skill directory at `dir`.
+/// Create a Scenery-managed skill directory at `dir`.
 fn write_managed_skill(dir: &std::path::Path, slug: &str, body: &str) {
     fs::create_dir_all(dir).unwrap();
     fs::write(
@@ -685,7 +685,7 @@ fn write_managed_skill(dir: &std::path::Path, slug: &str, body: &str) {
     )
     .unwrap();
     fs::write(
-        dir.join(".vectorhawk-managed.json"),
+        dir.join(".scenery-managed.json"),
         br#"{"marker_version":1,"installation_id":null,"source_sha256":"abc","migrated_at":"2026-01-01T00:00:00Z"}"#,
     )
     .unwrap();
@@ -779,7 +779,7 @@ fn migration_is_idempotent_with_a_real_managed_skill() {
         "second run must leave disk state byte-identical (no new backup dir)"
     );
     assert!(
-        !fake_home.path().join(".claude/.vectorhawk-backup").exists(),
+        !fake_home.path().join(".claude/.scenery-backup").exists(),
         "an already-migrated skill must never be backed up again"
     );
     assert_eq!(
@@ -853,7 +853,7 @@ fn migrates_several_skills_and_leaves_user_skills_alone() {
     assert!(!fake_home.path().join(".agents/skills/theirs").exists());
     assert!(marker_paths(&conn, "mine").is_empty());
     assert!(marker_paths(&conn, "theirs").is_empty());
-    assert!(!fake_home.path().join(".claude/.vectorhawk-backup").exists());
+    assert!(!fake_home.path().join(".claude/.scenery-backup").exists());
 }
 
 /// FINDING 1 (Critical) regression: a crash between `fs::rename` and the
@@ -966,7 +966,7 @@ fn repair_does_not_repoint_onto_foreign_canonical_content() {
     let fake_home = tempfile::tempdir().unwrap();
     let _home = HomeGuard::set(fake_home.path());
 
-    // An unrelated directory — no `.vectorhawk-managed.json` — happens to
+    // An unrelated directory — no `.scenery-managed.json` — happens to
     // share the slug under the canonical root.
     let canonical = fake_home.path().join(".agents/skills/notes");
     fs::create_dir_all(&canonical).unwrap();
@@ -994,7 +994,7 @@ fn repair_does_not_repoint_onto_foreign_canonical_content() {
 }
 
 /// The same repair, when the canonical directory *is* ours, must still happen —
-/// this pins that the `is_vectorhawk_managed` guard did not disable the repair.
+/// this pins that the `is_scenery_managed` guard did not disable the repair.
 #[test]
 fn repair_still_repoints_onto_our_own_canonical_content() {
     let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
@@ -1090,7 +1090,7 @@ fn identical_copy_converges_and_stops_creating_backups() {
     let conn = markers_conn();
     insert_marker(&conn, &old, "demo", "abc");
 
-    let backup_root = fake_home.path().join(".claude/.vectorhawk-backup");
+    let backup_root = fake_home.path().join(".claude/.scenery-backup");
 
     // Three runs, and no run creates a backup at all.
     for run in 1..=3 {
@@ -1142,7 +1142,7 @@ fn stale_legacy_content_is_backed_up_and_replaced() {
         vec![canonical.to_string_lossy().to_string()]
     );
     // The displaced content is recoverable under the links backup root.
-    let backups = snapshot(&fake_home.path().join(".claude/.vectorhawk-backup"));
+    let backups = snapshot(&fake_home.path().join(".claude/.scenery-backup"));
     assert!(
         backups.iter().any(|(_, v)| v.contains("OLD stale body")),
         "stale content must be preserved in a backup: {backups:?}"

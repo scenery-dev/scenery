@@ -1,4 +1,4 @@
-//! Scan client for the VectorHawk registry's `/runner/scan` endpoint.
+//! Scan client for the Scenery registry's `/runner/scan` endpoint.
 //!
 //! Provides a `ScanClient` trait with two implementations:
 //! - `HttpScanClient` — POSTs to the registry and returns the verdict.

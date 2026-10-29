@@ -83,7 +83,7 @@ fn scan_skills_files_in_root_skipped() {
     assert!(items.is_empty());
 }
 
-/// F13: the scanner no longer trusts the `.vectorhawk-managed.json` file —
+/// F13: the scanner no longer trusts the `.scenery-managed.json` file —
 /// anyone can drop one into a skill. It hands every well-formed dir to the
 /// migrator, which decides ownership from `managed_path_markers` (exact
 /// canonical path + hash). So both a forged-marker dir and the production
@@ -300,24 +300,24 @@ fn marketplace_walk_returns_plugin_with_forged_marker() {
     assert_eq!(items[0].slug, "acme-tool");
 }
 
-/// VectorHawk's own governed plugins (listed in the bundled-skills record)
+/// Scenery's own governed plugins (listed in the bundled-skills record)
 /// are not offered for adoption; anything else planted in our marketplace
 /// directory still is.
 #[test]
 fn marketplace_walk_skips_recorded_governed_plugins_only() {
     let tmp = tempfile::tempdir().unwrap();
     let plugins = tmp.path().join("plugins");
-    write_known_marketplaces(&plugins, &[("vectorhawk", "vectorhawk/vectorhawk")]);
+    write_known_marketplaces(&plugins, &[("scenery", "scenery/scenery")]);
     for slug in ["governed", "planted"] {
         write_marketplace_plugin(
             &plugins,
-            "vectorhawk",
+            "scenery",
             "plugins",
             slug,
             &format!(r#"{{"name":"{slug}"}}"#),
         );
     }
-    let record = plugins.join("marketplaces/vectorhawk/.vectorhawk");
+    let record = plugins.join("marketplaces/scenery/.scenery");
     fs::create_dir_all(&record).unwrap();
     fs::write(
         record.join("bundled-skills.json"),
@@ -347,11 +347,11 @@ fn scan_claude_json_no_mcp_servers_returns_empty() {
 }
 
 #[test]
-fn scan_claude_json_vectorhawk_entry_excluded() {
+fn scan_claude_json_scenery_entry_excluded() {
     let tmp = tempfile::tempdir().unwrap();
     let path = write_claude_json(
         tmp.path(),
-        r#"{"mcpServers":{"vectorhawk":{"command":"vectorhawk","args":["mcp","serve"]},"my-mcp":{"command":"npx","args":["my-mcp"]}}}"#,
+        r#"{"mcpServers":{"scenery":{"command":"scenery","args":["mcp","serve"]},"my-mcp":{"command":"npx","args":["my-mcp"]}}}"#,
     );
     let items = scan_claude_json(&path).unwrap();
     assert_eq!(items.len(), 1);

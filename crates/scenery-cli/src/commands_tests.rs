@@ -1,4 +1,4 @@
-//! Clap parsing smoke tests for the `vectorhawk` CLI.
+//! Clap parsing smoke tests for the `scenery` CLI.
 //!
 //! Kept separate from production code so `#[allow(clippy::unwrap_used)]` stays
 //! out of the production modules.
@@ -8,11 +8,11 @@ use super::Cli;
 use clap::Parser;
 
 fn parse(args: &[&str]) -> Cli {
-    Cli::try_parse_from(["vectorhawk"].iter().chain(args).copied()).unwrap()
+    Cli::try_parse_from(["scenery"].iter().chain(args).copied()).unwrap()
 }
 
 fn try_parse(args: &[&str]) -> Result<Cli, clap::Error> {
-    Cli::try_parse_from(["vectorhawk"].iter().chain(args).copied())
+    Cli::try_parse_from(["scenery"].iter().chain(args).copied())
 }
 
 // ── doctor ────────────────────────────────────────────────────────────────────
@@ -20,15 +20,15 @@ fn try_parse(args: &[&str]) -> Result<Cli, clap::Error> {
 #[test]
 fn doctor_parses() {
     use super::Command;
-    // Clear any inherited VECTORHAWK_REGISTRY_URL so this test doesn't
+    // Clear any inherited SCENERY_REGISTRY_URL so this test doesn't
     // depend on the user's shell — Doctor::registry_url is wired with
-    // `#[arg(env = "VECTORHAWK_REGISTRY_URL")]`, and the test's intent
+    // `#[arg(env = "SCENERY_REGISTRY_URL")]`, and the test's intent
     // is "no CLI flag → field is None", not "no env var".
     //
     // SAFETY: env mutation is process-global; this test is fast and
     // doesn't share state with other parallel tests because it doesn't
     // re-set the var.
-    unsafe { std::env::remove_var("VECTORHAWK_REGISTRY_URL") };
+    unsafe { std::env::remove_var("SCENERY_REGISTRY_URL") };
     match parse(&["doctor"]).command {
         Command::Doctor { registry_url } => {
             assert!(
@@ -65,7 +65,7 @@ fn skill_list_parses() {
 #[test]
 fn skill_install_local_path_parses() {
     use super::{Command, SkillCommand};
-    unsafe { std::env::remove_var("VECTORHAWK_REGISTRY_URL") };
+    unsafe { std::env::remove_var("SCENERY_REGISTRY_URL") };
     match parse(&["skill", "install", "./my-skill"]).command {
         Command::Skill(SkillCommand::Install {
             skill_ref,
@@ -87,7 +87,7 @@ fn skill_install_local_path_parses() {
 #[test]
 fn skill_install_registry_id_parses() {
     use super::{Command, SkillCommand};
-    unsafe { std::env::remove_var("VECTORHAWK_REGISTRY_URL") };
+    unsafe { std::env::remove_var("SCENERY_REGISTRY_URL") };
     match parse(&["skill", "install", "contract-compare"]).command {
         Command::Skill(SkillCommand::Install {
             skill_ref,
@@ -133,7 +133,7 @@ fn skill_install_registry_url_flag_parses() {
 #[test]
 fn skill_install_link_flag_parses() {
     use super::{Command, SkillCommand};
-    unsafe { std::env::remove_var("VECTORHAWK_REGISTRY_URL") };
+    unsafe { std::env::remove_var("SCENERY_REGISTRY_URL") };
     match parse(&["skill", "install", "./my-skill", "--link"]).command {
         Command::Skill(SkillCommand::Install {
             skill_ref: _, link, ..
@@ -147,7 +147,7 @@ fn skill_install_link_flag_parses() {
 #[test]
 fn skill_install_all_devices_flag_parses() {
     use super::{Command, SkillCommand};
-    unsafe { std::env::remove_var("VECTORHAWK_REGISTRY_URL") };
+    unsafe { std::env::remove_var("SCENERY_REGISTRY_URL") };
     // Default: device-scoped (all_devices = false).
     match parse(&["skill", "install", "contract-compare"]).command {
         Command::Skill(SkillCommand::Install { all_devices, .. }) => {
@@ -266,7 +266,7 @@ fn skill_validate_parses() {
 #[test]
 fn skill_update_with_id_parses() {
     use super::{Command, SkillCommand};
-    unsafe { std::env::remove_var("VECTORHAWK_REGISTRY_URL") };
+    unsafe { std::env::remove_var("SCENERY_REGISTRY_URL") };
     match parse(&["skill", "update", "my-skill"]).command {
         Command::Skill(SkillCommand::Update {
             id,
@@ -285,7 +285,7 @@ fn skill_update_with_id_parses() {
 #[test]
 fn skill_update_all_parses() {
     use super::{Command, SkillCommand};
-    unsafe { std::env::remove_var("VECTORHAWK_REGISTRY_URL") };
+    unsafe { std::env::remove_var("SCENERY_REGISTRY_URL") };
     match parse(&["skill", "update", "--all"]).command {
         Command::Skill(SkillCommand::Update { id, all, .. }) => {
             assert!(id.is_none());
@@ -723,7 +723,7 @@ fn is_daemon_foreground_true_only_for_daemon_run() {
 
 // ── M3: doctor OAuth listener line ───────────────────────────────────────────
 
-/// AC5 (M3): `vectorhawk doctor` must emit an `OAuth listener:` line.
+/// AC5 (M3): `scenery doctor` must emit an `OAuth listener:` line.
 ///
 /// When the daemon is not running the line reads "not running".  The test
 // ── plugin subcommands ────────────────────────────────────────────────────────
@@ -827,17 +827,17 @@ fn doctor_output_contains_oauth_listener_line() {
     let cli_bin = workspace_root
         .join("target")
         .join("release")
-        .join("vectorhawk");
+        .join("scenery");
 
     assert!(
         cli_bin.exists(),
-        "vectorhawk release binary not found at {cli_bin:?} — run cargo build --workspace --release"
+        "scenery release binary not found at {cli_bin:?} — run cargo build --workspace --release"
     );
 
     let output = Command::new(&cli_bin)
         .args(["doctor"])
         .output()
-        .expect("failed to spawn vectorhawk doctor");
+        .expect("failed to spawn scenery doctor");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
@@ -893,7 +893,7 @@ fn inject_publisher_field_inserts_after_description_when_missing() {
 //
 // The SKILL.md format migration (see crates/scenery-manifest/src/skill_md.rs)
 // only allows `name`, `description`, `license` at the top level; everything
-// VectorHawk-specific must nest under `metadata.vectorhawk.*`. These tests run
+// Scenery-specific must nest under `metadata.scenery.*`. These tests run
 // each generator's actual output through the real manifest loader / validator
 // so drift like this can't happen silently again.
 
@@ -911,7 +911,7 @@ async fn skill_init_produces_a_skill_md_that_the_manifest_loader_accepts() {
     let skill_dir = base.join("widget");
     SkillPackage::load_from_dir(&skill_dir).expect(
         "skill init's scaffolded SKILL.md must be loadable by the manifest parser \
-         (top-level vh_* keys are no longer valid — they must nest under metadata.vectorhawk)",
+         (top-level vh_* keys are no longer valid — they must nest under metadata.scenery)",
     );
 }
 
@@ -960,7 +960,7 @@ async fn skill_convert_produces_a_skill_md_that_passes_validation() {
         "Do the legacy thing.",
     )
     .unwrap();
-    // A workflow.yaml present means convert must emit metadata.vectorhawk.workflow_ref.
+    // A workflow.yaml present means convert must emit metadata.scenery.workflow_ref.
     std::fs::write(
         legacy_root.join("workflow.yaml"),
         "name: legacy_skill\nsteps:\n  - id: run\n    type: llm\n    prompt: prompts/system.txt\n    inputs: {}\n",

@@ -6,7 +6,7 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "vectorhawkd — VectorHawk runner daemon"
+description = "scenery — Scenery runner daemon"
 
 [lib]
 name = "scenery_daemon"

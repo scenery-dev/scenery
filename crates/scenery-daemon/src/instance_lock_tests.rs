@@ -23,7 +23,7 @@ fn lock_path_is_sibling_of_root_dir() {
 }
 
 /// Two `acquire()` calls against the same root dir must behave exactly like
-/// two separate `vectorhawkd` processes contending for the same `state.db`:
+/// two separate `scenery` processes contending for the same `state.db`:
 /// the second one fails fast while the first guard is alive, and succeeds
 /// once it is dropped. `flock` semantics are per *open file description*,
 /// not per-process, so two independent `OpenOptions::open` calls inside

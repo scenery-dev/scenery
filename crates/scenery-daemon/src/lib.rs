@@ -1,7 +1,7 @@
-//! `vectorhawkd` — VectorHawk runner daemon library.
+//! `scenery` — Scenery runner daemon library.
 //!
-//! Long-running per-user agent. The binary `vectorhawkd` is a thin wrapper
-//! around [`run_daemon`]; the user CLI's `vectorhawk daemon run --foreground`
+//! Long-running per-user agent. The binary `scenery` is a thin wrapper
+//! around [`run_daemon`]; the user CLI's `scenery daemon run --foreground`
 //! also calls [`run_daemon`] so support has a single code path to debug.
 //!
 //! # Process model
@@ -15,8 +15,8 @@
 //! # Socket
 //!
 //! Platform-appropriate path from `AppState::socket_path()`:
-//! - macOS: `~/Library/Application Support/VectorHawk/agent.sock`
-//! - Linux: `$XDG_RUNTIME_DIR/vectorhawk/agent.sock` (falls back to data dir)
+//! - macOS: `~/Library/Application Support/Scenery/agent.sock`
+//! - Linux: `$XDG_RUNTIME_DIR/scenery/agent.sock` (falls back to data dir)
 //!
 //! Permissions are set to 0600 (owner-only). A stale socket file from a
 //! previous daemon run is removed on startup.
@@ -82,13 +82,6 @@ pub mod sync;
 use sync::SyncEvent;
 
 use anyhow::{Context, Result};
-use std::{os::unix::fs::PermissionsExt, sync::Arc};
-use tokio::{
-    net::UnixListener,
-    signal::unix::{signal, SignalKind},
-    sync::{broadcast, mpsc, Notify},
-};
-use tracing::{debug, error, info, warn};
 use scenery_core::{
     audit::{AuditBuffer, SqliteAuditBuffer},
     auth::{load_all_tokens, load_tokens, record_refresh_failure, save_tokens, AuthClient},
@@ -105,6 +98,13 @@ use scenery_mcp::{
     backend::{Backend, RealBackend},
     tools::UpdateCheckCache,
 };
+use std::{os::unix::fs::PermissionsExt, sync::Arc};
+use tokio::{
+    net::UnixListener,
+    signal::unix::{signal, SignalKind},
+    sync::{broadcast, mpsc, Notify},
+};
+use tracing::{debug, error, info, warn};
 
 pub use oauth_state::OAuthState;
 pub use socket_dispatch::DaemonContext;
@@ -140,7 +140,7 @@ impl scenery_mcp::oauth::OAuthSubscriber for OAuthStateSubscriber {
 
 /// Bridges `SyncController` (daemon crate) to `TokensSavedHook` (MCP crate) so
 /// that `tools::handle_login_with_oauth`'s background task can register the
-/// device and start sync after `vectorhawk_login` saves fresh tokens, without
+/// device and start sync after `scenery_login` saves fresh tokens, without
 /// introducing a direct dependency on the daemon crate from the MCP crate —
 /// mirrors `OAuthStateSubscriber` above. `ensure_started` is idempotent, so
 /// this is safe to call even if sync is already running (e.g. the CLI's
@@ -152,10 +152,10 @@ impl scenery_mcp::aggregator::TokensSavedHook for SyncControllerHook {
         let sync_controller = Arc::clone(&self.0);
         Box::pin(async move {
             if sync_controller.ensure_started().await {
-                info!("vectorhawk_login: device registered / sync started");
+                info!("scenery_login: device registered / sync started");
             } else {
                 warn!(
-                    "vectorhawk_login: sync did not start after login (no usable \
+                    "scenery_login: sync did not start after login (no usable \
                      token or registration failed) — will retry on next auth event"
                 );
             }
@@ -166,23 +166,23 @@ impl scenery_mcp::aggregator::TokensSavedHook for SyncControllerHook {
 /// Configuration for the daemon entry point.
 ///
 /// The binary's `main.rs` populates these from environment variables; the CLI
-/// (`vectorhawk daemon run`) populates them from CLI flags.
+/// (`scenery daemon run`) populates them from CLI flags.
 #[derive(Debug, Default, Clone)]
 pub struct DaemonOpts {
     /// Override the registry URL. If `None`, falls back to env
-    /// (`VECTORHAWK_REGISTRY_URL`) or registry-driven defaults.
+    /// (`SCENERY_REGISTRY_URL`) or registry-driven defaults.
     pub registry_url: Option<String>,
 
     /// Override the socket path. If `None`, uses `AppState::socket_path()`.
     pub socket_path_override: Option<camino::Utf8PathBuf>,
 
     /// Override the Ollama base URL. If `None`, falls back to env
-    /// (`VECTORHAWK_OLLAMA_URL`) then managed config then the default
+    /// (`SCENERY_OLLAMA_URL`) then managed config then the default
     /// `http://127.0.0.1:11434`.
     pub ollama_url: Option<String>,
 
     /// Override the Ollama model tag. If `None`, falls back to env
-    /// (`VECTORHAWK_OLLAMA_MODEL`) then managed config then an empty string
+    /// (`SCENERY_OLLAMA_MODEL`) then managed config then an empty string
     /// (resolved at call time via `resolve_model`).
     pub ollama_model: Option<String>,
 }
@@ -214,7 +214,7 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
 
     // ── Automatic takeover of a verified stale daemon ────────────────────
     //
-    // If an older `vectorhawk daemon run` process (or one whose on-disk
+    // If an older `scenery daemon run` process (or one whose on-disk
     // binary has been replaced/deleted) is holding the instance lock
     // and/or the socket, verify it and take it over *before* the real
     // acquire calls below run — see `daemon_takeover`'s module docs for why
@@ -234,7 +234,7 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     // touched the registry.
     let _instance_lock = instance_lock::acquire(&state.root_dir).context(
         "failed to acquire the daemon's single-instance lock — another \
-         vectorhawkd process is already running against this state directory",
+         scenery process is already running against this state directory",
     )?;
 
     state.seed_block_third_party_from_sync_state();
@@ -242,22 +242,22 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     let registry_url = opts
         .registry_url
         .clone()
-        .or_else(|| std::env::var("VECTORHAWK_REGISTRY_URL").ok())
+        .or_else(|| std::env::var("SCENERY_REGISTRY_URL").ok())
         .unwrap_or_else(|| scenery_core::DEFAULT_REGISTRY_URL.to_string());
 
     info!(registry_url, "connecting to registry");
 
-    // Headless / CI auth: if VECTORHAWK_TOKEN is set and looks like a PAT,
+    // Headless / CI auth: if SCENERY_TOKEN is set and looks like a PAT,
     // save it to state.db so the daemon can make authenticated registry calls
     // without a browser-based OAuth flow (openclaw, CI pipelines, etc.).
-    if let Ok(pat) = std::env::var("VECTORHAWK_TOKEN") {
+    if let Ok(pat) = std::env::var("SCENERY_TOKEN") {
         if pat.starts_with("vh_pat_") {
             match scenery_core::auth::save_tokens(&state, &registry_url, &pat, &pat) {
-                Ok(()) => info!("VECTORHAWK_TOKEN: PAT saved for {registry_url}"),
-                Err(e) => warn!(error = %e, "VECTORHAWK_TOKEN: failed to save PAT to state DB"),
+                Ok(()) => info!("SCENERY_TOKEN: PAT saved for {registry_url}"),
+                Err(e) => warn!(error = %e, "SCENERY_TOKEN: failed to save PAT to state DB"),
             }
         } else {
-            warn!("VECTORHAWK_TOKEN is set but does not start with 'vh_pat_' — ignoring");
+            warn!("SCENERY_TOKEN is set but does not start with 'vh_pat_' — ignoring");
         }
     }
 
@@ -322,7 +322,7 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     let resolved_ollama_url = opts
         .ollama_url
         .clone()
-        .or_else(|| std::env::var("VECTORHAWK_OLLAMA_URL").ok())
+        .or_else(|| std::env::var("SCENERY_OLLAMA_URL").ok())
         .or_else(|| managed_config.as_ref().and_then(|c| c.ollama_url.clone()))
         .unwrap_or_else(|| "http://127.0.0.1:11434".to_string());
 
@@ -330,7 +330,7 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     let resolved_ollama_model = opts
         .ollama_model
         .clone()
-        .or_else(|| std::env::var("VECTORHAWK_OLLAMA_MODEL").ok())
+        .or_else(|| std::env::var("SCENERY_OLLAMA_MODEL").ok())
         .or_else(|| managed_config.as_ref().and_then(|c| c.ollama_model.clone()))
         .unwrap_or_default();
 
@@ -383,7 +383,7 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     // retired with the ~/.agents/skills pivot: the legacy installer symlink it
     // looked for could only ever exist at the old canonical path, and
     // `push_missing_active_skills` already covers the surviving job.
-    if std::env::var("VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER").is_err() {
+    if std::env::var("SCENERY_DISABLE_FILESYSTEM_RECONCILER").is_err() {
         let one_shot_pusher = managed_paths::ManagedPathsPusher::new(&state);
 
         // Self-heal: re-push any active installed skill whose canonical
@@ -398,30 +398,30 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
             Err(e) => warn!(error = %e, "heal: active-skill self-heal failed (non-fatal)"),
         }
 
-        // Self-heal: rewrite any `vectorhawk` MCP entry in a known AI-client
+        // Self-heal: rewrite any `scenery` MCP entry in a known AI-client
         // config (~/.claude.json, Cursor, Windsurf, ...) whose `command` is a
         // stale absolute path — either removed by a later `brew upgrade`, or
         // a pre-efb7fe1 versioned Homebrew Cellar path — back to the current
         // stable bin path. Covers machines upgraded headlessly over SSH,
         // where the brew post_install `mcp setup` hook can't run (no
         // D-Bus/desktop session) and a stale entry would otherwise never
-        // self-correct. Idempotent; only the `vectorhawk` entry is touched.
+        // self-correct. Idempotent; only the `scenery` entry is touched.
         let repaired_mcp_clients = scenery_mcp::setup::repair_stale_mcp_entries();
         if !repaired_mcp_clients.is_empty() {
             info!(
                 clients = ?repaired_mcp_clients,
-                "heal: rewrote stale vectorhawk MCP command to the stable bin path"
+                "heal: rewrote stale scenery MCP command to the stable bin path"
             );
         }
 
-        // De-bloat: remove VectorHawk's own management command-skills
-        // (/vectorhawk, /skill-*, /mcp-*) from ~/.claude/skills/. These wrap MCP
+        // De-bloat: remove Scenery's own management command-skills
+        // (/scenery, /skill-*, /mcp-*) from ~/.claude/skills/. These wrap MCP
         // tools and clutter the slash-command list; management lives in the
         // portal. User-installed skills above are untouched.
         match scenery_mcp::setup::uninstall_claude_skills() {
             Ok(removed) if !removed.is_empty() => info!(
                 removed = removed.len(),
-                "debloat: removed VectorHawk command-skills from ~/.claude/skills/"
+                "debloat: removed Scenery command-skills from ~/.claude/skills/"
             ),
             Ok(_) => {}
             Err(e) => warn!(error = %e, "debloat: command-skill removal failed (non-fatal)"),
@@ -437,7 +437,7 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     // converted to symlinks) rather than a transitional mix of the two
     // layouts. Idempotent and gated by the same env var; failure is
     // non-fatal — log and continue, never block daemon start.
-    if std::env::var("VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER").is_err() {
+    if std::env::var("SCENERY_DISABLE_FILESYSTEM_RECONCILER").is_err() {
         match rusqlite::Connection::open(&state.db_path) {
             Ok(conn) => match managed_paths::migrator::migrate_skills_to_agents_dir(&conn) {
                 Ok(0) => {}
@@ -455,15 +455,15 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     // startup.  Failure is non-fatal — the daemon continues regardless.
     //
     // One-shot adoption alert surfaced to the first connecting MCP client.
-    // Headless installs (e.g. openclaw) set VECTORHAWK_HEADLESS=1 to suppress the
+    // Headless installs (e.g. openclaw) set SCENERY_HEADLESS=1 to suppress the
     // in-client alert and rely on the portal banner instead.
     let pending_alert: Arc<std::sync::Mutex<Option<(String, std::time::Instant)>>> =
         Arc::new(std::sync::Mutex::new(None));
-    let headless = std::env::var("VECTORHAWK_HEADLESS").is_ok();
+    let headless = std::env::var("SCENERY_HEADLESS").is_ok();
 
-    // Set VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER=1 to skip entirely (useful
+    // Set SCENERY_DISABLE_FILESYSTEM_RECONCILER=1 to skip entirely (useful
     // in tests, CI, and operator opt-out scenarios).
-    if std::env::var("VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER").is_err() {
+    if std::env::var("SCENERY_DISABLE_FILESYSTEM_RECONCILER").is_err() {
         let state_arc_f1 = Arc::new(state.clone());
         let registry_url_f1 = registry_url.clone();
         match managed_paths::ManagedPathsReconciler::new(state_arc_f1, registry_url_f1) {
@@ -480,10 +480,10 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
                         report.skills_migrated + report.plugins_migrated + report.mcps_migrated;
                     if adopted > 0 && !headless {
                         let msg = format!(
-                            "VectorHawk adopted {adopted} tool(s) for governance \
+                            "Scenery adopted {adopted} tool(s) for governance \
                              ({} skill(s), {} plugin(s), {} MCP server(s)). They are private \
                              and pending IT review — review them in the portal, or run \
-                             `vectorhawk migrate rollback` to undo.",
+                             `scenery migrate rollback` to undo.",
                             report.skills_migrated, report.plugins_migrated, report.mcps_migrated
                         );
                         if let Ok(mut guard) = pending_alert.lock() {
@@ -501,7 +501,7 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
             }
         }
     } else {
-        info!("managed_paths: VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER set — skipping migration");
+        info!("managed_paths: SCENERY_DISABLE_FILESYSTEM_RECONCILER set — skipping migration");
     }
 
     // ── F3: Drift scanner ─────────────────────────────────────────────────────
@@ -509,8 +509,8 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     // Periodically (default 5 min) re-hashes every managed_path_markers row
     // and reports any divergence to the backend. Policy-aware: quarantines
     // when mode=quarantine, holds for approval when mode=approve_required.
-    // Killswitch: same VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER env var.
-    if std::env::var("VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER").is_err() {
+    // Killswitch: same SCENERY_DISABLE_FILESYSTEM_RECONCILER env var.
+    if std::env::var("SCENERY_DISABLE_FILESYSTEM_RECONCILER").is_err() {
         let state_arc_f3 = Arc::new(state.clone());
         // Persist registry_url so the SSE drift-resolution handler can find it.
         if let Err(e) = state_arc_f3.set_sync_state("registry_url", &registry_url) {
@@ -530,18 +530,18 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     // ── Tier-2: Local discoveries scanner ────────────────────────────────────
     //
     // Periodically scans extra skill roots (~/.agents/skills/ and
-    // VECTORHAWK_EXTRA_SKILL_ROOTS) for skills not yet tracked in
+    // SCENERY_EXTRA_SKILL_ROOTS) for skills not yet tracked in
     // managed_path_markers. Found items are POSTed to
     // /portal/managed-paths/discoveries so the portal can offer adoption.
     // Report-only: no local writes, no markers.
-    // Default interval: 300s. Override: VECTORHAWK_DISCOVERIES_INTERVAL_SECS.
-    // Killswitch: same VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER env var.
+    // Default interval: 300s. Override: SCENERY_DISCOVERIES_INTERVAL_SECS.
+    // Killswitch: same SCENERY_DISABLE_FILESYSTEM_RECONCILER env var.
     //
     // `discoveries_kick` is also shared with every DaemonContext so that a
     // successful MCP `initialize` handshake triggers an immediate scan instead
     // of waiting for the next periodic tick. Debounced to 10 s inside the loop.
     let discoveries_kick = Arc::new(Notify::new());
-    if std::env::var("VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER").is_err() {
+    if std::env::var("SCENERY_DISABLE_FILESYSTEM_RECONCILER").is_err() {
         let discoveries_state = Arc::new(state.clone());
         Arc::new(managed_paths::discoveries::DiscoveriesScanner::new(
             discoveries_state,
@@ -603,7 +603,7 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     let sync_state_arc = Arc::new(state.clone());
 
     // F2: Build the managed-paths pusher (gated by the same env var as F1).
-    let f2_pusher = if std::env::var("VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER").is_err() {
+    let f2_pusher = if std::env::var("SCENERY_DISABLE_FILESYSTEM_RECONCILER").is_err() {
         let pusher_state = state.clone();
         Some(Arc::new(managed_paths::ManagedPathsPusher::new(
             &pusher_state,
@@ -636,7 +636,7 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     // connections immediately regardless of how long the first sync attempt
     // takes; sync starting a few seconds late is a background concern
     // (logged below, from the spawned task) and still self-heals via the
-    // periodic sync tick / `auth/reload` / the `vectorhawk_login` hook.
+    // periodic sync tick / `auth/reload` / the `scenery_login` hook.
     let boot_sync_controller = Arc::clone(&sync_controller);
     tokio::spawn(async move {
         if boot_sync_controller.ensure_started().await {
@@ -650,10 +650,10 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
         }
     });
 
-    // R1: wire the same idempotent (re)start into the `vectorhawk_login`
+    // R1: wire the same idempotent (re)start into the `scenery_login`
     // MCP-tool path. `vh_registry` is the same `Arc<BackendRegistry>` that
     // `sync_controller` above and `RealBackend` below both share, so this
-    // hook fires regardless of which client called `vectorhawk_login`.
+    // hook fires regardless of which client called `scenery_login`.
     vh_registry.set_tokens_saved_hook(Arc::new(SyncControllerHook(Arc::clone(&sync_controller))));
 
     // Spawn the registry sync loop (300 s interval).
@@ -741,7 +741,7 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
         update_check_cache,
     );
 
-    // Wire the OAuth callback port + subscriber so vectorhawk_login can
+    // Wire the OAuth callback port + subscriber so scenery_login can
     // complete the PKCE flow automatically after the browser redirects.
     if let Some(port) = listener_port {
         backend = backend.with_oauth(
@@ -761,7 +761,7 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     // Serves the exact same tool surface as the Unix socket (same
     // `RealBackend`, same `sync_controller`) over `http://127.0.0.1:<port>/mcp`
     // so Claude Code can authenticate with native OAuth via `/mcp` →
-    // Authenticate instead of the `vectorhawk_login` MCP-tool/CLI flow. Starts
+    // Authenticate instead of the `scenery_login` MCP-tool/CLI flow. Starts
     // only after `daemon.lock` (`_instance_lock`, acquired at the very top of
     // this function) is held. Non-fatal: `mcp_http::start_listener` returns
     // `Ok(None)` (logging loudly) when the feature is disabled or the port
@@ -899,7 +899,7 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     let mut binary_replaced = false;
     let binary_watch_notify = Arc::new(Notify::new());
     if binary_watch::watch_disabled() {
-        info!("VH_NO_BINARY_WATCH set — binary-replacement watch disabled");
+        info!("SCN_NO_BINARY_WATCH set — binary-replacement watch disabled");
     } else {
         match binary_watch::resolve_watch_path() {
             Ok(watch_path) => match binary_watch::stat_identity(&watch_path) {
@@ -1060,7 +1060,7 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
         }
     }
 
-    info!("vectorhawkd shut down cleanly");
+    info!("scenery shut down cleanly");
 
     // Stand down with a non-zero code when the binary was replaced, so *every*
     // service definition restarts us onto it — including the legacy
@@ -1115,8 +1115,8 @@ async fn acquire_socket(path: &camino::Utf8Path) -> Result<UnixListener> {
         match probe {
             Ok(Ok(_stream)) => {
                 anyhow::bail!(
-                    "another vectorhawkd is already running and listening on {path} — \
-                     stop it first (`vectorhawk daemon restart` if it's the managed \
+                    "another scenery is already running and listening on {path} — \
+                     stop it first (`scenery daemon restart` if it's the managed \
                      instance, or `lsof {path}` to find and kill the process holding \
                      the socket) before starting a new one"
                 );
@@ -1131,7 +1131,7 @@ async fn acquire_socket(path: &camino::Utf8Path) -> Result<UnixListener> {
                 // whole function exists to prevent, so fail safe.
                 anyhow::bail!(
                     "timed out probing the existing socket at {path} — refusing to \
-                     assume it is stale. Another vectorhawkd may be running; check \
+                     assume it is stale. Another scenery may be running; check \
                      with `lsof {path}` and remove the file only if nothing holds it"
                 );
             }
@@ -1177,7 +1177,7 @@ fn connect_error_is_definitively_stale(e: &std::io::Error) -> bool {
     !matches!(e.kind(), std::io::ErrorKind::PermissionDenied)
 }
 
-/// Best-effort: verify and take over a stale `vectorhawk daemon run`
+/// Best-effort: verify and take over a stale `scenery daemon run`
 /// process blocking the instance lock and/or the socket. See this
 /// function's call site in `run_daemon` and `daemon_takeover`'s module
 /// docs for the rules this enforces. Never panics, never blocks longer than
@@ -1472,7 +1472,7 @@ pub fn refresh_one_tick(state: &AppState, registry_url: &str) -> Result<()> {
                         refresh_failures = row.refresh_failures + 1,
                         backoff_secs = backoff.unwrap_or(0),
                         "refresh_one_tick: refresh token rejected — user must re-login \
-                         (vectorhawk auth login && vectorhawk daemon restart)"
+                         (scenery auth login && scenery daemon restart)"
                     );
                 } else {
                     warn!(
@@ -1579,7 +1579,7 @@ struct RunningSync {
 /// Runtime-controllable handle to the SSE sync subsystem.
 ///
 /// At daemon boot we frequently have no auth token yet: the user runs
-/// `vectorhawk auth login` / `auth pair` *after* the daemon is already up.
+/// `scenery auth login` / `auth pair` *after* the daemon is already up.
 /// Without this controller, picking up the new credentials required a full
 /// daemon restart — until then device registration never happened and the SSE
 /// feed delivered nothing (no governed skills/MCP reached the machine).
@@ -1598,7 +1598,7 @@ struct RunningSync {
 /// whose SSE loop was already up would keep looping forever on the *old*
 /// captured token (only refreshable via its own stale refresh_token on a
 /// 401), silently ignoring the new tokens the user just supplied — matching
-/// the "needs re-auth" portal badge that only `vectorhawk daemon restart`
+/// the "needs re-auth" portal badge that only `scenery daemon restart`
 /// used to clear. It is still safe to call from every auth path and on every
 /// invocation: unchanged credentials remain a no-op, so a healthy connection
 /// is never thrashed.
@@ -1661,7 +1661,7 @@ impl SyncController {
     /// `sync_active: true` (or blindly assume an unchanged-fingerprint
     /// connection was still healthy) even when the connection had not
     /// actually come up yet, or had since dropped. That produced exactly the
-    /// inverse-looking bug this fixes: a live sales-demo `vectorhawk auth
+    /// inverse-looking bug this fixes: a live sales-demo `scenery auth
     /// pair` printed "the daemon could not start syncing yet" — false —
     /// because the (correct) credential-change restart this same call
     /// triggered was sampled for "active" before its freshly-spawned SSE
@@ -1781,7 +1781,7 @@ async fn wait_for_connected(rx: &mut tokio::sync::watch::Receiver<bool>) -> bool
 /// changed since. It is safe to call
 /// on every `ensure_started` invocation: `ensure_started` is only ever called
 /// right after a genuine user-initiated auth action (CLI `auth/reload`, or
-/// the `vectorhawk_login` MCP tool's `notify_tokens_saved` hook) — never by
+/// the `scenery_login` MCP tool's `notify_tokens_saved` hook) — never by
 /// the SSE client's own internal 401-triggered background token refresh
 /// (which calls `save_tokens` directly, bypassing this hook) — so there is no
 /// risk of a routine background refresh spuriously tripping this comparison
@@ -1900,7 +1900,7 @@ async fn try_start_sync(
 /// even attempt a network call — it must never auto-generate a fresh
 /// `device_uuid` and silently register it on its own. That would resurrect
 /// access through an unattended daemon restart rather than the deliberate
-/// `vectorhawk auth pair` the revocation model requires (revocation-model-
+/// `scenery auth pair` the revocation model requires (revocation-model-
 /// decisions, 2026-10-06: "every device, new or existing, must get in only
 /// through the pairing flow with a logged-in user"). Only `auth pair` clears
 /// `device_revoked_at` (see its implementation), so this stays a no-op until
@@ -1908,7 +1908,7 @@ async fn try_start_sync(
 async fn register_device(registry_url: &str, token: &str, state: Arc<AppState>) -> Result<String> {
     if state.get_sync_state("device_revoked_at")?.is_some() {
         anyhow::bail!(
-            "this device was revoked by an admin — run `vectorhawk auth pair` \
+            "this device was revoked by an admin — run `scenery auth pair` \
              to re-pair as a new device"
         );
     }
@@ -2023,7 +2023,7 @@ async fn register_with_backend(
             }
             warn!(
                 "device registration rejected — this device was revoked by an admin. \
-                 Run `vectorhawk auth pair` to re-pair as a new device."
+                 Run `scenery auth pair` to re-pair as a new device."
             );
             return Err(anyhow::Error::new(DeviceRevokedError));
         }
@@ -2098,7 +2098,7 @@ pub fn run_sync_tick(
     // fresh, disconnected flag that discarded any flip this tick made the
     // instant the function returned. Now it's the caller's real shared
     // handle (the daemon's long-running `AppState.block_third_party_inference`,
-    // or the standalone `vectorhawk mcp sync`/`skill update` CLI's own
+    // or the standalone `scenery mcp sync`/`skill update` CLI's own
     // seeded handle), so a flip made via the org-policy snapshot reconcile
     // below (Card 3) is actually observed by whatever reads this flag for
     // live enforcement.
@@ -2154,7 +2154,7 @@ pub fn run_sync_tick(
     //
     // The revocation list is applied UNCONDITIONALLY whenever a snapshot can
     // be fetched — a direct, reconciler-independent SQLite write (bug-
-    // revoke-loop fix) — not gated on `snapshot_tx`. `vectorhawk mcp sync`
+    // revoke-loop fix) — not gated on `snapshot_tx`. `scenery mcp sync`
     // (`cmd_mcp_sync`) is a one-shot CLI invocation with no reconciler
     // running at all (`snapshot_tx` is always `None` there), and before this
     // fix the entire fetch was skipped in that case, so that command could
@@ -2183,7 +2183,7 @@ pub fn run_sync_tick(
                         // Applied UNCONDITIONALLY — same reasoning as the
                         // revocation-list reconcile just below: this tick
                         // runs even with no reconciler at all (`snapshot_tx
-                        // == None`, e.g. standalone `vectorhawk mcp sync`),
+                        // == None`, e.g. standalone `scenery mcp sync`),
                         // so org policy must converge here directly rather
                         // than relying solely on the forwarded event
                         // reaching a reconciler that may not exist. `None`
@@ -2289,8 +2289,7 @@ pub fn run_sync_tick(
         // deactivate unpublished) AND voluntary version updates. It also calls
         // check_skill_status internally, so there is no separate lifecycle-only call.
         let policy_client = MockPolicyClient::new();
-        match scenery_core::updater::check_skill_updates(&state_view, registry, &policy_client)
-        {
+        match scenery_core::updater::check_skill_updates(&state_view, registry, &policy_client) {
             Ok(changes) => {
                 if changes > 0 {
                     info!(changes, "sync: skill updates applied");
@@ -2309,7 +2308,7 @@ pub fn run_sync_tick(
 
     flush_ratings_and_scan(registry, &state_view, update_cache)?;
 
-    // Record successful sync time so `vectorhawk doctor` can show it.
+    // Record successful sync time so `scenery doctor` can show it.
     let _ = state_view.record_sync_time();
 
     Ok(changed)
@@ -2327,8 +2326,8 @@ fn populate_update_check_cache(
     cache: &UpdateCheckCache,
 ) {
     use rusqlite::Connection;
-    use semver::Version;
     use scenery_mcp::tools::UpdateCheckEntry;
+    use semver::Version;
 
     let conn = match Connection::open(&state.db_path) {
         Ok(c) => c,
@@ -2445,7 +2444,7 @@ fn flush_ratings_and_scan(
     }
 
     // ── 7. Unmanaged MCP server scan ──────────────────────────────────────────
-    // Scan AI client config files for non-vectorhawk MCP servers and buffer an
+    // Scan AI client config files for non-scenery MCP servers and buffer an
     // audit event for each one. IT admins can use this stream to detect shadow
     // MCP installations that bypass governance.
     let unmanaged = detect_unmanaged_servers();
@@ -2621,7 +2620,7 @@ pub fn spawn_tool_discovery(
 /// a direct key lookup.
 ///
 /// Tools list starts empty. The AI client must call `tools/list` against the
-/// vectorhawk MCP server to trigger discovery — that call fans out to all
+/// scenery MCP server to trigger discovery — that call fans out to all
 /// registered backends and caches their tool definitions. Subsequent
 /// `tools/call` invocations dispatch against the cached list; calling
 /// `tools/call` BEFORE any `tools/list` returns an error from
@@ -2717,9 +2716,7 @@ fn init_gateway_token_refresh(state: &AppState, registry_url: &str) {
     });
 }
 
-pub fn mcp_row_to_backend_entry(
-    row: &scenery_core::state::McpInstallRow,
-) -> Option<BackendEntry> {
+pub fn mcp_row_to_backend_entry(row: &scenery_core::state::McpInstallRow) -> Option<BackendEntry> {
     // Gateway-brokered servers take precedence: the daemon connects to the
     // gateway proxy URL with the shared live portal JWT (read fresh per call
     // via the token handle). The credential broker injects the real upstream
@@ -2897,7 +2894,7 @@ mod backend_entry_tests {
         // the CURRENT value (not a captured one) so rotation is picked up.
         *gateway_token_handle().write().unwrap() = Some("jwt-abc".to_string());
         let row = row_with(
-            Some("https://app.vectorhawk.ai/gateway/home-assistant/mcp"),
+            Some("https://app.scenery.dev/gateway/home-assistant/mcp"),
             None,
         );
         let entry = mcp_row_to_backend_entry(&row).expect("entry");
@@ -2908,7 +2905,7 @@ mod backend_entry_tests {
                 auth_token,
                 token_handle,
             } => {
-                assert_eq!(url, "https://app.vectorhawk.ai/gateway/home-assistant/mcp");
+                assert_eq!(url, "https://app.scenery.dev/gateway/home-assistant/mcp");
                 assert!(
                     token_handle.is_some(),
                     "gateway backend must carry the live handle"
@@ -2934,7 +2931,7 @@ mod backend_entry_tests {
         // gateway_url present the daemon must NOT spawn the URL as a subprocess.
         let bad = r#"{"command":"https://ha.example/mcp_server/sse","args":[]}"#;
         let row = row_with(
-            Some("https://app.vectorhawk.ai/gateway/home-assistant/mcp"),
+            Some("https://app.scenery.dev/gateway/home-assistant/mcp"),
             Some(bad),
         );
         let entry = mcp_row_to_backend_entry(&row).expect("entry");

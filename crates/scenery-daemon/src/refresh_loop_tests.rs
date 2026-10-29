@@ -7,11 +7,11 @@
 
 use camino::Utf8PathBuf;
 use mockito::Server;
-use std::time::{SystemTime, UNIX_EPOCH};
 use scenery_core::{
     auth::{load_tokens, save_tokens, AuthClient},
     state::AppState,
 };
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::refresh_one_tick;
 
@@ -35,7 +35,7 @@ fn temp_root(label: &str) -> Utf8PathBuf {
 /// now a `#[ctor]` rather than something each test has to remember).
 #[ctor::ctor]
 fn disable_real_keychain_for_tests() {
-    std::env::set_var("VECTORHAWK_DISABLE_KEYCHAIN", "1");
+    std::env::set_var("SCENERY_DISABLE_KEYCHAIN", "1");
 }
 
 /// Regression guard for the safety net itself — see the identical test in
@@ -43,7 +43,7 @@ fn disable_real_keychain_for_tests() {
 #[test]
 fn real_keychain_is_disabled_for_this_test_binary() {
     assert_eq!(
-        std::env::var("VECTORHAWK_DISABLE_KEYCHAIN").as_deref(),
+        std::env::var("SCENERY_DISABLE_KEYCHAIN").as_deref(),
         Ok("1"),
         "disable_real_keychain_for_tests' #[ctor] must run before any test in this binary"
     );
@@ -59,7 +59,7 @@ static KEYCHAIN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 impl KeychainOff {
     fn enable() -> Self {
         let _g = KEYCHAIN_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("VECTORHAWK_DISABLE_KEYCHAIN", "1");
+        std::env::set_var("SCENERY_DISABLE_KEYCHAIN", "1");
         KeychainOff { _g }
     }
 }
@@ -69,7 +69,7 @@ impl Drop for KeychainOff {
         // sets this once for the whole process and nothing in this binary
         // should ever turn it back off, even transiently, while other
         // threads may be mid-test.
-        std::env::set_var("VECTORHAWK_DISABLE_KEYCHAIN", "1");
+        std::env::set_var("SCENERY_DISABLE_KEYCHAIN", "1");
     }
 }
 
@@ -339,7 +339,7 @@ fn refresh_one_tick_with_no_tokens_is_noop() {
     let root = temp_root("empty");
     let state = AppState::bootstrap_in(root.clone()).expect("bootstrap");
 
-    let result = refresh_one_tick(&state, "https://registry.vectorhawk.ai");
+    let result = refresh_one_tick(&state, "https://registry.scenery.dev");
     assert!(
         result.is_ok(),
         "refresh_one_tick with empty table should succeed"

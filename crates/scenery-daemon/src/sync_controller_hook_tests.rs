@@ -1,9 +1,9 @@
 //! Integration tests for `SyncControllerHook` (R1): confirms that a
 //! `BackendRegistry`'s `notify_tokens_saved` — the hook
 //! `tools::handle_login_with_oauth`'s background task fires after the
-//! `vectorhawk_login` MCP tool saves fresh tokens — actually reaches
+//! `scenery_login` MCP tool saves fresh tokens — actually reaches
 //! `SyncController::ensure_started` end to end, the same way `auth/reload`
-//! already does for the CLI's `vectorhawk auth login` path. Modeled on
+//! already does for the CLI's `scenery auth login` path. Modeled on
 //! `auth_dispatch_tests.rs`'s `reload_returns_inactive_without_token_and_is_idempotent`
 //! and `get_portal_session_returns_full_session_on_success`.
 //!
@@ -18,9 +18,9 @@
 
 use std::sync::Arc;
 
-use tokio::sync::broadcast;
 use scenery_core::state::AppState;
 use scenery_mcp::aggregator::BackendRegistry;
+use tokio::sync::broadcast;
 
 use crate::{SyncController, SyncControllerHook};
 
@@ -33,7 +33,7 @@ static KEYCHAIN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 impl KeychainOff {
     fn enable() -> Self {
         let _g = KEYCHAIN_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("VECTORHAWK_DISABLE_KEYCHAIN", "1");
+        std::env::set_var("SCENERY_DISABLE_KEYCHAIN", "1");
         KeychainOff { _g }
     }
 }
@@ -42,7 +42,7 @@ impl Drop for KeychainOff {
         // Re-assert rather than remove: `refresh_loop_tests`' `#[ctor]`
         // (`disable_real_keychain_for_tests`) sets this once for the whole
         // process; nothing in this binary should ever turn it back off.
-        std::env::set_var("VECTORHAWK_DISABLE_KEYCHAIN", "1");
+        std::env::set_var("SCENERY_DISABLE_KEYCHAIN", "1");
     }
 }
 
@@ -53,7 +53,7 @@ fn bootstrap_state() -> (Arc<AppState>, tempfile::TempDir) {
     (Arc::new(state), tmp)
 }
 
-/// End to end: a `vectorhawk_login` MCP-tool login (simulated by saving
+/// End to end: a `scenery_login` MCP-tool login (simulated by saving
 /// tokens directly, as the background task in `tools.rs` does) plus a
 /// `notify_tokens_saved` call registers the device — without any CLI
 /// `auth login`/`auth pair` call or daemon restart — and a second call is a
@@ -105,7 +105,7 @@ async fn hook_registers_device_exactly_once_even_when_fired_twice() {
     ));
     registry.set_tokens_saved_hook(Arc::new(SyncControllerHook(Arc::clone(&sync_controller))));
 
-    // Simulates the vectorhawk_login MCP-tool background task's call after
+    // Simulates the scenery_login MCP-tool background task's call after
     // `auth::save_tokens` succeeds (tools.rs's `handle_login_with_oauth`).
     registry.notify_tokens_saved().await;
     // A second login attempt (or any other caller) firing the same hook again
@@ -157,7 +157,7 @@ async fn hook_is_a_safe_noop_without_a_saved_token() {
 }
 
 /// The actual bug fix under test: sync starts successfully with `tok-1`
-/// (device `dev-1`), then the user re-authenticates — e.g. `vectorhawk auth
+/// (device `dev-1`), then the user re-authenticates — e.g. `scenery auth
 /// pair` after the daemon's SSE connection went stale — saving a *different*
 /// access token (`tok-2`) while the SSE task from the first start is still
 /// running. Before the fix, `ensure_started`'s `guard.is_some()` check made
@@ -233,7 +233,7 @@ async fn ensure_started_reconnects_sse_when_saved_token_changes() {
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     sse_tok1.assert_async().await;
 
-    // Simulate `vectorhawk auth pair` (or `auth login`/`auth token`) saving a
+    // Simulate `scenery auth pair` (or `auth login`/`auth token`) saving a
     // fresh access token while the daemon's SSE loop from above is still
     // running — the exact "needs re-auth" reproduction.
     scenery_core::auth::save_tokens(&state, &registry_url, "tok-2", "ref-2")
@@ -256,7 +256,7 @@ async fn ensure_started_reconnects_sse_when_saved_token_changes() {
 /// entirely, since it's not a user-initiated auth action. Before this fix,
 /// `RunningSync`'s credential fingerprint captured the token ONCE at spawn
 /// time, so the next legitimate `ensure_started()` call (a genuinely
-/// unrelated `auth pair`/`auth login`, or the `vectorhawk_login` hook firing
+/// unrelated `auth pair`/`auth login`, or the `scenery_login` hook firing
 /// again) compared the now-refreshed on-disk token against the STALE
 /// spawn-time token, saw a spurious mismatch, and tore down + restarted a
 /// perfectly healthy SSE connection for no reason.
@@ -464,8 +464,7 @@ async fn boot_time_sync_start_does_not_block_socket_accept() {
     // Pre-seed a token AND a cached device_id so `register_device` takes its
     // early-return path (no network call) — isolating this test to the SSE
     // connect specifically, which is where the real bug's hang would land.
-    scenery_core::auth::save_tokens(&state, &registry_url, "tok-1", "ref-1")
-        .expect("save_tokens");
+    scenery_core::auth::save_tokens(&state, &registry_url, "tok-1", "ref-1").expect("save_tokens");
     state
         .set_sync_state("device_id", "dev-1")
         .expect("set device_id");
@@ -815,7 +814,7 @@ async fn register_device_on_revoked_403_clears_identity_and_does_not_fall_back()
 /// attempt a network call — no generating a fresh `device_uuid` and
 /// silently registering it with the still-valid user bearer token. That
 /// would resurrect the device through an unattended daemon restart rather
-/// than the deliberate `vectorhawk auth pair` the revocation model
+/// than the deliberate `scenery auth pair` the revocation model
 /// requires.
 #[tokio::test]
 async fn register_device_refuses_to_auto_register_once_marked_revoked() {

@@ -37,7 +37,7 @@ async fn callback_returns_200_html_and_notifies_oauth_state() {
 
     let body = resp.text().await.unwrap();
     assert!(
-        body.contains("VectorHawk login complete"),
+        body.contains("Scenery login complete"),
         "body should contain success message; got: {body}"
     );
     assert!(

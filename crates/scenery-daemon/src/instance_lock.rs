@@ -20,7 +20,7 @@
 //! This lock is independent of the socket entirely. It is acquired once, at
 //! the very start of [`crate::run_daemon`], before any other startup work,
 //! and held for the process's whole lifetime. Its only job is the
-//! invariant: at most one `vectorhawkd` process operates on a given
+//! invariant: at most one `scenery` process operates on a given
 //! `state.db` at a time — full stop, regardless of socket state.
 //!
 //! # What this does NOT do
@@ -29,7 +29,7 @@
 //! terminate anything. On collision it fails safe — same philosophy as
 //! `acquire_socket`: the losing process refuses to start and reports why.
 //! Whether an upgrade path (or a new daemon) should be allowed to verify
-//! and SIGTERM an older `vectorhawk daemon run` process to take over
+//! and SIGTERM an older `scenery daemon run` process to take over
 //! automatically is a product decision left open — see the module-level
 //! discussion in `run_daemon`'s caller / the task that added this file.
 //!
@@ -94,11 +94,11 @@ pub fn acquire(root_dir: &Utf8Path) -> Result<InstanceLock> {
 
     file.try_lock_exclusive().map_err(|_| {
         anyhow::anyhow!(
-            "another vectorhawkd process already holds the instance lock at \
+            "another scenery process already holds the instance lock at \
              {path} — refusing to run two daemons against the same state \
-             directory. If you are certain no other vectorhawkd process is \
+             directory. If you are certain no other scenery process is \
              running, look for a stray process first \
-             (`pgrep -fl 'vectorhawk daemon run'` or `ps aux | grep vectorhawk`) \
+             (`pgrep -fl 'scenery daemon run'` or `ps aux | grep scenery`) \
              before removing this file by hand."
         )
     })?;

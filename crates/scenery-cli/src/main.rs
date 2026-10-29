@@ -1,29 +1,29 @@
-//! `vectorhawk` — VectorHawk runner user CLI.
+//! `scenery` — Scenery runner user CLI.
 //!
 //! Subcommand tree:
 //!
 //! ```text
-//! vectorhawk doctor
-//! vectorhawk skill list
-//! vectorhawk skill install <skill-ref> [--registry-url <url>]
-//! vectorhawk skill info <id>
-//! vectorhawk skill run <id> --input <file> [--stub]
-//! vectorhawk skill import <path>
-//! vectorhawk plugin export <path> --format <fmt> [--output-dir <dir>]
-//! vectorhawk plugin import <path> [--output-dir <dir>]
-//! vectorhawk skill validate <path>
-//! vectorhawk auth login [--registry-url <url>]
-//! vectorhawk auth logout [--registry-url <url>]
-//! vectorhawk auth status [--registry-url <url>]
-//! vectorhawk mcp serve
-//! vectorhawk mcp setup [--client <name>] [--dry-run]
-//! vectorhawk mcp sync
-//! vectorhawk mcp backends
-//! vectorhawk daemon run [--foreground]
-//! vectorhawk daemon install
-//! vectorhawk daemon uninstall
-//! vectorhawk migrate list-backups
-//! vectorhawk migrate rollback --ts <ts> [--slug <slug>] [--yes]
+//! scenery doctor
+//! scenery skill list
+//! scenery skill install <skill-ref> [--registry-url <url>]
+//! scenery skill info <id>
+//! scenery skill run <id> --input <file> [--stub]
+//! scenery skill import <path>
+//! scenery plugin export <path> --format <fmt> [--output-dir <dir>]
+//! scenery plugin import <path> [--output-dir <dir>]
+//! scenery skill validate <path>
+//! scenery auth login [--registry-url <url>]
+//! scenery auth logout [--registry-url <url>]
+//! scenery auth status [--registry-url <url>]
+//! scenery mcp serve
+//! scenery mcp setup [--client <name>] [--dry-run]
+//! scenery mcp sync
+//! scenery mcp backends
+//! scenery daemon run [--foreground]
+//! scenery daemon install
+//! scenery daemon uninstall
+//! scenery migrate list-backups
+//! scenery migrate rollback --ts <ts> [--slug <slug>] [--yes]
 //! ```
 //!
 //! `mcp serve` is the AI-client entry point — what `mcp setup` writes into
@@ -46,10 +46,10 @@ mod uninstall;
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "vectorhawk",
-    bin_name = "vectorhawk",
+    name = "scenery",
+    bin_name = "scenery",
     version,
-    about = "VectorHawk runner — governed AI platform"
+    about = "Scenery runner — governed AI platform"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -61,7 +61,7 @@ pub enum Command {
     /// Print health status: daemon reachability, state directory, versions.
     Doctor {
         /// Registry URL to probe for reachability check.
-        #[arg(long, env = "VECTORHAWK_REGISTRY_URL")]
+        #[arg(long, env = "SCENERY_REGISTRY_URL")]
         registry_url: Option<String>,
     },
 
@@ -93,18 +93,18 @@ pub enum Command {
     #[command(subcommand)]
     Migrate(commands_migrate::MigrateCommand),
 
-    /// Remove VectorHawk and restore the host to its pre-install state.
+    /// Remove Scenery and restore the host to its pre-install state.
     ///
     /// Unwinds every external change in reverse — stops the daemon, strips the
-    /// vectorhawk entries from all AI client configs, removes brokered MCP
+    /// scenery entries from all AI client configs, removes brokered MCP
     /// servers completely (they can't run without the runner), restores anything
-    /// VectorHawk took over, and writes a restore report listing what was
+    /// Scenery took over, and writes a restore report listing what was
     /// removed, what was kept, and what to re-add on your own configuration.
     Uninstall {
         /// Skip the confirmation prompt.
         #[arg(long, short = 'y')]
         yes: bool,
-        /// Also delete the VectorHawk data directory and keychain token.
+        /// Also delete the Scenery data directory and keychain token.
         #[arg(long)]
         purge: bool,
         /// Show the plan and report without changing anything.
@@ -114,7 +114,7 @@ pub enum Command {
         #[arg(long)]
         report_dir: Option<std::path::PathBuf>,
         /// Registry URL for the backend device-deprovision call.
-        #[arg(long, env = "VECTORHAWK_REGISTRY_URL")]
+        #[arg(long, env = "SCENERY_REGISTRY_URL")]
         registry_url: Option<String>,
     },
 }
@@ -143,7 +143,7 @@ pub enum SkillCommand {
         link: bool,
 
         /// Registry base URL (registry installs only).
-        #[arg(long, env = "VECTORHAWK_REGISTRY_URL")]
+        #[arg(long, env = "SCENERY_REGISTRY_URL")]
         registry_url: Option<String>,
 
         /// Install on every device registered to your account instead of
@@ -165,7 +165,7 @@ pub enum SkillCommand {
         /// Registry base URL.
         #[arg(
             long,
-            env = "VECTORHAWK_REGISTRY_URL",
+            env = "SCENERY_REGISTRY_URL",
             default_value = DEFAULT_REGISTRY_URL
         )]
         registry_url: Option<String>,
@@ -202,7 +202,7 @@ pub enum SkillCommand {
 
         /// Registry base URL used to call the scan endpoint.
         /// When omitted, scanning is skipped (offline / unauthenticated mode).
-        #[arg(long, env = "VECTORHAWK_REGISTRY_URL")]
+        #[arg(long, env = "SCENERY_REGISTRY_URL")]
         registry_url: Option<String>,
 
         /// Bypass the scan warning and proceed even when the verdict is risky
@@ -241,7 +241,7 @@ pub enum SkillCommand {
         /// Path to the skill directory (must contain SKILL.md).
         path: camino::Utf8PathBuf,
         /// Registry base URL.
-        #[arg(long, env = "VECTORHAWK_REGISTRY_URL")]
+        #[arg(long, env = "SCENERY_REGISTRY_URL")]
         registry_url: String,
         /// Compile and validate without creating a registry entry.
         #[arg(long, default_value_t = false)]
@@ -283,7 +283,7 @@ pub enum SkillCommand {
         /// Registry base URL (used to deactivate managed installs).
         #[arg(
             long,
-            env = "VECTORHAWK_REGISTRY_URL",
+            env = "SCENERY_REGISTRY_URL",
             default_value = DEFAULT_REGISTRY_URL
         )]
         registry_url: Option<String>,
@@ -308,7 +308,7 @@ pub enum SkillCommand {
         /// Registry base URL.
         #[arg(
             long,
-            env = "VECTORHAWK_REGISTRY_URL",
+            env = "SCENERY_REGISTRY_URL",
             default_value = DEFAULT_REGISTRY_URL
         )]
         registry_url: Option<String>,
@@ -341,30 +341,30 @@ pub enum SkillCommand {
         output_dir: Option<camino::Utf8PathBuf>,
 
         /// Registry URL used to look up your publisher ID (defaults to production).
-        #[arg(long, env = "VECTORHAWK_REGISTRY_URL")]
+        #[arg(long, env = "SCENERY_REGISTRY_URL")]
         registry_url: Option<String>,
     },
 }
 
 #[derive(Debug, Subcommand)]
 pub enum AuthCommand {
-    /// Log in to the VectorHawk registry using an OAuth browser flow.
+    /// Log in to the Scenery registry using an OAuth browser flow.
     Login {
         /// Registry base URL.
         #[arg(
             long,
-            env = "VECTORHAWK_REGISTRY_URL",
+            env = "SCENERY_REGISTRY_URL",
             default_value = DEFAULT_REGISTRY_URL
         )]
         registry_url: String,
     },
 
-    /// Log out of the VectorHawk registry.
+    /// Log out of the Scenery registry.
     Logout {
         /// Registry base URL.
         #[arg(
             long,
-            env = "VECTORHAWK_REGISTRY_URL",
+            env = "SCENERY_REGISTRY_URL",
             default_value = DEFAULT_REGISTRY_URL
         )]
         registry_url: String,
@@ -375,7 +375,7 @@ pub enum AuthCommand {
         /// Registry base URL.
         #[arg(
             long,
-            env = "VECTORHAWK_REGISTRY_URL",
+            env = "SCENERY_REGISTRY_URL",
             default_value = DEFAULT_REGISTRY_URL
         )]
         registry_url: String,
@@ -383,47 +383,47 @@ pub enum AuthCommand {
 
     /// Save a Personal Access Token for headless / CI environments.
     ///
-    /// Create a vh_pat_... token in the VectorHawk portal, then run
-    /// `vectorhawk auth token` and paste it at the hidden prompt, or pipe
-    /// it in on stdin, e.g. `vectorhawk auth token < pat.txt`.
+    /// Create a vh_pat_... token in the Scenery portal, then run
+    /// `scenery auth token` and paste it at the hidden prompt, or pipe
+    /// it in on stdin, e.g. `scenery auth token < pat.txt`.
     ///
     /// The token is never accepted as a command-line argument: arguments
     /// are visible to other local users in the process list and are kept
     /// in shell history.
     ///
-    /// Or set VECTORHAWK_TOKEN=<vh_pat_...> and restart the daemon.
+    /// Or set SCENERY_TOKEN=<vh_pat_...> and restart the daemon.
     Token {
         #[arg(
             long,
-            env = "VECTORHAWK_REGISTRY_URL",
+            env = "SCENERY_REGISTRY_URL",
             default_value = DEFAULT_REGISTRY_URL
         )]
         registry_url: String,
     },
 
-    /// Pair this device using a code from the VectorHawk portal.
+    /// Pair this device using a code from the Scenery portal.
     ///
     /// In the portal, open the catalog page — if this device isn't registered
     /// yet you'll see a setup screen with a pairing code.  Then run:
-    ///   vectorhawk auth pair <code>
+    ///   scenery auth pair <code>
     ///
     /// This registers the device and authenticates the CLI in one step,
     /// without a separate browser login.
     ///
     /// The code argument is optional — when omitted it's resolved, in
-    /// order: the VH_PAIR_CODE env var (unattended path for MDM / Intune /
+    /// order: the SCN_PAIR_CODE env var (unattended path for MDM / Intune /
     /// Jamf rollouts, used without prompting); otherwise an interactive
     /// prompt, if a terminal is available; otherwise the command exits
     /// non-zero with an error naming both escapes.
     Pair {
         /// The pairing code shown in the portal (e.g. VH-7X4K-9M2P).
-        /// Optional: falls back to VH_PAIR_CODE, then an interactive
+        /// Optional: falls back to SCN_PAIR_CODE, then an interactive
         /// prompt when a terminal is available.
         code: Option<String>,
 
         #[arg(
             long,
-            env = "VECTORHAWK_REGISTRY_URL",
+            env = "SCENERY_REGISTRY_URL",
             default_value = DEFAULT_REGISTRY_URL
         )]
         registry_url: String,
@@ -434,7 +434,7 @@ pub enum AuthCommand {
 pub enum McpCommand {
     /// Start the MCP relay shim — written into AI client configs by `mcp setup`.
     ///
-    /// Connects to the vectorhawkd daemon over a Unix socket. If the daemon
+    /// Connects to the scenery daemon over a Unix socket. If the daemon
     /// is unreachable, returns a JSON-RPC error containing install/restart
     /// instructions for every request — never a silent in-process fallback.
     ///
@@ -450,7 +450,7 @@ pub enum McpCommand {
         server: Option<String>,
     },
 
-    /// Write the VectorHawk MCP entry into the specified AI client's config.
+    /// Write the Scenery MCP entry into the specified AI client's config.
     Setup {
         /// Target AI client (currently only "claude-code" is supported in M0).
         #[arg(long)]
@@ -470,10 +470,10 @@ pub enum McpCommand {
         rotate_local_key: bool,
     },
 
-    /// Remove the VectorHawk MCP entry from all AI client configs and delete
-    /// VectorHawk slash command skill directories from ~/.claude/skills/.
+    /// Remove the Scenery MCP entry from all AI client configs and delete
+    /// Scenery slash command skill directories from ~/.claude/skills/.
     ///
-    /// Run this before `brew uninstall vectorhawk` to leave AI client configs clean.
+    /// Run this before `brew uninstall scenery` to leave AI client configs clean.
     Remove,
 
     /// Trigger an immediate registry sync via the daemon (M1.4).
@@ -492,22 +492,22 @@ pub enum DaemonCommand {
         foreground: bool,
 
         /// Override the registry URL for this daemon session.
-        #[arg(long, env = "VECTORHAWK_REGISTRY_URL")]
+        #[arg(long, env = "SCENERY_REGISTRY_URL")]
         registry_url: Option<String>,
 
         /// Override the Ollama base URL for local LLM inference.
-        #[arg(long, env = "VECTORHAWK_OLLAMA_URL")]
+        #[arg(long, env = "SCENERY_OLLAMA_URL")]
         ollama_url: Option<String>,
 
         /// Override the Ollama model tag to use for LLM steps.
-        #[arg(long, env = "VECTORHAWK_OLLAMA_MODEL")]
+        #[arg(long, env = "SCENERY_OLLAMA_MODEL")]
         ollama_model: Option<String>,
     },
 
-    /// Install the vectorhawkd LaunchAgent (macOS) or systemd user unit (Linux).
+    /// Install the scenery LaunchAgent (macOS) or systemd user unit (Linux).
     Install,
 
-    /// Remove the vectorhawkd LaunchAgent / systemd user unit.
+    /// Remove the scenery LaunchAgent / systemd user unit.
     Uninstall,
 
     /// Stop and start the daemon in place. Picks up a refreshed auth token
@@ -517,12 +517,12 @@ pub enum DaemonCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum PluginCommand {
-    /// Export a VectorHawk plugin to Claude Code plugin or .mcpb Desktop Extension format.
+    /// Export a Scenery plugin to Claude Code plugin or .mcpb Desktop Extension format.
     ///
     /// Use `--format mcpb` to produce a ZIP archive for Claude Desktop one-click install.
     /// Use `--format claude-code` to produce a Claude Code plugin directory.
     Export {
-        /// Path to the VectorHawk plugin directory.
+        /// Path to the Scenery plugin directory.
         path: camino::Utf8PathBuf,
 
         /// Export format: 'mcpb' for Desktop Extension archive, 'claude-code' for Claude Code plugin directory.
@@ -534,10 +534,10 @@ pub enum PluginCommand {
         output_dir: Option<camino::Utf8PathBuf>,
     },
 
-    /// Import a Claude Code plugin directory or .mcpb Desktop Extension into VectorHawk plugin format.
+    /// Import a Claude Code plugin directory or .mcpb Desktop Extension into Scenery plugin format.
     ///
     /// Auto-detects whether the input is a Claude Code plugin (directory with .claude-plugin/)
-    /// or a .mcpb archive. Writes a VectorHawk plugin.json to the output directory.
+    /// or a .mcpb archive. Writes a Scenery plugin.json to the output directory.
     Import {
         /// Path to the Claude Code plugin directory or .mcpb file.
         path: camino::Utf8PathBuf,
@@ -551,7 +551,7 @@ pub enum PluginCommand {
     ///
     /// Requests the install via the portal; the daemon then registers it as a
     /// self-contained Claude Code plugin (it appears in `/plugin list`, bundling
-    /// its skills). Requires `vectorhawk auth login`.
+    /// its skills). Requires `scenery auth login`.
     ///
     /// Device-scoped by default: installs only on the device running this
     /// command. Pass `--all-devices` to fan the install out to every device
@@ -566,7 +566,7 @@ pub enum PluginCommand {
 
         #[arg(
             long,
-            env = "VECTORHAWK_REGISTRY_URL",
+            env = "SCENERY_REGISTRY_URL",
             default_value = DEFAULT_REGISTRY_URL
         )]
         registry_url: String,
@@ -590,7 +590,7 @@ pub enum PluginCommand {
 
         #[arg(
             long,
-            env = "VECTORHAWK_REGISTRY_URL",
+            env = "SCENERY_REGISTRY_URL",
             default_value = DEFAULT_REGISTRY_URL
         )]
         registry_url: Option<String>,
@@ -603,7 +603,7 @@ pub enum SyncCommand {
     ///
     /// Shows skill_id, version, source (registry/local), installation_id, and
     /// deactivated status.  Useful for debugging reconcile failures reported by
-    /// `vectorhawk doctor`.
+    /// `scenery doctor`.
     Status,
 }
 
@@ -630,7 +630,7 @@ fn main() {
             Ok(root) => logging::init_daemon(root.join("logs").as_std_path()),
             Err(e) => {
                 eprintln!(
-                    "vectorhawk: warning: failed to resolve state directory for daemon \
+                    "scenery: warning: failed to resolve state directory for daemon \
                      logs: {e:#} — falling back to stderr logging"
                 );
                 logging::init_cli()
@@ -647,7 +647,7 @@ fn main() {
         .block_on(run(cli));
 
     if let Err(e) = result {
-        eprintln!("vectorhawk: error: {e:#}");
+        eprintln!("scenery: error: {e:#}");
         std::process::exit(1);
     }
 }
@@ -821,13 +821,13 @@ async fn run(cli: Cli) -> Result<()> {
 // ── doctor ────────────────────────────────────────────────────────────────────
 
 async fn cmd_doctor(registry_url: Option<&str>) -> Result<()> {
-    use scenery_core::app::VectorHawkApp;
+    use scenery_core::app::SceneryApp;
 
     let version = env!("CARGO_PKG_VERSION");
-    println!("VectorHawk runner version: {version}");
+    println!("Scenery runner version: {version}");
 
     // Bootstrap state to discover paths — do not fail doctor if this errors.
-    match VectorHawkApp::bootstrap() {
+    match SceneryApp::bootstrap() {
         Ok(app) => {
             println!("State directory: {}", app.state.root_dir);
             println!("State database:  {}", app.state.db_path);
@@ -907,7 +907,7 @@ async fn cmd_doctor(registry_url: Option<&str>) -> Result<()> {
                     match config_file_is_group_or_world_readable(&config.config_path) {
                         Some(true) => println!(
                             "Claude Code config:    {} is readable by other users on this \
-                             machine — it holds the H3 local key. Run `vectorhawk mcp setup \
+                             machine — it holds the H3 local key. Run `scenery mcp setup \
                              --rotate-local-key` to rotate it and tighten the file.",
                             config.config_path.display()
                         ),
@@ -1109,7 +1109,7 @@ fn claude_code_callback_port_status(port: u16) -> String {
         Err(_) => match port_holder_process_name(port) {
             Some(name) if !name.to_lowercase().contains("claude") => format!(
                 "BUSY — held by '{name}' (not Claude Code); Authenticate will fail until \
-                 this port is free. Re-run `vectorhawk mcp setup` to pick a different one."
+                 this port is free. Re-run `scenery mcp setup` to pick a different one."
             ),
             Some(name) => format!("busy — held by '{name}'"),
             None => "busy (holder unknown)".to_string(),
@@ -1257,12 +1257,12 @@ async fn finish_auth(state: &scenery_core::state::AppState) {
         DaemonReload::SyncInactive => {
             println!(
                 "Saved, but the daemon could not start syncing yet. \
-                 Run `vectorhawk doctor` to diagnose."
+                 Run `scenery doctor` to diagnose."
             );
         }
         DaemonReload::DaemonDown => {
             println!(
-                "Saved. Start the daemon with `vectorhawk daemon install` and \
+                "Saved. Start the daemon with `scenery daemon install` and \
                  your skills will sync automatically."
             );
         }
@@ -1392,7 +1392,7 @@ fn query_sync_status(db_path: &camino::Utf8PathBuf) -> String {
     match (device_id, last_event_id) {
         (Some(did), Some(eid)) => format!("device {did} — last event id: {eid}"),
         (Some(did), None) => format!("device {did} — no events received yet"),
-        (None, _) => "not registered — run 'vectorhawk auth login' to enable sync".to_string(),
+        (None, _) => "not registered — run 'scenery auth login' to enable sync".to_string(),
     }
 }
 
@@ -1434,7 +1434,7 @@ fn query_reconcile_status(db_path: &camino::Utf8PathBuf) -> String {
 
     if errors > 0 {
         format!(
-            "{installed} installed, {deactivated} deactivated, {errors} errors — run 'vectorhawk sync status'"
+            "{installed} installed, {deactivated} deactivated, {errors} errors — run 'scenery sync status'"
         )
     } else {
         format!("{installed} installed, {deactivated} deactivated, 0 errors")
@@ -1543,8 +1543,8 @@ async fn fetch_update_hints_for_list(
     state: &scenery_core::state::AppState,
     registry_url: &str,
 ) -> std::collections::HashMap<String, String> {
-    use semver::Version;
     use scenery_core::registry::RegistryClient;
+    use semver::Version;
 
     let db_path = state.db_path.clone();
     let registry_url = registry_url.to_string();
@@ -1608,9 +1608,7 @@ async fn cmd_skill_search(query: &str, registry_url: Option<&str>) -> Result<()>
     let tokens = load_tokens(&state, url)
         .context("failed to load auth tokens")?
         .ok_or_else(|| {
-            anyhow::anyhow!(
-                "not authenticated — run 'vectorhawk auth login' first, then retry search"
-            )
+            anyhow::anyhow!("not authenticated — run 'scenery auth login' first, then retry search")
         })?;
 
     let registry = RegistryClient::new(url).with_auth(tokens.access_token);
@@ -1683,7 +1681,7 @@ async fn cmd_skill_search(query: &str, registry_url: Option<&str>) -> Result<()>
     }
 
     let count = results.len();
-    println!("\n{count} result(s). Run: vectorhawk skill install <id>");
+    println!("\n{count} result(s). Run: scenery skill install <id>");
     Ok(())
 }
 
@@ -1820,7 +1818,7 @@ async fn install_via_desired_state(
             // helper emits its own audit event with source="cli-registry".
             eprintln!(
                 "note: not logged in — installing directly from registry (run \
-                 'vectorhawk auth login' to enable portal-driven installs)"
+                 'scenery auth login' to enable portal-driven installs)"
             );
             return direct_registry_install(skill_id, registry_url, state.db_path.clone(), version)
                 .await;
@@ -1854,7 +1852,7 @@ async fn install_via_desired_state(
         .with_context(|| format!("failed to call {url}"))?;
 
     if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-        anyhow::bail!("session expired — run 'vectorhawk auth login' to refresh");
+        anyhow::bail!("session expired — run 'scenery auth login' to refresh");
     }
 
     if !resp.status().is_success() {
@@ -1891,8 +1889,8 @@ async fn install_via_desired_state(
             eprintln!();
             anyhow::bail!(
                 "timed out waiting for '{skill_id}' to install — the daemon may not be \
-                 running. Run 'vectorhawk daemon install' to enable background sync, \
-                 or 'vectorhawk sync status' to check for errors."
+                 running. Run 'scenery daemon install' to enable background sync, \
+                 or 'scenery sync status' to check for errors."
             );
         }
 
@@ -1942,7 +1940,7 @@ async fn install_via_desired_state(
                 eprintln!();
                 anyhow::bail!(
                     "install of '{skill_id}' encountered an error — run \
-                     'vectorhawk sync status' for details"
+                     'scenery sync status' for details"
                 );
             }
             _ => {
@@ -1983,7 +1981,7 @@ async fn install_via_desired_state(
 /// checks `GET /api/installations/mine` for a backend-reported error on the
 /// installation it just requested. See the call site for the cadence
 /// rationale (mirrors `scenery_core::mcp_governance`'s identical
-/// constant/helper for the `vectorhawk_install` MCP tool's poll loop).
+/// constant/helper for the `scenery_install` MCP tool's poll loop).
 const REMOTE_CHECK_EVERY_N_TICKS: u64 = 10;
 
 /// Ask the backend whether `installation_id` has moved to `state == "error"`
@@ -2259,7 +2257,7 @@ fn select_model_for_skill(
 }
 
 /// A `ModelClient` tier representing "no cloud/sampling channel is available
-/// to this CLI process". `vectorhawk skill run`/`vectorhawk skill update` are
+/// to this CLI process". `scenery skill run`/`scenery skill update` are
 /// bare-process invocations with no connected AI client to delegate MCP
 /// sampling to and no daemon-brokered gateway session — so there is no
 /// legitimate non-local tier for `HybridModelClient` to fall back to here.
@@ -2277,7 +2275,7 @@ impl scenery_core::model::ModelClient for NoCloudChannel {
     ) -> Result<scenery_core::model::ModelResponse> {
         anyhow::bail!(
             "no cloud/sampling channel is available to a direct CLI invocation \
-             (vectorhawk skill run has no connected AI client or gateway session)"
+             (scenery skill run has no connected AI client or gateway session)"
         )
     }
 }
@@ -2290,7 +2288,7 @@ impl scenery_core::model::ModelClient for NoCloudChannel {
 /// daemon seeds it from persisted `sync_state` at startup
 /// (`scenery_daemon::run_daemon`). The CLI's direct-execution paths
 /// never did that seeding and never consulted the flag at all, so
-/// `vectorhawk skill run` on a policy-enabled endpoint ignored governance
+/// `scenery skill run` on a policy-enabled endpoint ignored governance
 /// entirely instead of failing closed.
 ///
 /// The caller must call `state.seed_block_third_party_from_sync_state()`
@@ -2349,7 +2347,7 @@ async fn cmd_skill_run(
     let run_outcome = if stub {
         run_skill(&state, &policy, id, &input, None)
     } else {
-        let ollama_url = std::env::var("VECTORHAWK_OLLAMA_URL")
+        let ollama_url = std::env::var("SCENERY_OLLAMA_URL")
             .or_else(|_| std::env::var("OLLAMA_BASE_URL"))
             .unwrap_or_else(|_| "http://localhost:11434".to_string());
 
@@ -2415,8 +2413,7 @@ async fn cmd_skill_run(
     // Only on success, matching the semantics of increment_execution_count.
     if let Ok(ref r) = run_outcome {
         if let Ok(conn) = rusqlite::Connection::open(&state.db_path) {
-            if let Err(e) =
-                scenery_core::ratings::increment_execution_count(&conn, id, &r.version)
+            if let Err(e) = scenery_core::ratings::increment_execution_count(&conn, id, &r.version)
             {
                 tracing::warn!(error = %e, "failed to increment execution count on CLI run");
             }
@@ -2446,7 +2443,7 @@ async fn cmd_skill_run(
             use scenery_core::model::ModelSource;
             let label = match source {
                 ModelSource::Local(name) => format!("local Ollama ({name})"),
-                ModelSource::Internal(name) => format!("internal VectorHawk model ({name})"),
+                ModelSource::Internal(name) => format!("internal Scenery model ({name})"),
                 ModelSource::Provider(name) => format!("cloud provider ({name})"),
                 ModelSource::McpSampling => "MCP sampling (delegated to AI client)".to_string(),
             };
@@ -2553,8 +2550,8 @@ fn maybe_enrich_skill_md(
     skill_md_path: &camino::Utf8PathBuf,
     accept_suggestions: bool,
 ) -> Result<()> {
-    use std::io::{self, Write};
     use scenery_core::recommend::recommend_from_prompt;
+    use std::io::{self, Write};
 
     let content = match std::fs::read_to_string(skill_md_path) {
         Ok(c) => c,
@@ -2752,7 +2749,7 @@ async fn cmd_skill_validate(path: camino::Utf8PathBuf) -> Result<()> {
     println!("{pass_count} passed, {warn_count} warn, {fail_count} fail");
 
     if fail_count == 0 {
-        println!("Run: vectorhawk skill install {path}/");
+        println!("Run: scenery skill install {path}/");
         Ok(())
     } else {
         anyhow::bail!("validation failed — fix FAIL rows above")
@@ -2772,7 +2769,7 @@ async fn check_ollama_for_validate(path: &camino::Utf8Path) -> Option<String> {
         .map(|r| r.recommended)
         .unwrap_or_default();
 
-    let ollama_url = std::env::var("VECTORHAWK_OLLAMA_URL")
+    let ollama_url = std::env::var("SCENERY_OLLAMA_URL")
         .or_else(|_| std::env::var("OLLAMA_BASE_URL"))
         .unwrap_or_else(|_| "http://localhost:11434".to_string());
 
@@ -2837,7 +2834,7 @@ async fn cmd_skill_init(name: &str, output_dir: Option<&camino::Utf8Path>) -> Re
 name: {name}
 description: "TODO: describe what this skill does"
 metadata:
-  vectorhawk:
+  scenery:
     version: 0.1.0
     publisher: YOUR_PUBLISHER_ID
     permissions:
@@ -2866,8 +2863,8 @@ You should: TODO
     println!();
     println!("Next steps:");
     println!("  1. Edit {skill_dir}/SKILL.md — fill in description, publisher, and prompt");
-    println!("  2. vectorhawk skill validate {skill_dir}/");
-    println!("  3. vectorhawk skill publish {skill_dir}/ --registry-url <url>");
+    println!("  2. scenery skill validate {skill_dir}/");
+    println!("  3. scenery skill publish {skill_dir}/ --registry-url <url>");
 
     Ok(())
 }
@@ -2994,9 +2991,9 @@ async fn cmd_skill_author(
     output_dir: Option<&camino::Utf8Path>,
     registry_url: Option<&str>,
 ) -> Result<()> {
+    use scenery_core::recommend::recommend_from_prompt;
     use std::fs;
     use std::io::{self, BufRead, Write};
-    use scenery_core::recommend::recommend_from_prompt;
 
     // ── Step 1: Resolve skill name ────────────────────────────────────────────
 
@@ -3051,7 +3048,7 @@ async fn cmd_skill_author(
     // that is actually installed locally. This prevents the common DX failure
     // where the scaffold recommends a model the user hasn't pulled yet.
 
-    let ollama_url_for_detect = std::env::var("VECTORHAWK_OLLAMA_URL")
+    let ollama_url_for_detect = std::env::var("SCENERY_OLLAMA_URL")
         .or_else(|_| std::env::var("OLLAMA_BASE_URL"))
         .unwrap_or_else(|_| "http://localhost:11434".to_string());
 
@@ -3125,7 +3122,7 @@ async fn cmd_skill_author(
             "  1. Edit {}/{}/SKILL.md — fill in description{}",
             base, skill_id, publisher_note
         );
-        println!("  2. vectorhawk skill validate {}/{}/", base, skill_id);
+        println!("  2. scenery skill validate {}/{}/", base, skill_id);
         return Ok(());
     }
 
@@ -3169,7 +3166,7 @@ async fn cmd_skill_author(
             println!("  Publisher: {publisher_id}");
         }
         println!();
-        println!("Next: vectorhawk skill validate {}/{}/", base, skill_id);
+        println!("Next: scenery skill validate {}/{}/", base, skill_id);
         return Ok(());
     }
 
@@ -3267,7 +3264,7 @@ async fn cmd_skill_author(
     let body_block = indent_block(&prompt_text, 12);
     let skill_md = format!(
         "---\nname: {skill_name}\ndescription: \"TODO: describe what this skill does\"\nlicense: MIT\n\
-         metadata:\n  vectorhawk:\n    version: 0.1.0\n    publisher: {publisher_id}\n\
+         metadata:\n  scenery:\n    version: 0.1.0\n    publisher: {publisher_id}\n\
          {triggers_yaml}\
          \n    permissions:\n      network: {net}\n      filesystem: {fs_perm}\n      clipboard: {clip}\n\
          \n    execution:\n      timeout_ms: {timeout_ms}\n      memory_mb: {memory_mb}\n      sandbox: {sandbox}\n\
@@ -3291,7 +3288,7 @@ async fn cmd_skill_author(
         format!(" — fill in description (publisher: {publisher_id})")
     };
     println!("  1. Edit {skill_dir}/SKILL.md{publisher_note}");
-    println!("  2. vectorhawk skill validate {skill_dir}/");
+    println!("  2. scenery skill validate {skill_dir}/");
 
     Ok(())
 }
@@ -3333,7 +3330,7 @@ fn scaffold_with_defaults(
     let body_block = indent_block(prompt_text, 12);
     let skill_md = format!(
         "---\nname: {skill_name}\ndescription: \"TODO: describe what this skill does\"\nlicense: MIT\n\
-         metadata:\n  vectorhawk:\n    version: 0.1.0\n    publisher: {publisher_id}\n\
+         metadata:\n  scenery:\n    version: 0.1.0\n    publisher: {publisher_id}\n\
          \n    permissions:\n      network: none\n      filesystem: none\n      clipboard: none\n\
          \n    execution:\n      timeout_ms: 30000\n      memory_mb: 256\n      sandbox: strict\n\
          \n    workflow:\n      - id: run\n        type: llm\n        prompt:\n          kind: inline\n          body: |\n\
@@ -3387,7 +3384,7 @@ fn scaffold_with_recommendations(
     let body_block = indent_block(prompt_text, 12);
     let skill_md = format!(
         "---\nname: {skill_name}\ndescription: \"TODO: describe what this skill does\"\nlicense: MIT\n\
-         metadata:\n  vectorhawk:\n    version: 0.1.0\n    publisher: {publisher_id}\n\
+         metadata:\n  scenery:\n    version: 0.1.0\n    publisher: {publisher_id}\n\
          {triggers_yaml}\
          \n    permissions:\n      network: {net}\n      filesystem: {fs_perm}\n      clipboard: {clip}\n\
          \n    execution:\n      timeout_ms: {timeout_ms}\n      memory_mb: {memory_mb}\n      sandbox: {sandbox}\n\
@@ -3634,17 +3631,17 @@ async fn cmd_skill_publish(
     fork_name: Option<&str>,
 ) -> Result<()> {
     use flate2::{write::GzEncoder, Compression};
-    use std::fs;
-    use tar::Builder;
     use scenery_core::{
         auth::{load_tokens, AuthClient},
         registry::RegistryClient,
         state::AppState,
     };
+    use std::fs;
+    use tar::Builder;
 
     if !path.join("SKILL.md").exists() {
         anyhow::bail!(
-            "no SKILL.md found at '{}' — run 'vectorhawk skill init' to create one",
+            "no SKILL.md found at '{}' — run 'scenery skill init' to create one",
             path
         );
     }
@@ -3672,7 +3669,7 @@ async fn cmd_skill_publish(
         .context("failed to load auth tokens")?
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "not authenticated — run 'vectorhawk auth login' first, then retry publish"
+                "not authenticated — run 'scenery auth login' first, then retry publish"
             )
         })?;
 
@@ -3685,7 +3682,7 @@ async fn cmd_skill_publish(
         let client = AuthClient::new(registry_url);
         let user = client
             .me(&tokens.access_token)
-            .context("failed to look up your publisher ID — try 'vectorhawk auth login'")?;
+            .context("failed to look up your publisher ID — try 'scenery auth login'")?;
         let slug = derive_publisher_slug(&user.display_name);
         let patched = inject_publisher_field(&skill_md_text, &slug);
         (patched, Some(slug))
@@ -3826,8 +3823,8 @@ async fn cmd_skill_convert(
     path: camino::Utf8PathBuf,
     output_dir: Option<&camino::Utf8Path>,
 ) -> Result<()> {
-    use std::fs;
     use scenery_manifest::Manifest;
+    use std::fs;
 
     let manifest_path = path.join("manifest.json");
     if !manifest_path.exists() {
@@ -3884,7 +3881,7 @@ async fn cmd_skill_convert(
 name: {name}
 description: "{description_escaped}"
 metadata:
-  vectorhawk:
+  scenery:
     version: {version}
     publisher: {publisher}
     permissions:
@@ -3958,8 +3955,8 @@ metadata:
     println!();
     println!("Next steps:");
     println!("  1. Review the generated SKILL.md");
-    println!("  2. vectorhawk skill validate {dest}/");
-    println!("  3. vectorhawk skill publish {dest}/ --registry-url <url>");
+    println!("  2. scenery skill validate {dest}/");
+    println!("  3. scenery skill publish {dest}/ --registry-url <url>");
 
     Ok(())
 }
@@ -4011,13 +4008,11 @@ struct UpdateRow {
 /// table with columns: SKILL_ID | CURRENT | LATEST | STATUS.
 async fn cmd_skill_update(id: Option<&str>, all: bool, registry_url: Option<&str>) -> Result<()> {
     use rusqlite::{Connection, OptionalExtension};
+    use scenery_core::{registry::RegistryClient, state::AppState, updater::install_from_registry};
     use semver::Version;
-    use scenery_core::{
-        registry::RegistryClient, state::AppState, updater::install_from_registry,
-    };
 
     if id.is_none() && !all {
-        eprintln!("Usage: vectorhawk skill update <id>  |  vectorhawk skill update --all");
+        eprintln!("Usage: scenery skill update <id>  |  scenery skill update --all");
         std::process::exit(2);
     }
 
@@ -4235,12 +4230,12 @@ async fn cmd_skill_update(id: Option<&str>, all: bool, registry_url: Option<&str
 ///
 /// No stdin prompt remains. The paste-the-code path has been removed.
 async fn cmd_auth_login(registry_url: &str) -> Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::UnixStream;
     use scenery_core::{
         auth::{save_tokens, AuthClient},
         state::AppState,
     };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UnixStream;
 
     let state = AppState::bootstrap().context("failed to bootstrap state")?;
     let socket_path = state.socket_path();
@@ -4255,8 +4250,8 @@ async fn cmd_auth_login(registry_url: &str) -> Result<()> {
         Ok(Ok(s)) => s,
         Ok(Err(_)) | Err(_) => {
             eprintln!(
-                "vectorhawk: auth login requires the running daemon — \
-                 run `vectorhawk daemon install` first"
+                "scenery: auth login requires the running daemon — \
+                 run `scenery daemon install` first"
             );
             std::process::exit(2);
         }
@@ -4328,7 +4323,7 @@ async fn cmd_auth_login(registry_url: &str) -> Result<()> {
 
     if let Some(err) = port_resp.get("error") {
         eprintln!(
-            "vectorhawk: OAuth listener not running on the daemon: {}",
+            "scenery: OAuth listener not running on the daemon: {}",
             err.get("message")
                 .and_then(|m| m.as_str())
                 .unwrap_or("unknown error")
@@ -4376,12 +4371,12 @@ async fn cmd_auth_login(registry_url: &str) -> Result<()> {
         println!("Option B — Personal Access Token (no tunnel needed):");
         println!("  1. Open https://app.scenery.dev/portal/settings in your browser.");
         println!("  2. Create a token (starts with vh_pat_...).");
-        println!("  3. Run:  vectorhawk auth token   (paste the token at the prompt)");
+        println!("  3. Run:  scenery auth token   (paste the token at the prompt)");
         println!();
     } else {
         let browser_opened = try_open_browser(&init.auth_url);
         if browser_opened {
-            println!("Opening browser for VectorHawk login...");
+            println!("Opening browser for Scenery login...");
             println!();
             println!("If your browser does not open automatically, open this URL:");
             println!("  {}", init.auth_url);
@@ -4610,7 +4605,7 @@ async fn cmd_auth_status(registry_url: &str) -> Result<()> {
                 }
                 Err(e) => {
                     println!("Token present for {registry_url} but validation failed: {e:#}");
-                    println!("Try `vectorhawk auth login` to refresh.");
+                    println!("Try `scenery auth login` to refresh.");
                     anyhow::bail!("stored token for {registry_url} failed validation")
                 }
             }
@@ -4629,7 +4624,7 @@ fn print_device_revoked_notice(state: &scenery_core::state::AppState) {
     if let Ok(Some(revoked_at)) = state.get_sync_state("device_revoked_at") {
         println!();
         println!("⚠ This device was revoked by an admin (at {revoked_at}).");
-        println!("  Run `vectorhawk auth pair` to re-pair it as a new device.");
+        println!("  Run `scenery auth pair` to re-pair it as a new device.");
     }
 }
 
@@ -4648,7 +4643,7 @@ async fn cmd_auth_token(registry_url: &str) -> Result<()> {
     if !token.starts_with("vh_pat_") {
         anyhow::bail!(
             "token must start with 'vh_pat_'. \
-             Create one in the VectorHawk portal under Settings → Access Tokens."
+             Create one in the Scenery portal under Settings → Access Tokens."
         );
     }
 
@@ -4675,7 +4670,7 @@ async fn cmd_auth_token(registry_url: &str) -> Result<()> {
 async fn cmd_auth_pair(code: Option<&str>, registry_url: &str) -> Result<()> {
     use scenery_core::{auth::save_tokens, state::AppState};
 
-    // Resolution order: explicit argument > VH_PAIR_CODE > interactive
+    // Resolution order: explicit argument > SCN_PAIR_CODE > interactive
     // prompt (if a terminal is available) > clear non-zero-exit error.
     // See `pair::resolve_pair_code` for the testable decision logic.
     let code = pair::resolve_pair_code_live(code).map_err(|e| anyhow::anyhow!(e))?;
@@ -4827,7 +4822,7 @@ async fn cmd_plugin_install(
         .ok()
         .flatten()
         .ok_or_else(|| {
-            anyhow::anyhow!("Not logged in to {registry_url}. Run `vectorhawk auth login` first.")
+            anyhow::anyhow!("Not logged in to {registry_url}. Run `scenery auth login` first.")
         })?;
 
     // Device-scoped by default, matching `skill install`; --all-devices omits
@@ -4863,7 +4858,7 @@ async fn cmd_plugin_install(
     let text = resp.text().await.unwrap_or_default();
 
     if status == reqwest::StatusCode::UNAUTHORIZED {
-        anyhow::bail!("Authentication failed — run `vectorhawk auth login` and try again.");
+        anyhow::bail!("Authentication failed — run `scenery auth login` and try again.");
     }
     if status == reqwest::StatusCode::NOT_FOUND {
         anyhow::bail!("Plugin '{slug}' not found in the catalog.");
@@ -4911,7 +4906,7 @@ enum ClientOutcome {
     Failed(String),
 }
 
-/// Attempt to write the VectorHawk MCP entry into every client in `clients`,
+/// Attempt to write the Scenery MCP entry into every client in `clients`,
 /// in order, via the injected `write` closure (`write_mcp_entry` in
 /// production; a stub in tests, so this control flow is unit-testable
 /// without touching the filesystem).
@@ -5074,7 +5069,7 @@ fn describe_claude_code_entry(
             permissions_tightened,
         } => {
             let mut msg = format!(
-                "wrote vectorhawk MCP entry (HTTP + native OAuth, callback port \
+                "wrote scenery MCP entry (HTTP + native OAuth, callback port \
                  {callback_port}) to {}. Open `/mcp` in Claude Code and choose Authenticate.",
                 config_path.display()
             );
@@ -5099,10 +5094,10 @@ fn describe_claude_code_entry(
         }
         ClaudeCodeEntryKind::Stdio { reason } => match reason {
             StdioReason::HttpUnavailable => {
-                format!("wrote vectorhawk MCP entry to {}.", config_path.display())
+                format!("wrote scenery MCP entry to {}.", config_path.display())
             }
             StdioReason::ClientTooOld => format!(
-                "wrote vectorhawk MCP entry (stdio) to {} — update Claude Code to {}.{}.{} \
+                "wrote scenery MCP entry (stdio) to {} — update Claude Code to {}.{}.{} \
                  or newer for native HTTP + OAuth (no CLI login step).",
                 config_path.display(),
                 MIN_CLAUDE_CODE_HTTP_OAUTH_VERSION.0,
@@ -5110,9 +5105,9 @@ fn describe_claude_code_entry(
                 MIN_CLAUDE_CODE_HTTP_OAUTH_VERSION.2,
             ),
             StdioReason::NoFreeCallbackPort { busy_ports } => format!(
-                "wrote vectorhawk MCP entry (stdio) to {} — every Claude Code callback port \
+                "wrote scenery MCP entry (stdio) to {} — every Claude Code callback port \
                  ({}-{}) is busy ({}), so HTTP + native OAuth is unavailable until one frees \
-                 up. Re-run `vectorhawk mcp setup` after freeing one.",
+                 up. Re-run `scenery mcp setup` after freeing one.",
                 config_path.display(),
                 CLAUDE_CODE_CALLBACK_PORT_RANGE.start(),
                 CLAUDE_CODE_CALLBACK_PORT_RANGE.end(),
@@ -5135,7 +5130,7 @@ async fn cmd_mcp_setup(client: Option<&str>, dry_run: bool, rotate_local_key: bo
 
     // H3: rotate, then fall through to the normal flow below with the new
     // key already in place — rotating is only meaningful for Claude Code's
-    // HTTP entry, and `is_vectorhawk_configured` otherwise treats an
+    // HTTP entry, and `is_scenery_configured` otherwise treats an
     // existing HTTP entry as "already configured" and skips rewriting it,
     // so this has to force a rewrite rather than relying on that path.
     if rotate_local_key {
@@ -5169,7 +5164,7 @@ async fn cmd_mcp_setup(client: Option<&str>, dry_run: bool, rotate_local_key: bo
         .context("failed to rewrite Claude Code's config with the rotated key")?;
         match kind {
             ClaudeCodeEntryKind::Http { callback_port, .. } => println!(
-                "Rewrote vectorhawk's MCP entry for Claude Code with the new key (HTTP + \
+                "Rewrote scenery's MCP entry for Claude Code with the new key (HTTP + \
                  native OAuth, callback port {callback_port}) at {}. Re-authenticate via \
                  `/mcp` in Claude Code — the old key no longer works.",
                 config.config_path.display()
@@ -5285,7 +5280,7 @@ async fn cmd_mcp_setup(client: Option<&str>, dry_run: bool, rotate_local_key: bo
         for (config, outcome) in clients.iter().zip(outcomes.iter()) {
             match outcome {
                 ClientOutcome::AlreadyConfigured => {
-                    println!("{}: vectorhawk already configured — skipped.", config.name);
+                    println!("{}: scenery already configured — skipped.", config.name);
                 }
                 ClientOutcome::Wrote => {
                     if config.name == "Claude Code" {
@@ -5296,14 +5291,14 @@ async fn cmd_mcp_setup(client: Option<&str>, dry_run: bool, rotate_local_key: bo
                                 describe_claude_code_entry(&kind, &config.config_path)
                             ),
                             None => println!(
-                                "{}: wrote vectorhawk MCP entry to {}.",
+                                "{}: wrote scenery MCP entry to {}.",
                                 config.name,
                                 config.config_path.display()
                             ),
                         }
                     } else {
                         println!(
-                            "{}: wrote vectorhawk MCP entry to {}.",
+                            "{}: wrote scenery MCP entry to {}.",
                             config.name,
                             config.config_path.display()
                         );
@@ -5321,7 +5316,7 @@ async fn cmd_mcp_setup(client: Option<&str>, dry_run: bool, rotate_local_key: bo
             }
         }
 
-        // Remove VectorHawk's own command-skills whenever Claude Code is present.
+        // Remove Scenery's own command-skills whenever Claude Code is present.
         // These wrapped MCP tools as slash commands and cluttered the skills
         // list; management now lives in the portal. User-installed skills are
         // untouched.
@@ -5330,8 +5325,8 @@ async fn cmd_mcp_setup(client: Option<&str>, dry_run: bool, rotate_local_key: bo
             match uninstall_claude_skills() {
                 Ok(removed) if !removed.is_empty() => {
                     println!(
-                        "Removed {} VectorHawk command-skill(s) from ~/.claude/skills/ \
-                         (manage skills in the portal or via the vectorhawk MCP tools).",
+                        "Removed {} Scenery command-skill(s) from ~/.claude/skills/ \
+                         (manage skills in the portal or via the scenery MCP tools).",
                         removed.len()
                     );
                 }
@@ -5409,7 +5404,7 @@ async fn cmd_mcp_setup(client: Option<&str>, dry_run: bool, rotate_local_key: bo
 
             if config.already_configured {
                 println!(
-                    "vectorhawk is already configured in {} — no changes made.",
+                    "scenery is already configured in {} — no changes made.",
                     config.config_path.display()
                 );
             } else {
@@ -5427,7 +5422,7 @@ async fn cmd_mcp_setup(client: Option<&str>, dry_run: bool, rotate_local_key: bo
             match uninstall_claude_skills() {
                 Ok(removed) if !removed.is_empty() => {
                     println!(
-                        "Removed {} VectorHawk command-skill(s) from ~/.claude/skills/.",
+                        "Removed {} Scenery command-skill(s) from ~/.claude/skills/.",
                         removed.len()
                     );
                 }
@@ -5439,7 +5434,7 @@ async fn cmd_mcp_setup(client: Option<&str>, dry_run: bool, rotate_local_key: bo
         }
         other => {
             eprintln!(
-                "vectorhawk mcp setup: client '{other}' is not yet supported. \
+                "scenery mcp setup: client '{other}' is not yet supported. \
                  Omit --client to auto-detect all supported clients."
             );
             std::process::exit(2);
@@ -5470,7 +5465,7 @@ async fn wait_for_daemon_socket(timeout_ms: u64) {
     eprintln!(
         "warning: daemon socket not reachable within {timeout_ms} ms. \
          The config entry has been written; the daemon will be available after \
-         your next login or once `vectorhawk daemon install` completes."
+         your next login or once `scenery daemon install` completes."
     );
 }
 
@@ -5537,7 +5532,7 @@ async fn cmd_plugin_import(
     };
 
     println!("Imported to {result}");
-    println!("Next: vectorhawk skill validate {result}");
+    println!("Next: scenery skill validate {result}");
     Ok(())
 }
 
@@ -5553,11 +5548,11 @@ async fn cmd_mcp_remove() -> Result<()> {
         for config in &clients {
             match remove_mcp_entry(config) {
                 Ok(true) => println!(
-                    "{}: removed vectorhawk MCP entry from {}.",
+                    "{}: removed scenery MCP entry from {}.",
                     config.name,
                     config.config_path.display()
                 ),
-                Ok(false) => println!("{}: vectorhawk was not configured — skipped.", config.name),
+                Ok(false) => println!("{}: scenery was not configured — skipped.", config.name),
                 Err(e) => eprintln!(
                     "warning: failed to update {} config at {}: {e:#}",
                     config.name,
@@ -5570,12 +5565,12 @@ async fn cmd_mcp_remove() -> Result<()> {
     match uninstall_claude_skills() {
         Ok(removed) if !removed.is_empty() => {
             println!(
-                "Removed {} VectorHawk slash command(s) from ~/.claude/skills/.",
+                "Removed {} Scenery slash command(s) from ~/.claude/skills/.",
                 removed.len()
             );
         }
         Ok(_) => {
-            println!("No VectorHawk slash commands found in ~/.claude/skills/.");
+            println!("No Scenery slash commands found in ~/.claude/skills/.");
         }
         Err(e) => {
             eprintln!("warning: failed to remove slash commands: {e:#}");
@@ -5595,10 +5590,10 @@ async fn cmd_mcp_remove() -> Result<()> {
 /// This does NOT communicate with a running daemon — it operates on the shared
 /// SQLite state independently.
 async fn cmd_mcp_sync() -> Result<()> {
-    use std::sync::Arc;
     use scenery_core::{audit::SqliteAuditBuffer, registry::RegistryClient, state::AppState};
     use scenery_daemon::run_sync_tick;
     use scenery_mcp::tools::UpdateCheckCache;
+    use std::sync::Arc;
 
     let state = AppState::bootstrap().context("failed to bootstrap state")?;
     // Card 2 fix: seed the real block_third_party_inference handle from
@@ -5608,8 +5603,8 @@ async fn cmd_mcp_sync() -> Result<()> {
     // org-policy snapshot reconcile (Card 3) during this tick would have
     // been invisible to anything else in this process.
     state.seed_block_third_party_from_sync_state();
-    let registry_url = std::env::var("VECTORHAWK_REGISTRY_URL")
-        .unwrap_or_else(|_| DEFAULT_REGISTRY_URL.to_string());
+    let registry_url =
+        std::env::var("SCENERY_REGISTRY_URL").unwrap_or_else(|_| DEFAULT_REGISTRY_URL.to_string());
 
     let registry = Arc::new(RegistryClient::new(&registry_url));
     let audit = Arc::new(SqliteAuditBuffer::new(Arc::clone(&registry), &state));
@@ -6070,11 +6065,11 @@ fn load_all_tokens_from_db(
 /// Uninstall a locally installed plugin.
 ///
 /// Removes:
-/// - `~/.claude/plugins/marketplaces/vectorhawk/plugins/<slug>/`
-/// - `~/.claude/plugins/cache/vectorhawk/<slug>/`
-/// - Entry in `~/.claude/plugins/marketplaces/vectorhawk/.claude-plugin/marketplace.json`
+/// - `~/.claude/plugins/marketplaces/scenery/plugins/<slug>/`
+/// - `~/.claude/plugins/cache/scenery/<slug>/`
+/// - Entry in `~/.claude/plugins/marketplaces/scenery/.claude-plugin/marketplace.json`
 /// - Entry in `~/.claude/plugins/installed_plugins.json`
-/// - `enabledPlugins["<slug>@vectorhawk"]` in `~/.claude/settings.json`
+/// - `enabledPlugins["<slug>@scenery"]` in `~/.claude/settings.json`
 ///
 /// Also PATCHes the backend plugin-installation to "deactivated" if an
 /// installation_id is discoverable from the managed_path_markers table.
@@ -6175,7 +6170,7 @@ async fn cmd_plugin_uninstall(slug: &str, registry_url: Option<&str>) -> Result<
 }
 
 /// Returns `true` if the plugin's marketplace source directory exists under
-/// `~/.claude/plugins/marketplaces/vectorhawk/plugins/<slug>/`.
+/// `~/.claude/plugins/marketplaces/scenery/plugins/<slug>/`.
 fn is_plugin_installed_locally(slug: &str) -> Result<bool> {
     let home =
         dirs::home_dir().ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
@@ -6183,7 +6178,7 @@ fn is_plugin_installed_locally(slug: &str) -> Result<bool> {
         .join(".claude")
         .join("plugins")
         .join("marketplaces")
-        .join("vectorhawk")
+        .join("scenery")
         .join("plugins")
         .join(slug);
     Ok(plugin_src.exists())

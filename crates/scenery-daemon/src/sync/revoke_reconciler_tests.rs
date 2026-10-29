@@ -465,8 +465,7 @@ async fn snapshot_revocations_some_empty_clears_an_unblocked_entry() {
     // local gate must clear, allowing a future install again.
     let root = temp_root("snapshot-revocations-unblock");
     let state = Arc::new(AppState::bootstrap_in(root.clone()).unwrap());
-    scenery_core::revocation::upsert_revocation(&state, "skill", "unblocked-skill", None)
-        .unwrap();
+    scenery_core::revocation::upsert_revocation(&state, "skill", "unblocked-skill", None).unwrap();
     assert!(
         scenery_core::revocation::is_revoked(&state, "skill", "unblocked-skill", None).unwrap()
     );
@@ -485,8 +484,7 @@ async fn snapshot_revocations_some_empty_clears_an_unblocked_entry() {
     .await;
 
     assert!(
-        !scenery_core::revocation::is_revoked(&state, "skill", "unblocked-skill", None)
-            .unwrap(),
+        !scenery_core::revocation::is_revoked(&state, "skill", "unblocked-skill", None).unwrap(),
         "an empty (but present) revocations list must clear every local entry"
     );
 
@@ -607,13 +605,10 @@ async fn install_event_proceeds_for_a_different_unrevoked_version() {
     // revocation row exists for version 2.0.0's install path having been
     // gated at all by asserting the whole-skill revocation check: scoped
     // revoke of 1.0.0 must not report 2.0.0 as revoked.
-    assert!(!scenery_core::revocation::is_revoked(
-        &state,
-        "skill",
-        "scoped-skill",
-        Some("2.0.0")
-    )
-    .unwrap());
+    assert!(
+        !scenery_core::revocation::is_revoked(&state, "skill", "scoped-skill", Some("2.0.0"))
+            .unwrap()
+    );
     let _ = error_row;
 
     cleanup(&root);

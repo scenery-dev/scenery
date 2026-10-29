@@ -44,7 +44,7 @@ fn make_pusher() -> (ManagedPathsPusher, TempDir) {
     (pusher, tmp)
 }
 
-/// Read `.vectorhawk-managed.json` from a dir.
+/// Read `.scenery-managed.json` from a dir.
 fn read_marker(dir: &std::path::Path) -> super::super::marker::ManagedMarkerFile {
     super::super::marker::read_file_marker(dir)
         .unwrap()
@@ -169,7 +169,7 @@ fn modify_claude_json_creates_file_when_absent() {
     modify_claude_json(&path, |root| {
         root.as_object_mut().unwrap().insert(
             "mcpServers".to_string(),
-            serde_json::json!({"test-server": {"command": "vectorhawk"}}),
+            serde_json::json!({"test-server": {"command": "scenery"}}),
         );
     })
     .unwrap();
@@ -197,7 +197,7 @@ fn modify_claude_json_keeps_owner_only_mode_of_existing_file() {
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
 
     modify_claude_json(&path, |root| {
-        root["mcpServers"]["test-server"] = serde_json::json!({"command": "vectorhawk"});
+        root["mcpServers"]["test-server"] = serde_json::json!({"command": "scenery"});
     })
     .unwrap();
 
@@ -241,7 +241,7 @@ fn modify_claude_json_preserves_existing_entries() {
         if let Some(Value::Object(ref mut map)) = root.get_mut("mcpServers") {
             map.insert(
                 "my-server".to_string(),
-                serde_json::json!({"command": "vectorhawk", "args": ["mcp", "serve", "--server", "my-server"]}),
+                serde_json::json!({"command": "scenery", "args": ["mcp", "serve", "--server", "my-server"]}),
             );
         }
     })
@@ -263,7 +263,7 @@ fn modify_claude_json_preserves_existing_entries() {
 
     // Verify the new entry shape.
     let entry = servers.get("my-server").unwrap();
-    assert_eq!(entry["command"], "vectorhawk");
+    assert_eq!(entry["command"], "scenery");
     let args = entry["args"].as_array().unwrap();
     assert_eq!(args[0], "mcp");
     assert_eq!(args[1], "serve");
@@ -279,7 +279,7 @@ fn modify_claude_json_remove_entry_preserves_others() {
     let initial = serde_json::json!({
         "mcpServers": {
             "keep-me": {"command": "keep"},
-            "remove-me": {"command": "vectorhawk", "args": ["mcp", "serve", "--server", "remove-me"]}
+            "remove-me": {"command": "scenery", "args": ["mcp", "serve", "--server", "remove-me"]}
         }
     });
     fs::write(&path, serde_json::to_string_pretty(&initial).unwrap()).unwrap();
@@ -326,7 +326,7 @@ fn modify_claude_json_concurrent_writers_no_corruption() {
                     if let Value::Object(ref mut map) = servers {
                         map.insert(
                             slug.clone(),
-                            serde_json::json!({"command": "vectorhawk", "args": ["mcp", "serve", "--server", slug]}),
+                            serde_json::json!({"command": "scenery", "args": ["mcp", "serve", "--server", slug]}),
                         );
                     }
                 }
@@ -468,7 +468,7 @@ fn push_skill_writes_canonical_and_links_claude() {
     assert!(canonical.is_dir());
     assert!(!canonical.is_symlink());
     assert!(canonical.join("SKILL.md").exists());
-    assert!(canonical.join(".vectorhawk-managed.json").exists());
+    assert!(canonical.join(".scenery-managed.json").exists());
     // Claude Code's path is a link, and the content is reachable through it.
     assert!(link.is_symlink());
     assert!(link.join("SKILL.md").exists());
@@ -599,7 +599,7 @@ fn push_skill_replaces_real_marked_dir_at_claude_path_with_link() {
     let fake_home = tempfile::tempdir().unwrap();
 
     // A pre-pivot managed skill: real directory at the Claude path, carrying
-    // the `.vectorhawk-managed.json` marker push_skill used to write there.
+    // the `.scenery-managed.json` marker push_skill used to write there.
     let claude_skill_dir = fake_home
         .path()
         .join(".claude")
@@ -608,7 +608,7 @@ fn push_skill_replaces_real_marked_dir_at_claude_path_with_link() {
     fs::create_dir_all(&claude_skill_dir).unwrap();
     fs::write(claude_skill_dir.join("SKILL.md"), b"pre-pivot content").unwrap();
     fs::write(
-        claude_skill_dir.join(".vectorhawk-managed.json"),
+        claude_skill_dir.join(".scenery-managed.json"),
         format!(
             r#"{{"marker_version":{MARKER_FILE_VERSION},"installation_id":null,"source_sha256":"old","migrated_at":"2026-01-01T00:00:00Z"}}"#
         ),
@@ -664,10 +664,10 @@ fn push_skill_replaces_real_marked_dir_at_claude_path_with_link() {
 
 /// **Regression (shared-root symlink clobber).**
 ///
-/// `~/.agents/skills` is not VectorHawk's private root. `npx skills`, Cursor
+/// `~/.agents/skills` is not Scenery's private root. `npx skills`, Cursor
 /// and Codex users all populate it — `discoveries.rs` scans it *because* it is
 /// user-populated — and symlinking a skill in from a checkout elsewhere is a
-/// normal thing for a user to do there. VectorHawk never puts a symlink at
+/// normal thing for a user to do there. Scenery never puts a symlink at
 /// the canonical path itself (it writes a real directory), so a symlink whose
 /// target carries no marker is someone else's.
 ///
@@ -723,7 +723,7 @@ fn push_skill_refuses_to_clobber_an_unmanaged_symlink_in_the_shared_root() {
 }
 
 /// The counterpart: a symlink at the canonical path that resolves to
-/// VectorHawk-marked content *is* ours to replace, so the push proceeds and
+/// Scenery-marked content *is* ours to replace, so the push proceeds and
 /// materialises a real managed directory.
 #[test]
 fn push_skill_replaces_a_managed_symlink_in_the_shared_root() {
@@ -735,7 +735,7 @@ fn push_skill_replaces_a_managed_symlink_in_the_shared_root() {
     let managed_target = fake_home.path().join("vh-managed").join("hello-world");
     fs::create_dir_all(&managed_target).unwrap();
     fs::write(managed_target.join("SKILL.md"), b"old managed content").unwrap();
-    fs::write(managed_target.join(".vectorhawk-managed.json"), b"{}").unwrap();
+    fs::write(managed_target.join(".scenery-managed.json"), b"{}").unwrap();
 
     let agents_skills = fake_home.path().join(".agents").join("skills");
     fs::create_dir_all(&agents_skills).unwrap();
@@ -773,8 +773,8 @@ fn push_skill_replaces_a_managed_symlink_in_the_shared_root() {
 /// legitimately sit there unmanaged forever. `push_skill` must refuse a slug
 /// collision against one of these exactly as it refuses one against a foreign
 /// symlink — not silently annex it, overwrite its `SKILL.md`, stamp it with
-/// VectorHawk's marker, and leave it primed for a later `remove_skill` to
-/// `remove_dir_all` content VectorHawk never wrote.
+/// Scenery's marker, and leave it primed for a later `remove_skill` to
+/// `remove_dir_all` content Scenery never wrote.
 #[test]
 fn push_skill_refuses_to_clobber_an_unmanaged_real_dir_in_the_shared_root() {
     let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
@@ -783,7 +783,7 @@ fn push_skill_refuses_to_clobber_an_unmanaged_real_dir_in_the_shared_root() {
     let fake_home = tempfile::tempdir().unwrap();
 
     // A real, unmanaged directory at the canonical path — e.g. left by `npx
-    // skills`, Cursor, or Codex, and never carrying VectorHawk's marker.
+    // skills`, Cursor, or Codex, and never carrying Scenery's marker.
     let agents_skills = fake_home.path().join(".agents").join("skills");
     fs::create_dir_all(&agents_skills).unwrap();
     let collision = agents_skills.join("hello-world");
@@ -802,7 +802,7 @@ fn push_skill_refuses_to_clobber_an_unmanaged_real_dir_in_the_shared_root() {
 
     let skill_md_after_push = fs::read(collision.join("SKILL.md")).ok();
     let notes_md_after_push = fs::read(collision.join("notes.md")).ok();
-    let marker_written = collision.join(".vectorhawk-managed.json").exists();
+    let marker_written = collision.join(".scenery-managed.json").exists();
 
     // A subsequent remove_skill (as the reconciler would call on deactivate)
     // must not destroy the directory either.
@@ -833,7 +833,7 @@ fn push_skill_refuses_to_clobber_an_unmanaged_real_dir_in_the_shared_root() {
     );
     assert!(
         !marker_written,
-        "BUG: push_skill stamped the user's directory as VectorHawk-managed"
+        "BUG: push_skill stamped the user's directory as Scenery-managed"
     );
     assert!(
         dir_survives_remove,
@@ -900,13 +900,13 @@ async fn push_adopted_discovery_noop_for_non_skill_kind() {
     assert!(result.is_ok(), "non-skill kind must noop OK");
 }
 
-// ── VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER gate ─────────────────────────────
+// ── SCENERY_DISABLE_FILESYSTEM_RECONCILER gate ─────────────────────────────
 
 #[test]
 fn push_skill_is_noop_when_reconciler_disabled() {
     let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     // Set the env var to disable reconciler.
-    std::env::set_var("VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER", "1");
+    std::env::set_var("SCENERY_DISABLE_FILESYSTEM_RECONCILER", "1");
 
     let (pusher, _tmp) = make_pusher();
     // Calling push_skill must succeed immediately without touching the filesystem.
@@ -914,7 +914,7 @@ fn push_skill_is_noop_when_reconciler_disabled() {
     assert!(result.is_ok(), "must return Ok when gate is active");
 
     // Clean up so this test doesn't affect others.
-    std::env::remove_var("VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER");
+    std::env::remove_var("SCENERY_DISABLE_FILESYSTEM_RECONCILER");
 }
 
 // ── push_missing_active_skills (self-heal) ────────────────────────────────────
@@ -995,7 +995,7 @@ fn push_missing_active_skills_repushes_only_absent() {
 
     let alpha_now = skills_dir.join("alpha");
     let alpha_pushed = alpha_now.is_dir()
-        && alpha_now.join(".vectorhawk-managed.json").exists()
+        && alpha_now.join(".scenery-managed.json").exists()
         && fs::read(alpha_now.join("SKILL.md")).unwrap() == b"---\nname: alpha\n---\nbody";
     let beta_untouched =
         fs::read(skills_dir.join("beta").join("SKILL.md")).unwrap() == b"preexisting";
@@ -1019,7 +1019,7 @@ fn push_missing_active_skills_repushes_only_absent() {
 
 /// Regression test for the reported "CLI local install doesn't create
 /// active/ symlink" bug: drive the exact same entry point
-/// `vectorhawk skill install /path/to/skill-dir/` uses
+/// `scenery skill install /path/to/skill-dir/` uses
 /// (`scenery_core::installer::install_unpacked_skill` with
 /// `InstallMode::Copy`, called on a `SkillPackage` loaded straight from a
 /// local directory — the `cli-local` branch of `cmd_skill_install`), then
@@ -1186,12 +1186,12 @@ fn push_mcp_appends_managed_entry_when_not_brokered() {
 #[test]
 fn push_skill_writes_no_journal_entry_when_reconciler_disabled() {
     let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var("VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER", "1");
+    std::env::set_var("SCENERY_DISABLE_FILESYSTEM_RECONCILER", "1");
 
     let (pusher, tmp) = make_pusher();
     let result = pusher.push_skill("gated-journal-skill", None, b"---\nname: x\n---\n", &[]);
 
-    std::env::remove_var("VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER");
+    std::env::remove_var("SCENERY_DISABLE_FILESYSTEM_RECONCILER");
     result.expect("must return Ok when gate is active");
 
     let journal =
@@ -1253,8 +1253,8 @@ fn remove_skill_keeps_row_when_directory_removal_fails() {
 }
 
 /// Retrying after a partial removal must finish the job even if the
-/// `.vectorhawk-managed.json` file was already deleted: the DB row at the
-/// exact path is proof enough that VectorHawk owns the dir.
+/// `.scenery-managed.json` file was already deleted: the DB row at the
+/// exact path is proof enough that Scenery owns the dir.
 #[test]
 fn remove_skill_finishes_a_half_removed_dir_tracked_by_its_row() {
     let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
@@ -1267,7 +1267,7 @@ fn remove_skill_finishes_a_half_removed_dir_tracked_by_its_row() {
         .push_skill("demo", None, b"---\nname: demo\n---\n", &[])
         .unwrap();
     let canonical = fake_home.path().join(".agents/skills/demo");
-    fs::remove_file(canonical.join(".vectorhawk-managed.json")).unwrap();
+    fs::remove_file(canonical.join(".scenery-managed.json")).unwrap();
     let result = pusher.remove_skill("demo");
 
     if let Some(v) = prev_home {

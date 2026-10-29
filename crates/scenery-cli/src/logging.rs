@@ -1,4 +1,4 @@
-//! Tracing initialization for the `vectorhawk` process.
+//! Tracing initialization for the `scenery` process.
 //!
 //! Two logging profiles, chosen by `main()` based on the parsed subcommand
 //! (see `is_daemon_foreground` in `main.rs`):
@@ -6,10 +6,10 @@
 //! - **Interactive CLI subcommands** ([`init_cli`]) — human-readable output
 //!   to stderr, WARN by default. The AI client reads stdout for MCP
 //!   JSON-RPC and ignores stderr, so this is safe on every subcommand.
-//! - **`vectorhawk daemon run`** ([`init_daemon`]) — the exact command line
+//! - **`scenery daemon run`** ([`init_daemon`]) — the exact command line
 //!   the installed LaunchAgent (macOS) and systemd user unit (Linux) both
 //!   invoke — INFO by default, written to a size-bounded rotating file
-//!   under the daemon's state directory (`<root_dir>/logs/vectorhawkd.log`).
+//!   under the daemon's state directory (`<root_dir>/logs/scenery.log`).
 //!   This is the *durable* daemon log: launchd does not rotate
 //!   `StandardOutPath`, so the plist no longer depends on it for the log
 //!   that matters (see `install/macos.rs`); rotation is self-contained and
@@ -37,7 +37,7 @@ const LOG_SEGMENT_BYTES: u64 = 5 * 1024 * 1024;
 /// Rotated backups kept in addition to the active segment (10 segments
 /// total * 5 MB = ~50 MB daemon log footprint cap).
 const LOG_MAX_BACKUPS: usize = 9;
-const LOG_FILE_BASENAME: &str = "vectorhawkd.log";
+const LOG_FILE_BASENAME: &str = "scenery.log";
 
 /// Keeps the background writer thread (when file logging is active) alive.
 /// Must be held for the lifetime of `main()` — dropping it early stops the
@@ -54,7 +54,7 @@ pub fn init_cli() -> LoggingGuard {
     LoggingGuard(None)
 }
 
-/// `vectorhawk daemon run`: size-bounded rotating file under `log_dir`, INFO
+/// `scenery daemon run`: size-bounded rotating file under `log_dir`, INFO
 /// by default.
 ///
 /// Falls back to stderr (still INFO by default) if the log directory or the
@@ -64,7 +64,7 @@ pub fn init_cli() -> LoggingGuard {
 pub fn init_daemon(log_dir: &Path) -> LoggingGuard {
     if let Err(e) = std::fs::create_dir_all(log_dir) {
         eprintln!(
-            "vectorhawk: warning: failed to create log dir {}: {e:#} \
+            "scenery: warning: failed to create log dir {}: {e:#} \
              — falling back to stderr logging",
             log_dir.display()
         );
@@ -80,7 +80,7 @@ pub fn init_daemon(log_dir: &Path) -> LoggingGuard {
         Ok(a) => a,
         Err(e) => {
             eprintln!(
-                "vectorhawk: warning: failed to open rotating log file under {}: {e:#} \
+                "scenery: warning: failed to open rotating log file under {}: {e:#} \
                  — falling back to stderr logging",
                 log_dir.display()
             );

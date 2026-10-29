@@ -6,9 +6,9 @@
 //! tests in `scenery-core`.
 #![allow(clippy::unwrap_used)]
 
+use scenery_core::state::AppState;
 use std::{fs, sync::Arc};
 use tempfile::TempDir;
-use scenery_core::state::AppState;
 
 use super::*;
 use crate::managed_paths::ENV_MUTEX;
@@ -29,7 +29,7 @@ async fn handle_discovery_adopted_noop_for_non_skill_kind() {
 
     let result = handle_discovery_adopted(
         Arc::clone(&state),
-        "https://app.vectorhawk.ai".to_string(),
+        "https://app.scenery.dev".to_string(),
         "some-mcp".to_string(),
         "mcp".to_string(),
         "/does/not/matter".to_string(),
@@ -61,7 +61,7 @@ async fn handle_discovery_adopted_noop_when_source_already_removed() {
 
     let result = handle_discovery_adopted(
         Arc::clone(&state),
-        "https://app.vectorhawk.ai".to_string(),
+        "https://app.scenery.dev".to_string(),
         "hello-world".to_string(),
         "skill".to_string(),
         missing,
@@ -94,7 +94,7 @@ async fn handle_discovery_adopted_noop_when_source_already_removed() {
 #[tokio::test]
 async fn handle_discovery_adopted_records_pending_takeover_before_failing_without_token() {
     // This test never sets the env vars itself, but `handle_discovery_adopted`
-    // reads `VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER` — take the shared
+    // reads `SCENERY_DISABLE_FILESYSTEM_RECONCILER` — take the shared
     // guard so a concurrent test toggling that var can't flip the killswitch
     // mid-run and turn this into a spurious early `Ok(())`.
     let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
@@ -111,7 +111,7 @@ async fn handle_discovery_adopted_records_pending_takeover_before_failing_withou
 
     let result = handle_discovery_adopted(
         Arc::clone(&state),
-        "https://app.vectorhawk.ai".to_string(),
+        "https://app.scenery.dev".to_string(),
         "hello-world".to_string(),
         "skill".to_string(),
         source_dir.to_string_lossy().to_string(),
@@ -159,7 +159,7 @@ async fn handle_discovery_adopted_noop_under_killswitch() {
     std::env::set_var(ENV_DISABLE, "1");
     let result = handle_discovery_adopted(
         Arc::clone(&state),
-        "https://app.vectorhawk.ai".to_string(),
+        "https://app.scenery.dev".to_string(),
         "hello-world".to_string(),
         "skill".to_string(),
         source_dir.to_string_lossy().to_string(),

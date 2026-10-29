@@ -16,7 +16,7 @@ struct FakeInspector {
 
 impl FakeInspector {
     fn daemon_run(mut self, pid: u32) -> Self {
-        self.argv.insert(pid, b"vectorhawk\0daemon\0run".to_vec());
+        self.argv.insert(pid, b"scenery\0daemon\0run".to_vec());
         self.same_uid_alive.insert(pid, Some(true));
         self.exe_replaced_or_deleted.insert(pid, Some(false));
         self
@@ -70,19 +70,20 @@ fn v(s: &str) -> Version {
 
 #[test]
 fn matches_bare_daemon_run() {
-    assert!(cmdline_is_daemon_run(b"vectorhawk\0daemon\0run"));
+    assert!(cmdline_is_daemon_run(b"scenery\0daemon\0run"));
+    assert!(cmdline_is_daemon_run(b"scn\0daemon\0run"));
 }
 
 #[test]
 fn matches_absolute_path_with_trailing_flag() {
     assert!(cmdline_is_daemon_run(
-        b"/home/linuxbrew/.linuxbrew/bin/vectorhawk\0daemon\0run\0--foreground"
+        b"/home/linuxbrew/.linuxbrew/bin/scenery\0daemon\0run\0--foreground"
     ));
 }
 
 #[test]
 fn rejects_install_subcommand() {
-    assert!(!cmdline_is_daemon_run(b"vectorhawk\0daemon\0install"));
+    assert!(!cmdline_is_daemon_run(b"scenery\0daemon\0install"));
 }
 
 #[test]
@@ -90,7 +91,7 @@ fn rejects_substring_only_match_the_live_incident() {
     // The exact shape of the 0a862ca incident: tokens present, but not in
     // the right argv positions.
     assert!(!cmdline_is_daemon_run(
-        b"bash\0-c\0vectorhawk status; daemon stuff; /run/user/1000/bus"
+        b"bash\0-c\0scenery status; daemon stuff; /run/user/1000/bus"
     ));
 }
 
@@ -131,7 +132,7 @@ fn newer_version_refuses() {
 fn argv_mismatch_refuses_even_with_older_version() {
     let inspector = FakeInspector::default()
         .with_uid(100, Some(true))
-        .with_argv(100, b"bash\0-c\0something vectorhawk daemon run adjacent");
+        .with_argv(100, b"bash\0-c\0something scenery daemon run adjacent");
     let verdict = verify_pid(&inspector, 100, 1, &v("2.0.0"), Some(v("1.0.0")));
     assert!(matches!(verdict, Verdict::Refuse(_)));
 }
@@ -289,7 +290,7 @@ fn decide_and_signal_invokes_takeover_only_for_a_verified_stale_holder() {
         }
     );
     assert_eq!(result, Some(TakeoverResult::AcquiredAfterTerm));
-    assert_eq!(calls, vec![(100, b"vectorhawk\0daemon\0run".to_vec())]);
+    assert_eq!(calls, vec![(100, b"scenery\0daemon\0run".to_vec())]);
 }
 
 #[test]

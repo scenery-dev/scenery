@@ -6,7 +6,7 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "VectorHawk runner — stdio↔socket relay shim"
+description = "Scenery runner — stdio↔socket relay shim"
 
 [lib]
 name = "scenery_shim"

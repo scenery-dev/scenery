@@ -133,7 +133,7 @@ fn classify_plugin_drift() {
 fn classify_mcp_drift_via_claude_json() {
     let td = TempDir::new().unwrap();
     let claude_json = td.path().join(".claude.json");
-    let entry = serde_json::json!({"command":"vectorhawk","args":["mcp","serve","--server","fs"]});
+    let entry = serde_json::json!({"command":"scenery","args":["mcp","serve","--server","fs"]});
     let root = serde_json::json!({"mcpServers": {"fs": entry}});
     fs::write(&claude_json, serde_json::to_vec_pretty(&root).unwrap()).unwrap();
 
@@ -200,7 +200,7 @@ fn quarantine_skill_moves_dir_aside() {
     // The quarantine destination does.
     assert!(dest.join("SKILL.md").exists());
     // dest path includes the quarantine root.
-    assert!(dest.to_string_lossy().contains(".vectorhawk-quarantine"));
+    assert!(dest.to_string_lossy().contains(".scenery-quarantine"));
 
     // Restore env so we don't poison parallel tests.
     if let Some(v) = prev_home {
@@ -219,7 +219,7 @@ fn quarantine_mcp_writes_entry_snapshot_and_removes() {
     let claude_json = fake_home.join(".claude.json");
     let root = serde_json::json!({
         "mcpServers": {
-            "fs": {"command":"vectorhawk","args":["mcp","serve","--server","fs"]},
+            "fs": {"command":"scenery","args":["mcp","serve","--server","fs"]},
             "preserved": {"command":"keep-me"}
         }
     });
@@ -381,7 +381,7 @@ fn link_integrity_false_when_link_replaced_by_real_dir() {
     fs::create_dir_all(&canonical).unwrap();
     fs::write(canonical.join("SKILL.md"), b"managed").unwrap();
     // User replaced the link with their own real directory — not
-    // VectorHawk-managed (no marker file), so it can never read as intact.
+    // Scenery-managed (no marker file), so it can never read as intact.
     let link = fake_home.path().join(".claude/skills/demo");
     fs::create_dir_all(&link).unwrap();
     fs::write(link.join("SKILL.md"), b"tampered").unwrap();
@@ -427,7 +427,7 @@ fn link_integrity_true_when_link_absent() {
     assert!(result.unwrap());
 }
 
-/// State 3: a real directory at the Claude path that is VectorHawk-managed
+/// State 3: a real directory at the Claude path that is Scenery-managed
 /// and byte-identical to canonical — the legitimate `LinkMode::Copy` steady
 /// state (e.g. Windows without Developer Mode). `links::link_is_intact`
 /// alone returns `false` here because it checks `is_symlink()` first; a
@@ -440,7 +440,7 @@ fn link_integrity_true_when_healthy_managed_copy() {
     let fake_home = tempfile::tempdir().unwrap();
     let _home_guard = HomeGuard::set(fake_home.path());
 
-    // The pusher writes the `.vectorhawk-managed.json` marker into the
+    // The pusher writes the `.scenery-managed.json` marker into the
     // *canonical* directory, and `copy_tree` necessarily carries it along
     // into the copy — so a real steady-state pair has the marker on both
     // sides, not just the copy.
@@ -454,7 +454,7 @@ fn link_integrity_true_when_healthy_managed_copy() {
     .unwrap();
 
     // A real directory (not a symlink) at the Claude path, carrying the
-    // VectorHawk marker and identical content — as `link_dir` leaves behind
+    // Scenery marker and identical content — as `link_dir` leaves behind
     // on a copy-mode host.
     let link = fake_home.path().join(".claude/skills/demo");
     fs::create_dir_all(&link).unwrap();

@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://vectorhawk.ai/schemas/skill_md_frontmatter/v1.json",
+  "$id": "https://scenery.dev/schemas/skill_md_frontmatter/v1.json",
   "title": "SKILL.md Frontmatter",
-  "description": "Schema for the YAML frontmatter block of a VectorHawk SKILL.md file. All VectorHawk-specific fields live under metadata.vectorhawk.*. Top-level vh_* keys are rejected.",
+  "description": "Schema for the YAML frontmatter block of a Scenery SKILL.md file. All Scenery-specific fields live under metadata.scenery.*. Top-level vh_* keys are rejected.",
   "type": "object",
   "required": ["name", "description"],
   "additionalProperties": false,
@@ -27,10 +27,10 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "vectorhawk": {
+        "scenery": {
           "type": "object",
           "additionalProperties": false,
-          "description": "VectorHawk-specific skill metadata.",
+          "description": "Scenery-specific skill metadata.",
           "properties": {
             "version": {
               "type": "string",

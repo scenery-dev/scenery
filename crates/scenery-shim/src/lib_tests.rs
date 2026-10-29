@@ -22,16 +22,16 @@ fn daemon_socket_path_ends_with_agent_sock() {
     );
 }
 
-/// `daemon_socket_path` contains `VectorHawk` on macOS.
+/// `daemon_socket_path` contains `Scenery` on macOS.
 ///
 /// Guards against accidental renames drifting from the daemon's path.
 #[test]
 #[cfg(target_os = "macos")]
-fn daemon_socket_path_contains_vectorhawk_on_macos() {
+fn daemon_socket_path_contains_scenery_on_macos() {
     let path = crate::daemon_socket_path().unwrap();
     assert!(
-        path.to_string_lossy().contains("VectorHawk"),
-        "macOS socket path must be under VectorHawk data dir; got: {}",
+        path.to_string_lossy().contains("Scenery"),
+        "macOS socket path must be under Scenery data dir; got: {}",
         path.display()
     );
 }
@@ -49,8 +49,8 @@ fn daemon_required_error_contains_install_hint() {
         .expect("daemon-required response must be an error");
     assert_eq!(err.code, -32001i64, "must use the DAEMON_UNREACHABLE code");
     assert!(
-        err.message.contains("vectorhawk daemon install"),
-        "message must include `vectorhawk daemon install` install hint; got: {}",
+        err.message.contains("scenery daemon install"),
+        "message must include `scenery daemon install` install hint; got: {}",
         err.message
     );
     assert!(
@@ -145,7 +145,7 @@ fn filter_tools_for_server_strips_prefix_and_filters() {
                 input_schema: serde_json::json!({}),
             },
             ToolDefinition {
-                name: "vectorhawk_list_skills".to_string(),
+                name: "scenery_list_skills".to_string(),
                 description: "VH management".to_string(),
                 input_schema: serde_json::json!({}),
             },
@@ -195,7 +195,7 @@ fn filter_tools_for_aggregator_drops_excluded_slugs() {
                 input_schema: serde_json::json!({}),
             },
             ToolDefinition {
-                name: "vectorhawk_list".to_string(),
+                name: "scenery_list".to_string(),
                 description: "".to_string(),
                 input_schema: serde_json::json!({}),
             },
@@ -207,7 +207,7 @@ fn filter_tools_for_aggregator_drops_excluded_slugs() {
     let filtered = crate::filter_tools_for_aggregator(result, &excluded);
 
     let names: Vec<&str> = filtered.tools.iter().map(|t| t.name.as_str()).collect();
-    assert_eq!(names, vec!["filesystem__read_file", "vectorhawk_list"]);
+    assert_eq!(names, vec!["filesystem__read_file", "scenery_list"]);
 }
 
 /// Empty exclusion set is a no-op.

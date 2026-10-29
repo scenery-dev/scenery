@@ -25,7 +25,7 @@ pub struct ClientConfig {
 /// Gemini CLI) shares one JSON merge/read/remove implementation. Codex CLI's
 /// `~/.codex/config.toml` is TOML, not JSON, so the handful of functions that
 /// touch a config file branch on this field rather than assuming JSON
-/// everywhere. Kept to exactly the two formats VectorHawk actually writes —
+/// everywhere. Kept to exactly the two formats Scenery actually writes —
 /// add a variant only when a third client needs one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigFormat {
@@ -33,22 +33,22 @@ pub enum ConfigFormat {
     Toml,
 }
 
-/// Path segment marking a versioned Homebrew Cellar install for `vectorhawk`
-/// (`<prefix>/Cellar/vectorhawk/<ver>/bin/vectorhawk`). `brew upgrade` deletes
+/// Path segment marking a versioned Homebrew Cellar install for `scenery`
+/// (`<prefix>/Cellar/scenery/<ver>/bin/scenery`). `brew upgrade` deletes
 /// the old version's Cellar directory, so any command still pointing inside
 /// one is either already dead or about to be on the next upgrade. Shared by
 /// [`stable_command_from_exe`] (used when writing a fresh entry) and
 /// [`command_needs_repair`] (used when checking an existing one).
-const CELLAR: &str = "/Cellar/vectorhawk/";
+const CELLAR: &str = "/Cellar/scenery/";
 
-/// The name under which VectorHawk registers itself in AI client configs.
+/// The name under which Scenery registers itself in AI client configs.
 ///
 /// Must match what `scenery-shim` advertises and what `mcp setup` writes.
 /// Changing this is a breaking change for all AI clients already configured.
-pub const MCP_SERVER_NAME: &str = "vectorhawk";
+pub const MCP_SERVER_NAME: &str = "scenery";
 
 /// The command the AI client runs to start the shim.
-pub const MCP_COMMAND: &str = "vectorhawk";
+pub const MCP_COMMAND: &str = "scenery";
 
 /// Arguments passed to the shim command.
 pub const MCP_ARGS: &[&str] = &["mcp", "serve"];
@@ -63,15 +63,15 @@ pub fn build_mcp_entry() -> serde_json::Value {
 
 /// Resolve the absolute command path an AI client should spawn for the shim.
 ///
-/// We write an absolute path (not bare `vectorhawk`) because AI clients launch
+/// We write an absolute path (not bare `scenery`) because AI clients launch
 /// MCP servers with a non-login shell that often lacks Homebrew/Linuxbrew on
 /// PATH. But `current_exe()` canonicalizes through symlinks to the *version-
-/// pinned* Homebrew Cellar path (`…/Cellar/vectorhawk/<ver>/bin/vectorhawk`),
+/// pinned* Homebrew Cellar path (`…/Cellar/scenery/<ver>/bin/scenery`),
 /// which `brew upgrade` deletes — leaving the client pointing at a dead binary.
 /// So when a Cellar layout is detected, rewrite to the stable `<prefix>/bin`
 /// symlink Homebrew keeps current across upgrades.
 fn resolve_mcp_command() -> String {
-    match std::env::current_exe()
+    match current_exe_unaliased()
         .ok()
         .and_then(|p| p.to_str().map(|s| s.to_string()))
     {
@@ -80,7 +80,18 @@ fn resolve_mcp_command() -> String {
     }
 }
 
-/// Rewrite a Homebrew Cellar exe path (`<prefix>/Cellar/vectorhawk/<ver>/bin/<bin>`)
+/// `current_exe()` with the `scn` alias mapped back to `scenery` (macOS does
+/// not resolve the symlink), so configs always name the canonical binary.
+fn current_exe_unaliased() -> std::io::Result<std::path::PathBuf> {
+    let exe = std::env::current_exe()?;
+    if exe.file_name() == Some(std::ffi::OsStr::new("scn")) {
+        Ok(exe.with_file_name("scenery"))
+    } else {
+        Ok(exe)
+    }
+}
+
+/// Rewrite a Homebrew Cellar exe path (`<prefix>/Cellar/scenery/<ver>/bin/<bin>`)
 /// to the version-independent `<prefix>/bin/<bin>` symlink when that symlink
 /// exists; otherwise return `exe` unchanged. Pure, with an injectable existence
 /// check so the rewrite is unit-testable without a real Homebrew install.
@@ -131,7 +142,7 @@ fn mcp_entry_for(config: &ClientConfig) -> serde_json::Value {
 
 /// The only OAuth client this resource server accepts (§8 of the frozen
 /// contract) — must match `scenery-daemon::mcp_http::JWT_CLIENT_ID`.
-pub const MCP_HTTP_CLIENT_ID: &str = "vectorhawk-claude-code";
+pub const MCP_HTTP_CLIENT_ID: &str = "scenery-claude-code";
 
 /// Allowed `callbackPort` range for Claude Code's own loopback OAuth
 /// redirect listener (§8: `http://localhost:{P}/callback` for `P` in this
@@ -183,7 +194,7 @@ pub enum StdioReason {
 }
 
 /// Build the exact HTTP+OAuth entry from §8, plus the H3 local-key header:
-/// `{"type":"http","url":"http://127.0.0.1:<port>/mcp","oauth":{"clientId":"vectorhawk-claude-code","callbackPort":<P>},"headers":{"X-VectorHawk-Local-Key":"<local_key>"}}`.
+/// `{"type":"http","url":"http://127.0.0.1:<port>/mcp","oauth":{"clientId":"scenery-claude-code","callbackPort":<P>},"headers":{"X-Scenery-Local-Key":"<local_key>"}}`.
 pub fn build_claude_code_http_entry(
     mcp_http_port: u16,
     callback_port: u16,
@@ -197,7 +208,7 @@ pub fn build_claude_code_http_entry(
             "callbackPort": callback_port,
         },
         "headers": {
-            "X-VectorHawk-Local-Key": local_key,
+            "X-Scenery-Local-Key": local_key,
         }
     })
 }
@@ -215,7 +226,7 @@ pub struct CallbackPortPick {
 /// Find a free port in [`CLAUDE_CODE_CALLBACK_PORT_RANGE`] by actually
 /// binding and immediately releasing it — "free at setup time", a one-shot
 /// snapshot check (not reserved/held), matching how this is a one-off
-/// `vectorhawk mcp setup` decision rather than something re-verified on
+/// `scenery mcp setup` decision rather than something re-verified on
 /// every daemon boot.
 ///
 /// M8: also reports every port tried and found busy before (or instead of)
@@ -232,7 +243,7 @@ pub fn pick_free_callback_port() -> CallbackPortPick {
 /// unit-testable without ever binding a real socket — tests substitute a
 /// pure closure over a fixed set of "busy" ports instead of racing real
 /// `TcpListener::bind` calls against ports this Mac's actual services (or a
-/// real `vectorhawk mcp setup` run) might be using.
+/// real `scenery mcp setup` run) might be using.
 fn pick_free_port_in(
     range: std::ops::RangeInclusive<u16>,
     is_free: impl Fn(u16) -> bool,
@@ -393,7 +404,7 @@ pub fn write_claude_code_entry(
     })
 }
 
-/// Point Claude Code's `vectorhawk` entry back at the stdio shim if it is
+/// Point Claude Code's `scenery` entry back at the stdio shim if it is
 /// the HTTP+OAuth entry for `mcp_http_port`. The daemon calls this when that
 /// pinned port is held by another process: Claude Code would otherwise send
 /// its local key and bearer token to whoever owns the port. Returns whether
@@ -402,8 +413,8 @@ pub fn revert_claude_code_http_entry(
     claude_json: &std::path::Path,
     mcp_http_port: u16,
 ) -> Result<bool> {
-    let url = read_vectorhawk_entry_url(claude_json, "mcpServers");
-    if read_vectorhawk_entry_type(claude_json, "mcpServers").as_deref() != Some("http")
+    let url = read_scenery_entry_url(claude_json, "mcpServers");
+    if read_scenery_entry_type(claude_json, "mcpServers").as_deref() != Some("http")
         || url.as_deref() != Some(format!("http://127.0.0.1:{mcp_http_port}/mcp").as_str())
     {
         return Ok(false);
@@ -460,7 +471,7 @@ pub fn detect_claude_code() -> Option<ClientConfig> {
     if !claude_dir.exists() && !claude_config.exists() && !app_present {
         return None;
     }
-    let already = is_vectorhawk_configured(&claude_config, "mcpServers", ConfigFormat::Json);
+    let already = is_scenery_configured(&claude_config, "mcpServers", ConfigFormat::Json);
     Some(ClientConfig {
         name: "Claude Code".to_string(),
         config_path: claude_config,
@@ -497,7 +508,7 @@ fn detect_ai_clients_in(
     let claude_config = home.join(".claude.json");
     let claude_dir = home.join(".claude");
     if claude_dir.exists() || claude_config.exists() || claude_code_app_present(system_root) {
-        let already = is_vectorhawk_configured(&claude_config, "mcpServers", ConfigFormat::Json);
+        let already = is_scenery_configured(&claude_config, "mcpServers", ConfigFormat::Json);
         clients.push(ClientConfig {
             name: "Claude Code".to_string(),
             config_path: claude_config,
@@ -511,8 +522,7 @@ fn detect_ai_clients_in(
     if let Some(desktop_config) = claude_desktop_config_path(home) {
         let desktop_dir = desktop_config.parent().map(|p| p.to_path_buf());
         if desktop_dir.as_ref().map(|d| d.exists()).unwrap_or(false) || desktop_config.exists() {
-            let already =
-                is_vectorhawk_configured(&desktop_config, "mcpServers", ConfigFormat::Json);
+            let already = is_scenery_configured(&desktop_config, "mcpServers", ConfigFormat::Json);
             clients.push(ClientConfig {
                 name: "Claude Desktop".to_string(),
                 config_path: desktop_config,
@@ -527,7 +537,7 @@ fn detect_ai_clients_in(
     let cursor_dir = home.join(".cursor");
     if cursor_dir.exists() {
         let cursor_config = cursor_dir.join("mcp.json");
-        let already = is_vectorhawk_configured(&cursor_config, "mcpServers", ConfigFormat::Json);
+        let already = is_scenery_configured(&cursor_config, "mcpServers", ConfigFormat::Json);
         clients.push(ClientConfig {
             name: "Cursor".to_string(),
             config_path: cursor_config,
@@ -541,7 +551,7 @@ fn detect_ai_clients_in(
     let windsurf_dir = home.join(".codeium").join("windsurf");
     if windsurf_dir.exists() {
         let windsurf_config = windsurf_dir.join("mcp_config.json");
-        let already = is_vectorhawk_configured(&windsurf_config, "mcpServers", ConfigFormat::Json);
+        let already = is_scenery_configured(&windsurf_config, "mcpServers", ConfigFormat::Json);
         clients.push(ClientConfig {
             name: "Windsurf".to_string(),
             config_path: windsurf_config,
@@ -557,7 +567,7 @@ fn detect_ai_clients_in(
     if let Some(vscode_config) = vscode_mcp_json_path(home) {
         let vscode_dir = vscode_config.parent().map(|p| p.to_path_buf());
         if vscode_dir.as_ref().map(|d| d.exists()).unwrap_or(false) || vscode_config.exists() {
-            let already = is_vectorhawk_configured(&vscode_config, "servers", ConfigFormat::Json);
+            let already = is_scenery_configured(&vscode_config, "servers", ConfigFormat::Json);
             clients.push(ClientConfig {
                 name: "VS Code".to_string(),
                 config_path: vscode_config,
@@ -572,7 +582,7 @@ fn detect_ai_clients_in(
     let gemini_dir = home.join(".gemini");
     if gemini_dir.exists() {
         let gemini_config = gemini_dir.join("settings.json");
-        let already = is_vectorhawk_configured(&gemini_config, "mcpServers", ConfigFormat::Json);
+        let already = is_scenery_configured(&gemini_config, "mcpServers", ConfigFormat::Json);
         clients.push(ClientConfig {
             name: "Gemini CLI".to_string(),
             config_path: gemini_config,
@@ -598,8 +608,7 @@ fn detect_ai_clients_in(
         let codex_dir = home.join(".codex");
         if codex_dir.exists() {
             let codex_config = codex_dir.join("config.toml");
-            let already =
-                is_vectorhawk_configured(&codex_config, "mcp_servers", ConfigFormat::Toml);
+            let already = is_scenery_configured(&codex_config, "mcp_servers", ConfigFormat::Toml);
             clients.push(ClientConfig {
                 name: "Codex".to_string(),
                 config_path: codex_config,
@@ -613,15 +622,15 @@ fn detect_ai_clients_in(
     clients
 }
 
-/// Write the VectorHawk MCP entry into a client config file.
+/// Write the Scenery MCP entry into a client config file.
 ///
 /// Reads the existing JSON (if any), merges the entry under `mcp_key`, and
 /// writes back. Creates the file (and parent directories) if they do not exist.
 ///
 /// Before the very first edit to a given `config_path`, the pre-edit file is
 /// backed up and a `restore-journal` entry (`op=config_edit`, `source=native`)
-/// is appended, so `vectorhawk uninstall` can restore the client's config to
-/// exactly what it was before VectorHawk touched it. Journal/backup failures
+/// is appended, so `scenery uninstall` can restore the client's config to
+/// exactly what it was before Scenery touched it. Journal/backup failures
 /// are logged and never block the actual config write — see
 /// [`record_config_edit_journal`].
 ///
@@ -762,7 +771,7 @@ fn write_mcp_entry_json_with_value(
 
     // Journal + backup BEFORE overwriting the file, so the backup captures
     // the file exactly as it stood before this edit (or before any
-    // VectorHawk edit at all, on repeat calls — see doc comment below).
+    // Scenery edit at all, on repeat calls — see doc comment below).
     #[cfg(feature = "daemon")]
     record_config_edit_journal(config);
 
@@ -771,7 +780,7 @@ fn write_mcp_entry_json_with_value(
     Ok(())
 }
 
-/// Write/merge the `[mcp_servers.vectorhawk]` table into a Codex-style TOML
+/// Write/merge the `[mcp_servers.scenery]` table into a Codex-style TOML
 /// config via `toml_edit`'s format-preserving document model, so any other
 /// tables, keys, comments, or formatting in the user's `config.toml` survive
 /// byte-for-byte. Mirrors [`write_mcp_entry_json`]'s merge-then-write shape
@@ -829,9 +838,9 @@ fn write_mcp_entry_toml(config: &ClientConfig) -> Result<()> {
     // `TableLike::insert` on an inline table converts this `Item::Table` into
     // a nested inline table via `Item::into_value` (`Table::into_inline_table`
     // under the hood) rather than panicking, so the outer `mcp_servers = {
-    // ... }` stays inline and the new `vectorhawk = { command = ..., args =
+    // ... }` stays inline and the new `scenery = { command = ..., args =
     // [...] }` entry matches its sibling entries' style; on a standard table
-    // it inserts as `[mcp_servers.vectorhawk]` exactly as before.
+    // it inserts as `[mcp_servers.scenery]` exactly as before.
     servers.insert(MCP_SERVER_NAME, Item::Table(entry));
 
     if let Some(parent) = config.config_path.parent() {
@@ -859,7 +868,7 @@ fn write_mcp_entry_toml(_config: &ClientConfig) -> Result<()> {
 /// path is journaled — determined by scanning existing entries for a prior
 /// `config_edit` against the same `target_path` and reusing its
 /// `backup_path` — so a second `mcp setup` run never clobbers the pristine
-/// pre-VectorHawk backup with an already-modified copy. If the file did not
+/// pre-Scenery backup with an already-modified copy. If the file did not
 /// exist before this edit, `backup_path` is left `None`: uninstall should
 /// delete `target_path` rather than restore it in that case.
 ///
@@ -940,7 +949,7 @@ fn record_config_edit_journal_in(config: &ClientConfig, root_dir: camino::Utf8Pa
     }
 }
 
-/// Remove the VectorHawk MCP entry from a client config file.
+/// Remove the Scenery MCP entry from a client config file.
 ///
 /// Returns `true` if the entry existed and was removed, `false` if it wasn't
 /// present. The file is left unchanged when the entry is absent.
@@ -982,7 +991,7 @@ fn remove_mcp_entry_json(config: &ClientConfig) -> Result<bool> {
 }
 
 /// TOML counterpart of [`remove_mcp_entry_json`], via `toml_edit` so removing
-/// the `vectorhawk` sub-table leaves every other table/comment/formatting in
+/// the `scenery` sub-table leaves every other table/comment/formatting in
 /// the file untouched. Same `daemon`-only gating as [`write_mcp_entry_toml`].
 #[cfg(feature = "daemon")]
 fn remove_mcp_entry_toml(config: &ClientConfig) -> Result<bool> {
@@ -996,7 +1005,7 @@ fn remove_mcp_entry_toml(config: &ClientConfig) -> Result<bool> {
         return Ok(false);
     };
     // Same `as_table_like_mut` reasoning as `write_mcp_entry_toml`: an inline
-    // `mcp_servers = { vectorhawk = {...} }` must be removable too, not just
+    // `mcp_servers = { scenery = {...} }` must be removable too, not just
     // a standard `[mcp_servers]` table.
     let Some(servers) = doc
         .get_mut(config.mcp_key.as_str())
@@ -1022,23 +1031,23 @@ fn remove_mcp_entry_toml(_config: &ClientConfig) -> Result<bool> {
 
 // ── Slash command skills ───────────────────────────────────────────────────────
 
-/// SKILL.md definitions for VectorHawk slash commands.
+/// SKILL.md definitions for Scenery slash commands.
 /// Each tuple is (directory_name, SKILL.md content).
 fn skill_definitions() -> Vec<(&'static str, &'static str)> {
     vec![
         (
-            "vectorhawk",
+            "scenery",
             r#"---
-name: vectorhawk
-description: VectorHawk hub — show auth status, installed skills, MCP servers, and available commands
+name: scenery
+description: Scenery hub — show auth status, installed skills, MCP servers, and available commands
 ---
-Show the user a VectorHawk status overview:
+Show the user a Scenery status overview:
 
-1. Call vectorhawk_login to check authentication status (if registry is configured)
-2. Call vectorhawk_list to show installed skills count and names
-3. Call vectorhawk_mcp_status to show active MCP server count (if registry is configured)
-4. Then list all available VectorHawk slash commands:
-   - /mcp-login — Authenticate with VectorHawk
+1. Call scenery_login to check authentication status (if registry is configured)
+2. Call scenery_list to show installed skills count and names
+3. Call scenery_mcp_status to show active MCP server count (if registry is configured)
+4. Then list all available Scenery slash commands:
+   - /mcp-login — Authenticate with Scenery
    - /mcp-search — Browse approved MCP servers
    - /mcp-install — Install an approved MCP server
    - /mcp-request — Request access to a new MCP server
@@ -1054,9 +1063,9 @@ Show the user a VectorHawk status overview:
             "mcp-login",
             r#"---
 name: mcp-login
-description: Authenticate with the VectorHawk registry
+description: Authenticate with the Scenery registry
 ---
-Log the user into VectorHawk. Call the vectorhawk_login tool.
+Log the user into Scenery. Call the scenery_login tool.
 
 If it succeeds, confirm they are logged in and show their identity.
 If it fails, show the error and suggest checking their registry URL.
@@ -1068,7 +1077,7 @@ If it fails, show the error and suggest checking their registry URL.
 name: mcp-search
 description: Browse approved MCP servers in your organization's catalog
 ---
-Browse available MCP servers. Call the vectorhawk_mcp_catalog tool.
+Browse available MCP servers. Call the scenery_mcp_catalog tool.
 
 $ARGUMENTS
 
@@ -1080,9 +1089,9 @@ If no servers are found, suggest the user contact their IT admin.
             "mcp-install",
             r#"---
 name: mcp-install
-description: Install an approved MCP server through VectorHawk governance
+description: Install an approved MCP server through Scenery governance
 ---
-Install an MCP server through governance. Call the vectorhawk_mcp_install tool with the server ID from the arguments.
+Install an MCP server through governance. Call the scenery_mcp_install tool with the server ID from the arguments.
 
 $ARGUMENTS
 
@@ -1095,7 +1104,7 @@ If the server is not yet approved, suggest using /mcp-request first.
 name: mcp-request
 description: Request access to a new MCP server from your organization
 ---
-Request access to an MCP server. Call the vectorhawk_mcp_request tool with the server ID from the arguments.
+Request access to an MCP server. Call the scenery_mcp_request tool with the server ID from the arguments.
 
 $ARGUMENTS
 
@@ -1109,7 +1118,7 @@ Suggest using /mcp-status to check back on pending requests.
 name: mcp-status
 description: Check the status of your MCP server access requests
 ---
-Check MCP server request status. Call the vectorhawk_mcp_status tool.
+Check MCP server request status. Call the scenery_mcp_status tool.
 
 Show results clearly — which requests are approved, pending, or denied.
 For approved servers, suggest using /mcp-install to activate them.
@@ -1119,9 +1128,9 @@ For approved servers, suggest using /mcp-install to activate them.
             "skill-search",
             r#"---
 name: skill-search
-description: Search the VectorHawk registry for available skills
+description: Search the Scenery registry for available skills
 ---
-Search for skills in the VectorHawk registry. Call the vectorhawk_search tool with the query from the arguments.
+Search for skills in the Scenery registry. Call the scenery_search tool with the query from the arguments.
 
 If no query was provided, ask the user what they're looking for before calling the tool.
 
@@ -1134,9 +1143,9 @@ Show results with skill name, version, and description.
             "skill-install",
             r#"---
 name: skill-install
-description: Install a skill from the VectorHawk registry
+description: Install a skill from the Scenery registry
 ---
-Install a skill. Call the vectorhawk_install tool with the skill ID from the arguments.
+Install a skill. Call the scenery_install tool with the skill ID from the arguments.
 
 $ARGUMENTS
 
@@ -1147,9 +1156,9 @@ Confirm installation and show what the skill does.
             "skill-list",
             r#"---
 name: skill-list
-description: List all installed VectorHawk skills
+description: List all installed Scenery skills
 ---
-List installed skills. Call the vectorhawk_list tool.
+List installed skills. Call the scenery_list tool.
 
 Show each skill's name, version, and a brief description.
 "#,
@@ -1158,9 +1167,9 @@ Show each skill's name, version, and a brief description.
             "skill-create",
             r#"---
 name: skill-create
-description: Create a new VectorHawk skill from a name and system prompt
+description: Create a new Scenery skill from a name and system prompt
 ---
-Create a new skill. Call vectorhawk_author with the skill name and a system prompt from the arguments.
+Create a new skill. Call scenery_author with the skill name and a system prompt from the arguments.
 
 $ARGUMENTS
 
@@ -1171,9 +1180,9 @@ Walk the user through the result — show the generated SKILL.md and suggest nex
             "skill-publish",
             r#"---
 name: skill-publish
-description: Publish a skill bundle to the VectorHawk registry
+description: Publish a skill bundle to the Scenery registry
 ---
-Publish a skill to the registry. Use `vectorhawk skill publish` via the Bash tool with the skill path from the arguments.
+Publish a skill to the registry. Use `scenery skill publish` via the Bash tool with the skill path from the arguments.
 
 $ARGUMENTS
 
@@ -1184,9 +1193,9 @@ Show the publish result and the skill's registry URL.
     ]
 }
 
-/// Install VectorHawk slash command skills to `~/.claude/skills/`.
+/// Install Scenery slash command skills to `~/.claude/skills/`.
 ///
-/// Each skill is a SKILL.md file that wraps a VectorHawk MCP tool,
+/// Each skill is a SKILL.md file that wraps a Scenery MCP tool,
 /// giving users clean top-level slash commands in Claude Code.
 /// Skips writing if the skill file already exists with identical content.
 pub fn install_claude_skills() -> Result<Vec<String>> {
@@ -1194,7 +1203,7 @@ pub fn install_claude_skills() -> Result<Vec<String>> {
     install_claude_skills_in(&home)
 }
 
-/// Remove VectorHawk slash command skill directories from `~/.claude/skills/`.
+/// Remove Scenery slash command skill directories from `~/.claude/skills/`.
 ///
 /// Returns the names of directories that were removed.
 pub fn uninstall_claude_skills() -> Result<Vec<String>> {
@@ -1341,7 +1350,7 @@ fn vscode_mcp_json_path(home: &std::path::Path) -> Option<PathBuf> {
 ///
 /// No longer written to by `mcp setup` / the repair pass — kept only so
 /// [`migrate_stale_vscode_settings_entry`] can find and remove a stale
-/// `mcpServers.vectorhawk` key a pre-fix build left there. Gated behind
+/// `mcpServers.scenery` key a pre-fix build left there. Gated behind
 /// `daemon` because that's its only (non-test) caller — see the feature-gate
 /// note on `migrate_stale_vscode_settings_entry` itself.
 #[cfg(feature = "daemon")]
@@ -1350,12 +1359,12 @@ fn vscode_settings_path(home: &std::path::Path) -> Option<PathBuf> {
 }
 
 /// Returns `true` if the config file at `path` already contains a
-/// `vectorhawk` entry under `mcp_key`, with a `command` that's current.
+/// `scenery` entry under `mcp_key`, with a `command` that's current.
 ///
-/// Format-agnostic: reads the entry via [`read_vectorhawk_command`], then
+/// Format-agnostic: reads the entry via [`read_scenery_command`], then
 /// applies the same staleness rule regardless of whether it came from JSON
 /// or TOML — see [`command_is_current`].
-fn is_vectorhawk_configured(path: &std::path::Path, mcp_key: &str, format: ConfigFormat) -> bool {
+fn is_scenery_configured(path: &std::path::Path, mcp_key: &str, format: ConfigFormat) -> bool {
     // An HTTP+OAuth entry (Claude Code only, `write_claude_code_entry`) has
     // no `command` to go stale — once written it stays "configured" until
     // the user removes it, so check for it before falling through to the
@@ -1363,23 +1372,23 @@ fn is_vectorhawk_configured(path: &std::path::Path, mcp_key: &str, format: Confi
     // `command` field and report "not configured", making `mcp setup`
     // rewrite — and `pick_free_callback_port` re-pick — it on every run).
     if format == ConfigFormat::Json
-        && read_vectorhawk_entry_type(path, mcp_key).as_deref() == Some("http")
+        && read_scenery_entry_type(path, mcp_key).as_deref() == Some("http")
     {
         return true;
     }
-    match read_vectorhawk_command(path, mcp_key, format) {
+    match read_scenery_command(path, mcp_key, format) {
         Some(command) => command_is_current(&command),
         None => false,
     }
 }
 
-/// Read the `type` string of the `vectorhawk` entry (`{mcp_key}.vectorhawk.type`)
+/// Read the `type` string of the `scenery` entry (`{mcp_key}.scenery.type`)
 /// out of a JSON client config file. `None` if the file is missing,
 /// unparsable, or the entry has no `type` field at all (every stdio entry
 /// this module writes, except VS Code's `"stdio"` marker — see
-/// [`is_vectorhawk_configured`]'s caller, which only treats `"http"`
+/// [`is_scenery_configured`]'s caller, which only treats `"http"`
 /// specially).
-fn read_vectorhawk_entry_type(path: &std::path::Path, mcp_key: &str) -> Option<String> {
+fn read_scenery_entry_type(path: &std::path::Path, mcp_key: &str) -> Option<String> {
     let text = fs::read_to_string(path).ok()?;
     let json: serde_json::Value = serde_json::from_str(&text).ok()?;
     json.get(mcp_key)?
@@ -1389,8 +1398,8 @@ fn read_vectorhawk_entry_type(path: &std::path::Path, mcp_key: &str) -> Option<S
         .map(str::to_string)
 }
 
-/// Read the `url` of the `vectorhawk` entry out of a JSON client config.
-fn read_vectorhawk_entry_url(path: &std::path::Path, mcp_key: &str) -> Option<String> {
+/// Read the `url` of the `scenery` entry out of a JSON client config.
+fn read_scenery_entry_url(path: &std::path::Path, mcp_key: &str) -> Option<String> {
     let text = fs::read_to_string(path).ok()?;
     let json: serde_json::Value = serde_json::from_str(&text).ok()?;
     json.get(mcp_key)?
@@ -1400,11 +1409,11 @@ fn read_vectorhawk_entry_url(path: &std::path::Path, mcp_key: &str) -> Option<St
         .map(str::to_string)
 }
 
-/// Read the `oauth.callbackPort` of the `vectorhawk` entry out of a JSON
+/// Read the `oauth.callbackPort` of the `scenery` entry out of a JSON
 /// client config file — i.e. Claude Code's HTTP+OAuth entry written by
 /// [`write_claude_code_entry`] (§8). `None` if the file is missing,
 /// unparsable, the entry has no HTTP/OAuth shape (still on stdio), or the
-/// port doesn't fit a `u16`. Used by `vectorhawk doctor` (M8) to check
+/// port doesn't fit a `u16`. Used by `scenery doctor` (M8) to check
 /// whether the configured callback port is currently free.
 pub fn read_claude_code_callback_port(path: &std::path::Path, mcp_key: &str) -> Option<u16> {
     let text = fs::read_to_string(path).ok()?;
@@ -1417,7 +1426,7 @@ pub fn read_claude_code_callback_port(path: &std::path::Path, mcp_key: &str) -> 
         .and_then(|v| u16::try_from(v).ok())
 }
 
-/// Returns `true` if `command` is a `vectorhawk` MCP entry's command that's
+/// Returns `true` if `command` is a `scenery` MCP entry's command that's
 /// still current — i.e. does NOT need `mcp setup`/repair to rewrite it.
 ///
 /// Treated as stale (returns `false`) if the command is:
@@ -1431,18 +1440,18 @@ fn command_is_current(command: &str) -> bool {
     if !p.is_absolute() {
         return false;
     }
-    match std::env::current_exe().ok() {
+    match current_exe_unaliased().ok() {
         Some(exe) => p == exe.as_path(),
         None => p.exists(),
     }
 }
 
-/// Read the `command` string of the `vectorhawk` entry (`{mcp_key}.vectorhawk.command`)
+/// Read the `command` string of the `scenery` entry (`{mcp_key}.scenery.command`)
 /// out of a client config file, whatever its on-disk format. Returns `None`
 /// if the file is missing, unparsable, or the entry simply isn't present —
-/// callers ([`is_vectorhawk_configured`], [`repair_stale_mcp_entries_in`])
+/// callers ([`is_scenery_configured`], [`repair_stale_mcp_entries_in`])
 /// treat that the same as "nothing to check/repair".
-fn read_vectorhawk_command(
+fn read_scenery_command(
     path: &std::path::Path,
     mcp_key: &str,
     format: ConfigFormat,
@@ -1457,12 +1466,12 @@ fn read_vectorhawk_command(
                 .as_str()
                 .map(str::to_string)
         }
-        ConfigFormat::Toml => read_vectorhawk_command_toml(path, mcp_key),
+        ConfigFormat::Toml => read_scenery_command_toml(path, mcp_key),
     }
 }
 
 #[cfg(feature = "daemon")]
-fn read_vectorhawk_command_toml(path: &std::path::Path, mcp_key: &str) -> Option<String> {
+fn read_scenery_command_toml(path: &std::path::Path, mcp_key: &str) -> Option<String> {
     let text = fs::read_to_string(path).ok()?;
     let doc = text.parse::<toml_edit::DocumentMut>().ok()?;
     // `Item::get` (unlike `as_table_mut`) already looks inside both a
@@ -1479,13 +1488,13 @@ fn read_vectorhawk_command_toml(path: &std::path::Path, mcp_key: &str) -> Option
 }
 
 #[cfg(not(feature = "daemon"))]
-fn read_vectorhawk_command_toml(_path: &std::path::Path, _mcp_key: &str) -> Option<String> {
+fn read_scenery_command_toml(_path: &std::path::Path, _mcp_key: &str) -> Option<String> {
     None
 }
 
 // ── Unmanaged server detection (GAP-06) ───────────────────────────────────────
 
-/// An MCP server entry found in a client's config file that is NOT managed by VectorHawk.
+/// An MCP server entry found in a client's config file that is NOT managed by Scenery.
 #[derive(Debug, Clone)]
 pub struct UnmanagedServer {
     /// Name/key of the server in the config file (e.g. `"github-mcp"`).
@@ -1496,9 +1505,9 @@ pub struct UnmanagedServer {
     pub client_name: String,
 }
 
-/// Scan all detected AI client config files and return MCP servers not managed by VectorHawk.
+/// Scan all detected AI client config files and return MCP servers not managed by Scenery.
 ///
-/// A server is considered managed if its key is `MCP_SERVER_NAME` (`"vectorhawk"`).
+/// A server is considered managed if its key is `MCP_SERVER_NAME` (`"scenery"`).
 /// Every other server key is reported as unmanaged so IT admins can audit shadow
 /// MCP installations via the `unmanaged_server_detected` audit event stream.
 pub fn detect_unmanaged_servers() -> Vec<UnmanagedServer> {
@@ -1561,7 +1570,7 @@ pub struct RawMcpEntry {
 /// for the same underlying reason: VS Code's `mcp.json` and similar configs
 /// routinely carry `//`/`/* */` comments and trailing commas — and
 /// `toml_edit` for Codex's TOML client (the same parse
-/// [`write_mcp_entry_toml`] / [`read_vectorhawk_command_toml`] already use)
+/// [`write_mcp_entry_toml`] / [`read_scenery_command_toml`] already use)
 /// — including Codex's `[mcp_servers]` table, which
 /// [`detect_unmanaged_servers`] (GAP-06, JSON-only) does not cover.
 ///
@@ -1692,7 +1701,7 @@ fn toml_value_to_json(value: &toml_edit::Value) -> serde_json::Value {
 
 // ── Daemon-boot self-heal for stale MCP commands ───────────────────────────────
 
-/// Returns `true` when `command` looks like a stale `vectorhawk` MCP command
+/// Returns `true` when `command` looks like a stale `scenery` MCP command
 /// that daemon-boot repair should rewrite: an absolute path that either (a)
 /// no longer exists on disk — Homebrew deleted the old Cellar version on a
 /// later upgrade — or (b) still points inside a versioned Cellar directory
@@ -1710,7 +1719,7 @@ fn command_needs_repair(command: &str, exists: impl Fn(&str) -> bool) -> bool {
     command.contains(CELLAR)
 }
 
-/// Scan all detected AI-client configs and rewrite any `vectorhawk` MCP
+/// Scan all detected AI-client configs and rewrite any `scenery` MCP
 /// entry whose `command` is stale (see [`command_needs_repair`]) back to the
 /// current stable path, via the same [`write_mcp_entry`] used by `mcp setup`
 /// (so the write goes through the restore journal identically).
@@ -1726,7 +1735,7 @@ fn command_needs_repair(command: &str, exists: impl Fn(&str) -> bool) -> bool {
 /// requiring anyone to manually re-run `mcp setup`.
 ///
 /// Idempotent: a config whose command already matches the current stable
-/// path is left untouched. Only the `vectorhawk` entry is ever touched —
+/// path is left untouched. Only the `scenery` entry is ever touched —
 /// every other MCP server entry in the file is left exactly as-is.
 ///
 /// Returns the names of clients whose entry was rewritten. Per-client I/O
@@ -1756,7 +1765,7 @@ fn repair_stale_mcp_entries_in(
         // so a stale versioned `command` in `~/.codex/config.toml` gets
         // rewritten by the same daemon-boot self-heal as every other client.
         let Some(command) =
-            read_vectorhawk_command(&client.config_path, &client.mcp_key, client.format)
+            read_scenery_command(&client.config_path, &client.mcp_key, client.format)
         else {
             continue;
         };
@@ -1771,14 +1780,14 @@ fn repair_stale_mcp_entries_in(
                     client = %client.name,
                     path = %client.config_path.display(),
                     error = %e,
-                    "heal: failed to repair stale vectorhawk MCP command"
+                    "heal: failed to repair stale scenery MCP command"
                 );
             }
         }
     }
 
     // Legacy-location cleanup: a pre-fix build may have left a dead
-    // `mcpServers.vectorhawk` key in Code/User/settings.json (the wrong
+    // `mcpServers.scenery` key in Code/User/settings.json (the wrong
     // file/key — VS Code never read it). Clean it up here too, alongside the
     // per-client loop above, so it doesn't linger forever now that fresh
     // writes/repairs only ever touch the real `mcp.json` location.
@@ -1795,7 +1804,7 @@ fn repair_stale_mcp_entries_in(
         // exists at `client.config_path` (`mcp.json`) — it never creates one.
         // An existing VS Code user configured by a pre-fix build only ever
         // had the entry in `settings.json`, which the migration above just
-        // deleted, so without this they'd be left with no VectorHawk MCP
+        // deleted, so without this they'd be left with no Scenery MCP
         // entry anywhere. Write the working entry at the real location
         // through the same journaled `write_mcp_entry` path fresh installs
         // and the per-client repair loop use — never a second hand-rolled
@@ -1818,7 +1827,7 @@ fn repair_stale_mcp_entries_in(
                     tracing::warn!(
                         path = %config.config_path.display(),
                         error = %e,
-                        "heal: failed to write vectorhawk MCP entry to mcp.json after settings.json migration"
+                        "heal: failed to write scenery MCP entry to mcp.json after settings.json migration"
                     );
                 }
             }
@@ -1830,7 +1839,7 @@ fn repair_stale_mcp_entries_in(
 
 // ── VS Code settings.json → mcp.json migration ─────────────────────────────────
 
-/// Remove a stale `mcpServers.vectorhawk` key left in the legacy
+/// Remove a stale `mcpServers.scenery` key left in the legacy
 /// `Code/User/settings.json` by a pre-fix `mcp setup`/self-heal build. VS
 /// Code never reads `mcpServers` out of `settings.json` — the real location
 /// is `Code/User/mcp.json` → `servers` (see [`vscode_mcp_json_path`]) — so a
@@ -1849,7 +1858,7 @@ fn repair_stale_mcp_entries_in(
 /// attached to neighboring properties) byte-for-byte as written.
 /// `CstRootNode::parse` is lenient about JSONC syntax but still returns
 /// `Err` for genuinely malformed JSON (e.g. unmatched braces); that case,
-/// same as a non-object root or a missing `mcpServers`/`vectorhawk` key,
+/// same as a non-object root or a missing `mcpServers`/`scenery` key,
 /// leaves the file completely untouched.
 ///
 /// Returns `true` if the stale entry was found and removed.
@@ -1879,16 +1888,16 @@ fn migrate_stale_vscode_settings_entry(home: &std::path::Path) -> bool {
     let Some(mcp_servers_obj) = root_obj.object_value("mcpServers") else {
         return false;
     };
-    let Some(vectorhawk_prop) = mcp_servers_obj.get(MCP_SERVER_NAME) else {
+    let Some(scenery_prop) = mcp_servers_obj.get(MCP_SERVER_NAME) else {
         return false;
     };
 
     // Journal this edit the same way `write_mcp_entry` journals a fresh
-    // write, so `vectorhawk uninstall` still restores the user's true
-    // pre-VectorHawk settings.json. `record_config_edit_journal` reuses the
-    // *original* backup captured the first time VectorHawk ever touched
+    // write, so `scenery uninstall` still restores the user's true
+    // pre-Scenery settings.json. `record_config_edit_journal` reuses the
+    // *original* backup captured the first time Scenery ever touched
     // this file (see its backup-reuse doc comment) rather than backing up
-    // the already-VectorHawk-modified content we're about to write below.
+    // the already-Scenery-modified content we're about to write below.
     // Runs before the write, same ordering `write_mcp_entry` uses.
     let legacy_config = ClientConfig {
         name: "VS Code".to_string(),
@@ -1901,9 +1910,9 @@ fn migrate_stale_vscode_settings_entry(home: &std::path::Path) -> bool {
 
     // Removing the property node preserves every comment, blank line, and
     // the rest of the file's formatting exactly as written — only the
-    // `"vectorhawk": {...}` property (and its now-dangling comma, if any)
+    // `"scenery": {...}` property (and its now-dangling comma, if any)
     // is excised.
-    vectorhawk_prop.remove();
+    scenery_prop.remove();
     atomic_write(&settings_path, &root.to_string()).is_ok()
 }
 
@@ -1926,7 +1935,7 @@ mod tests {
     /// the `daemon` feature on, resolves the real platform data dir via
     /// `$HOME` to record a restore-journal entry). Redirecting `HOME` to a
     /// throwaway temp dir keeps that side effect out of the developer's real
-    /// `~/Library/Application Support/VectorHawk`; the mutex prevents
+    /// `~/Library/Application Support/Scenery`; the mutex prevents
     /// parallel tests from racing on the process-global env var.
     static HOME_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -1951,7 +1960,7 @@ mod tests {
     /// executable, or the `MCP_COMMAND` fallback when it can't be resolved.
     /// (Absolute path so AI clients spawning a non-login shell still find it.)
     fn expected_command() -> String {
-        std::env::current_exe()
+        current_exe_unaliased()
             .ok()
             .and_then(|p| p.to_str().map(|s| s.to_string()))
             .unwrap_or_else(|| MCP_COMMAND.to_string())
@@ -1973,28 +1982,25 @@ mod tests {
         // Linuxbrew
         assert_eq!(
             stable_command_from_exe(
-                "/home/linuxbrew/.linuxbrew/Cellar/vectorhawk/1.0.65/bin/vectorhawk",
+                "/home/linuxbrew/.linuxbrew/Cellar/scenery/1.0.65/bin/scenery",
                 |_| true,
             ),
-            "/home/linuxbrew/.linuxbrew/bin/vectorhawk"
+            "/home/linuxbrew/.linuxbrew/bin/scenery"
         );
         // macOS Apple-silicon Homebrew
         assert_eq!(
-            stable_command_from_exe(
-                "/opt/homebrew/Cellar/vectorhawk/1.0.65/bin/vectorhawk",
-                |_| true,
-            ),
-            "/opt/homebrew/bin/vectorhawk"
+            stable_command_from_exe("/opt/homebrew/Cellar/scenery/1.0.65/bin/scenery", |_| true,),
+            "/opt/homebrew/bin/scenery"
         );
     }
 
     #[test]
     fn stable_command_keeps_non_cellar_paths() {
         // A plain install symlink is already stable — leave it.
-        let bin = "/usr/local/bin/vectorhawk";
+        let bin = "/usr/local/bin/scenery";
         assert_eq!(stable_command_from_exe(bin, |_| true), bin);
         // A cargo dev build is not a Homebrew layout — leave it.
-        let dev = "/home/dev/vectorhawkd/target/release/vectorhawk";
+        let dev = "/home/dev/scenery/target/release/scenery";
         assert_eq!(stable_command_from_exe(dev, |_| true), dev);
     }
 
@@ -2002,7 +2008,7 @@ mod tests {
     fn stable_command_falls_back_when_symlink_missing() {
         // If the <prefix>/bin symlink doesn't exist, keep the real Cellar path
         // rather than inventing a dead one.
-        let cellar = "/opt/homebrew/Cellar/vectorhawk/1.0.65/bin/vectorhawk";
+        let cellar = "/opt/homebrew/Cellar/scenery/1.0.65/bin/scenery";
         assert_eq!(stable_command_from_exe(cellar, |_| false), cellar);
     }
 
@@ -2024,11 +2030,11 @@ mod tests {
                 "type": "http",
                 "url": "http://127.0.0.1:39140/mcp",
                 "oauth": {
-                    "clientId": "vectorhawk-claude-code",
+                    "clientId": "scenery-claude-code",
                     "callbackPort": 39150,
                 },
                 "headers": {
-                    "X-VectorHawk-Local-Key": "the-local-key",
+                    "X-Scenery-Local-Key": "the-local-key",
                 }
             })
         );
@@ -2137,21 +2143,21 @@ mod tests {
         }
         let text = fs::read_to_string(&config.config_path).unwrap();
         let json: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(json["mcpServers"]["vectorhawk"]["type"], "http");
+        assert_eq!(json["mcpServers"]["scenery"]["type"], "http");
         assert_eq!(
-            json["mcpServers"]["vectorhawk"]["url"],
+            json["mcpServers"]["scenery"]["url"],
             "http://127.0.0.1:39140/mcp"
         );
         assert_eq!(
-            json["mcpServers"]["vectorhawk"]["oauth"]["clientId"],
-            "vectorhawk-claude-code"
+            json["mcpServers"]["scenery"]["oauth"]["clientId"],
+            "scenery-claude-code"
         );
         assert_eq!(
-            json["mcpServers"]["vectorhawk"]["oauth"]["callbackPort"],
+            json["mcpServers"]["scenery"]["oauth"]["callbackPort"],
             39150
         );
         assert_eq!(
-            json["mcpServers"]["vectorhawk"]["headers"]["X-VectorHawk-Local-Key"],
+            json["mcpServers"]["scenery"]["headers"]["X-Scenery-Local-Key"],
             "the-local-key"
         );
 
@@ -2211,13 +2217,10 @@ mod tests {
         let text = fs::read_to_string(&config.config_path).unwrap();
         let json: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert!(
-            json["mcpServers"]["vectorhawk"].get("type").is_none(),
+            json["mcpServers"]["scenery"].get("type").is_none(),
             "stdio entry must not carry a type field"
         );
-        assert_eq!(
-            json["mcpServers"]["vectorhawk"]["command"],
-            expected_command()
-        );
+        assert_eq!(json["mcpServers"]["scenery"]["command"], expected_command());
 
         let _ = fs::remove_dir_all(&tmp);
     }
@@ -2401,7 +2404,7 @@ mod tests {
     }
 
     #[test]
-    fn is_vectorhawk_configured_recognizes_http_entry_as_configured() {
+    fn is_scenery_configured_recognizes_http_entry_as_configured() {
         let tmp = temp_root("claude-http-configured");
         fs::create_dir_all(&tmp).unwrap();
         let config_path = tmp.join("claude.json");
@@ -2409,14 +2412,14 @@ mod tests {
             &config_path,
             serde_json::json!({
                 "mcpServers": {
-                    "vectorhawk": build_claude_code_http_entry(39140, 39150, "the-local-key")
+                    "scenery": build_claude_code_http_entry(39140, 39150, "the-local-key")
                 }
             })
             .to_string(),
         )
         .unwrap();
 
-        assert!(is_vectorhawk_configured(
+        assert!(is_scenery_configured(
             &config_path,
             "mcpServers",
             ConfigFormat::Json
@@ -2434,7 +2437,7 @@ mod tests {
             &config_path,
             serde_json::json!({
                 "mcpServers": {
-                    "vectorhawk": build_claude_code_http_entry(39140, 39155, "the-local-key")
+                    "scenery": build_claude_code_http_entry(39140, 39155, "the-local-key")
                 }
             })
             .to_string(),
@@ -2458,7 +2461,7 @@ mod tests {
             &config_path,
             serde_json::json!({
                 "mcpServers": {
-                    "vectorhawk": {"command": "vectorhawk", "args": ["mcp", "serve"]}
+                    "scenery": {"command": "scenery", "args": ["mcp", "serve"]}
                 }
             })
             .to_string(),
@@ -2495,12 +2498,9 @@ mod tests {
 
         let json: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
-        assert_eq!(
-            json["mcpServers"]["vectorhawk"]["command"],
-            expected_command()
-        );
-        assert_eq!(json["mcpServers"]["vectorhawk"]["args"][0], "mcp");
-        assert_eq!(json["mcpServers"]["vectorhawk"]["args"][1], "serve");
+        assert_eq!(json["mcpServers"]["scenery"]["command"], expected_command());
+        assert_eq!(json["mcpServers"]["scenery"]["args"][0], "mcp");
+        assert_eq!(json["mcpServers"]["scenery"]["args"][1], "serve");
 
         let _ = fs::remove_dir_all(&tmp);
     }
@@ -2535,10 +2535,7 @@ mod tests {
         let json: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
 
-        assert_eq!(
-            json["mcpServers"]["vectorhawk"]["command"],
-            expected_command()
-        );
+        assert_eq!(json["mcpServers"]["scenery"]["command"], expected_command());
         assert_eq!(json["mcpServers"]["other-tool"]["command"], "other");
 
         let _ = fs::remove_dir_all(&tmp);
@@ -2554,7 +2551,7 @@ mod tests {
         let write = |entry: serde_json::Value| {
             let root = serde_json::json!({
                 "mcpServers": {
-                    "vectorhawk": entry,
+                    "scenery": entry,
                     "other": {"command": "other", "env": {"TOKEN": "secret"}}
                 }
             });
@@ -2567,7 +2564,7 @@ mod tests {
         // HTTP entry for another port: left alone.
         write(build_claude_code_http_entry(39141, 39200, "key"));
         assert!(!with_fake_home(&tmp, || revert_claude_code_http_entry(&path, 39140)).unwrap());
-        assert_eq!(read()["mcpServers"]["vectorhawk"]["type"], "http");
+        assert_eq!(read()["mcpServers"]["scenery"]["type"], "http");
 
         // HTTP entry for this port: back to the stdio shim, key gone,
         // other servers untouched.
@@ -2575,10 +2572,10 @@ mod tests {
         assert!(with_fake_home(&tmp, || revert_claude_code_http_entry(&path, 39140)).unwrap());
         let after = read();
         assert_eq!(
-            after["mcpServers"]["vectorhawk"]["command"],
+            after["mcpServers"]["scenery"]["command"],
             expected_command()
         );
-        assert!(after["mcpServers"]["vectorhawk"].get("headers").is_none());
+        assert!(after["mcpServers"]["scenery"].get("headers").is_none());
         assert_eq!(after["mcpServers"]["other"]["env"]["TOKEN"], "secret");
 
         // Already stdio: nothing to do.
@@ -2873,10 +2870,7 @@ mod tests {
         );
         let json: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&real_file).unwrap()).unwrap();
-        assert_eq!(
-            json["mcpServers"]["vectorhawk"]["command"],
-            expected_command()
-        );
+        assert_eq!(json["mcpServers"]["scenery"]["command"], expected_command());
         assert_eq!(json["mcpServers"]["other"]["command"], "other");
 
         let _ = fs::remove_dir_all(&tmp);
@@ -2913,10 +2907,7 @@ mod tests {
 
         let json: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
-        assert_eq!(
-            json["mcpServers"]["vectorhawk"]["command"],
-            expected_command()
-        );
+        assert_eq!(json["mcpServers"]["scenery"]["command"], expected_command());
         assert_eq!(json["mcpServers"]["other"]["command"], "other");
 
         let _ = fs::remove_dir_all(&tmp);
@@ -2927,9 +2918,7 @@ mod tests {
     // tests never touch the real platform data dir.
 
     #[cfg(feature = "daemon")]
-    fn journal_for(
-        root_dir: &camino::Utf8Path,
-    ) -> scenery_core::restore_journal::RestoreJournal {
+    fn journal_for(root_dir: &camino::Utf8Path) -> scenery_core::restore_journal::RestoreJournal {
         scenery_core::restore_journal::RestoreJournal::new(root_dir.to_owned())
     }
 
@@ -3037,8 +3026,8 @@ mod tests {
 
         // First edit: backs up "original content".
         record_config_edit_journal_in(&config, root_dir.clone());
-        // Simulate the actual write happening (file now VectorHawk-modified).
-        fs::write(&config_path, "vectorhawk-modified content").unwrap();
+        // Simulate the actual write happening (file now Scenery-modified).
+        fs::write(&config_path, "scenery-modified content").unwrap();
         // Second edit (e.g. a later `mcp setup` re-run): must NOT re-back-up
         // the now-modified content over the pristine original.
         record_config_edit_journal_in(&config, root_dir.clone());
@@ -3054,7 +3043,7 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&backup_1).unwrap(),
             "original content",
-            "backup must still hold the pristine pre-VectorHawk content"
+            "backup must still hold the pristine pre-Scenery content"
         );
 
         let _ = fs::remove_dir_all(&tmp);
@@ -3300,10 +3289,7 @@ mod tests {
 
         let json: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
-        assert_eq!(
-            json["mcpServers"]["vectorhawk"]["command"],
-            expected_command()
-        );
+        assert_eq!(json["mcpServers"]["scenery"]["command"], expected_command());
 
         let _ = fs::remove_dir_all(&tmp);
     }
@@ -3327,10 +3313,7 @@ mod tests {
 
         let json: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
-        assert_eq!(
-            json["mcpServers"]["vectorhawk"]["command"],
-            expected_command()
-        );
+        assert_eq!(json["mcpServers"]["scenery"]["command"], expected_command());
 
         let _ = fs::remove_dir_all(&tmp);
     }
@@ -3354,12 +3337,12 @@ mod tests {
         let json: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
         assert_eq!(
-            json["servers"]["vectorhawk"]["type"], "stdio",
+            json["servers"]["scenery"]["type"], "stdio",
             "VS Code's mcp.json requires an explicit `type` field per server"
         );
-        assert_eq!(json["servers"]["vectorhawk"]["command"], expected_command());
-        assert_eq!(json["servers"]["vectorhawk"]["args"][0], "mcp");
-        assert_eq!(json["servers"]["vectorhawk"]["args"][1], "serve");
+        assert_eq!(json["servers"]["scenery"]["command"], expected_command());
+        assert_eq!(json["servers"]["scenery"]["args"][0], "mcp");
+        assert_eq!(json["servers"]["scenery"]["args"][1], "serve");
 
         let _ = fs::remove_dir_all(&tmp);
     }
@@ -3385,7 +3368,7 @@ mod tests {
 
         let json: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
-        assert!(json["mcpServers"]["vectorhawk"].get("type").is_none());
+        assert!(json["mcpServers"]["scenery"].get("type").is_none());
 
         let _ = fs::remove_dir_all(&tmp);
     }
@@ -3400,7 +3383,7 @@ mod tests {
         let mcp_json = vscode_mcp_json_path(&tmp).unwrap();
         fs::write(
             &mcp_json,
-            r#"{"servers":{"vectorhawk":{"type":"stdio","command":"/opt/homebrew/Cellar/vectorhawk/1.0.65/bin/vectorhawk","args":["mcp","serve"]}}}"#,
+            r#"{"servers":{"scenery":{"type":"stdio","command":"/opt/homebrew/Cellar/scenery/1.0.65/bin/scenery","args":["mcp","serve"]}}}"#,
         )
         .unwrap();
 
@@ -3412,9 +3395,9 @@ mod tests {
 
         let json: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&mcp_json).unwrap()).unwrap();
-        assert_eq!(json["servers"]["vectorhawk"]["command"], expected_command());
+        assert_eq!(json["servers"]["scenery"]["command"], expected_command());
         assert_eq!(
-            json["servers"]["vectorhawk"]["type"], "stdio",
+            json["servers"]["scenery"]["type"], "stdio",
             "repair goes through write_mcp_entry, which must keep the required `type` field"
         );
 
@@ -3436,7 +3419,7 @@ mod tests {
         let settings_path = vscode_settings_path(&tmp).unwrap();
         fs::write(
             &settings_path,
-            r#"{"editor.fontSize": 14, "mcpServers": {"vectorhawk": {"command": "vectorhawk", "args": ["mcp", "serve"]}}}"#,
+            r#"{"editor.fontSize": 14, "mcpServers": {"scenery": {"command": "scenery", "args": ["mcp", "serve"]}}}"#,
         )
         .unwrap();
 
@@ -3446,8 +3429,8 @@ mod tests {
         let json: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
         assert!(
-            json["mcpServers"].get("vectorhawk").is_none(),
-            "vectorhawk key must be gone"
+            json["mcpServers"].get("scenery").is_none(),
+            "scenery key must be gone"
         );
         assert_eq!(
             json["editor.fontSize"], 14,
@@ -3468,7 +3451,7 @@ mod tests {
         let vscode_dir = vscode_user_dir(&tmp).unwrap();
         fs::create_dir_all(&vscode_dir).unwrap();
         let settings_path = vscode_settings_path(&tmp).unwrap();
-        let original = "{\n  // my favorite theme\n  \"workbench.colorTheme\": \"Dark+\",\n  /* block comment */\n  \"mcpServers\": {\"vectorhawk\": {\"command\": \"vectorhawk\"}},\n}\n";
+        let original = "{\n  // my favorite theme\n  \"workbench.colorTheme\": \"Dark+\",\n  /* block comment */\n  \"mcpServers\": {\"scenery\": {\"command\": \"scenery\"}},\n}\n";
         fs::write(&settings_path, original).unwrap();
 
         let removed = with_fake_home(&tmp, || migrate_stale_vscode_settings_entry(&tmp));
@@ -3491,8 +3474,8 @@ mod tests {
             "unrelated setting must survive untouched: {after:?}"
         );
         assert!(
-            !after.contains("vectorhawk"),
-            "stale vectorhawk entry must be gone: {after:?}"
+            !after.contains("scenery"),
+            "stale scenery entry must be gone: {after:?}"
         );
 
         let _ = fs::remove_dir_all(&tmp);
@@ -3507,7 +3490,7 @@ mod tests {
         let vscode_dir = vscode_user_dir(&tmp).unwrap();
         fs::create_dir_all(&vscode_dir).unwrap();
         let settings_path = vscode_settings_path(&tmp).unwrap();
-        let original = r#"{"mcpServers": {"vectorhawk": {"command": "vectorhawk"}}"#; // missing closing brace
+        let original = r#"{"mcpServers": {"scenery": {"command": "scenery"}}"#; // missing closing brace
         fs::write(&settings_path, original).unwrap();
 
         let removed = with_fake_home(&tmp, || migrate_stale_vscode_settings_entry(&tmp));
@@ -3556,7 +3539,7 @@ mod tests {
         let settings_path = vscode_settings_path(&tmp).unwrap();
         fs::write(
             &settings_path,
-            r#"{"mcpServers": {"vectorhawk": {"command": "vectorhawk", "args": ["mcp", "serve"]}}}"#,
+            r#"{"mcpServers": {"scenery": {"command": "scenery", "args": ["mcp", "serve"]}}}"#,
         )
         .unwrap();
         // No mcp.json yet — this is the pre-fix-build state: the user only
@@ -3573,21 +3556,21 @@ mod tests {
         // The stale legacy entry is gone from settings.json...
         let settings_json: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
-        assert!(settings_json["mcpServers"].get("vectorhawk").is_none());
+        assert!(settings_json["mcpServers"].get("scenery").is_none());
 
         // ...and the working entry now exists at the location VS Code
         // actually reads, written through the normal journaled path.
         assert!(
             mcp_json_path.exists(),
-            "mcp.json should be created with the vectorhawk entry"
+            "mcp.json should be created with the scenery entry"
         );
         let mcp_json: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&mcp_json_path).unwrap()).unwrap();
         assert_eq!(
-            mcp_json["servers"]["vectorhawk"]["command"],
+            mcp_json["servers"]["scenery"]["command"],
             expected_command()
         );
-        assert_eq!(mcp_json["servers"]["vectorhawk"]["type"], "stdio");
+        assert_eq!(mcp_json["servers"]["scenery"]["type"], "stdio");
 
         let _ = fs::remove_dir_all(&tmp);
     }
@@ -3598,7 +3581,7 @@ mod tests {
         let tmp = temp_root("repair-no-legacy");
         let vscode_dir = vscode_user_dir(&tmp).unwrap();
         fs::create_dir_all(&vscode_dir).unwrap();
-        // settings.json exists but has no stale vectorhawk entry, and
+        // settings.json exists but has no stale scenery entry, and
         // mcp.json doesn't exist at all — nothing for the migration to do,
         // and nothing should be created (covers both a user who never
         // configured VS Code and one who deliberately removed the entry).
@@ -3636,7 +3619,7 @@ mod tests {
         );
 
         let expected = [
-            "vectorhawk",
+            "scenery",
             "mcp-login",
             "mcp-search",
             "mcp-install",
@@ -3679,7 +3662,7 @@ mod tests {
     }
 
     #[test]
-    fn install_claude_skills_uses_vectorhawk_tool_names() {
+    fn install_claude_skills_uses_scenery_tool_names() {
         let tmp = temp_root("skills-toolnames");
         fs::create_dir_all(tmp.join(".claude")).unwrap();
 
@@ -3687,19 +3670,14 @@ mod tests {
 
         let skills_dir = tmp.join(".claude").join("skills");
 
-        // Every SKILL.md that references a tool must use vectorhawk_* names, not skillclub_*
+        // Every SKILL.md that references a tool must use scenery_* names.
         for entry in fs::read_dir(&skills_dir).unwrap() {
             let entry = entry.unwrap();
             let skill_file = entry.path().join("SKILL.md");
             if skill_file.exists() {
                 let content = fs::read_to_string(&skill_file).unwrap();
-                assert!(
-                    !content.contains("skillclub_"),
-                    "SKILL.md {:?} must not reference skillclub_* tools",
-                    skill_file
-                );
-                // Hub and tool-calling skills should reference vectorhawk_* tools
-                if content.contains("vectorhawk_") {
+                // Hub and tool-calling skills should reference scenery_* tools
+                if content.contains("scenery_") {
                     // Good — referencing the correct tool namespace
                 }
             }
@@ -3746,8 +3724,8 @@ mod tests {
 
         let content = fs::read_to_string(&skill_file).unwrap();
         assert!(
-            content.contains("vectorhawk_login"),
-            "updated SKILL.md should reference vectorhawk_login"
+            content.contains("scenery_login"),
+            "updated SKILL.md should reference scenery_login"
         );
 
         let _ = fs::remove_dir_all(&tmp);
@@ -3769,10 +3747,6 @@ mod tests {
                 content.contains(&format!("name: {name}")),
                 "{name}: name field must match dir name"
             );
-            assert!(
-                !content.contains("skillclub_"),
-                "{name}: must not reference skillclub_* tools"
-            );
         }
     }
 
@@ -3793,7 +3767,7 @@ mod tests {
         };
 
         with_fake_home(&tmp, || write_mcp_entry(&config)).unwrap();
-        assert!(is_vectorhawk_configured(
+        assert!(is_scenery_configured(
             &config_path,
             "mcpServers",
             ConfigFormat::Json
@@ -3802,7 +3776,7 @@ mod tests {
         let removed = remove_mcp_entry(&config).unwrap();
         assert!(removed, "should report entry was removed");
         assert!(
-            !is_vectorhawk_configured(&config_path, "mcpServers", ConfigFormat::Json),
+            !is_scenery_configured(&config_path, "mcpServers", ConfigFormat::Json),
             "entry should be gone after remove"
         );
 
@@ -3864,7 +3838,7 @@ mod tests {
         fs::create_dir_all(&tmp).unwrap();
         fs::write(
             &config_path,
-            r#"{"mcpServers": {"vectorhawk": {"command": "vectorhawk", "args": ["mcp", "serve"]}, "other": {"command": "other"}}}"#,
+            r#"{"mcpServers": {"scenery": {"command": "scenery", "args": ["mcp", "serve"]}, "other": {"command": "other"}}}"#,
         )
         .unwrap();
 
@@ -3886,8 +3860,8 @@ mod tests {
             "other MCP entry should be preserved"
         );
         assert!(
-            json["mcpServers"].get("vectorhawk").is_none(),
-            "vectorhawk entry should be removed"
+            json["mcpServers"].get("scenery").is_none(),
+            "scenery entry should be removed"
         );
 
         let _ = fs::remove_dir_all(&tmp);
@@ -3898,7 +3872,7 @@ mod tests {
     #[test]
     fn command_needs_repair_when_path_does_not_exist() {
         assert!(command_needs_repair(
-            "/home/linuxbrew/.linuxbrew/Cellar/vectorhawk/1.0.65/bin/vectorhawk",
+            "/home/linuxbrew/.linuxbrew/Cellar/scenery/1.0.65/bin/scenery",
             |_| false,
         ));
     }
@@ -3908,7 +3882,7 @@ mod tests {
         // Old Cellar dir hasn't been pruned yet (e.g. mid-upgrade), but it's
         // still a versioned path that must be rewritten to the stable one.
         assert!(command_needs_repair(
-            "/opt/homebrew/Cellar/vectorhawk/1.0.65/bin/vectorhawk",
+            "/opt/homebrew/Cellar/scenery/1.0.65/bin/scenery",
             |_| true,
         ));
     }
@@ -3916,7 +3890,7 @@ mod tests {
     #[test]
     fn command_does_not_need_repair_when_stable_path_exists() {
         assert!(!command_needs_repair(
-            "/home/linuxbrew/.linuxbrew/bin/vectorhawk",
+            "/home/linuxbrew/.linuxbrew/bin/scenery",
             |_| true,
         ));
     }
@@ -3924,7 +3898,7 @@ mod tests {
     #[test]
     fn command_does_not_need_repair_for_bare_command() {
         // Not an absolute path — nothing for the repair pass to rewrite.
-        assert!(!command_needs_repair("vectorhawk", |_| false));
+        assert!(!command_needs_repair("scenery", |_| false));
     }
 
     // ── repair_stale_mcp_entries ──────────────────────────────────────────────
@@ -3936,7 +3910,7 @@ mod tests {
         let config_path = tmp.join(".claude.json");
         fs::write(
             &config_path,
-            r#"{"mcpServers":{"vectorhawk":{"command":"/home/linuxbrew/.linuxbrew/Cellar/vectorhawk/1.0.65/bin/vectorhawk","args":["mcp","serve"]}}}"#,
+            r#"{"mcpServers":{"scenery":{"command":"/home/linuxbrew/.linuxbrew/Cellar/scenery/1.0.65/bin/scenery","args":["mcp","serve"]}}}"#,
         )
         .unwrap();
 
@@ -3950,7 +3924,7 @@ mod tests {
         let json: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
         assert_eq!(
-            json["mcpServers"]["vectorhawk"]["command"],
+            json["mcpServers"]["scenery"]["command"],
             expected_command(),
             "command should be rewritten to the current stable path"
         );
@@ -3965,7 +3939,7 @@ mod tests {
         let config_path = tmp.join(".claude.json");
         let existing = serde_json::json!({
             "mcpServers": {
-                "vectorhawk": {"command": expected_command(), "args": ["mcp", "serve"]}
+                "scenery": {"command": expected_command(), "args": ["mcp", "serve"]}
             }
         });
         fs::write(&config_path, serde_json::to_string(&existing).unwrap()).unwrap();
@@ -3986,7 +3960,7 @@ mod tests {
         let config_path = tmp.join(".claude.json");
         fs::write(
             &config_path,
-            r#"{"mcpServers":{"vectorhawk":{"command":"/opt/homebrew/Cellar/vectorhawk/1.0.65/bin/vectorhawk","args":["mcp","serve"]}}}"#,
+            r#"{"mcpServers":{"scenery":{"command":"/opt/homebrew/Cellar/scenery/1.0.65/bin/scenery","args":["mcp","serve"]}}}"#,
         )
         .unwrap();
 
@@ -4003,13 +3977,13 @@ mod tests {
     }
 
     #[test]
-    fn repair_preserves_other_entries_and_only_touches_vectorhawk() {
+    fn repair_preserves_other_entries_and_only_touches_scenery() {
         let tmp = temp_root("repair-preserves");
         fs::create_dir_all(tmp.join(".claude")).unwrap();
         let config_path = tmp.join(".claude.json");
         fs::write(
             &config_path,
-            r#"{"mcpServers":{"vectorhawk":{"command":"/opt/homebrew/Cellar/vectorhawk/1.0.65/bin/vectorhawk","args":["mcp","serve"]},"other-tool":{"command":"/does/not/exist/other","args":[]}}}"#,
+            r#"{"mcpServers":{"scenery":{"command":"/opt/homebrew/Cellar/scenery/1.0.65/bin/scenery","args":["mcp","serve"]},"other-tool":{"command":"/does/not/exist/other","args":[]}}}"#,
         )
         .unwrap();
 
@@ -4098,10 +4072,10 @@ mod tests {
         let after = fs::read_to_string(&config_path).unwrap();
         let doc: toml_edit::DocumentMut = after.parse().expect("output must be valid TOML");
         assert_eq!(
-            doc["mcp_servers"]["vectorhawk"]["command"].as_str(),
+            doc["mcp_servers"]["scenery"]["command"].as_str(),
             Some(expected_command().as_str())
         );
-        let args = doc["mcp_servers"]["vectorhawk"]["args"]
+        let args = doc["mcp_servers"]["scenery"]["args"]
             .as_array()
             .expect("args must be an array");
         assert_eq!(args.get(0).and_then(|v| v.as_str()), Some("mcp"));
@@ -4141,7 +4115,7 @@ mod tests {
             .parse()
             .expect("output must be valid TOML");
         assert_eq!(
-            doc["mcp_servers"]["vectorhawk"]["command"].as_str(),
+            doc["mcp_servers"]["scenery"]["command"].as_str(),
             Some(expected_command().as_str())
         );
 
@@ -4175,14 +4149,14 @@ mod tests {
 
     #[cfg(feature = "daemon")]
     #[test]
-    fn codex_remove_mcp_entry_removes_only_vectorhawk_table() {
+    fn codex_remove_mcp_entry_removes_only_scenery_table() {
         let tmp = temp_root("codex-remove");
         let codex_dir = tmp.join(".codex");
         fs::create_dir_all(&codex_dir).unwrap();
         let config_path = codex_dir.join("config.toml");
         fs::write(
             &config_path,
-            "model = \"gpt-5.1\"\n\n[mcp_servers.other-tool]\ncommand = \"other\"\nargs = []\n\n[mcp_servers.vectorhawk]\ncommand = \"/opt/homebrew/bin/vectorhawk\"\nargs = [\"mcp\", \"serve\"]\n",
+            "model = \"gpt-5.1\"\n\n[mcp_servers.other-tool]\ncommand = \"other\"\nargs = []\n\n[mcp_servers.scenery]\ncommand = \"/opt/homebrew/bin/scenery\"\nargs = [\"mcp\", \"serve\"]\n",
         )
         .unwrap();
 
@@ -4200,8 +4174,8 @@ mod tests {
         let after = fs::read_to_string(&config_path).unwrap();
         let doc: toml_edit::DocumentMut = after.parse().unwrap();
         assert!(
-            doc["mcp_servers"].get("vectorhawk").is_none(),
-            "vectorhawk table must be gone: {after:?}"
+            doc["mcp_servers"].get("scenery").is_none(),
+            "scenery table must be gone: {after:?}"
         );
         assert_eq!(
             doc["mcp_servers"]["other-tool"]["command"].as_str(),
@@ -4277,7 +4251,7 @@ mod tests {
         let after = fs::read_to_string(&config_path).unwrap();
         let doc: toml_edit::DocumentMut = after.parse().expect("output must be valid TOML");
         assert_eq!(
-            doc["mcp_servers"]["vectorhawk"]["command"].as_str(),
+            doc["mcp_servers"]["scenery"]["command"].as_str(),
             Some(expected_command().as_str())
         );
         assert_eq!(
@@ -4319,8 +4293,8 @@ mod tests {
         with_fake_home(&tmp, || write_mcp_entry(&config)).unwrap();
 
         assert!(
-            is_vectorhawk_configured(&config_path, "mcp_servers", ConfigFormat::Toml),
-            "must detect vectorhawk as configured inside an inline mcp_servers table"
+            is_scenery_configured(&config_path, "mcp_servers", ConfigFormat::Toml),
+            "must detect scenery as configured inside an inline mcp_servers table"
         );
 
         let _ = fs::remove_dir_all(&tmp);
@@ -4335,7 +4309,7 @@ mod tests {
         let config_path = codex_dir.join("config.toml");
         fs::write(
             &config_path,
-            "mcp_servers = { other-tool = { command = \"other\" }, vectorhawk = { command = \"/opt/homebrew/bin/vectorhawk\", args = [\"mcp\", \"serve\"] } }\n",
+            "mcp_servers = { other-tool = { command = \"other\" }, scenery = { command = \"/opt/homebrew/bin/scenery\", args = [\"mcp\", \"serve\"] } }\n",
         )
         .unwrap();
 
@@ -4353,8 +4327,8 @@ mod tests {
         let after = fs::read_to_string(&config_path).unwrap();
         let doc: toml_edit::DocumentMut = after.parse().unwrap();
         assert!(
-            doc["mcp_servers"].get("vectorhawk").is_none(),
-            "vectorhawk entry must be gone: {after:?}"
+            doc["mcp_servers"].get("scenery").is_none(),
+            "scenery entry must be gone: {after:?}"
         );
         assert_eq!(
             doc["mcp_servers"]["other-tool"]["command"].as_str(),
@@ -4374,7 +4348,7 @@ mod tests {
         let config_path = codex_dir.join("config.toml");
         fs::write(
             &config_path,
-            "mcp_servers = { vectorhawk = { command = \"/opt/homebrew/Cellar/vectorhawk/1.0.65/bin/vectorhawk\", args = [\"mcp\", \"serve\"] } }\n",
+            "mcp_servers = { scenery = { command = \"/opt/homebrew/Cellar/scenery/1.0.65/bin/scenery\", args = [\"mcp\", \"serve\"] } }\n",
         )
         .unwrap();
 
@@ -4387,7 +4361,7 @@ mod tests {
         let doc: toml_edit::DocumentMut =
             fs::read_to_string(&config_path).unwrap().parse().unwrap();
         assert_eq!(
-            doc["mcp_servers"]["vectorhawk"]["command"].as_str(),
+            doc["mcp_servers"]["scenery"]["command"].as_str(),
             Some(expected_command().as_str())
         );
 
@@ -4397,21 +4371,21 @@ mod tests {
     #[cfg(feature = "daemon")]
     #[test]
     fn codex_read_command_from_inline_table() {
-        // Documents/verifies that `read_vectorhawk_command`'s TOML path
+        // Documents/verifies that `read_scenery_command`'s TOML path
         // already handles inline tables via `Item::get`'s generic `Index`
         // impl — no `as_table_like` needed on the read side, unlike write/
-        // remove. See the doc comment on `read_vectorhawk_command_toml`.
+        // remove. See the doc comment on `read_scenery_command_toml`.
         let tmp = temp_root("codex-read-inline");
         fs::create_dir_all(&tmp).unwrap();
         let config_path = tmp.join("config.toml");
         fs::write(
             &config_path,
-            "mcp_servers = { vectorhawk = { command = \"/opt/homebrew/bin/vectorhawk\" } }\n",
+            "mcp_servers = { scenery = { command = \"/opt/homebrew/bin/scenery\" } }\n",
         )
         .unwrap();
 
-        let command = read_vectorhawk_command(&config_path, "mcp_servers", ConfigFormat::Toml);
-        assert_eq!(command.as_deref(), Some("/opt/homebrew/bin/vectorhawk"));
+        let command = read_scenery_command(&config_path, "mcp_servers", ConfigFormat::Toml);
+        assert_eq!(command.as_deref(), Some("/opt/homebrew/bin/scenery"));
 
         let _ = fs::remove_dir_all(&tmp);
     }
@@ -4457,7 +4431,7 @@ mod tests {
         let config_path = codex_dir.join("config.toml");
         fs::write(
             &config_path,
-            "[mcp_servers.vectorhawk]\ncommand = \"/opt/homebrew/Cellar/vectorhawk/1.0.65/bin/vectorhawk\"\nargs = [\"mcp\", \"serve\"]\n",
+            "[mcp_servers.scenery]\ncommand = \"/opt/homebrew/Cellar/scenery/1.0.65/bin/scenery\"\nargs = [\"mcp\", \"serve\"]\n",
         )
         .unwrap();
 
@@ -4470,7 +4444,7 @@ mod tests {
         let doc: toml_edit::DocumentMut =
             fs::read_to_string(&config_path).unwrap().parse().unwrap();
         assert_eq!(
-            doc["mcp_servers"]["vectorhawk"]["command"].as_str(),
+            doc["mcp_servers"]["scenery"]["command"].as_str(),
             Some(expected_command().as_str())
         );
 
@@ -4482,7 +4456,7 @@ mod tests {
     fn record_config_edit_journal_backs_up_codex_toml_and_appends_entry() {
         // Mirrors `record_config_edit_journal_backs_up_pre_existing_file_and_appends_entry`
         // above, but for a TOML (Codex) client, so the restore-journal path
-        // that `vectorhawk uninstall` relies on is verified for TOML too.
+        // that `scenery uninstall` relies on is verified for TOML too.
         let tmp = temp_root("journal-codex");
         let config_path = tmp.join("config.toml");
         fs::create_dir_all(&tmp).unwrap();
@@ -4583,7 +4557,7 @@ mod tests {
             &config_path,
             serde_json::to_string_pretty(&serde_json::json!({
                 "mcpServers": {
-                    "vectorhawk": {"command": "/opt/homebrew/bin/vectorhawk", "args": ["mcp", "serve"]},
+                    "scenery": {"command": "/opt/homebrew/bin/scenery", "args": ["mcp", "serve"]},
                     "github-mcp": {"command": "npx", "args": ["-y", "@github/mcp"], "env": {"GITHUB_TOKEN": "ghp_secret"}}
                 }
             }))
@@ -4605,7 +4579,7 @@ mod tests {
         assert_eq!(entries[0].key, "github-mcp");
         assert_eq!(entries[0].value["command"], "npx");
         assert_eq!(entries[0].value["env"]["GITHUB_TOKEN"], "ghp_secret");
-        assert_eq!(entries[1].key, "vectorhawk");
+        assert_eq!(entries[1].key, "scenery");
 
         let _ = fs::remove_dir_all(&tmp);
     }

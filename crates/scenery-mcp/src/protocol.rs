@@ -243,7 +243,7 @@ pub const INTERNAL_ERROR: i64 = -32603;
 
 /// `_meta` key a transport uses to pass the connected client's name along
 /// with requests (such as `tools/list`) that don't carry `clientInfo`.
-pub const CLIENT_META_KEY: &str = "vectorhawk/client";
+pub const CLIENT_META_KEY: &str = "scenery/client";
 
 /// Claude Code's MCP `clientInfo.name`.
 pub const CLAUDE_CODE_CLIENT_NAME: &str = "claude-code";
@@ -341,7 +341,7 @@ mod tests {
                 tools: Some(ToolsCapability { list_changed: true }),
             },
             server_info: ServerInfo {
-                name: "vectorhawkd".to_string(),
+                name: "scenery".to_string(),
                 version: "0.1.0".to_string(),
             },
             instructions: None,
@@ -349,7 +349,7 @@ mod tests {
         let json = serde_json::to_value(&result).unwrap();
         assert_eq!(json["protocolVersion"], "2024-11-05");
         assert_eq!(json["capabilities"]["tools"]["listChanged"], true);
-        assert_eq!(json["serverInfo"]["name"], "vectorhawkd");
+        assert_eq!(json["serverInfo"]["name"], "scenery");
         assert!(json.get("instructions").is_none());
     }
 
@@ -361,15 +361,15 @@ mod tests {
                 tools: Some(ToolsCapability { list_changed: true }),
             },
             server_info: ServerInfo {
-                name: "vectorhawkd".to_string(),
+                name: "scenery".to_string(),
                 version: "0.1.0".to_string(),
             },
-            instructions: Some("Use vectorhawk_list to show installed skills.".to_string()),
+            instructions: Some("Use scenery_list to show installed skills.".to_string()),
         };
         let json = serde_json::to_value(&result).unwrap();
         assert_eq!(
             json["instructions"],
-            "Use vectorhawk_list to show installed skills."
+            "Use scenery_list to show installed skills."
         );
     }
 }

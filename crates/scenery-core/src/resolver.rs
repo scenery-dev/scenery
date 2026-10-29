@@ -6,8 +6,8 @@ use crate::{
 use anyhow::{Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use rusqlite::{Connection, OptionalExtension};
-use semver::Version;
 use scenery_manifest::SkillPackage;
+use semver::Version;
 
 #[derive(Debug, PartialEq)]
 pub enum ResolveOutcome {
@@ -27,7 +27,7 @@ pub enum ResolveOutcome {
 /// Resolve `skill_id` to a runnable path or a block/not-installed reason.
 ///
 /// Resolution order:
-/// 1. If `project_root` is `Some`, check `.vectorhawk/skills/{skill_id}/SKILL.md`.
+/// 1. If `project_root` is `Some`, check `.scenery/skills/{skill_id}/SKILL.md`.
 ///    If present, load the bundle and return `Active` with `scope = Project(...)` — no policy check.
 /// 2. Check user-scope SQLite — not found → `NotInstalled`.
 /// 3. Fetch policy — `Blocked` status → `Blocked`.
@@ -41,7 +41,7 @@ pub fn resolve_skill(
     project_root: Option<&Utf8Path>,
 ) -> Result<ResolveOutcome> {
     if let Some(root) = project_root {
-        let project_skill_dir = root.join(".vectorhawk").join("skills").join(skill_id);
+        let project_skill_dir = root.join(".scenery").join("skills").join(skill_id);
         if project_skill_dir.join("SKILL.md").exists() {
             let pkg = SkillPackage::load_from_dir(&project_skill_dir).with_context(|| {
                 format!("failed to load project-scope skill '{skill_id}' at {project_skill_dir}")
@@ -98,7 +98,7 @@ pub fn resolve_skill(
                 skill_id: skill_id.to_string(),
                 reason: format!(
                     "Installed version {installed} is below the minimum allowed version \
-                     {min_ver}. Run `vectorhawk skill install` to update.",
+                     {min_ver}. Run `scenery skill install` to update.",
                 ),
             });
         }

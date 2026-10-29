@@ -1,5 +1,5 @@
 //! Shadow-AI discovery, runner task R1: a **read-only** scanner that
-//! enumerates MCP servers configured in AI clients outside VectorHawk
+//! enumerates MCP servers configured in AI clients outside Scenery
 //! governance.
 //!
 //! This module never writes to any AI client config file. It builds
@@ -70,17 +70,17 @@
 //!
 //! # What counts as "already governed" (and therefore excluded)
 //!
-//! 1. The `vectorhawk` aggregator entry itself — key `"vectorhawk"`, tested
-//!    via [`scenery_mcp::ownership::is_vectorhawk_mcp_key`].
-//! 2. Any entry whose `command` is the VectorHawk shim binary
+//! 1. The `scenery` aggregator entry itself — key `"scenery"`, tested
+//!    via [`scenery_mcp::ownership::is_scenery_mcp_key`].
+//! 2. Any entry whose `command` is the Scenery shim binary
 //!    (`scenery_mcp::setup::MCP_COMMAND`, matched by file-name so both
-//!    the aggregator's resolved absolute path and a bare `"vectorhawk"` are
+//!    the aggregator's resolved absolute path and a bare `"scenery"` are
 //!    caught) with `args` starting `["mcp", "serve"]`
 //!    (`scenery_mcp::setup::MCP_ARGS`). This is the shape
 //!    `ManagedPathsPusher::push_mcp` (`pusher.rs`) writes for each
-//!    individually-adopted MCP server: `{"command": "vectorhawk", "args":
+//!    individually-adopted MCP server: `{"command": "scenery", "args":
 //!    ["mcp", "serve", "--server", "<slug>"]}` under `mcpServers.<slug>` —
-//!    same routing shim, different key than `"vectorhawk"` — so key-name
+//!    same routing shim, different key than `"scenery"` — so key-name
 //!    matching alone (rule 1) would miss these. (This check reads the raw,
 //!    unredacted `command`/`args` internally for classification only — it
 //!    never ends up in the transmitted [`McpDiscoveryDetail`].)
@@ -104,25 +104,25 @@
 //!    configured `registry_url` — a gateway-brokered server. No code path
 //!    writes such an entry into a client config *today* (see the migrator.rs
 //!    citation above — gateway-URL client rewriting is explicitly deferred),
-//!    but once it ships, this scanner must not mis-report VectorHawk's own
+//!    but once it ships, this scanner must not mis-report Scenery's own
 //!    gateway-routed entries as shadow AI just because rule 2/3 don't cover
 //!    a URL-shaped entry.
 
 use rusqlite::Connection;
+use scenery_core::state::AppState;
+use scenery_mcp::{
+    ownership::is_scenery_mcp_key,
+    setup::{read_all_mcp_entries, ClientConfig, MCP_ARGS, MCP_COMMAND},
+};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tracing::warn;
-use scenery_core::state::AppState;
-use scenery_mcp::{
-    ownership::is_vectorhawk_mcp_key,
-    setup::{read_all_mcp_entries, ClientConfig, MCP_ARGS, MCP_COMMAND},
-};
 
 use super::marker::is_already_marked;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
-/// Metadata about one shadow (non-VectorHawk-governed) MCP server entry.
+/// Metadata about one shadow (non-Scenery-governed) MCP server entry.
 ///
 /// **Allowlist, not denylist** — see the module-level privacy doc. Every
 /// field here is safe to transmit by construction: there is no field that
@@ -189,7 +189,7 @@ pub struct McpDiscoveryItem {
 // ── Scan ──────────────────────────────────────────────────────────────────────
 
 /// Scan every detected AI client for MCP server entries that are neither
-/// VectorHawk's own nor already governed, and return one [`McpDiscoveryItem`]
+/// Scenery's own nor already governed, and return one [`McpDiscoveryItem`]
 /// per shadow entry found.
 ///
 /// Read-only: never writes to any client config file, never writes to
@@ -220,7 +220,7 @@ pub fn collect_mcp_discoveries(
         }
 
         for entry in read_all_mcp_entries(client) {
-            if is_vectorhawk_mcp_key(&entry.key) {
+            if is_scenery_mcp_key(&entry.key) {
                 continue;
             }
             if is_governed_entry(&entry.value, registry_url) {
@@ -264,14 +264,14 @@ fn is_already_managed(conn: &Connection, virtual_path: &str) -> bool {
 
 // ── Governed-entry detection ────────────────────────────────────────────────
 
-/// True if `value` is an MCP entry VectorHawk itself is already responsible
+/// True if `value` is an MCP entry Scenery itself is already responsible
 /// for — see the module-level "What counts as already governed" doc.
 ///
 /// Reads the raw `command`/`args`/`url` fields for classification only —
 /// none of it is copied into a transmitted [`McpDiscoveryDetail`].
 fn is_governed_entry(value: &serde_json::Value, registry_url: &str) -> bool {
     if let Some(command) = value.get("command").and_then(|v| v.as_str()) {
-        if command_is_vectorhawk_shim(command) && args_start_with_mcp_serve(value) {
+        if command_is_scenery_shim(command) && args_start_with_mcp_serve(value) {
             return true;
         }
     }
@@ -285,11 +285,11 @@ fn is_governed_entry(value: &serde_json::Value, registry_url: &str) -> bool {
     false
 }
 
-/// True if `command`'s file name is exactly `MCP_COMMAND` ("vectorhawk") —
+/// True if `command`'s file name is exactly `MCP_COMMAND` ("scenery") —
 /// matches both the aggregator's resolved absolute path
-/// (`/opt/homebrew/bin/vectorhawk`) and the bare command `pusher::push_mcp`
+/// (`/opt/homebrew/bin/scenery`) and the bare command `pusher::push_mcp`
 /// writes for per-server entries.
-fn command_is_vectorhawk_shim(command: &str) -> bool {
+fn command_is_scenery_shim(command: &str) -> bool {
     std::path::Path::new(command)
         .file_name()
         .and_then(|n| n.to_str())
@@ -298,7 +298,7 @@ fn command_is_vectorhawk_shim(command: &str) -> bool {
 }
 
 /// True if `value.args` starts with `MCP_ARGS` (`["mcp", "serve"]`) — the
-/// shim invocation every VectorHawk-written entry uses, whether it's the
+/// shim invocation every Scenery-written entry uses, whether it's the
 /// aggregator's own entry or a `push_mcp`-written per-server entry (which
 /// appends `"--server", "<slug>"` after these two).
 fn args_start_with_mcp_serve(value: &serde_json::Value) -> bool {
@@ -953,8 +953,8 @@ mod tests {
     use super::*;
     use crate::managed_paths::ENV_MUTEX;
     use camino::Utf8PathBuf;
-    use std::{fs, path::PathBuf};
     use scenery_mcp::setup::ConfigFormat;
+    use std::{fs, path::PathBuf};
 
     fn temp_state() -> (AppState, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
@@ -1018,7 +1018,7 @@ mod tests {
         );
         let (state, _guard) = temp_state();
 
-        let items = collect_mcp_discoveries(&[client], &state, "https://app.vectorhawk.ai");
+        let items = collect_mcp_discoveries(&[client], &state, "https://app.scenery.dev");
 
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].kind, "mcp");
@@ -1055,7 +1055,7 @@ mod tests {
         );
         let (state, _guard) = temp_state();
 
-        let items = collect_mcp_discoveries(&[client], &state, "https://app.vectorhawk.ai");
+        let items = collect_mcp_discoveries(&[client], &state, "https://app.scenery.dev");
 
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].detail.env_keys, vec!["API_KEY".to_string()]);
@@ -1079,7 +1079,7 @@ mod tests {
         );
         let (state, _guard) = temp_state();
 
-        let items = collect_mcp_discoveries(&[client], &state, "https://app.vectorhawk.ai");
+        let items = collect_mcp_discoveries(&[client], &state, "https://app.scenery.dev");
 
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].detail.arg_count, 2);
@@ -1107,7 +1107,7 @@ mod tests {
         );
         let (state, _guard) = temp_state();
 
-        let items = collect_mcp_discoveries(&[client], &state, "https://app.vectorhawk.ai");
+        let items = collect_mcp_discoveries(&[client], &state, "https://app.scenery.dev");
 
         assert_eq!(items.len(), 1);
         assert_never_leaks(&items[0], "HEADERARGSECRETVALUE");
@@ -1131,7 +1131,7 @@ mod tests {
         );
         let (state, _guard) = temp_state();
 
-        let items = collect_mcp_discoveries(&[client], &state, "https://app.vectorhawk.ai");
+        let items = collect_mcp_discoveries(&[client], &state, "https://app.scenery.dev");
 
         assert_eq!(items.len(), 1);
         assert_eq!(
@@ -1159,7 +1159,7 @@ mod tests {
         );
         let (state, _guard) = temp_state();
 
-        let items = collect_mcp_discoveries(&[client], &state, "https://app.vectorhawk.ai");
+        let items = collect_mcp_discoveries(&[client], &state, "https://app.scenery.dev");
 
         assert_eq!(items.len(), 1);
         assert_eq!(
@@ -1189,7 +1189,7 @@ mod tests {
         );
         let (state, _guard) = temp_state();
 
-        let items = collect_mcp_discoveries(&[client], &state, "https://app.vectorhawk.ai");
+        let items = collect_mcp_discoveries(&[client], &state, "https://app.scenery.dev");
 
         assert_eq!(items.len(), 1);
         assert_eq!(
@@ -1220,7 +1220,7 @@ mod tests {
         );
         let (state, _guard) = temp_state();
 
-        let items = collect_mcp_discoveries(&[client], &state, "https://app.vectorhawk.ai");
+        let items = collect_mcp_discoveries(&[client], &state, "https://app.scenery.dev");
 
         assert_eq!(items.len(), 1);
         let mut header_keys = items[0].detail.header_keys.clone();
@@ -1246,7 +1246,7 @@ mod tests {
         );
         let (state, _guard) = temp_state();
 
-        let items = collect_mcp_discoveries(&[client], &state, "https://app.vectorhawk.ai");
+        let items = collect_mcp_discoveries(&[client], &state, "https://app.scenery.dev");
 
         assert_eq!(items.len(), 1);
         assert_never_leaks(&items[0], "SCHEMELESSTOKENVALUE");
@@ -1276,7 +1276,7 @@ mod tests {
         };
         let (state, _guard) = temp_state();
 
-        let items = collect_mcp_discoveries(&[client], &state, "https://app.vectorhawk.ai");
+        let items = collect_mcp_discoveries(&[client], &state, "https://app.scenery.dev");
 
         assert_eq!(
             items.len(),
@@ -1316,7 +1316,7 @@ mod tests {
             .unwrap();
         }
 
-        let items = collect_mcp_discoveries(&[client], &state, "https://app.vectorhawk.ai");
+        let items = collect_mcp_discoveries(&[client], &state, "https://app.scenery.dev");
 
         assert_eq!(
             items.len(),
@@ -1328,26 +1328,26 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp);
     }
 
-    // ── 12. The vectorhawk key itself is excluded ──────────────────────────────
+    // ── 12. The scenery key itself is excluded ──────────────────────────────
 
     #[test]
-    fn excludes_the_vectorhawk_key_itself() {
-        let tmp = temp_root("vectorhawk-key");
+    fn excludes_the_scenery_key_itself() {
+        let tmp = temp_root("scenery-key");
         let client = write_json_client(
             &tmp,
             "Claude Desktop",
             "mcpServers",
             serde_json::json!({
-                "vectorhawk": {"command": "/opt/homebrew/bin/vectorhawk", "args": ["mcp", "serve"]}
+                "scenery": {"command": "/opt/homebrew/bin/scenery", "args": ["mcp", "serve"]}
             }),
         );
         let (state, _guard) = temp_state();
 
-        let items = collect_mcp_discoveries(&[client], &state, "https://app.vectorhawk.ai");
+        let items = collect_mcp_discoveries(&[client], &state, "https://app.scenery.dev");
 
         assert!(
             items.is_empty(),
-            "the vectorhawk entry itself must never be reported as shadow AI"
+            "the scenery entry itself must never be reported as shadow AI"
         );
 
         let _ = fs::remove_dir_all(&tmp);
@@ -1358,19 +1358,19 @@ mod tests {
     #[test]
     fn excludes_pusher_pushed_per_server_entry() {
         let tmp = temp_root("pusher-slug");
-        // Shape pusher.rs::push_mcp writes: bare "vectorhawk" command, a
+        // Shape pusher.rs::push_mcp writes: bare "scenery" command, a
         // different key (the server's slug), args ["mcp","serve","--server",slug].
         let client = write_json_client(
             &tmp,
             "Claude Code",
             "mcpServers",
             serde_json::json!({
-                "notion-mcp": {"command": "vectorhawk", "args": ["mcp", "serve", "--server", "notion-mcp"]}
+                "notion-mcp": {"command": "scenery", "args": ["mcp", "serve", "--server", "notion-mcp"]}
             }),
         );
         let (state, _guard) = temp_state();
 
-        let items = collect_mcp_discoveries(&[client], &state, "https://app.vectorhawk.ai");
+        let items = collect_mcp_discoveries(&[client], &state, "https://app.scenery.dev");
 
         assert!(
             items.is_empty(),
@@ -1390,12 +1390,12 @@ mod tests {
             "Cursor",
             "mcpServers",
             serde_json::json!({
-                "brokered-mcp": {"url": "https://app.vectorhawk.ai/gateway/mcp/brokered-mcp", "type": "http"}
+                "brokered-mcp": {"url": "https://app.scenery.dev/gateway/mcp/brokered-mcp", "type": "http"}
             }),
         );
         let (state, _guard) = temp_state();
 
-        let items = collect_mcp_discoveries(&[client], &state, "https://app.vectorhawk.ai");
+        let items = collect_mcp_discoveries(&[client], &state, "https://app.scenery.dev");
 
         assert!(
             items.is_empty(),
@@ -1420,7 +1420,7 @@ mod tests {
         );
         let (state, _guard) = temp_state();
 
-        let items = collect_mcp_discoveries(&[client], &state, "https://app.vectorhawk.ai");
+        let items = collect_mcp_discoveries(&[client], &state, "https://app.scenery.dev");
 
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].detail.transport, "http");
@@ -1453,7 +1453,7 @@ mod tests {
         };
         let (state, _guard) = temp_state();
 
-        let items = collect_mcp_discoveries(&[client], &state, "https://app.vectorhawk.ai");
+        let items = collect_mcp_discoveries(&[client], &state, "https://app.scenery.dev");
 
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].slug, "Codex:linear-mcp");
@@ -1485,7 +1485,7 @@ mod tests {
         };
         let (state, _guard) = temp_state();
 
-        let items = collect_mcp_discoveries(&[client], &state, "https://app.vectorhawk.ai");
+        let items = collect_mcp_discoveries(&[client], &state, "https://app.scenery.dev");
 
         assert!(items.is_empty());
 
@@ -1568,10 +1568,7 @@ mod tests {
 
     #[test]
     fn command_basename_strips_full_path() {
-        assert_eq!(
-            command_basename_of("/opt/homebrew/bin/vectorhawk"),
-            "vectorhawk"
-        );
+        assert_eq!(command_basename_of("/opt/homebrew/bin/scenery"), "scenery");
         assert_eq!(command_basename_of("npx"), "npx");
     }
 
@@ -1614,7 +1611,7 @@ mod tests {
         );
         let (state, _guard) = temp_state();
 
-        let items = collect_mcp_discoveries(&[client], &state, "https://app.vectorhawk.ai");
+        let items = collect_mcp_discoveries(&[client], &state, "https://app.scenery.dev");
 
         assert_eq!(items.len(), 1);
         assert_eq!(
@@ -1644,7 +1641,7 @@ mod tests {
         );
         let (state, _guard) = temp_state();
 
-        let items = collect_mcp_discoveries(&[client], &state, "https://app.vectorhawk.ai");
+        let items = collect_mcp_discoveries(&[client], &state, "https://app.scenery.dev");
 
         assert_eq!(items.len(), 1);
         assert_eq!(
@@ -1674,7 +1671,7 @@ mod tests {
         );
         let (state, _guard) = temp_state();
 
-        let items = collect_mcp_discoveries(&[client], &state, "https://app.vectorhawk.ai");
+        let items = collect_mcp_discoveries(&[client], &state, "https://app.scenery.dev");
 
         assert_eq!(items.len(), 1);
         assert_eq!(
@@ -1702,7 +1699,7 @@ mod tests {
         );
         let (state, _guard) = temp_state();
 
-        let items = collect_mcp_discoveries(&[client], &state, "https://app.vectorhawk.ai");
+        let items = collect_mcp_discoveries(&[client], &state, "https://app.scenery.dev");
 
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].detail.package_identifier.as_deref(), Some("image"));
@@ -1728,7 +1725,7 @@ mod tests {
         );
         let (state, _guard) = temp_state();
 
-        let items = collect_mcp_discoveries(&[client], &state, "https://app.vectorhawk.ai");
+        let items = collect_mcp_discoveries(&[client], &state, "https://app.scenery.dev");
 
         assert_eq!(items.len(), 1);
         assert_eq!(
@@ -1757,7 +1754,7 @@ mod tests {
         );
         let (state, _guard) = temp_state();
 
-        let items = collect_mcp_discoveries(&[client], &state, "https://app.vectorhawk.ai");
+        let items = collect_mcp_discoveries(&[client], &state, "https://app.scenery.dev");
 
         assert_eq!(items.len(), 1);
         assert_eq!(
@@ -1785,7 +1782,7 @@ mod tests {
         );
         let (state, _guard) = temp_state();
 
-        let items = collect_mcp_discoveries(&[client], &state, "https://app.vectorhawk.ai");
+        let items = collect_mcp_discoveries(&[client], &state, "https://app.scenery.dev");
 
         assert_eq!(items.len(), 1);
         assert_eq!(
@@ -1822,7 +1819,7 @@ mod tests {
         );
         let (state, _state_guard) = temp_state();
 
-        let items = collect_mcp_discoveries(&[client], &state, "https://app.vectorhawk.ai");
+        let items = collect_mcp_discoveries(&[client], &state, "https://app.scenery.dev");
 
         match original_home {
             Some(v) => std::env::set_var("HOME", v),
@@ -1866,7 +1863,7 @@ mod tests {
         );
         let (state, _guard) = temp_state();
 
-        let items = collect_mcp_discoveries(&[client], &state, "https://app.vectorhawk.ai");
+        let items = collect_mcp_discoveries(&[client], &state, "https://app.scenery.dev");
 
         assert_eq!(
             items.len(),
@@ -1929,7 +1926,7 @@ mod tests {
         );
         let (state, _guard) = temp_state();
 
-        let items = collect_mcp_discoveries(&[client], &state, "https://app.vectorhawk.ai");
+        let items = collect_mcp_discoveries(&[client], &state, "https://app.scenery.dev");
 
         assert_eq!(items.len(), 1);
         assert_eq!(
@@ -1957,7 +1954,7 @@ mod tests {
         );
         let (state, _guard) = temp_state();
 
-        let items = collect_mcp_discoveries(&[client], &state, "https://app.vectorhawk.ai");
+        let items = collect_mcp_discoveries(&[client], &state, "https://app.scenery.dev");
 
         assert_eq!(items.len(), 1);
         assert_eq!(
@@ -1981,7 +1978,7 @@ mod tests {
         );
         let (state, _guard) = temp_state();
 
-        let items = collect_mcp_discoveries(&[client], &state, "https://app.vectorhawk.ai");
+        let items = collect_mcp_discoveries(&[client], &state, "https://app.scenery.dev");
 
         assert_eq!(items.len(), 1);
         assert_eq!(
@@ -2009,7 +2006,7 @@ mod tests {
         );
         let (state, _guard) = temp_state();
 
-        let items = collect_mcp_discoveries(&[client], &state, "https://app.vectorhawk.ai");
+        let items = collect_mcp_discoveries(&[client], &state, "https://app.scenery.dev");
 
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].detail.package_identifier.as_deref(), Some("image"));
@@ -2031,7 +2028,7 @@ mod tests {
         );
         let (state, _guard) = temp_state();
 
-        let items = collect_mcp_discoveries(&[client], &state, "https://app.vectorhawk.ai");
+        let items = collect_mcp_discoveries(&[client], &state, "https://app.scenery.dev");
 
         assert_eq!(items.len(), 1);
         assert_eq!(

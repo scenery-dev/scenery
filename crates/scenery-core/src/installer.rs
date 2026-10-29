@@ -2,15 +2,15 @@ use crate::state::AppState;
 use anyhow::{Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use rusqlite::{params, Connection, OptionalExtension};
-use std::fs;
 use scenery_manifest::SkillPackage;
+use std::fs;
 
 // ── `~/.claude/skills/` ownership ─────────────────────────────────────────────
 //
 // As of v1.0.51 the installer NO LONGER creates symlinks under
 // `~/.claude/skills/<skill_id>`.  That path is owned by the F2 pusher
 // (`managed_paths::pusher::push_skill`) which writes a real directory plus a
-// `.vectorhawk-managed.json` marker.  Having two writers caused state to
+// `.scenery-managed.json` marker.  Having two writers caused state to
 // resurrect itself after F2-driven cleanup — see the v1.0.50→1.0.51 fix.
 //
 // The legacy `register_in_claude_skills` / `unregister_from_claude_skills`
@@ -19,7 +19,7 @@ use scenery_manifest::SkillPackage;
 // only a symlink to it.  Any pre-existing symlink or stale directory at the
 // Claude path is healed by the daemon at startup via
 // `managed_paths::pusher::push_missing_active_skills`, whose `push_skill`
-// call re-writes the canonical dir (with its `.vectorhawk-managed.json`
+// call re-writes the canonical dir (with its `.scenery-managed.json`
 // marker) and re-points the Claude link at it.
 
 /// Controls how a skill source directory is placed into the versioned install layout.
@@ -88,7 +88,7 @@ pub fn install_unpacked_skill(
 
     // NOTE: ~/.claude/skills/<id> is owned by the F2 pusher; the installer no
     // longer writes a symlink there. F2's push_skill creates a real directory
-    // + .vectorhawk-managed.json marker, so there's a single writer per path.
+    // + .scenery-managed.json marker, so there's a single writer per path.
     let _ = active_dir;
 
     Ok(())
@@ -338,9 +338,9 @@ pub fn reactivate_skill(state: &AppState, skill_id: &str) -> Result<bool> {
 /// Where an installed skill lives: in the global user store, or local to a project.
 #[derive(Clone, Debug, PartialEq)]
 pub enum InstallScope {
-    /// Global user install: `~/Library/Application Support/VectorHawk/skills/...`
+    /// Global user install: `~/Library/Application Support/Scenery/skills/...`
     User,
-    /// Project-local install: `{project_root}/.vectorhawk/skills/{id}/`
+    /// Project-local install: `{project_root}/.scenery/skills/{id}/`
     Project(Utf8PathBuf),
 }
 
@@ -372,7 +372,7 @@ mod tests {
 
     fn temp_root(test_name: &str) -> Utf8PathBuf {
         // The installer no longer touches ~/.claude/skills/ — that's owned by
-        // the F2 pusher. The legacy VECTORHAWK_DISABLE_CLAUDE_SKILLS_LINK
+        // the F2 pusher. The legacy SCENERY_DISABLE_CLAUDE_SKILLS_LINK
         // escape hatch is therefore no longer needed.
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -710,7 +710,7 @@ mod tests {
         let root = temp_root("install-no-claude-skills");
         let state = AppState::bootstrap_in(root.clone()).expect("state bootstrap should succeed");
         // Point HOME at a temp dir so we can observe whether anything got
-        // written under it. We do NOT set VECTORHAWK_DISABLE_CLAUDE_SKILLS_LINK
+        // written under it. We do NOT set SCENERY_DISABLE_CLAUDE_SKILLS_LINK
         // — that's a legacy escape hatch and irrelevant now.
         let fake_home = temp_root("install-no-claude-skills-home");
         fs::create_dir_all(fake_home.as_std_path()).expect("create fake home");

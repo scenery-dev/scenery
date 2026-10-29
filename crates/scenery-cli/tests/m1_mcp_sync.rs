@@ -1,4 +1,4 @@
-//! Integration tests for `vectorhawk mcp sync` and `vectorhawk mcp backends`.
+//! Integration tests for `scenery mcp sync` and `scenery mcp backends`.
 //!
 //! `mcp sync` runs an in-process registry sync tick; `mcp backends` lists
 //! the stub backend registry.  Both must exit 0 and produce useful output.
@@ -33,9 +33,9 @@ fn build_stub_registry_returns_empty_registry() {
 /// errors, so the function must return Ok(()) even if all HTTP calls fail.
 #[test]
 fn mcp_sync_succeeds_when_registry_unreachable() {
-    use std::sync::Arc;
     use scenery_core::{audit::SqliteAuditBuffer, registry::RegistryClient, state::AppState};
     use scenery_daemon::run_sync_tick;
+    use std::sync::Arc;
 
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -74,9 +74,9 @@ fn mcp_sync_succeeds_when_registry_unreachable() {
 /// server endpoints when the registry is reachable.
 #[test]
 fn mcp_sync_calls_registry_endpoints_when_reachable() {
-    use std::sync::Arc;
     use scenery_core::{audit::SqliteAuditBuffer, registry::RegistryClient, state::AppState};
     use scenery_daemon::run_sync_tick;
+    use std::sync::Arc;
 
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

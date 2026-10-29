@@ -2,9 +2,9 @@
 //!
 //! # What this tests
 //!
-//! After any tool call that mutates the tool set (`vectorhawk_install`,
-//! `vectorhawk_uninstall`, `vectorhawk_update`, `vectorhawk_import`,
-//! `vectorhawk_mcp_install`, `vectorhawk_mcp_uninstall`), the daemon must:
+//! After any tool call that mutates the tool set (`scenery_install`,
+//! `scenery_uninstall`, `scenery_update`, `scenery_import`,
+//! `scenery_mcp_install`, `scenery_mcp_uninstall`), the daemon must:
 //!
 //! 1. Send a `notifications/tools/list_changed` framed frame to the calling
 //!    shim connection.
@@ -15,7 +15,7 @@
 //!
 //! Two raw Unix-socket "shim" connections are established directly (no shim
 //! binary needed — we drive the framed JSON-RPC protocol ourselves). Shim A
-//! issues a `vectorhawk_install` call. Both shim A and shim B must receive a
+//! issues a `scenery_install` call. Both shim A and shim B must receive a
 //! `notifications/tools/list_changed` frame within 1 s.
 //!
 //! Because the daemon uses length-prefixed framing (4-byte big-endian length +
@@ -62,11 +62,11 @@ fn daemon_socket_path() -> PathBuf {
     #[cfg(target_os = "linux")]
     {
         if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
-            return PathBuf::from(runtime).join("vectorhawk").join("agent.sock");
+            return PathBuf::from(runtime).join("scenery").join("agent.sock");
         }
     }
     let data_dir = dirs::data_dir().expect("dirs::data_dir() should succeed");
-    data_dir.join("VectorHawk").join("agent.sock")
+    data_dir.join("Scenery").join("agent.sock")
 }
 
 fn wait_for_socket(path: &Path, timeout: Duration) -> bool {
@@ -92,7 +92,7 @@ fn kill_child(child: &mut Child) {
 }
 
 fn kill_stale_daemon() {
-    let _ = Command::new("pkill").args(["-x", "vectorhawk"]).status();
+    let _ = Command::new("pkill").args(["-x", "scenery"]).status();
     std::thread::sleep(Duration::from_millis(300));
 }
 
@@ -149,7 +149,7 @@ fn handshake(stream: &mut UnixStream) {
     );
 }
 
-/// Send a `vectorhawk_install` call and read the response frame.
+/// Send a `scenery_install` call and read the response frame.
 ///
 /// The tool will error (no skill found at "nonexistent-skill") but that's fine —
 /// what matters is that the dispatch path fires and emits list_changed regardless
@@ -162,7 +162,7 @@ fn call_install(stream: &mut UnixStream, call_id: u64) -> Value {
             "id": call_id,
             "method": "tools/call",
             "params": {
-                "name": "vectorhawk_install",
+                "name": "scenery_install",
                 "arguments": { "skill_id": "nonexistent-skill-gap03-test" }
             }
         }),
@@ -222,17 +222,17 @@ fn wait_for_list_changed(stream: &mut UnixStream, deadline: Instant) -> bool {
 
 // ── Main test ─────────────────────────────────────────────────────────────────
 
-/// GAP-03: after `vectorhawk_install`, both the calling shim (A) and a
+/// GAP-03: after `scenery_install`, both the calling shim (A) and a
 /// bystander shim (B) must receive `notifications/tools/list_changed` within 1 s.
 ///
 /// Marked `#[ignore]` — requires pre-built release binaries.
 #[test]
 #[ignore = "requires pre-built release binaries — run cargo build --workspace --release first"]
 fn gap03_list_changed_broadcast_to_all_shims() {
-    let daemon_bin = release_bin("vectorhawk");
+    let daemon_bin = release_bin("scenery");
     assert!(
         daemon_bin.exists(),
-        "vectorhawk binary not found at {daemon_bin:?} — run cargo build --workspace --release"
+        "scenery binary not found at {daemon_bin:?} — run cargo build --workspace --release"
     );
 
     let socket_path = daemon_socket_path();
@@ -244,7 +244,7 @@ fn gap03_list_changed_broadcast_to_all_shims() {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("failed to spawn vectorhawk daemon run");
+        .expect("failed to spawn scenery daemon run");
 
     let socket_appeared = wait_for_socket(&socket_path, Duration::from_secs(5));
     if !socket_appeared {
@@ -274,7 +274,7 @@ fn gap03_list_changed_broadcast_to_all_shims() {
         }
     });
 
-    // Shim A calls vectorhawk_install (will error with "not found", that's fine).
+    // Shim A calls scenery_install (will error with "not found", that's fine).
     let install_resp = call_install(&mut shim_a, 2);
     eprintln!("install response: {install_resp}");
     // We don't assert on the tool-level result (it may be isError=true).
@@ -285,7 +285,7 @@ fn gap03_list_changed_broadcast_to_all_shims() {
     let a_got = wait_for_list_changed(&mut shim_a, deadline_a);
     assert!(
         a_got,
-        "shim A: did not receive notifications/tools/list_changed within 1 s after vectorhawk_install"
+        "shim A: did not receive notifications/tools/list_changed within 1 s after scenery_install"
     );
 
     // Give shim B thread up to 1 s total to receive its notification.
@@ -301,7 +301,7 @@ fn gap03_list_changed_broadcast_to_all_shims() {
     }
     assert!(
         *b_received.lock().unwrap(),
-        "shim B: did not receive notifications/tools/list_changed within 1 s after shim A's vectorhawk_install"
+        "shim B: did not receive notifications/tools/list_changed within 1 s after shim A's scenery_install"
     );
 
     // Cleanup
