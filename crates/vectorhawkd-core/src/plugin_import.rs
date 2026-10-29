@@ -692,7 +692,10 @@ mod tests {
             let mut archive =
                 zip::ZipArchive::new(fs::File::open(&mcpb_file).unwrap()).expect("open zip");
             let entry = archive.by_name("payload.bin").expect("payload entry");
-            (entry.data_start().expect("data start"), entry.compressed_size())
+            (
+                entry.data_start().expect("data start"),
+                entry.compressed_size(),
+            )
         };
         let mut bytes = fs::read(&mcpb_file).unwrap();
         for b in &mut bytes[(start + len / 4) as usize..(start + len / 2) as usize] {
