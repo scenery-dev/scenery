@@ -1,4 +1,4 @@
-//! Plugin marketplace pusher — makes a governed VectorHawk plugin appear in
+//! Plugin marketplace pusher — makes a governed Scenery plugin appear in
 //! Claude Code's `/plugin list` as a self-contained bundle.
 //!
 //! # Why a marketplace?
@@ -6,7 +6,7 @@
 //! Claude Code does NOT list "loose" plugin directories. A plugin only shows in
 //! `/plugin list` (and has its skills/commands loaded) when it comes from a
 //! **registered marketplace** and is **enabled**. We therefore maintain a local
-//! directory marketplace named `vectorhawk` and register/enable plugins into it
+//! directory marketplace named `scenery` and register/enable plugins into it
 //! by writing the same on-disk state the `claude plugin` CLI produces — verified
 //! empirically (see the BUG card). No shell-out to `claude` is required, so this
 //! works from the daemon regardless of its PATH.
@@ -15,24 +15,24 @@
 //!
 //! | Path | Purpose |
 //! |------|---------|
-//! | `plugins/marketplaces/vectorhawk/.claude-plugin/marketplace.json` | catalog listing every VH plugin |
-//! | `plugins/marketplaces/vectorhawk/plugins/<slug>/.claude-plugin/plugin.json` | per-plugin manifest |
-//! | `plugins/marketplaces/vectorhawk/plugins/<slug>/skills/<id>/SKILL.md` | bundled skill content |
-//! | `plugins/cache/vectorhawk/<slug>/<version>/` | install cache (copy of the plugin dir) |
-//! | `plugins/known_marketplaces.json` | marketplace registry (merge `vectorhawk`) |
-//! | `plugins/installed_plugins.json` | installed-plugin registry v2 (merge `<slug>@vectorhawk`) |
-//! | `settings.json` | merge `extraKnownMarketplaces.vectorhawk` + `enabledPlugins["<slug>@vectorhawk"]` |
-//! | `plugins/marketplaces/vectorhawk/.vectorhawk/bundled-skills.json` | which registry skills (id → version) VectorHawk bundled into each plugin |
+//! | `plugins/marketplaces/scenery/.claude-plugin/marketplace.json` | catalog listing every VH plugin |
+//! | `plugins/marketplaces/scenery/plugins/<slug>/.claude-plugin/plugin.json` | per-plugin manifest |
+//! | `plugins/marketplaces/scenery/plugins/<slug>/skills/<id>/SKILL.md` | bundled skill content |
+//! | `plugins/cache/scenery/<slug>/<version>/` | install cache (copy of the plugin dir) |
+//! | `plugins/known_marketplaces.json` | marketplace registry (merge `scenery`) |
+//! | `plugins/installed_plugins.json` | installed-plugin registry v2 (merge `<slug>@scenery`) |
+//! | `settings.json` | merge `extraKnownMarketplaces.scenery` + `enabledPlugins["<slug>@scenery"]` |
+//! | `plugins/marketplaces/scenery/.scenery/bundled-skills.json` | which registry skills (id → version) Scenery bundled into each plugin |
 //!
 //! The bundled-skills record is what lets a skill revoke strip that skill
 //! from plugins installed earlier ([`plugins_bundling_skill`] +
 //! [`remove_bundled_skill`]). It lives outside every plugin tree, so an
 //! imported plugin's mirrored files can never forge an entry, and only
-//! skills VectorHawk itself bundled from the registry are ever listed — an
+//! skills Scenery itself bundled from the registry are ever listed — an
 //! imported plugin's own `skills/<name>` folder, or any plugin from another
 //! marketplace, is never touched.
 //!
-//! All writes honour the `VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER` killswitch.
+//! All writes honour the `SCENERY_DISABLE_FILESYSTEM_RECONCILER` killswitch.
 
 use anyhow::{Context, Result};
 use fs2::FileExt;
@@ -46,7 +46,7 @@ use std::{
 use tracing::{debug, info};
 
 /// Marketplace name (the `@<marketplace>` suffix Claude Code uses).
-pub const MARKETPLACE_NAME: &str = "vectorhawk";
+pub const MARKETPLACE_NAME: &str = "scenery";
 
 /// A skill to bundle inside a plugin: its id plus the raw SKILL.md and any
 /// sibling files (prompts/, etc.).
@@ -71,7 +71,7 @@ pub struct PluginBundle {
     pub version: String,
     pub author: String,
     /// Registry-skill bundling: skills referenced by id and downloaded from the
-    /// registry (used for VectorHawk-published plugins).
+    /// registry (used for Scenery-published plugins).
     pub skills: Vec<BundledSkill>,
     /// Imported-plugin content: the plugin's declarative source tree mirrored
     /// from GitHub (`relative_path -> bytes`), written verbatim into the plugin
@@ -85,7 +85,7 @@ pub struct PluginBundle {
 }
 
 fn reconciler_disabled() -> bool {
-    std::env::var_os("VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER").is_some()
+    std::env::var_os("SCENERY_DISABLE_FILESYSTEM_RECONCILER").is_some()
 }
 
 fn home() -> Result<PathBuf> {
@@ -96,14 +96,14 @@ fn plugins_dir(home: &Path) -> PathBuf {
     home.join(".claude").join("plugins")
 }
 
-/// Source dir of the local `vectorhawk` directory marketplace.
+/// Source dir of the local `scenery` directory marketplace.
 fn marketplace_dir(home: &Path) -> PathBuf {
     plugins_dir(home)
         .join("marketplaces")
         .join(MARKETPLACE_NAME)
 }
 
-/// Plugin key as Claude Code addresses it: `<slug>@vectorhawk`.
+/// Plugin key as Claude Code addresses it: `<slug>@scenery`.
 fn plugin_key(slug: &str) -> String {
     format!("{slug}@{MARKETPLACE_NAME}")
 }
@@ -113,7 +113,7 @@ fn plugin_key(slug: &str) -> String {
 /// third-party `plugin.json`) and are joined into marketplace and cache paths
 /// that are then `remove_dir_all`'d and refilled, so an empty value, `.`,
 /// `..`, a separator, or a root/drive prefix would aim those operations
-/// outside the `vectorhawk` dirs.
+/// outside the `scenery` dirs.
 fn ensure_single_path_component(what: &str, value: &str) -> Result<()> {
     let mut components = Path::new(value).components();
     let single_normal = matches!(
@@ -187,14 +187,14 @@ pub fn install_plugin_bundle(bundle: &PluginBundle) -> Result<()> {
     info!(
         slug = %bundle.slug,
         skills = bundle.skills.len(),
-        "plugin_marketplace: installed plugin into vectorhawk marketplace"
+        "plugin_marketplace: installed plugin into scenery marketplace"
     );
     Ok(())
 }
 
 /// List governed plugins currently recorded in `installed_plugins.json`,
-/// scoped to entries registered under the `vectorhawk` marketplace (keys of
-/// shape `<slug>@vectorhawk`). Returns `plugin_slug -> version`.
+/// scoped to entries registered under the `scenery` marketplace (keys of
+/// shape `<slug>@scenery`). Returns `plugin_slug -> version`.
 ///
 /// This is the local-state side of the RB1 snapshot reconcile (see
 /// `sync::reconciler::build_derived_plugin_events_blocking`) — the daemon has
@@ -279,7 +279,7 @@ pub fn uninstall_plugin_bundle(slug: &str) -> Result<()> {
 
     info!(
         slug,
-        "plugin_marketplace: uninstalled plugin from vectorhawk marketplace"
+        "plugin_marketplace: uninstalled plugin from scenery marketplace"
     );
     Ok(())
 }
@@ -287,7 +287,7 @@ pub fn uninstall_plugin_bundle(slug: &str) -> Result<()> {
 // ── Bundled registry skills record ──────────────────────────────────────────
 
 fn bundled_record_path(mp: &Path) -> PathBuf {
-    mp.join(".vectorhawk").join("bundled-skills.json")
+    mp.join(".scenery").join("bundled-skills.json")
 }
 
 /// `slug -> (plugin_version, skill_id -> skill_version)` from the record.
@@ -319,7 +319,7 @@ fn read_bundled_record(mp: &Path) -> HashMap<String, (String, HashMap<String, St
         .collect()
 }
 
-/// Slugs VectorHawk itself installed into its marketplace under
+/// Slugs Scenery itself installed into its marketplace under
 /// `plugins_dir`, per the bundled-skills record (which lives outside every
 /// plugin tree, so a plugin can't forge an entry). The F1 adoption scan
 /// skips exactly these; anything else in our marketplace directory is
@@ -342,7 +342,7 @@ pub fn has_bundled_skill_record(slug: &str) -> Result<bool> {
     Ok(read_bundled_record(&mp).contains_key(slug))
 }
 
-/// Slugs of VectorHawk-installed plugins that bundle registry skill
+/// Slugs of Scenery-installed plugins that bundle registry skill
 /// `skill_id` — at `version` when given, at any version otherwise.
 pub fn plugins_bundling_skill(skill_id: &str, version: Option<&str>) -> Result<Vec<String>> {
     if reconciler_disabled() {
@@ -363,9 +363,9 @@ pub fn plugins_bundling_skill(skill_id: &str, version: Option<&str>) -> Result<V
     Ok(slugs)
 }
 
-/// Remove registry skill `skill_id` from VectorHawk-installed plugin `slug`
+/// Remove registry skill `skill_id` from Scenery-installed plugin `slug`
 /// (marketplace source and install cache — the copy Claude Code loads) and
-/// drop it from the record. Acts only when the record says VectorHawk
+/// drop it from the record. Acts only when the record says Scenery
 /// bundled that skill into that plugin, so an imported plugin's own folder
 /// of the same name is never touched. Returns whether anything was removed.
 /// Idempotent.
@@ -507,8 +507,8 @@ fn upsert_marketplace_manifest(mp: &Path, bundle: &PluginBundle) -> Result<()> {
     let mut root = read_json(&path).unwrap_or_else(|| {
         json!({
             "name": MARKETPLACE_NAME,
-            "description": "VectorHawk governed plugins",
-            "owner": { "name": "VectorHawk" },
+            "description": "Scenery governed plugins",
+            "owner": { "name": "Scenery" },
             "plugins": [],
         })
     });

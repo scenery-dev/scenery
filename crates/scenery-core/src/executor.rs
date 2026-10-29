@@ -6,11 +6,11 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use camino::Utf8PathBuf;
-use std::collections::HashMap;
-use std::fs;
 use scenery_manifest::{
     resolve_bundle_file, BundlePathError, PromptSource, SkillPackage, WorkflowStep,
 };
+use std::collections::HashMap;
+use std::fs;
 
 // ── Public result types ───────────────────────────────────────────────────────
 
@@ -98,8 +98,8 @@ pub fn run_skill_with_scope(
     if !pkg_path.exists() {
         anyhow::bail!(
             "Skill '{}' is registered in state.db but its install directory is missing or corrupt.\n\
-             Run: vectorhawk skill install {}  (to reinstall from the registry)\n\
-              or: vectorhawk skill install ./path/to/{}  (to reinstall from source)",
+             Run: scenery skill install {}  (to reinstall from the registry)\n\
+              or: scenery skill install ./path/to/{}  (to reinstall from source)",
             skill_id,
             skill_id,
             skill_id,
@@ -139,7 +139,7 @@ pub fn run_skill_with_scope(
 
     // Per-run execution history was previously persisted to a local
     // `execution_history` SQLite table. It was only ever read by
-    // `vectorhawk skill info`, never uploaded anywhere — so we keep it in
+    // `scenery skill info`, never uploaded anywhere — so we keep it in
     // the returned RunResult for the immediate caller and drop the
     // long-term local store. Aggregate counts still land in
     // `skill_execution_counts` via `ratings.rs` and get synced to the
@@ -392,7 +392,7 @@ fn execute_llm_step(pkg: &SkillPackage, p: LlmStepParams<'_>) -> Result<StepResu
             format!(
                 "step '{id}' output failed schema validation. Schema: {schema_rel}. \
                  Model returned a {shape}; expected output conforming to the schema. \
-                 Run the skill locally with `vectorhawk skill run` to inspect the raw output."
+                 Run the skill locally with `scenery skill run` to inspect the raw output."
             )
         })?;
     }
@@ -538,10 +538,7 @@ fn validate_output(
 
 // ── Model requirements check ──────────────────────────────────────────────────
 
-fn check_model_requirements(
-    reqs: &scenery_manifest::ModelRequirements,
-    _client: &dyn ModelClient,
-) {
+fn check_model_requirements(reqs: &scenery_manifest::ModelRequirements, _client: &dyn ModelClient) {
     if let Some(min_params) = reqs.min_params_b {
         tracing::info!(
             "skill requires min_params_b={min_params}B — cannot verify locally, proceeding"
@@ -588,7 +585,7 @@ mod tests {
         let input_schema_yaml =
             format!("      inputs: {input_schema_json}\n      outputs: {{\"type\": \"object\"}}");
         let skill_md = format!(
-            "---\nname: Test Skill\ndescription: A test skill.\nmetadata:\n  vectorhawk:\n    version: 0.1.0\n    publisher: skillclub\n    permissions:\n      filesystem: none\n      network: none\n      clipboard: none\n    execution:\n      sandbox: strict\n      timeout_ms: 30000\n      memory_mb: 256\n    schemas:\n{input_schema_yaml}\n    workflow_ref: ./workflow.yaml\n---\n\nDo the thing.\n"
+            "---\nname: Test Skill\ndescription: A test skill.\nmetadata:\n  scenery:\n    version: 0.1.0\n    publisher: scenery\n    permissions:\n      filesystem: none\n      network: none\n      clipboard: none\n    execution:\n      sandbox: strict\n      timeout_ms: 30000\n      memory_mb: 256\n    schemas:\n{input_schema_yaml}\n    workflow_ref: ./workflow.yaml\n---\n\nDo the thing.\n"
         );
         fs::write(root.join("SKILL.md"), skill_md).expect("write SKILL.md");
         fs::write(
@@ -913,7 +910,7 @@ mod tests {
         let project = temp_root(&format!("{label}-project"));
         let state = AppState::bootstrap_in(state_root.clone()).expect("bootstrap");
         write_skill_bundle(
-            &project.join(".vectorhawk/skills/test-skill"),
+            &project.join(".scenery/skills/test-skill"),
             &schema.to_string(),
         );
         let err = run_skill_with_scope(

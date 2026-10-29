@@ -50,11 +50,11 @@ fn daemon_socket_path() -> PathBuf {
     #[cfg(target_os = "linux")]
     {
         if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
-            return PathBuf::from(runtime).join("vectorhawk").join("agent.sock");
+            return PathBuf::from(runtime).join("scenery").join("agent.sock");
         }
     }
     let data_dir = dirs::data_dir().expect("dirs::data_dir() should succeed");
-    data_dir.join("VectorHawk").join("agent.sock")
+    data_dir.join("Scenery").join("agent.sock")
 }
 
 fn wait_for_socket(path: &std::path::Path, timeout: Duration) -> bool {
@@ -69,7 +69,7 @@ fn wait_for_socket(path: &std::path::Path, timeout: Duration) -> bool {
 }
 
 fn kill_stale_daemon() {
-    let _ = Command::new("pkill").args(["-x", "vectorhawk"]).status();
+    let _ = Command::new("pkill").args(["-x", "scenery"]).status();
     std::thread::sleep(Duration::from_millis(300));
 }
 
@@ -166,16 +166,13 @@ fn http_get_raw(host: &str, port: u16, path: &str) -> u16 {
 #[ignore = "requires pre-built release binaries — run cargo build --workspace --release first"]
 fn m3_ac2_login_full_flow() {
     // We need the CLI binary, daemon binary, and a mockito token endpoint.
-    let cli_bin = release_bin("vectorhawk");
-    let daemon_bin = release_bin("vectorhawk");
+    let cli_bin = release_bin("scenery");
+    let daemon_bin = release_bin("scenery");
 
-    assert!(
-        cli_bin.exists(),
-        "vectorhawk binary not found at {cli_bin:?}"
-    );
+    assert!(cli_bin.exists(), "scenery binary not found at {cli_bin:?}");
     assert!(
         daemon_bin.exists(),
-        "vectorhawk binary not found at {daemon_bin:?}"
+        "scenery binary not found at {daemon_bin:?}"
     );
 
     let socket_path = daemon_socket_path();
@@ -208,7 +205,7 @@ fn m3_ac2_login_full_flow() {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("failed to spawn vectorhawk daemon run");
+        .expect("failed to spawn scenery daemon run");
 
     let socket_appeared = wait_for_socket(&socket_path, Duration::from_secs(5));
     if !socket_appeared {
@@ -326,15 +323,15 @@ fn m3_ac2_login_full_flow() {
 /// exits with code 2 and the "daemon required" message on stderr.
 ///
 /// This test does NOT require pre-built release binaries — it uses the debug
-/// binary path via CARGO_BIN_EXE_vectorhawk if available, falling back to
+/// binary path via CARGO_BIN_EXE_scenery if available, falling back to
 /// shelling out via cargo run.
 #[test]
 #[ignore = "requires pre-built release binary — run cargo build --workspace --release first"]
 fn m3_daemon_not_running_exits_code_2() {
-    let cli_bin = release_bin("vectorhawk");
+    let cli_bin = release_bin("scenery");
     assert!(
         cli_bin.exists(),
-        "vectorhawk release binary not found — run cargo build --workspace --release"
+        "scenery release binary not found — run cargo build --workspace --release"
     );
 
     // Ensure daemon is not running.
@@ -351,7 +348,7 @@ fn m3_daemon_not_running_exits_code_2() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .expect("failed to spawn vectorhawk");
+        .expect("failed to spawn scenery");
 
     let exit_code = output.status.code().unwrap_or(-1);
     let stderr = String::from_utf8_lossy(&output.stderr);

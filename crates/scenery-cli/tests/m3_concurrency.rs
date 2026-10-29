@@ -53,11 +53,11 @@ fn daemon_socket_path() -> PathBuf {
     #[cfg(target_os = "linux")]
     {
         if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
-            return PathBuf::from(runtime).join("vectorhawk").join("agent.sock");
+            return PathBuf::from(runtime).join("scenery").join("agent.sock");
         }
     }
     let data_dir = dirs::data_dir().expect("dirs::data_dir() should succeed");
-    data_dir.join("VectorHawk").join("agent.sock")
+    data_dir.join("Scenery").join("agent.sock")
 }
 
 fn wait_for_socket(path: &std::path::Path, timeout: Duration) -> bool {
@@ -72,7 +72,7 @@ fn wait_for_socket(path: &std::path::Path, timeout: Duration) -> bool {
 }
 
 fn kill_stale_daemon() {
-    let _ = Command::new("pkill").args(["-x", "vectorhawk"]).status();
+    let _ = Command::new("pkill").args(["-x", "scenery"]).status();
     std::thread::sleep(Duration::from_millis(300));
 }
 
@@ -175,10 +175,10 @@ fn http_get_status(host: &str, port: u16, path: &str) -> u16 {
 #[test]
 #[ignore = "requires pre-built release binaries — run cargo build --workspace --release first"]
 fn m3_concurrent_login_flows_no_cross_contamination() {
-    let daemon_bin = release_bin("vectorhawk");
+    let daemon_bin = release_bin("scenery");
     assert!(
         daemon_bin.exists(),
-        "vectorhawk binary not found — run cargo build --workspace --release"
+        "scenery binary not found — run cargo build --workspace --release"
     );
 
     let socket_path = daemon_socket_path();
@@ -193,7 +193,7 @@ fn m3_concurrent_login_flows_no_cross_contamination() {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("failed to spawn vectorhawk daemon run");
+        .expect("failed to spawn scenery daemon run");
 
     let socket_appeared = wait_for_socket(&socket_path, Duration::from_secs(5));
     if !socket_appeared {
@@ -328,10 +328,10 @@ fn m3_concurrent_login_flows_no_cross_contamination() {
 #[test]
 #[ignore = "requires pre-built release binaries — run cargo build --workspace --release first"]
 fn m3_concurrent_same_state_second_subscriber_errors() {
-    let daemon_bin = release_bin("vectorhawk");
+    let daemon_bin = release_bin("scenery");
     assert!(
         daemon_bin.exists(),
-        "vectorhawk binary not found — run cargo build --workspace --release"
+        "scenery binary not found — run cargo build --workspace --release"
     );
 
     let socket_path = daemon_socket_path();
@@ -345,7 +345,7 @@ fn m3_concurrent_same_state_second_subscriber_errors() {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("failed to spawn vectorhawk daemon run");
+        .expect("failed to spawn scenery daemon run");
 
     let appeared = wait_for_socket(&socket_path, Duration::from_secs(5));
     if !appeared {

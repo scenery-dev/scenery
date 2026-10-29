@@ -16,11 +16,11 @@ pub use reconciler::ReconcilerHandle;
 pub use sse_client::SyncEvent;
 
 use anyhow::Result;
+use scenery_core::state::AppState;
+use scenery_mcp::aggregator::BackendRegistry;
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::info;
-use scenery_core::state::AppState;
-use scenery_mcp::aggregator::BackendRegistry;
 
 use crate::managed_paths::ManagedPathsPusher;
 
@@ -36,7 +36,7 @@ pub struct SyncConfig {
     /// Last SSE event ID received (for resume on reconnect).
     pub last_event_id: Option<String>,
     /// F2: pusher for writing installs into Claude Code's native directories.
-    /// `None` when `VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER` is set.
+    /// `None` when `SCENERY_DISABLE_FILESYSTEM_RECONCILER` is set.
     pub pusher: Option<Arc<ManagedPathsPusher>>,
     /// The SSE client's *current* access token, live-updated.
     ///

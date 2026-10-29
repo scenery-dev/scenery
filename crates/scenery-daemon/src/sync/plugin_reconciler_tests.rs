@@ -2,7 +2,7 @@
 //!
 //! The daemon already fully handles the live `install_plugin` SSE delta
 //! (`SyncEvent::InstallPlugin` → `spawn_install_plugin` → the local
-//! `vectorhawk` Claude Code marketplace). These tests cover the new
+//! `scenery` Claude Code marketplace). These tests cover the new
 //! `plugin_installations` snapshot key: a plugin installed before a device
 //! registered (or while a live delta was dropped) is only ever delivered
 //! through the snapshot, so the daemon must converge it the same way it
@@ -72,7 +72,7 @@ fn make_record(slug: &str, iid: Uuid, state: &str) -> PluginInstallationRecord {
         plugin_name: slug.to_string(),
         description: "test plugin".to_string(),
         version: "1.0.0".to_string(),
-        author: "VectorHawk".to_string(),
+        author: "Scenery".to_string(),
         skills: vec![PluginSkillRef {
             skill_id: "some-skill".to_string(),
             version: "1.0.0".to_string(),
@@ -109,11 +109,11 @@ fn seed_installed_plugins(home: &std::path::Path, entries: &[(&str, &str)]) {
     // diff treats a governed plugin as legacy and reinstalls it once (see
     // `revocation_scope_tests::snapshot_reinstalls_a_governed_plugin_with_no_bundled_skill_record`).
     let record_path =
-        home.join(".claude/plugins/marketplaces/vectorhawk/.vectorhawk/bundled-skills.json");
+        home.join(".claude/plugins/marketplaces/scenery/.scenery/bundled-skills.json");
     std::fs::create_dir_all(record_path.parent().unwrap()).unwrap();
     let mut record = serde_json::Map::new();
     for (key, version) in entries {
-        if let Some(slug) = key.strip_suffix("@vectorhawk") {
+        if let Some(slug) = key.strip_suffix("@scenery") {
             record.insert(
                 slug.to_string(),
                 serde_json::json!({ "version": version, "skills": { "some-skill": "1.0.0" } }),
@@ -135,19 +135,19 @@ fn read_installed_plugins(home: &std::path::Path) -> serde_json::Value {
 // ── list_governed_plugins ───────────────────────────────────────────────────
 
 #[test]
-fn list_governed_plugins_scopes_to_vectorhawk_marketplace() {
+fn list_governed_plugins_scopes_to_scenery_marketplace() {
     let home = FakeHome::new();
     seed_installed_plugins(
         home.path(),
         &[
-            ("superpowers@vectorhawk", "5.0.7"),
+            ("superpowers@scenery", "5.0.7"),
             ("other-plugin@official", "1.2.0"),
         ],
     );
 
     let governed = crate::managed_paths::list_governed_plugins().unwrap();
 
-    assert_eq!(governed.len(), 1, "only vectorhawk-marketplace entries");
+    assert_eq!(governed.len(), 1, "only scenery-marketplace entries");
     assert_eq!(
         governed.get("superpowers").map(String::as_str),
         Some("5.0.7")
@@ -186,7 +186,7 @@ fn snapshot_plugin_not_installed_produces_one_install_event() {
 #[test]
 fn snapshot_plugin_already_installed_is_noop() {
     let home = FakeHome::new();
-    seed_installed_plugins(home.path(), &[("superpowers@vectorhawk", "1.0.0")]);
+    seed_installed_plugins(home.path(), &[("superpowers@scenery", "1.0.0")]);
 
     let records = vec![make_record("superpowers", install_id(), "installed")];
 
@@ -206,7 +206,7 @@ fn snapshot_plugin_empty_array_is_noop_for_existing_installs() {
     // dispatch_event guards this before calling the async wrapper, but the
     // blocking function must also be a safe no-op when called directly.
     let home = FakeHome::new();
-    seed_installed_plugins(home.path(), &[("superpowers@vectorhawk", "1.0.0")]);
+    seed_installed_plugins(home.path(), &[("superpowers@scenery", "1.0.0")]);
 
     let diff = super::build_derived_plugin_events_blocking_for_test(vec![]);
 
@@ -238,8 +238,8 @@ fn snapshot_plugin_orphan_is_queued_for_silent_purge_and_diff_is_pure() {
     seed_installed_plugins(
         home.path(),
         &[
-            ("plugin-a@vectorhawk", "1.0.0"),
-            ("plugin-b@vectorhawk", "1.0.0"),
+            ("plugin-a@scenery", "1.0.0"),
+            ("plugin-b@scenery", "1.0.0"),
             ("manual-plugin@official", "2.0.0"),
         ],
     );
@@ -271,7 +271,7 @@ fn snapshot_plugin_orphan_is_queued_for_silent_purge_and_diff_is_pure() {
 #[test]
 fn snapshot_plugin_deactivated_state_emits_event_without_mutating_filesystem() {
     let home = FakeHome::new();
-    seed_installed_plugins(home.path(), &[("superpowers@vectorhawk", "1.0.0")]);
+    seed_installed_plugins(home.path(), &[("superpowers@scenery", "1.0.0")]);
     let before = read_installed_plugins(home.path());
 
     let iid = install_id();
@@ -306,7 +306,7 @@ fn snapshot_plugin_deactivated_state_emits_event_without_mutating_filesystem() {
 #[test]
 fn snapshot_plugin_removed_state_is_queued_for_silent_purge_and_diff_is_pure() {
     let home = FakeHome::new();
-    seed_installed_plugins(home.path(), &[("superpowers@vectorhawk", "1.0.0")]);
+    seed_installed_plugins(home.path(), &[("superpowers@scenery", "1.0.0")]);
     let before = read_installed_plugins(home.path());
 
     let records = vec![make_record("superpowers", install_id(), "removed")];
@@ -340,10 +340,10 @@ fn build_derived_plugin_events_blocking_never_touches_filesystem() {
     seed_installed_plugins(
         home.path(),
         &[
-            ("already@vectorhawk", "1.0.0"),
-            ("to-deactivate@vectorhawk", "1.0.0"),
-            ("to-remove@vectorhawk", "1.0.0"),
-            ("orphan@vectorhawk", "1.0.0"),
+            ("already@scenery", "1.0.0"),
+            ("to-deactivate@scenery", "1.0.0"),
+            ("to-remove@scenery", "1.0.0"),
+            ("orphan@scenery", "1.0.0"),
         ],
     );
     let before = read_installed_plugins(home.path());
@@ -381,7 +381,7 @@ fn build_derived_plugin_events_blocking_never_touches_filesystem() {
 
     let marketplace_plugins_dir = home
         .path()
-        .join(".claude/plugins/marketplaces/vectorhawk/plugins");
+        .join(".claude/plugins/marketplaces/scenery/plugins");
     assert!(
         !marketplace_plugins_dir.exists(),
         "the diff function must never touch the marketplace filesystem tree \
@@ -452,7 +452,7 @@ async fn concurrent_live_and_snapshot_install_for_same_slug_are_serialized() {
         plugin_name: slug.to_string(),
         description: "test plugin".to_string(),
         version: "1.0.0".to_string(),
-        author: "VectorHawk".to_string(),
+        author: "Scenery".to_string(),
         skills: vec![],
     };
 
@@ -556,7 +556,7 @@ async fn concurrent_live_and_snapshot_install_for_same_slug_are_serialized() {
     );
     let plugin_json = home
         .path()
-        .join(".claude/plugins/marketplaces/vectorhawk/plugins/racer/.claude-plugin/plugin.json");
+        .join(".claude/plugins/marketplaces/scenery/plugins/racer/.claude-plugin/plugin.json");
     assert!(
         plugin_json.exists(),
         "plugin.json must exist and be fully written, not torn by an \
@@ -588,10 +588,7 @@ async fn concurrent_live_install_and_snapshot_derived_orphan_purge_for_same_slug
     // non-empty without spawning any extra work for it.
     seed_installed_plugins(
         home.path(),
-        &[
-            ("furnace@vectorhawk", "1.0.0"),
-            ("decoy@vectorhawk", "1.0.0"),
-        ],
+        &[("furnace@scenery", "1.0.0"), ("decoy@scenery", "1.0.0")],
     );
 
     let server = mockito::Server::new_async().await;
@@ -620,7 +617,7 @@ async fn concurrent_live_install_and_snapshot_derived_orphan_purge_for_same_slug
         plugin_name: slug.to_string(),
         description: "test plugin".to_string(),
         version: "1.0.0".to_string(),
-        author: "VectorHawk".to_string(),
+        author: "Scenery".to_string(),
         skills: vec![],
     };
     dispatch_event(
@@ -711,7 +708,7 @@ async fn concurrent_live_install_and_snapshot_derived_orphan_purge_for_same_slug
     );
     let plugin_dir = home
         .path()
-        .join(".claude/plugins/marketplaces/vectorhawk/plugins/furnace");
+        .join(".claude/plugins/marketplaces/scenery/plugins/furnace");
     assert!(
         !plugin_dir.exists(),
         "furnace's plugin directory must be cleanly removed, not left as a \
@@ -736,10 +733,10 @@ async fn dispatch_event_snapshot_converges_deactivated_and_orphan_and_removed_pl
     seed_installed_plugins(
         home.path(),
         &[
-            ("to-deactivate@vectorhawk", "1.0.0"),
-            ("to-remove@vectorhawk", "1.0.0"),
-            ("orphan@vectorhawk", "1.0.0"),
-            ("keep@vectorhawk", "1.0.0"),
+            ("to-deactivate@scenery", "1.0.0"),
+            ("to-remove@scenery", "1.0.0"),
+            ("orphan@scenery", "1.0.0"),
+            ("keep@scenery", "1.0.0"),
         ],
     );
 

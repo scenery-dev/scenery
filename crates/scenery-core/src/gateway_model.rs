@@ -1,5 +1,5 @@
 //! HTTP-based model client that routes inference requests through the
-//! VectorHawk gateway at `/gateway/v1/inference`.
+//! Scenery gateway at `/gateway/v1/inference`.
 //!
 //! Auth flow:
 //! 1. Look up the stored access token for `base_url` in SQLite via
@@ -62,7 +62,7 @@ struct GatewayResponse {
 
 // ── Client ────────────────────────────────────────────────────────────────────
 
-/// Routes inference requests to the VectorHawk gateway over HTTPS.
+/// Routes inference requests to the Scenery gateway over HTTPS.
 ///
 /// Auth tokens are read from the daemon's local SQLite state on every call so
 /// that token rotation by the background refresh loop is picked up
@@ -104,7 +104,7 @@ impl ModelClient for GatewayModelClient {
             Some(t) => t.access_token,
             None => {
                 anyhow::bail!(
-                    "not authenticated — run `vectorhawk auth login` to connect to the gateway"
+                    "not authenticated — run `scenery auth login` to connect to the gateway"
                 );
             }
         };
@@ -136,7 +136,7 @@ impl ModelClient for GatewayModelClient {
 
         if status == reqwest::StatusCode::UNAUTHORIZED {
             anyhow::bail!(
-                "auth token expired — run `vectorhawk auth login` to refresh your credentials"
+                "auth token expired — run `scenery auth login` to refresh your credentials"
             );
         }
 

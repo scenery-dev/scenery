@@ -11,7 +11,7 @@
 //! On Linux, a running process keeps executing its binary's original inode
 //! even after the file on disk is replaced — `readlink /proc/<pid>/exe` on
 //! a stale daemon after `brew upgrade` shows e.g.
-//! `…/Cellar/vectorhawk/1.0.93/bin/vectorhawk (deleted)`. Upgrades were
+//! `…/Cellar/scenery/1.0.93/bin/scenery (deleted)`. Upgrades were
 //! therefore invisible to a running daemon: it kept serving the old build
 //! forever, until something happened to restart it by other means.
 //!
@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 /// path doesn't make sense — e.g. a container that intentionally overlays a
 /// new binary without wanting a restart, or a debug build run repeatedly
 /// out of `target/` where every `cargo build` would otherwise trigger one.
-pub const NO_BINARY_WATCH_ENV: &str = "VH_NO_BINARY_WATCH";
+pub const NO_BINARY_WATCH_ENV: &str = "SCN_NO_BINARY_WATCH";
 
 /// How often (in seconds) the binary-watch task re-stats the watch path.
 /// Coarse on purpose: an upgrade landing up to a minute late costs nothing
@@ -98,7 +98,7 @@ pub fn binary_changed(recorded: ExeIdentity, current: Option<ExeIdentity>) -> bo
 ///
 /// Deliberately not `std::env::current_exe()`: under Homebrew that resolves
 /// to the *versioned* Cellar path (e.g.
-/// `/opt/homebrew/Cellar/vectorhawk/1.0.94/bin/vectorhawk`). An upgrade
+/// `/opt/homebrew/Cellar/scenery/1.0.94/bin/scenery`). An upgrade
 /// deletes that exact path outright rather than replacing it in place, so
 /// stat'ing it after an upgrade always returns "not found" — which
 /// [`binary_changed`] correctly refuses to treat as a change (see its
@@ -123,7 +123,7 @@ pub fn resolve_watch_path() -> std::io::Result<PathBuf> {
 
 /// Stat `path`, **following symlinks** (`std::fs::metadata`, not
 /// `symlink_metadata`) — the watch path is often itself a symlink (e.g.
-/// Homebrew's `<prefix>/bin/vectorhawk`), and it is the *target's* identity
+/// Homebrew's `<prefix>/bin/scenery`), and it is the *target's* identity
 /// that changes on relink, not necessarily the symlink's own inode. Returns
 /// `None` on any stat failure (missing path, permission error, dangling
 /// symlink mid-relink, ...) — callers must treat that as "unknown, try
@@ -195,10 +195,7 @@ mod tests {
 
     #[test]
     fn stat_identity_returns_none_for_missing_path() {
-        assert_eq!(
-            stat_identity(Path::new("/nonexistent/path/vectorhawk")),
-            None
-        );
+        assert_eq!(stat_identity(Path::new("/nonexistent/path/scenery")), None);
     }
 
     #[test]

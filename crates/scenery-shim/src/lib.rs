@@ -1,7 +1,7 @@
-//! VectorHawk runner — shim library.
+//! Scenery runner — shim library.
 //!
 //! Exposes [`run_shim`], the single entry point for the shim binary and for
-//! the `vectorhawk mcp serve` subcommand.
+//! the `scenery mcp serve` subcommand.
 //!
 //! # Single-mode posture (M4)
 //!
@@ -10,7 +10,7 @@
 //! fall back to in-process execution. Instead it enters `DaemonRequired`
 //! mode and answers every JSON-RPC request with a structured error
 //! containing install/restart instructions. The AI client surfaces the
-//! error to the user, who runs `vectorhawk daemon install` (or restarts
+//! error to the user, who runs `scenery daemon install` (or restarts
 //! the existing agent) and retries. There is no in-process degradation
 //! mode in production code.
 //!
@@ -30,7 +30,7 @@
 //! Up through M3 the shim transparently switched to an in-process
 //! `EmbeddedBackend` with stub tools (list_skills, run_skill, etc.) on
 //! daemon failure. The stub responses were hardcoded, not real — the AI
-//! client believed VectorHawk was working when it wasn't. M4 deletes
+//! client believed Scenery was working when it wasn't. M4 deletes
 //! that silent-degradation path: a missing daemon must be visible to the
 //! user.
 //!
@@ -45,22 +45,22 @@
 //! implementation lives there; any change must be mirrored here.
 
 use anyhow::Result;
+use scenery_mcp::{
+    backend::SocketBackend,
+    protocol::{JsonRpcRequest, JsonRpcResponse, PARSE_ERROR},
+};
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::io::{AsyncBufReadExt, BufReader as TokioBufReader};
 use tracing::{debug, error, info, warn};
-use scenery_mcp::{
-    backend::SocketBackend,
-    protocol::{JsonRpcRequest, JsonRpcResponse, PARSE_ERROR},
-};
 
 // ── JSON-RPC error code for the daemon-required state ────────────────────────
 
 /// Server-defined JSON-RPC error code for the daemon-required state.
 ///
 /// Per JSON-RPC 2.0, the range -32000..=-32099 is reserved for server-defined
-/// errors. We use -32001 for "VectorHawk daemon unreachable".
+/// errors. We use -32001 for "Scenery daemon unreachable".
 const DAEMON_UNREACHABLE: i64 = -32001;
 
 // ── Socket path ───────────────────────────────────────────────────────────────
@@ -70,20 +70,20 @@ const DAEMON_UNREACHABLE: i64 = -32001;
 /// Mirrors `scenery_core::state::AppState::socket_path` exactly.
 /// See that function for rationale. Do not diverge.
 ///
-/// - macOS: `~/Library/Application Support/VectorHawk/agent.sock`
-/// - Linux: `$XDG_RUNTIME_DIR/vectorhawk/agent.sock`
-///   (fallback: `~/.local/share/VectorHawk/agent.sock`)
+/// - macOS: `~/Library/Application Support/Scenery/agent.sock`
+/// - Linux: `$XDG_RUNTIME_DIR/scenery/agent.sock`
+///   (fallback: `~/.local/share/Scenery/agent.sock`)
 pub fn daemon_socket_path() -> Option<PathBuf> {
     #[cfg(target_os = "linux")]
     {
         if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
-            let candidate = PathBuf::from(runtime).join("vectorhawk").join("agent.sock");
+            let candidate = PathBuf::from(runtime).join("scenery").join("agent.sock");
             return Some(candidate);
         }
     }
     // macOS and Linux fallback: data dir
     let base = dirs::data_dir()?;
-    Some(base.join("VectorHawk").join("agent.sock"))
+    Some(base.join("Scenery").join("agent.sock"))
 }
 
 // ── Session mode ──────────────────────────────────────────────────────────────
@@ -234,8 +234,8 @@ pub async fn run_shim(server: Option<String>) -> Result<()> {
 /// are ignored — they belong to no in-flight request from this pump.
 #[cfg(unix)]
 async fn run_notification_pump(socket_path: PathBuf, stdout_lock: Arc<StdMutex<()>>) -> Result<()> {
-    use tokio::net::UnixStream;
     use scenery_mcp::backend::read_framed;
+    use tokio::net::UnixStream;
 
     let stream = UnixStream::connect(&socket_path)
         .await
@@ -447,13 +447,13 @@ fn filter_tools_for_server(
 /// Filter `ToolsListResult` to drop any `<slug>__*` tools whose slug is in
 /// `excluded_slugs`.
 ///
-/// Used by the aggregator shim (`vectorhawk mcp serve` with no `--server`
+/// Used by the aggregator shim (`scenery mcp serve` with no `--server`
 /// flag) to hide backends that are already surfaced to the AI client as
 /// per-server entries in `~/.claude.json`. Without this, the AI client sees
 /// the same tool twice — once natively (via the per-server shim spawned for
-/// that slug) and once nested under the `vectorhawk` aggregator namespace.
+/// that slug) and once nested under the `scenery` aggregator namespace.
 ///
-/// Unprefixed tools (`vectorhawk_*` management tools, etc.) are always kept.
+/// Unprefixed tools (`scenery_*` management tools, etc.) are always kept.
 #[cfg(unix)]
 fn filter_tools_for_aggregator(
     mut result: scenery_mcp::protocol::ToolsListResult,
@@ -480,9 +480,9 @@ fn filter_tools_for_aggregator(
 /// AI clients can display a consistent message to the user.
 fn daemon_required_error(id: Option<serde_json::Value>, reason: &str) -> JsonRpcResponse {
     let message = format!(
-        "VectorHawk daemon unreachable. Run `vectorhawk daemon install` to install \
-         and start it, or restart it with `launchctl kickstart gui/$(id -u)/com.vectorhawk.agent` \
-         (macOS) / `systemctl --user start vectorhawk-agent` (Linux). Detail: {reason}"
+        "Scenery daemon unreachable. Run `scenery daemon install` to install \
+         and start it, or restart it with `launchctl kickstart gui/$(id -u)/com.scenery.agent` \
+         (macOS) / `systemctl --user start scenery-agent` (Linux). Detail: {reason}"
     );
     JsonRpcResponse::error(id, DAEMON_UNREACHABLE, message)
 }

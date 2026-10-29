@@ -38,9 +38,9 @@ async fn get_port_returns_error_when_listener_not_running() {
 #[tokio::test]
 async fn reload_returns_inactive_without_token_and_is_idempotent() {
     use crate::SyncController;
-    use tokio::sync::broadcast;
     use scenery_core::state::AppState;
     use scenery_mcp::aggregator::BackendRegistry;
+    use tokio::sync::broadcast;
 
     let tmp = tempfile::tempdir().unwrap();
     let root = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
@@ -65,7 +65,7 @@ async fn reload_returns_inactive_without_token_and_is_idempotent() {
     assert!(!controller.ensure_started().await);
 }
 
-/// Regression test for the sales-demo bug: `vectorhawk auth pair` against a
+/// Regression test for the sales-demo bug: `scenery auth pair` against a
 /// daemon whose SSE sync loop is already running under *different*
 /// credentials must report `sync_active: true` once the credential-change
 /// restart it triggers actually connects — not `false` just because the
@@ -77,8 +77,8 @@ async fn reload_returns_inactive_without_token_and_is_idempotent() {
 #[tokio::test]
 async fn reload_reports_active_after_credential_change_on_running_daemon() {
     use crate::SyncController;
-    use tokio::sync::broadcast;
     use scenery_mcp::aggregator::BackendRegistry;
+    use tokio::sync::broadcast;
 
     let _guard = KeychainOff::enable();
     let (state, _tmp) = bootstrap_state();
@@ -130,7 +130,7 @@ async fn reload_reports_active_after_credential_change_on_running_daemon() {
         None,
     ));
 
-    // First auth (e.g. `vectorhawk auth login`) — sync starts and connects
+    // First auth (e.g. `scenery auth login`) — sync starts and connects
     // with tok-1.
     scenery_core::auth::save_tokens(&state, &registry_url, "tok-1", "ref-1")
         .expect("save_tokens tok-1");
@@ -143,7 +143,7 @@ async fn reload_reports_active_after_credential_change_on_running_daemon() {
     );
     sse_tok1.assert_async().await;
 
-    // The reproduction: `vectorhawk auth pair` (or `auth login`/`auth
+    // The reproduction: `scenery auth pair` (or `auth login`/`auth
     // token`) writes a *different* access token while the daemon's SSE loop
     // from above is still running — exactly what a re-pair mid-demo does.
     scenery_core::auth::save_tokens(&state, &registry_url, "tok-2", "ref-2")
@@ -171,8 +171,8 @@ async fn reload_reports_active_after_credential_change_on_running_daemon() {
 #[tokio::test]
 async fn reload_reports_inactive_when_sse_connection_genuinely_fails() {
     use crate::SyncController;
-    use tokio::sync::broadcast;
     use scenery_mcp::aggregator::BackendRegistry;
+    use tokio::sync::broadcast;
 
     let _guard = KeychainOff::enable();
     let (state, _tmp) = bootstrap_state();
@@ -212,8 +212,7 @@ async fn reload_reports_inactive_when_sse_connection_genuinely_fails() {
         None,
     ));
 
-    scenery_core::auth::save_tokens(&state, &registry_url, "tok-1", "ref-1")
-        .expect("save_tokens");
+    scenery_core::auth::save_tokens(&state, &registry_url, "tok-1", "ref-1").expect("save_tokens");
 
     let resp = handle_reload(id(), Arc::clone(&controller)).await;
     assert!(resp.error.is_none(), "should not error: {:?}", resp.error);
@@ -396,7 +395,7 @@ static KEYCHAIN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 impl KeychainOff {
     fn enable() -> Self {
         let _g = KEYCHAIN_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("VECTORHAWK_DISABLE_KEYCHAIN", "1");
+        std::env::set_var("SCENERY_DISABLE_KEYCHAIN", "1");
         KeychainOff { _g }
     }
 }
@@ -405,7 +404,7 @@ impl Drop for KeychainOff {
         // Re-assert rather than remove: `refresh_loop_tests`' `#[ctor]`
         // (`disable_real_keychain_for_tests`) sets this once for the whole
         // process; nothing in this binary should ever turn it back off.
-        std::env::set_var("VECTORHAWK_DISABLE_KEYCHAIN", "1");
+        std::env::set_var("SCENERY_DISABLE_KEYCHAIN", "1");
     }
 }
 

@@ -293,7 +293,7 @@ struct RegistryInner {
     last_synced: Option<Instant>,
 }
 
-/// Notified once after `vectorhawk_login` saves fresh OAuth tokens, so the
+/// Notified once after `scenery_login` saves fresh OAuth tokens, so the
 /// daemon can register this device and start sync without a restart — the
 /// same outcome `auth/reload` already gives the CLI login path.
 ///
@@ -315,7 +315,7 @@ pub struct BackendRegistry {
     /// Shared async HTTP client used for HTTP transport dispatch.
     http: reqwest::Client,
     /// Set by the daemon after construction (see `set_tokens_saved_hook`);
-    /// `None` in the shim, which never handles `vectorhawk_login` tokens.
+    /// `None` in the shim, which never handles `scenery_login` tokens.
     tokens_saved_hook: Arc<Mutex<Option<Arc<dyn TokensSavedHook>>>>,
 }
 
@@ -444,9 +444,9 @@ impl BackendRegistry {
     ///
     /// The daemon's MCP server passes the set of F2-pushed slugs here so that
     /// backends already surfaced as per-server entries in `~/.claude.json`
-    /// don't get double-exposed under the `vectorhawk` aggregator namespace.
+    /// don't get double-exposed under the `scenery` aggregator namespace.
     /// Without this filter, Claude Code sees the same tool twice — once as
-    /// `<slug>__tool` (native) and once as `vectorhawk__<slug>__tool` (nested).
+    /// `<slug>__tool` (native) and once as `scenery__<slug>__tool` (nested).
     pub fn all_tools_excluding(
         &self,
         excluded_server_ids: &std::collections::HashSet<String>,
@@ -566,13 +566,13 @@ impl BackendRegistry {
 
         let result = match target {
             DispatchTarget::Stub { response } => {
-                // Test hook: `VECTORHAWK_STUB_LATENCY_MS` injects a blocking
+                // Test hook: `SCENERY_STUB_LATENCY_MS` injects a blocking
                 // sleep wrapped in `spawn_blocking` to simulate a slow real
                 // backend. Used by the M1.7 blocking-I/O stress test to
                 // validate that independent calls aren't head-of-line blocked
                 // when other calls are doing slow blocking work. No-op when
                 // the env var is unset, so production code path is unchanged.
-                if let Some(latency_ms) = std::env::var("VECTORHAWK_STUB_LATENCY_MS")
+                if let Some(latency_ms) = std::env::var("SCENERY_STUB_LATENCY_MS")
                     .ok()
                     .and_then(|v| v.parse::<u64>().ok())
                 {
@@ -1027,7 +1027,7 @@ mod tests {
 
     #[test]
     fn parse_tool_name_returns_none_without_separator() {
-        assert!(parse_tool_name("skillclub_search").is_none());
+        assert!(parse_tool_name("scenery_search").is_none());
         assert!(parse_tool_name("create_issue").is_none());
         assert!(parse_tool_name("nodoubleunderscore").is_none());
     }
@@ -1238,7 +1238,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_returns_none_for_non_namespaced_tool() {
         let registry = BackendRegistry::new();
-        let result = registry.dispatch("skillclub_search", &Value::Null).await;
+        let result = registry.dispatch("scenery_search", &Value::Null).await;
         assert!(result.is_none());
     }
 

@@ -163,9 +163,9 @@ fn is_addr_in_use(e: &std::io::Error) -> bool {
 fn build_success_page() -> String {
     r#"<!DOCTYPE html>
 <html lang="en">
-<head><meta charset="UTF-8"><title>VectorHawk Login</title></head>
+<head><meta charset="UTF-8"><title>Scenery Login</title></head>
 <body>
-<h2>VectorHawk login complete.</h2>
+<h2>Scenery login complete.</h2>
 <p>You can close this window.</p>
 <script>window.close();</script>
 </body>
@@ -178,14 +178,14 @@ fn build_success_page() -> String {
 fn build_orphaned_page() -> String {
     r#"<!DOCTYPE html>
 <html lang="en">
-<head><meta charset="UTF-8"><title>VectorHawk Login – Retry Required</title></head>
+<head><meta charset="UTF-8"><title>Scenery Login – Retry Required</title></head>
 <body>
 <h2>Almost there — please start the login again.</h2>
-<p>Your browser completed authorization, but the VectorHawk daemon was
+<p>Your browser completed authorization, but the Scenery daemon was
 restarted before the confirmation could be delivered.  This can happen
 when the daemon is upgraded mid-flow.</p>
-<p>Run <code>vectorhawk auth login</code> (or call the
-<code>vectorhawk_login</code> tool) again — it will complete instantly
+<p>Run <code>scenery auth login</code> (or call the
+<code>scenery_login</code> tool) again — it will complete instantly
 this time because you are already authorized.</p>
 <p>You can close this window.</p>
 </body>
@@ -215,9 +215,9 @@ fn build_error_page(error: &str) -> String {
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
-<head><meta charset="UTF-8"><title>VectorHawk Login Failed</title></head>
+<head><meta charset="UTF-8"><title>Scenery Login Failed</title></head>
 <body>
-<h2>VectorHawk login failed.</h2>
+<h2>Scenery login failed.</h2>
 <p>The authorization server returned an error: <code>{error}</code></p>
 <p>You can close this window and try again.</p>
 </body>

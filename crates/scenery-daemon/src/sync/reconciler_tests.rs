@@ -8,9 +8,9 @@ use super::{
 use crate::sync::sse_client::{InstallationRecord, SyncEvent};
 use camino::Utf8PathBuf;
 use rusqlite::Connection;
+use scenery_core::state::AppState;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
-use scenery_core::state::AppState;
 
 fn temp_root(label: &str) -> Utf8PathBuf {
     let nanos = SystemTime::now()
@@ -837,8 +837,8 @@ fn purge_skill_blocking_does_not_touch_foreign_unmanaged_projection() {
 
     with_fake_home(|home| {
         // A real, unmanaged directory at the canonical path — e.g. left by
-        // `npx skills`, Cursor, or Codex — never carrying VectorHawk's
-        // `.vectorhawk-managed.json` marker. Purge must never touch it.
+        // `npx skills`, Cursor, or Codex — never carrying Scenery's
+        // `.scenery-managed.json` marker. Purge must never touch it.
         let agents_skills = home.join(".agents").join("skills");
         std::fs::create_dir_all(&agents_skills).unwrap();
         let foreign = agents_skills.join("demo");
@@ -851,7 +851,7 @@ fn purge_skill_blocking_does_not_touch_foreign_unmanaged_projection() {
 
         assert!(
             foreign.is_dir(),
-            "BUG: Purge deleted a directory VectorHawk never marked as managed"
+            "BUG: Purge deleted a directory Scenery never marked as managed"
         );
         assert_eq!(
             std::fs::read(foreign.join("SKILL.md")).ok().as_deref(),

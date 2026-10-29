@@ -7,7 +7,7 @@
 //! # Killswitch
 //!
 //! Returns `Ok(())` immediately when
-//! `VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER` is set in the environment.
+//! `SCENERY_DISABLE_FILESYSTEM_RECONCILER` is set in the environment.
 //!
 //! # Failure model
 //!
@@ -16,13 +16,13 @@
 //! for detecting stale `publishing` rows on its own schedule.
 
 use anyhow::{Context, Result};
+use scenery_core::{auth::load_all_tokens, registry::RegistryClient, state::AppState};
 use std::{path::Path, sync::Arc};
 use tracing::{info, warn};
-use scenery_core::{auth::load_all_tokens, registry::RegistryClient, state::AppState};
 
 // ── Env-var gate ──────────────────────────────────────────────────────────────
 
-const ENV_DISABLE: &str = "VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER";
+const ENV_DISABLE: &str = "SCENERY_DISABLE_FILESYSTEM_RECONCILER";
 
 fn reconciler_disabled() -> bool {
     std::env::var_os(ENV_DISABLE).is_some()
@@ -32,7 +32,7 @@ fn reconciler_disabled() -> bool {
 
 /// Handle a `discovery_publish_requested` SSE event.
 ///
-/// 1. Honours the `VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER` killswitch.
+/// 1. Honours the `SCENERY_DISABLE_FILESYSTEM_RECONCILER` killswitch.
 /// 2. Loads the stored bearer token for `registry_url` from SQLite.
 /// 3. Builds a gzipped tar of the directory at `source_path`.
 /// 4. Uploads via [`RegistryClient::compile_and_publish`].
@@ -134,7 +134,7 @@ pub(crate) fn load_token_for_registry(state: &AppState, registry_url: &str) -> R
         .map(|r| r.access_token)
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "publish: no stored token for registry '{}' — run `vectorhawk auth login`",
+                "publish: no stored token for registry '{}' — run `scenery auth login`",
                 registry_url
             )
         })
@@ -184,7 +184,7 @@ mod tests {
     /// Bootstrap a minimal `AppState` pointing at a temp SQLite DB with all
     /// required tables.  No `auth_tokens` rows are inserted.
     fn make_state(home: &TempDir) -> AppState {
-        let db_dir = home.path().join(".vectorhawk");
+        let db_dir = home.path().join(".scenery");
         fs::create_dir_all(&db_dir).unwrap();
         let db_path = camino::Utf8PathBuf::from(db_dir.join("state.db").to_string_lossy().as_ref());
         let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -208,7 +208,7 @@ mod tests {
     /// on disk.  The source path check fires before the auth-token lookup, so
     /// the expected error mentions "does not exist".
     ///
-    /// This test avoids any env-var mutation — the `VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER`
+    /// This test avoids any env-var mutation — the `SCENERY_DISABLE_FILESYSTEM_RECONCILER`
     /// variable is manipulated by `discoveries.rs` tests on concurrent threads;
     /// reading or writing it here would be racy.  Instead, the test creates a
     /// real `AppState` (no tokens stored) and a guaranteed-absent path so the
@@ -232,7 +232,7 @@ mod tests {
 
         let result = handle_publish_requested(
             state,
-            "https://app.vectorhawk.ai".to_string(),
+            "https://app.scenery.dev".to_string(),
             "disc-002".to_string(),
             "my-skill".to_string(),
             missing,
@@ -268,7 +268,7 @@ mod tests {
 
         let result = handle_publish_requested(
             state,
-            "https://app.vectorhawk.ai".to_string(),
+            "https://app.scenery.dev".to_string(),
             "disc-003".to_string(),
             "my-skill".to_string(),
             source_dir.to_string_lossy().to_string(),

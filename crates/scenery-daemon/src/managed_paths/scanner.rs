@@ -6,13 +6,13 @@
 
 use super::ItemKind;
 use anyhow::{Context, Result};
+use scenery_mcp::ownership::{self, is_excluded_plugin_dir, is_scenery_mcp_key};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
     path::{Path, PathBuf},
 };
 use tracing::warn;
-use scenery_mcp::ownership::{self, is_excluded_plugin_dir, is_vectorhawk_mcp_key};
 
 /// One discovered item ready for migration.
 #[derive(Debug, Clone)]
@@ -70,7 +70,7 @@ pub fn scan_skills_dir(skills_dir: &Path) -> Result<Vec<MigrationItem>> {
             continue;
         }
 
-        // Ownership is NOT decided here (F13): a `.vectorhawk-managed.json`
+        // Ownership is NOT decided here (F13): a `.scenery-managed.json`
         // file is attacker-controllable, so this scanner returns every
         // well-formed dir and `migrator::migrate_item` decides from
         // `managed_path_markers` (exact canonical path) whether it is ours —
@@ -264,7 +264,7 @@ pub fn scan_plugin_marketplaces(plugins_dir: &Path) -> Result<Vec<MigrationItem>
         if !mkt_path.is_dir() {
             continue;
         }
-        // VectorHawk's own governed plugins are not adoption candidates.
+        // Scenery's own governed plugins are not adoption candidates.
         let governed = if mkt.file_name() == super::plugin_marketplace::MARKETPLACE_NAME {
             super::plugin_marketplace::recorded_plugin_slugs_in(plugins_dir)
         } else {
@@ -358,7 +358,7 @@ pub fn scan_plugin_marketplaces(plugins_dir: &Path) -> Result<Vec<MigrationItem>
 // ── MCP servers ───────────────────────────────────────────────────────────────
 
 /// Parse `~/.claude.json` and return one `MigrationItem` per `mcpServers` entry
-/// that is not named exactly `"vectorhawk"`.
+/// that is not named exactly `"scenery"`.
 pub fn scan_claude_json(claude_json: &Path) -> Result<Vec<MigrationItem>> {
     if !claude_json.exists() {
         return Ok(vec![]);
@@ -384,8 +384,8 @@ pub fn scan_claude_json(claude_json: &Path) -> Result<Vec<MigrationItem>> {
     let mut items = Vec::new();
 
     for (key, value) in &mcp_servers {
-        // Always skip the VectorHawk aggregator entry.
-        if is_vectorhawk_mcp_key(key) {
+        // Always skip the Scenery aggregator entry.
+        if is_scenery_mcp_key(key) {
             continue;
         }
 

@@ -3,9 +3,9 @@
 //! # Overview
 //!
 //! Validates M2 acceptance criteria 1, 3, and 4 on macOS:
-//! - AC1: `vectorhawk daemon install` writes the plist and daemon is reachable
+//! - AC1: `scenery daemon install` writes the plist and daemon is reachable
 //!   on the socket within 5 s.
-//! - AC3: `vectorhawk daemon uninstall` stops the agent and removes the plist.
+//! - AC3: `scenery daemon uninstall` stops the agent and removes the plist.
 //! - AC4: Running `daemon install` twice is idempotent (exits 0 both times).
 //!
 //! # Running
@@ -49,13 +49,13 @@ fn plist_path() -> PathBuf {
     let home = dirs::home_dir().expect("HOME directory must be resolvable");
     home.join("Library")
         .join("LaunchAgents")
-        .join("com.vectorhawk.agent.plist")
+        .join("com.scenery.agent.plist")
 }
 
 fn socket_path() -> PathBuf {
     // Mirrors install::mod.rs daemon_socket_path() for macOS.
     let data_dir = dirs::data_dir().expect("dirs::data_dir() must succeed on macOS");
-    data_dir.join("VectorHawk").join("agent.sock")
+    data_dir.join("Scenery").join("agent.sock")
 }
 
 /// Poll until the path exists (or doesn't, when `expect_present` is false).
@@ -71,12 +71,12 @@ fn wait_for_path(path: &std::path::Path, expect_present: bool, timeout: Duration
     false
 }
 
-/// Run `vectorhawk <args>` and return the exit status code.
+/// Run `scenery <args>` and return the exit status code.
 fn run_cli(cli_bin: &Path, args: &[&str]) -> std::process::ExitStatus {
     Command::new(cli_bin)
         .args(args)
         .status()
-        .unwrap_or_else(|e| panic!("failed to spawn vectorhawk {args:?}: {e}"))
+        .unwrap_or_else(|e| panic!("failed to spawn scenery {args:?}: {e}"))
 }
 
 // ── Main test ─────────────────────────────────────────────────────────────────
@@ -89,10 +89,10 @@ fn run_cli(cli_bin: &Path, args: &[&str]) -> std::process::ExitStatus {
 #[ignore = "requires pre-built release binaries + macOS with launchctl — \
             run cargo build --workspace --release first"]
 fn m2_install_uninstall_macos_end_to_end() {
-    let cli_bin = release_bin("vectorhawk");
+    let cli_bin = release_bin("scenery");
     assert!(
         cli_bin.exists(),
-        "vectorhawk binary not found at {cli_bin:?} — run cargo build --workspace --release"
+        "scenery binary not found at {cli_bin:?} — run cargo build --workspace --release"
     );
 
     let plist = plist_path();
@@ -109,7 +109,7 @@ fn m2_install_uninstall_macos_end_to_end() {
     let status = run_cli(&cli_bin, &["daemon", "install"]);
     assert!(
         status.success(),
-        "vectorhawk daemon install exited non-zero: {status}"
+        "scenery daemon install exited non-zero: {status}"
     );
 
     // ── Step 3: plist exists ──────────────────────────────────────────────────
@@ -133,7 +133,7 @@ fn m2_install_uninstall_macos_end_to_end() {
     let status2 = run_cli(&cli_bin, &["daemon", "install"]);
     assert!(
         status2.success(),
-        "vectorhawk daemon install (second run) exited non-zero: {status2}"
+        "scenery daemon install (second run) exited non-zero: {status2}"
     );
 
     // Socket must still be reachable after the idempotent install.
@@ -144,7 +144,7 @@ fn m2_install_uninstall_macos_end_to_end() {
     let status3 = run_cli(&cli_bin, &["daemon", "uninstall"]);
     assert!(
         status3.success(),
-        "vectorhawk daemon uninstall exited non-zero: {status3}"
+        "scenery daemon uninstall exited non-zero: {status3}"
     );
 
     // ── Step 8: plist is gone ─────────────────────────────────────────────────

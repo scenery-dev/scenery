@@ -1,18 +1,18 @@
 //! Universal restore journal — an append-only ledger of every mutation
-//! VectorHawk makes to files *outside* its own data directory (AI-client
+//! Scenery makes to files *outside* its own data directory (AI-client
 //! config edits, F2 pushes into `~/.claude/...`, F1 native takeovers).
 //!
-//! `vectorhawk uninstall` replays this journal in reverse so the invariant
+//! `scenery uninstall` replays this journal in reverse so the invariant
 //! holds: **uninstall is a RESTORE, not a DELETE.** Everything the user
 //! brought to the machine comes back; everything that only ever worked
-//! because VectorHawk brokered it goes away cleanly.
+//! because Scenery brokered it goes away cleanly.
 //!
 //! # Layout
 //!
 //! - Journal: `<root_dir>/restore-journal.json` — a single JSON array of
 //!   [`JournalEntry`], oldest first.
 //! - Backups: `<root_dir>/restore-backups/<ts>/...` — snapshots of files/dirs
-//!   taken immediately before the first VectorHawk-caused mutation to them.
+//!   taken immediately before the first Scenery-caused mutation to them.
 //!
 //! # Schema stability
 //!
@@ -47,12 +47,12 @@ pub enum JournalOp {
     /// A keyed entry was added/changed inside a JSON config file (AI client
     /// config, `~/.claude.json`) rather than the whole file being replaced.
     ConfigEdit,
-    /// A whole file or directory was replaced in place with a VectorHawk-
+    /// A whole file or directory was replaced in place with a Scenery-
     /// managed copy (e.g. F1 taking ownership of a native skill dir).
     FileReplace,
     /// A file or directory was deleted outright.
     FileDelete,
-    /// VectorHawk pushed a new managed artifact into a native directory that
+    /// Scenery pushed a new managed artifact into a native directory that
     /// did not contain it before (F2 skill/plugin/MCP push).
     ArtifactPush,
 }
@@ -60,10 +60,10 @@ pub enum JournalOp {
 /// Provenance classification — drives the three-way uninstall decision.
 ///
 /// - `Native` / `Adopted` → the target existed (or was derived from something
-///   that existed) before VectorHawk touched it. Uninstall **restores**
+///   that existed) before Scenery touched it. Uninstall **restores**
 ///   `target_path` from `backup_path`.
 /// - `Brokered` / `Managed` → the target only ever worked *through*
-///   VectorHawk (credential-brokered MCP server, or a governed copy pushed
+///   Scenery (credential-brokered MCP server, or a governed copy pushed
 ///   into a native directory). Uninstall **removes it completely** — there
 ///   is nothing of the user's to restore.
 ///
@@ -171,7 +171,7 @@ pub fn now_iso() -> String {
 
 /// Filesystem-safe timestamp (no colons) for `restore-backups/<ts>/`
 /// directory names — mirrors the convention already used by the F1 migrator's
-/// `.vectorhawk-backup/<ts>/` run directories.
+/// `.scenery-backup/<ts>/` run directories.
 pub fn new_backup_ts() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H%M%SZ").to_string()
 }
@@ -531,10 +531,10 @@ mod tests {
             JournalSource::Native,
             "/x/.claude.json",
         )
-        .with_slug("vectorhawk")
+        .with_slug("scenery")
         .with_client("Claude Code")
         .with_backup_path("/x/backup/claude.json")
-        .with_detail(serde_json::json!({"server_key": "vectorhawk", "mcp_key": "mcpServers"}));
+        .with_detail(serde_json::json!({"server_key": "scenery", "mcp_key": "mcpServers"}));
         journal.append(entry.clone()).unwrap();
 
         let all = journal.read_all().unwrap();
@@ -698,7 +698,7 @@ mod tests {
         // Simulate the target being mutated, then restored from the backup.
         fs::write(
             source_file.as_std_path(),
-            r#"{"mcpServers":{"vectorhawk":{}}}"#,
+            r#"{"mcpServers":{"scenery":{}}}"#,
         )
         .unwrap();
         fs::copy(backup_path.as_std_path(), source_file.as_std_path()).unwrap();

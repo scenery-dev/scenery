@@ -16,7 +16,7 @@ pub fn agents_skills_dir() -> Option<PathBuf> {
     scenery_mcp::ownership::agents_skills_dir()
 }
 
-/// Resolve `~/.claude/skills/` — where Claude Code looks. VectorHawk places
+/// Resolve `~/.claude/skills/` — where Claude Code looks. Scenery places
 /// only symlinks here, pointing at `agents_skills_dir()`.
 pub fn claude_skills_link_dir() -> Option<PathBuf> {
     scenery_mcp::ownership::claude_skills_dir()
@@ -44,7 +44,7 @@ mod tests {
         assert!(is_excluded_plugin_dir("cache"));
         assert!(is_excluded_plugin_dir("data"));
         assert!(!is_excluded_plugin_dir("my-plugin"));
-        assert!(!is_excluded_plugin_dir("vectorhawk-plugin"));
+        assert!(!is_excluded_plugin_dir("scenery-plugin"));
     }
 
     #[test]

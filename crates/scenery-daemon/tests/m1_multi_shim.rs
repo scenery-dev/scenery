@@ -7,8 +7,8 @@
 //! writer, no SQLite contention errors."
 //!
 //! This test:
-//! 1. Spawns `vectorhawkd` (daemon).
-//! 2. Spawns 3 `vectorhawk mcp serve` processes concurrently, each piped for JSON-RPC.
+//! 1. Spawns `scenery` (daemon).
+//! 2. Spawns 3 `scenery mcp serve` processes concurrently, each piped for JSON-RPC.
 //! 3. Each shim performs: `initialize` + `tools/list` + 3 × `tools/call` (9 total).
 //! 4. Asserts all shims see the same sorted tool list.
 //! 5. Asserts all 9 tool calls succeed.
@@ -51,16 +51,16 @@ fn daemon_socket_path() -> PathBuf {
     #[cfg(target_os = "linux")]
     {
         if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
-            return PathBuf::from(runtime).join("vectorhawk").join("agent.sock");
+            return PathBuf::from(runtime).join("scenery").join("agent.sock");
         }
     }
     let data_dir = dirs::data_dir().expect("dirs::data_dir() should succeed");
-    data_dir.join("VectorHawk").join("agent.sock")
+    data_dir.join("Scenery").join("agent.sock")
 }
 
 fn daemon_db_path() -> PathBuf {
     let data_dir = dirs::data_dir().expect("dirs::data_dir() should succeed");
-    data_dir.join("VectorHawk").join("state.db")
+    data_dir.join("Scenery").join("state.db")
 }
 
 fn wait_for_socket(path: &std::path::Path, timeout: Duration) -> bool {
@@ -86,9 +86,9 @@ fn kill_child(child: &mut Child) {
 }
 
 fn kill_stale_daemon() {
-    // `-x vectorhawk` for exact process-name match — see m0_acceptance::kill_stale_daemon
+    // `-x scenery` for exact process-name match — see m0_acceptance::kill_stale_daemon
     // for why `-f` was wrong on Linux.
-    let _ = Command::new("pkill").args(["-x", "vectorhawk"]).status();
+    let _ = Command::new("pkill").args(["-x", "scenery"]).status();
     std::thread::sleep(Duration::from_millis(300));
 }
 
@@ -144,9 +144,7 @@ fn drive_shim(shim_bin: &PathBuf, shim_index: usize) -> (Vec<String>, usize) {
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .unwrap_or_else(|e| {
-            panic!("shim #{shim_index}: failed to spawn vectorhawk mcp serve: {e}")
-        });
+        .unwrap_or_else(|e| panic!("shim #{shim_index}: failed to spawn scenery mcp serve: {e}"));
 
     let mut stdin = shim.stdin.take().expect("shim stdin");
     let stdout_raw = shim.stdout.take().expect("shim stdout");
@@ -275,16 +273,16 @@ fn drive_shim(shim_bin: &PathBuf, shim_index: usize) -> (Vec<String>, usize) {
 #[test]
 #[ignore = "requires pre-built release binaries — run cargo build --workspace --release first"]
 fn m1_three_concurrent_shims_shared_tool_list_and_audit() {
-    let daemon_bin = release_bin("vectorhawk");
-    let shim_bin = release_bin("vectorhawk");
+    let daemon_bin = release_bin("scenery");
+    let shim_bin = release_bin("scenery");
 
     assert!(
         daemon_bin.exists(),
-        "vectorhawk binary not found at {daemon_bin:?} — run cargo build --workspace --release"
+        "scenery binary not found at {daemon_bin:?} — run cargo build --workspace --release"
     );
     assert!(
         shim_bin.exists(),
-        "vectorhawk binary not found at {shim_bin:?} — run cargo build --workspace --release"
+        "scenery binary not found at {shim_bin:?} — run cargo build --workspace --release"
     );
 
     let socket_path = daemon_socket_path();
@@ -299,7 +297,7 @@ fn m1_three_concurrent_shims_shared_tool_list_and_audit() {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("failed to spawn vectorhawk daemon run");
+        .expect("failed to spawn scenery daemon run");
 
     let socket_appeared = wait_for_socket(&socket_path, Duration::from_secs(5));
     if !socket_appeared {

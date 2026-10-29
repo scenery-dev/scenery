@@ -1,4 +1,4 @@
-//! Regression tests for `vectorhawk skill validate` — bug: constructing
+//! Regression tests for `scenery skill validate` — bug: constructing
 //! `OllamaClient` (a blocking `reqwest::blocking::Client`) directly on the
 //! async executor thread panics with "Cannot drop a runtime in a context
 //! where blocking is not allowed" (reqwest's debug-only
@@ -31,8 +31,8 @@ fn write_passing_bundle(root: &camino::Utf8PathBuf) {
         root.join("SKILL.md"),
         concat!(
             "---\nname: Validate Test Skill\ndescription: A skill used to test validate.\n",
-            "metadata:\n  vectorhawk:\n",
-            "    version: 0.1.0\n    publisher: skillclub\n",
+            "metadata:\n  scenery:\n",
+            "    version: 0.1.0\n    publisher: scenery\n",
             "    permissions:\n      filesystem: none\n      network: none\n      clipboard: none\n",
             "    execution:\n      sandbox: strict\n      timeout_ms: 30000\n      memory_mb: 256\n",
             "    triggers:\n      - validate this\n",
@@ -48,18 +48,18 @@ fn write_passing_bundle(root: &camino::Utf8PathBuf) {
     fs::write(root.join("prompts/system.txt"), "Do the thing.").unwrap();
 }
 
-/// Points VECTORHAWK_OLLAMA_URL at a port nothing is listening on, so the
+/// Points SCENERY_OLLAMA_URL at a port nothing is listening on, so the
 /// health check fails fast and deterministically — the test must not depend
 /// on whether a real Ollama happens to be running on the machine.
 ///
 /// SAFETY: env mutation is process-global. No other test in this binary
-/// reads/writes VECTORHAWK_OLLAMA_URL (grepped repo-wide), and this test
+/// reads/writes SCENERY_OLLAMA_URL (grepped repo-wide), and this test
 /// does not spawn children that would race on it.
 fn set_unreachable_ollama_url() {
-    unsafe { std::env::set_var("VECTORHAWK_OLLAMA_URL", "http://127.0.0.1:1") };
+    unsafe { std::env::set_var("SCENERY_OLLAMA_URL", "http://127.0.0.1:1") };
 }
 
-/// Reproduces the panic report: `vectorhawk skill validate` on a manifest
+/// Reproduces the panic report: `scenery skill validate` on a manifest
 /// that passes the schema check must not panic when it reaches the Ollama
 /// probe, with no real Ollama required.
 #[tokio::test]

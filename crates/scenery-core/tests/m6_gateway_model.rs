@@ -1,13 +1,13 @@
 //! M6.2 integration tests: GatewayModelClient HTTP inference, auth token handling.
 
 use camino::Utf8PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
 use scenery_core::{
     auth::save_tokens,
     gateway_model::GatewayModelClient,
     model::{ModelClient, ModelRequest, ModelSource},
     state::AppState,
 };
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn temp_root(label: &str) -> Utf8PathBuf {
     let nanos = SystemTime::now()

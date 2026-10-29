@@ -45,15 +45,15 @@ fn try_load(path: &Utf8PathBuf) -> Option<ManagedConfig> {
 /// Load managed deployment config.
 ///
 /// Search order (first hit wins):
-/// 1. `/etc/vectorhawk/managed.json` — IT-managed system override (Linux/macOS).
+/// 1. `/etc/scenery/managed.json` — IT-managed system override (Linux/macOS).
 /// 2. `<state.root_dir>/managed.json` — per-user app data dir
-///    (`~/Library/Application Support/VectorHawk/managed.json` on macOS,
-///    `~/.config/vectorhawk/managed.json` on Linux).
+///    (`~/Library/Application Support/Scenery/managed.json` on macOS,
+///    `~/.config/scenery/managed.json` on Linux).
 ///
 /// Returns `None` if no file exists, the JSON is malformed, or the file
 /// has `"managed": false`.
 pub fn load_managed_config(state: &crate::state::AppState) -> Option<ManagedConfig> {
-    let system_path = Utf8PathBuf::from("/etc/vectorhawk/managed.json");
+    let system_path = Utf8PathBuf::from("/etc/scenery/managed.json");
     if let Some(config) = try_load(&system_path) {
         return Some(config);
     }

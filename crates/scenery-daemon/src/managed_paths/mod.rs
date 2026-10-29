@@ -1,7 +1,7 @@
 //! Managed-paths filesystem reconciler — Phase F1.
 //!
 //! On daemon startup, scans three watched paths, migrates existing items into
-//! VectorHawk's DB as locally-owned submissions, and backs up originals before
+//! Scenery's DB as locally-owned submissions, and backs up originals before
 //! taking ownership.  No quarantine, no drift detection, no write-on-install
 //! yet — those are F3 and F2 respectively.
 //!
@@ -12,13 +12,13 @@
 //! | `~/.claude/skills/`   | Immediate subdirs that contain `SKILL.md` |
 //! | `~/.claude/plugins/`  | Immediate subdirs, excluding Anthropic    |
 //! |                       | plumbing dirs (marketplaces/cache/data)   |
-//! | `~/.claude.json`      | `mcpServers` object (excluding `vectorhawk`) |
+//! | `~/.claude.json`      | `mcpServers` object (excluding `scenery`) |
 //!
 //! F1 still *scans* `~/.claude/skills/` — that is where a Claude Code user's
 //! own skills live — but it is no longer where managed skills land. Since the
 //! pivot, adopted skills are written to the canonical `~/.agents/skills/<slug>/`
 //! and surfaced to Claude Code via a symlink at `~/.claude/skills/<slug>`, so
-//! this scan sees a mix of real user directories (adoptable) and VectorHawk's
+//! this scan sees a mix of real user directories (adoptable) and Scenery's
 //! own links (skipped). `migrator::migrate_skills_to_agents_dir` normalises
 //! the pre-pivot layout before this runs; unmanaged skill *discovery* in the
 //! canonical root is `discoveries.rs`'s job, not F1's.
@@ -51,7 +51,7 @@ pub mod scanner;
 pub mod takeover;
 
 /// Serializes every test that mutates process-global state (`$HOME`,
-/// `VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER`).
+/// `SCENERY_DISABLE_FILESYSTEM_RECONCILER`).
 ///
 /// This MUST be a single shared static. A `static` is per-module, so a
 /// per-file `ENV_MUTEX` in each test file yields independent locks and no
@@ -60,9 +60,9 @@ pub mod takeover;
 pub(crate) static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 use anyhow::Result;
+use scenery_core::state::AppState;
 use std::{path::PathBuf, sync::Arc};
 use tracing::{info, warn};
-use scenery_core::state::AppState;
 
 pub use discoveries::DiscoveriesScanner;
 pub use drift::DriftScanner;
@@ -145,10 +145,7 @@ impl ManagedPathsReconciler {
 
         // Compute a single ISO-8601 timestamp for this migration run's backup dir.
         let now_ts = chrono::Utc::now().format("%Y-%m-%dT%H%M%SZ").to_string();
-        let backup_root = home
-            .join(".claude")
-            .join(".vectorhawk-backup")
-            .join(&now_ts);
+        let backup_root = home.join(".claude").join(".scenery-backup").join(&now_ts);
 
         let mut report = MigrationReport {
             backed_up_to: Some(backup_root.clone()),

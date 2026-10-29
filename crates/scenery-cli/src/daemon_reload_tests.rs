@@ -6,9 +6,9 @@
 //! `scenery-daemon`'s own unit tests (`auth_dispatch_tests.rs`,
 //! `sync_controller_hook_tests.rs`) call `handle_reload` directly and all
 //! passed — the daemon-side `sync_active` computation was correct. But the
-//! real `vectorhawk auth pair` against a running daemon still printed "the
+//! real `scenery auth pair` against a running daemon still printed "the
 //! daemon could not start syncing yet" in the live demo sandbox, immediately
-//! after `vectorhawk daemon install` (i.e. within
+//! after `scenery daemon install` (i.e. within
 //! `socket_dispatch::ALERT_WINDOW` of boot, while an adoption alert from the
 //! daemon's F1 first-run migration was still fresh).
 //!
@@ -35,8 +35,8 @@
 
 use std::time::Duration;
 
-use tokio::net::{UnixListener, UnixStream};
 use scenery_mcp::backend::{read_framed, write_framed};
+use tokio::net::{UnixListener, UnixStream};
 
 use super::{daemon_auth_reload, DaemonReload};
 
@@ -79,8 +79,8 @@ async fn daemon_auth_reload_skips_a_leading_notification_frame() {
             "method": "notifications/message",
             "params": {
                 "level": "info",
-                "logger": "vectorhawk",
-                "data": "VectorHawk auto-adopted 1 tool for governance",
+                "logger": "scenery",
+                "data": "Scenery auto-adopted 1 tool for governance",
             },
         });
         write_framed(&mut stream, &serde_json::to_vec(&alert).unwrap())
@@ -158,7 +158,7 @@ async fn daemon_auth_reload_reports_inactive_after_notification_when_sync_genuin
         let alert = serde_json::json!({
             "jsonrpc": "2.0",
             "method": "notifications/message",
-            "params": { "level": "info", "logger": "vectorhawk", "data": "adopted" },
+            "params": { "level": "info", "logger": "scenery", "data": "adopted" },
         });
         write_framed(&mut stream, &serde_json::to_vec(&alert).unwrap())
             .await

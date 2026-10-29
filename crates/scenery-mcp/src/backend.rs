@@ -163,7 +163,7 @@ pub struct EmbeddedBackend {
     server_name: String,
     server_version: String,
     /// Optional model client for skill LLM steps. When `Some`, skill
-    /// executions triggered via `vectorhawk_run` can call the local
+    /// executions triggered via `scenery_run` can call the local
     /// Ollama backend and/or gateway. When `None`, LLM steps surface a
     /// "no model client" error.
     ///
@@ -179,7 +179,7 @@ impl EmbeddedBackend {
     pub fn new(registry: Arc<BackendRegistry>) -> Self {
         Self {
             registry,
-            server_name: "vectorhawkd".to_string(),
+            server_name: "scenery".to_string(),
             server_version: env!("CARGO_PKG_VERSION").to_string(),
             #[cfg(feature = "daemon")]
             model_client: None,
@@ -221,10 +221,7 @@ impl EmbeddedBackend {
     ///
     /// Has no effect when compiled without the `daemon` feature.
     #[cfg(feature = "daemon")]
-    pub fn with_model_client(
-        mut self,
-        client: Arc<dyn scenery_core::model::ModelClient>,
-    ) -> Self {
+    pub fn with_model_client(mut self, client: Arc<dyn scenery_core::model::ModelClient>) -> Self {
         self.model_client = Some(client);
         self
     }
@@ -243,7 +240,7 @@ impl Backend for EmbeddedBackend {
                 version: self.server_version.clone(),
             },
             instructions: Some(
-                "VectorHawk runner — governed AI platform. \
+                "Scenery runner — governed AI platform. \
                  Running in in-process fallback mode (daemon unreachable). \
                  Audit, registry sync, and OAuth are unavailable in this session."
                     .to_string(),
@@ -524,7 +521,7 @@ impl RealBackend {
     pub fn new(registry: Arc<BackendRegistry>) -> Self {
         Self {
             registry,
-            server_name: "vectorhawkd".to_string(),
+            server_name: "scenery".to_string(),
             server_version: env!("CARGO_PKG_VERSION").to_string(),
             #[cfg(feature = "daemon")]
             audit: None,
@@ -558,7 +555,7 @@ impl RealBackend {
     ) -> Self {
         Self {
             registry,
-            server_name: "vectorhawkd".to_string(),
+            server_name: "scenery".to_string(),
             server_version: env!("CARGO_PKG_VERSION").to_string(),
             audit: Some(audit),
             managed: None,
@@ -584,7 +581,7 @@ impl RealBackend {
     ) -> Self {
         Self {
             registry,
-            server_name: "vectorhawkd".to_string(),
+            server_name: "scenery".to_string(),
             server_version: env!("CARGO_PKG_VERSION").to_string(),
             audit: Some(audit),
             managed,
@@ -603,8 +600,8 @@ impl RealBackend {
     ///
     /// This is the constructor used by the daemon for production. It wires in
     /// all context needed for `tools::handle_tool_call` and
-    /// `tools::build_tool_list` so that management tools (`vectorhawk_list`,
-    /// `vectorhawk_install`, `vectorhawk_search`, etc.) are reachable from
+    /// `tools::build_tool_list` so that management tools (`scenery_list`,
+    /// `scenery_install`, `scenery_search`, etc.) are reachable from
     /// `list_tools` / `call_tool`.
     #[cfg(feature = "daemon")]
     #[allow(clippy::too_many_arguments)]
@@ -620,7 +617,7 @@ impl RealBackend {
     ) -> Self {
         Self {
             registry,
-            server_name: "vectorhawkd".to_string(),
+            server_name: "scenery".to_string(),
             server_version: env!("CARGO_PKG_VERSION").to_string(),
             audit: Some(audit),
             managed,
@@ -637,10 +634,10 @@ impl RealBackend {
 
     /// Attach the OAuth callback port and subscriber to this backend.
     ///
-    /// Call this after any of the constructors above. Enables `vectorhawk_login`
+    /// Call this after any of the constructors above. Enables `scenery_login`
     /// to complete the PKCE flow automatically after the browser redirects.
     ///
-    /// When not called (or when the listener failed to bind), `vectorhawk_login`
+    /// When not called (or when the listener failed to bind), `scenery_login`
     /// falls back to the legacy no-redirect URL and instructs the user to restart
     /// the daemon manually.
     #[cfg(feature = "daemon")]
@@ -664,11 +661,7 @@ impl Backend for RealBackend {
             let logged_in = self.state.as_ref().map_or(false, |state| {
                 self.registry_url
                     .as_ref()
-                    .and_then(|url| {
-                        scenery_core::auth::load_tokens(state, url)
-                            .ok()
-                            .flatten()
-                    })
+                    .and_then(|url| scenery_core::auth::load_tokens(state, url).ok().flatten())
                     .is_some()
             });
             // The instructions must never name a tool `list_tools` doesn't
@@ -694,7 +687,7 @@ impl Backend for RealBackend {
             )
         };
         #[cfg(not(feature = "daemon"))]
-        let instructions = "VectorHawk runner — governed AI platform.".to_string();
+        let instructions = "Scenery runner — governed AI platform.".to_string();
 
         Ok(InitializeResult {
             protocol_version: "2024-11-05".to_string(),
@@ -710,7 +703,7 @@ impl Backend for RealBackend {
     }
 
     async fn list_tools(&self, params: Value) -> Result<ToolsListResult> {
-        // Management tools (vectorhawk_*) from the installed tools layer.
+        // Management tools (scenery_*) from the installed tools layer.
         // Only available when the full context has been wired (daemon path).
         #[cfg(feature = "daemon")]
         let mut tools: Vec<ProtoToolDef> = if let Some(state) = &self.state {
@@ -732,10 +725,10 @@ impl Backend for RealBackend {
 
         // Merge in namespaced backend tools from the BackendRegistry.
         // Names are already namespaced with `__` so they cannot collide with
-        // `vectorhawk_*` management tools.
+        // `scenery_*` management tools.
         //
         // Filtering F2-pushed slugs out of the aggregator surface is done in
-        // the *aggregator shim* (vectorhawk mcp serve, no --server flag), not
+        // the *aggregator shim* (scenery mcp serve, no --server flag), not
         // here, because the per-server shim depends on this response still
         // containing every `<slug>__*` tool — it filters client-side. If the
         // daemon stripped them server-side, per-server shims would see an
@@ -764,16 +757,16 @@ impl Backend for RealBackend {
     async fn call_tool(&self, params: ToolCallParams) -> Result<ToolCallResult> {
         let started = std::time::Instant::now();
 
-        // Route vectorhawk_* management tools and installed skill IDs through
+        // Route scenery_* management tools and installed skill IDs through
         // the tools layer. Namespaced backend tools (containing `__`) go
         // straight to the BackendRegistry.
         #[cfg(feature = "daemon")]
         if let Some(state) = &self.state {
-            // Intercept vectorhawk_login first so it receives an OAuthContext
+            // Intercept scenery_login first so it receives an OAuthContext
             // when the daemon's callback listener is running. Falls through to
             // handle_tool_call (which calls the legacy handle_login) only when
             // state is absent — which cannot happen here.
-            if params.name == "vectorhawk_login" {
+            if params.name == "scenery_login" {
                 let oauth_ctx = match (self.oauth_listener_port, self.oauth_subscriber.as_ref()) {
                     (Some(port), Some(sub)) => Some(crate::oauth::OAuthContext {
                         listener_port: port,
@@ -804,7 +797,7 @@ impl Backend for RealBackend {
                 .await
                 .unwrap_or_else(|join_err| {
                     crate::protocol::ToolCallResult::error_result(format!(
-                        "vectorhawk_login handler panicked: {join_err}"
+                        "scenery_login handler panicked: {join_err}"
                     ))
                 });
 
@@ -837,7 +830,7 @@ impl Backend for RealBackend {
                 return Ok(tool_result);
             }
 
-            let is_management_tool = params.name.starts_with("vectorhawk_");
+            let is_management_tool = params.name.starts_with("scenery_");
             let is_backend_tool = params.name.contains("__");
 
             if is_management_tool || !is_backend_tool {
@@ -997,11 +990,11 @@ mod tests {
     #[cfg(feature = "daemon")]
     mod instructions_match_tools_list {
         use super::*;
+        use scenery_core::{audit::NoOpAuditBuffer, policy::MockPolicyClient, state::AppState};
         use std::collections::HashMap;
         use std::sync::Mutex as StdMutex;
         use std::time::{SystemTime, UNIX_EPOCH};
         use tokio::sync::Mutex as AsyncMutex;
-        use scenery_core::{audit::NoOpAuditBuffer, policy::MockPolicyClient, state::AppState};
 
         fn temp_root(label: &str) -> camino::Utf8PathBuf {
             let nanos = SystemTime::now()
@@ -1015,7 +1008,7 @@ mod tests {
         }
 
         /// Serializes every test in this module that touches
-        /// `VECTORHAWK_EXPOSE_BUILTIN_TOOLS` — it's process-global, and this
+        /// `SCENERY_EXPOSE_BUILTIN_TOOLS` — it's process-global, and this
         /// is the only module in the binary that reads/writes it, so a
         /// single mutex around the set/assert/clear sequence is enough to
         /// make five otherwise-parallel `#[tokio::test]`s deterministic.
@@ -1026,11 +1019,11 @@ mod tests {
         /// `instructions.rs`'s own source, so this test can't pass merely
         /// because both files agree on the same (possibly wrong) list.
         const MENTIONABLE_TOOL_NAMES: &[&str] = &[
-            "vectorhawk_login",
-            "vectorhawk_list",
-            "vectorhawk_search",
-            "vectorhawk_mcp_catalog",
-            "vectorhawk_mcp_request",
+            "scenery_login",
+            "scenery_list",
+            "scenery_search",
+            "scenery_mcp_catalog",
+            "scenery_mcp_request",
         ];
 
         fn make_backend(
@@ -1081,14 +1074,14 @@ mod tests {
             }
         }
 
-        /// The real production default: `VECTORHAWK_EXPOSE_BUILTIN_TOOLS`
+        /// The real production default: `SCENERY_EXPOSE_BUILTIN_TOOLS`
         /// unset, so management tools are hidden — the exact surface that
-        /// was broken (instructions always named vectorhawk_list/_search/
+        /// was broken (instructions always named scenery_list/_search/
         /// _mcp_catalog regardless).
         #[tokio::test]
         async fn default_surface_logged_out_with_registry() {
             let _guard = EXPOSE_BUILTINS_ENV_LOCK.lock().await;
-            std::env::remove_var("VECTORHAWK_EXPOSE_BUILTIN_TOOLS");
+            std::env::remove_var("SCENERY_EXPOSE_BUILTIN_TOOLS");
             let state_root = temp_root("default-logged-out");
             let backend = make_backend(
                 Some("http://localhost:8000".to_string()),
@@ -1103,7 +1096,7 @@ mod tests {
         #[tokio::test]
         async fn default_surface_logged_in_with_registry() {
             let _guard = EXPOSE_BUILTINS_ENV_LOCK.lock().await;
-            std::env::remove_var("VECTORHAWK_EXPOSE_BUILTIN_TOOLS");
+            std::env::remove_var("SCENERY_EXPOSE_BUILTIN_TOOLS");
             let state_root = temp_root("default-logged-in");
             let backend = make_backend(
                 Some("http://localhost:8000".to_string()),
@@ -1115,12 +1108,12 @@ mod tests {
             let _ = std::fs::remove_dir_all(&state_root);
         }
 
-        /// No registry URL at all — `vectorhawk_login` must not be named
+        /// No registry URL at all — `scenery_login` must not be named
         /// either, since there is nothing to log into.
         #[tokio::test]
         async fn default_surface_no_registry_configured() {
             let _guard = EXPOSE_BUILTINS_ENV_LOCK.lock().await;
-            std::env::remove_var("VECTORHAWK_EXPOSE_BUILTIN_TOOLS");
+            std::env::remove_var("SCENERY_EXPOSE_BUILTIN_TOOLS");
             let state_root = temp_root("default-no-registry");
             let backend = make_backend(None, None, false, &state_root);
             assert_instructions_match_tools_list(&backend, "default/no-registry").await;
@@ -1128,11 +1121,11 @@ mod tests {
         }
 
         /// Managed mode, default (hidden-builtins) surface — the governance
-        /// block previously always named `vectorhawk_mcp_request`.
+        /// block previously always named `scenery_mcp_request`.
         #[tokio::test]
         async fn managed_default_surface_logged_in() {
             let _guard = EXPOSE_BUILTINS_ENV_LOCK.lock().await;
-            std::env::remove_var("VECTORHAWK_EXPOSE_BUILTIN_TOOLS");
+            std::env::remove_var("SCENERY_EXPOSE_BUILTIN_TOOLS");
             let state_root = temp_root("managed-default-logged-in");
             let managed = scenery_core::managed::ManagedConfig {
                 managed: true,
@@ -1155,13 +1148,13 @@ mod tests {
             let _ = std::fs::remove_dir_all(&state_root);
         }
 
-        /// Opt-in surface (`VECTORHAWK_EXPOSE_BUILTIN_TOOLS=1`) — every
+        /// Opt-in surface (`SCENERY_EXPOSE_BUILTIN_TOOLS=1`) — every
         /// built-in should now be both mentioned AND listed; this guards
         /// against the fix over-correcting into never mentioning anything.
         #[tokio::test]
         async fn builtins_exposed_surface_logged_in() {
             let _guard = EXPOSE_BUILTINS_ENV_LOCK.lock().await;
-            std::env::set_var("VECTORHAWK_EXPOSE_BUILTIN_TOOLS", "1");
+            std::env::set_var("SCENERY_EXPOSE_BUILTIN_TOOLS", "1");
             let state_root = temp_root("exposed-logged-in");
             let backend = make_backend(
                 Some("http://localhost:8000".to_string()),
@@ -1174,14 +1167,14 @@ mod tests {
             let init = backend.initialize(serde_json::json!({})).await.unwrap();
             let instructions = init.instructions.unwrap_or_default();
             assert!(
-                instructions.contains("vectorhawk_list")
-                    && instructions.contains("vectorhawk_search")
-                    && instructions.contains("vectorhawk_mcp_catalog"),
+                instructions.contains("scenery_list")
+                    && instructions.contains("scenery_search")
+                    && instructions.contains("scenery_mcp_catalog"),
                 "expected the fully-exposed surface to still advertise its \
                  built-in tools; got: {instructions}"
             );
 
-            std::env::remove_var("VECTORHAWK_EXPOSE_BUILTIN_TOOLS");
+            std::env::remove_var("SCENERY_EXPOSE_BUILTIN_TOOLS");
             let _ = std::fs::remove_dir_all(&state_root);
         }
     }
@@ -1198,7 +1191,7 @@ mod tests {
         let backend = make_embedded().await;
         let result = backend.initialize(serde_json::json!({})).await.unwrap();
         assert_eq!(result.protocol_version, "2024-11-05");
-        assert_eq!(result.server_info.name, "vectorhawkd");
+        assert_eq!(result.server_info.name, "scenery");
         assert!(result.capabilities.tools.is_some());
     }
 
@@ -1368,13 +1361,13 @@ mod tests {
     #[cfg(feature = "daemon")]
     #[tokio::test]
     async fn real_backend_never_leaves_a_client_without_a_governed_skill() {
-        use std::collections::HashMap;
-        use std::sync::Mutex as StdMutex;
         use scenery_core::{
             audit::NoOpAuditBuffer, installer::install_unpacked_skill, policy::MockPolicyClient,
             state::AppState,
         };
         use scenery_manifest::SkillPackage;
+        use std::collections::HashMap;
+        use std::sync::Mutex as StdMutex;
 
         let base = std::env::temp_dir().join(format!(
             "vh-native-skills-{}",
@@ -1388,7 +1381,7 @@ mod tests {
         std::fs::create_dir_all(skill_root.join("prompts")).unwrap();
         std::fs::write(
             skill_root.join("SKILL.md"),
-            "---\nname: Test Skill\ndescription: A test skill\nmetadata:\n  vectorhawk:\n    version: 0.1.0\n    publisher: vectorhawk\n    permissions:\n      network: none\n      filesystem: none\n      clipboard: none\n    execution:\n      sandbox: strict\n      timeout_ms: 30000\n      memory_mb: 256\n    workflow_ref: workflow.yaml\n---\n\nDo the thing.\n",
+            "---\nname: Test Skill\ndescription: A test skill\nmetadata:\n  scenery:\n    version: 0.1.0\n    publisher: scenery\n    permissions:\n      network: none\n      filesystem: none\n      clipboard: none\n    execution:\n      sandbox: strict\n      timeout_ms: 30000\n      memory_mb: 256\n    workflow_ref: workflow.yaml\n---\n\nDo the thing.\n",
         )
         .unwrap();
         std::fs::write(
@@ -1400,8 +1393,7 @@ mod tests {
 
         let state = Arc::new(AppState::bootstrap_in(state_root).unwrap());
         let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
-        install_unpacked_skill(&state, &pkg, scenery_core::installer::InstallMode::Copy)
-            .unwrap();
+        install_unpacked_skill(&state, &pkg, scenery_core::installer::InstallMode::Copy).unwrap();
         let backend = RealBackend::with_full_context(
             Arc::new(BackendRegistry::new()),
             Arc::new(NoOpAuditBuffer),
@@ -1434,7 +1426,7 @@ mod tests {
         );
         let unknown = names(backend.list_tools(serde_json::json!({})).await.unwrap());
 
-        // No VectorHawk copy in this machine's ~/.claude/skills, so Claude
+        // No Scenery copy in this machine's ~/.claude/skills, so Claude
         // Code keeps the tool (the hidden case is covered in tools.rs).
         assert!(claude.contains(&"test-skill".to_string()), "{claude:?}");
         assert!(cursor.contains(&"test-skill".to_string()), "{cursor:?}");

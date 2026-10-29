@@ -9,7 +9,7 @@
 //!
 //! [`is_revoked`] is the one check every install path must make before
 //! installing anything (SSE `install`/`install_mcp`/`install_plugin`,
-//! snapshot-derived installs, `vectorhawk skill install`, and the
+//! snapshot-derived installs, `scenery skill install`, and the
 //! auto-updater) — revoke overrides desired state, so a stale `install`
 //! event or a CLI command must never resurrect something an admin pulled.
 //!

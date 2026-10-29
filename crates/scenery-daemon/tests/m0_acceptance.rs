@@ -5,9 +5,9 @@
 //! This test exercises the full daemon + shim stack as required by M0 acceptance
 //! criteria AC2 and AC3:
 //!
-//!   AC2: `vectorhawk daemon run` boots, listens on a Unix socket at the platform
+//!   AC2: `scenery daemon run` boots, listens on a Unix socket at the platform
 //!        data directory, and holds at least one stub backend.
-//!   AC3: `vectorhawk mcp serve` connects to
+//!   AC3: `scenery mcp serve` connects to
 //!        the daemon socket, relays an MCP `initialize` handshake + `tools/list`
 //!        + >=5 `tools/call` invocations.  The AI client does not see an error.
 //!
@@ -65,20 +65,20 @@ fn release_bin(name: &str) -> PathBuf {
 /// Resolve the daemon Unix socket path using the same logic as
 /// `scenery_core::state::AppState::socket_path()`.
 ///
-/// macOS:  `~/Library/Application Support/VectorHawk/agent.sock`
-/// Linux:  `$XDG_RUNTIME_DIR/vectorhawk/agent.sock`
-///         (falls back to `~/.local/share/VectorHawk/agent.sock`)
+/// macOS:  `~/Library/Application Support/Scenery/agent.sock`
+/// Linux:  `$XDG_RUNTIME_DIR/scenery/agent.sock`
+///         (falls back to `~/.local/share/Scenery/agent.sock`)
 fn daemon_socket_path() -> PathBuf {
     #[cfg(target_os = "linux")]
     {
         if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
-            return PathBuf::from(runtime).join("vectorhawk").join("agent.sock");
+            return PathBuf::from(runtime).join("scenery").join("agent.sock");
         }
     }
 
     // macOS default (and Linux fallback without XDG_RUNTIME_DIR).
     let data_dir = dirs::data_dir().expect("dirs::data_dir() should succeed");
-    data_dir.join("VectorHawk").join("agent.sock")
+    data_dir.join("Scenery").join("agent.sock")
 }
 
 /// Wait up to `timeout` for the socket file to appear on disk.
@@ -129,14 +129,14 @@ fn send_rpc(
 
 // ── Pre-test helpers ──────────────────────────────────────────────────────────
 
-/// Kill any lingering `vectorhawk` daemon process that might be left from a prior run.
+/// Kill any lingering `scenery` daemon process that might be left from a prior run.
 fn kill_stale_daemon() {
-    // `-x vectorhawk` matches the process *name* exactly. The previous
-    // `-f vectorhawkd` matched the full command line, which on Linux
+    // `-x scenery` matches the process *name* exactly. The previous
+    // `-f scenery` matched the full command line, which on Linux
     // matches `cargo test -p scenery-daemon` (the test runner's own
     // cmdline) and SIGTERMs it with exit 143. Surfaced by the spaceghost
     // Linux acceptance run.
-    let _ = Command::new("pkill").args(["-x", "vectorhawk"]).status();
+    let _ = Command::new("pkill").args(["-x", "scenery"]).status();
     std::thread::sleep(Duration::from_millis(300));
 }
 
@@ -152,16 +152,16 @@ fn kill_stale_daemon() {
 #[test]
 #[ignore = "requires pre-built release binaries — run cargo build --workspace --release first"]
 fn ac2_ac3_initialize_tools_list_and_five_tool_calls() {
-    let daemon_bin = release_bin("vectorhawk");
-    let shim_bin = release_bin("vectorhawk");
+    let daemon_bin = release_bin("scenery");
+    let shim_bin = release_bin("scenery");
 
     assert!(
         daemon_bin.exists(),
-        "vectorhawk binary not found at {daemon_bin:?} — run cargo build --workspace --release"
+        "scenery binary not found at {daemon_bin:?} — run cargo build --workspace --release"
     );
     assert!(
         shim_bin.exists(),
-        "vectorhawk binary not found at {shim_bin:?} — run cargo build --workspace --release"
+        "scenery binary not found at {shim_bin:?} — run cargo build --workspace --release"
     );
 
     let socket_path = daemon_socket_path();
@@ -176,7 +176,7 @@ fn ac2_ac3_initialize_tools_list_and_five_tool_calls() {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("failed to spawn vectorhawk daemon run");
+        .expect("failed to spawn scenery daemon run");
 
     // Wait up to 5 seconds for the socket file to appear.
     let socket_appeared = wait_for_socket(&socket_path, Duration::from_secs(5));
@@ -192,7 +192,7 @@ fn ac2_ac3_initialize_tools_list_and_five_tool_calls() {
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .expect("failed to spawn vectorhawk mcp serve");
+        .expect("failed to spawn scenery mcp serve");
 
     let mut stdin = shim.stdin.take().expect("shim stdin");
     let stdout_raw = shim.stdout.take().expect("shim stdout");

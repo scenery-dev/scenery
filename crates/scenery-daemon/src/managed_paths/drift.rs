@@ -20,16 +20,20 @@
 //! | approve_required   | `awaiting_approval`         | `deleted`      |
 //!
 //! Quarantine moves the drifted file/dir to
-//! `~/.claude/.vectorhawk-quarantine/<ISO8601>/<kind>/<slug>/` and drops the
+//! `~/.claude/.scenery-quarantine/<ISO8601>/<kind>/<slug>/` and drops the
 //! marker so the next desired-state snapshot triggers a fresh install from the
 //! registry.
 //!
-//! The killswitch `VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER=1` makes every
+//! The killswitch `SCENERY_DISABLE_FILESYSTEM_RECONCILER=1` makes every
 //! public entry-point a no-op.
 
 use super::marker::ManagedPathMarker;
 use anyhow::{Context, Result};
 use rusqlite::Connection;
+use scenery_core::atomic_file;
+use scenery_core::auth::load_all_tokens;
+use scenery_core::state::AppState;
+use scenery_mcp::ownership;
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -41,15 +45,11 @@ use std::{
 };
 use tokio::time::interval;
 use tracing::{debug, info, warn};
-use scenery_core::atomic_file;
-use scenery_core::auth::load_all_tokens;
-use scenery_core::state::AppState;
-use scenery_mcp::ownership;
 
 const DEFAULT_INTERVAL_SECS: u64 = 300;
 const SCAN_BUDGET_SECS: u64 = 30;
-const ENV_INTERVAL: &str = "VECTORHAWK_DRIFT_SCAN_INTERVAL_SECS";
-const ENV_DISABLE: &str = "VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER";
+const ENV_INTERVAL: &str = "SCENERY_DRIFT_SCAN_INTERVAL_SECS";
+const ENV_DISABLE: &str = "SCENERY_DISABLE_FILESYSTEM_RECONCILER";
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -132,7 +132,7 @@ impl DriftScanner {
     pub fn spawn_loop(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             if reconciler_disabled() {
-                info!("drift: VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER set — scanner disabled");
+                info!("drift: SCENERY_DISABLE_FILESYSTEM_RECONCILER set — scanner disabled");
                 return;
             }
             let secs = std::env::var(ENV_INTERVAL)
@@ -567,8 +567,8 @@ fn remove_path_for(marker: &ManagedPathMarker) -> Result<()> {
         "mcp" => {
             let (json_path, slug) = split_mcp_path(&marker.path)?;
             // Never remove our own aggregator entry via drift.
-            if ownership::is_vectorhawk_mcp_key(&slug) {
-                anyhow::bail!("drift: refusing to remove the vectorhawk aggregator entry");
+            if ownership::is_scenery_mcp_key(&slug) {
+                anyhow::bail!("drift: refusing to remove the scenery aggregator entry");
             }
             if !json_path.exists() {
                 return Ok(());
@@ -604,8 +604,8 @@ fn remove_path_for(marker: &ManagedPathMarker) -> Result<()> {
 /// 1. A symlink resolving to canonical.
 /// 2. Absent — a surfacing failure the pusher heals on the next reconcile,
 ///    not tampering.
-/// 3. A **real directory** that is VectorHawk-managed (carries the
-///    `.vectorhawk-managed.json` marker) whose `SKILL.md` hash matches
+/// 3. A **real directory** that is Scenery-managed (carries the
+///    `.scenery-managed.json` marker) whose `SKILL.md` hash matches
 ///    `expected_hash` — the legitimate `LinkMode::Copy` steady state on
 ///    hosts where a symlink could not be created (Windows without Developer
 ///    Mode). `link_dir` deliberately leaves this alone rather than
@@ -625,7 +625,7 @@ fn remove_path_for(marker: &ManagedPathMarker) -> Result<()> {
 ///
 /// Only a real directory that is *not* ours, or one that is ours but has a
 /// diverged `SKILL.md`, returns `false` — that is the actual tamper signal:
-/// something outside VectorHawk is serving content to Claude Code under a
+/// something outside Scenery is serving content to Claude Code under a
 /// managed slug.
 pub fn check_link_integrity(slug: &str, expected_hash: &str) -> Result<bool> {
     let (Some(canonical_root), Some(link_root)) = (
@@ -650,7 +650,7 @@ pub fn check_link_integrity(slug: &str, expected_hash: &str) -> Result<bool> {
     // `current_hash_for`'s single-file granularity: hash the copy's
     // SKILL.md and compare against canonical's already-known hash, instead
     // of a full recursive tree compare.
-    if ownership::is_vectorhawk_managed(&link) {
+    if ownership::is_scenery_managed(&link) {
         let skill_md = link.join("SKILL.md");
         if let Ok(bytes) = fs::read(&skill_md) {
             if hex_sha256(&bytes) == expected_hash {
@@ -669,7 +669,7 @@ fn quarantine_item(outcome: &DriftOutcome) -> Result<PathBuf> {
     let ts = chrono::Utc::now().format("%Y-%m-%dT%H%M%SZ").to_string();
     let dest_root = home
         .join(".claude")
-        .join(".vectorhawk-quarantine")
+        .join(".scenery-quarantine")
         .join(ts)
         .join(&outcome.kind);
     fs::create_dir_all(&dest_root).with_context(|| {
@@ -697,8 +697,8 @@ fn quarantine_item(outcome: &DriftOutcome) -> Result<PathBuf> {
         }
         "mcp" => {
             let (json_path, slug) = split_mcp_path(&outcome.path)?;
-            if ownership::is_vectorhawk_mcp_key(&slug) {
-                anyhow::bail!("drift: refusing to quarantine the vectorhawk aggregator entry");
+            if ownership::is_scenery_mcp_key(&slug) {
+                anyhow::bail!("drift: refusing to quarantine the scenery aggregator entry");
             }
             if !json_path.exists() {
                 return Ok(dest_root);

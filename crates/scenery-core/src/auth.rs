@@ -382,7 +382,7 @@ impl AuthClient {
             .http
             .post(&url)
             .bearer_auth(access_token)
-            .json(&serde_json::json!({ "reason": "vectorhawk uninstall" }))
+            .json(&serde_json::json!({ "reason": "scenery uninstall" }))
             .send()
             .with_context(|| format!("failed to reach registry at {url}"))?;
         if !resp.status().is_success() {
@@ -477,7 +477,7 @@ pub fn decode_jwt_sub(token: &str) -> Option<String> {
 // `load_all_tokens` has something to iterate over.
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-const KEYRING_SERVICE: &str = "com.vectorhawk.agent";
+const KEYRING_SERVICE: &str = "com.scenery.agent";
 
 /// Stable account name for a given registry URL inside the OS keychain.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -488,13 +488,13 @@ fn keyring_account(registry_url: &str) -> String {
     format!("registry::{registry_url}")
 }
 
-/// Escape hatch — when `VECTORHAWK_DISABLE_KEYCHAIN=1` is set the OS keychain
+/// Escape hatch — when `SCENERY_DISABLE_KEYCHAIN=1` is set the OS keychain
 /// is treated as if it were unavailable, forcing the secrets-file fallback. Used
 /// by the test suite (so tests don't pollute the real macOS Keychain) and
 /// by users on shared boxes who prefer to keep tokens out of system stores.
-/// Public so `vectorhawk uninstall`'s keychain sweep honours it too.
+/// Public so `scenery uninstall`'s keychain sweep honours it too.
 pub fn keychain_disabled() -> bool {
-    std::env::var("VECTORHAWK_DISABLE_KEYCHAIN")
+    std::env::var("SCENERY_DISABLE_KEYCHAIN")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
 }
@@ -1029,7 +1029,7 @@ mod tests {
 
     #[test]
     fn initiate_oauth_flow_with_redirect_builds_correct_url() {
-        let client = AuthClient::new("https://app.vectorhawk.ai");
+        let client = AuthClient::new("https://app.scenery.dev");
         let redirect = "http://127.0.0.1:39127/oauth/cli/callback";
         let init = client
             .initiate_oauth_flow_with_redirect(redirect)
@@ -1062,7 +1062,7 @@ mod tests {
 
     #[test]
     fn code_verifier_and_challenge_are_correct_length() {
-        let client = AuthClient::new("https://app.vectorhawk.ai");
+        let client = AuthClient::new("https://app.scenery.dev");
         let init = client
             .initiate_oauth_flow_with_redirect("http://127.0.0.1:39127/oauth/cli/callback")
             .expect("should initiate");
@@ -1081,7 +1081,7 @@ mod tests {
 
     #[test]
     fn code_challenge_is_sha256_of_verifier() {
-        let client = AuthClient::new("https://app.vectorhawk.ai");
+        let client = AuthClient::new("https://app.scenery.dev");
         let init = client
             .initiate_oauth_flow_with_redirect("http://127.0.0.1:39127/oauth/cli/callback")
             .expect("should initiate");
@@ -1096,7 +1096,7 @@ mod tests {
 
     #[test]
     fn oauth_initiation_produces_auth_url_with_state() {
-        let client = AuthClient::new("https://app.vectorhawk.ai");
+        let client = AuthClient::new("https://app.scenery.dev");
         let init = client.initiate_oauth_flow().expect("should initiate");
         assert!(
             init.auth_url.contains("authorize"),
@@ -1151,7 +1151,7 @@ mod tests {
 
     // ── Token storage tests ───────────────────────────────────────────────────
     //
-    // These tests run with VECTORHAWK_DISABLE_KEYCHAIN=1 so they exercise the
+    // These tests run with SCENERY_DISABLE_KEYCHAIN=1 so they exercise the
     // SQLite fallback path without touching the real macOS Keychain.
     //
     // `load_tokens` calls `keychain_get` unconditionally on *every* call —
@@ -1170,7 +1170,7 @@ mod tests {
     // function is what actually provides the guarantee.
     #[ctor::ctor]
     fn disable_real_keychain_for_tests() {
-        std::env::set_var("VECTORHAWK_DISABLE_KEYCHAIN", "1");
+        std::env::set_var("SCENERY_DISABLE_KEYCHAIN", "1");
     }
 
     /// Regression guard for the safety net itself: if `#[ctor]` support
@@ -1180,13 +1180,13 @@ mod tests {
     #[test]
     fn real_keychain_is_disabled_for_this_test_binary() {
         assert_eq!(
-            std::env::var("VECTORHAWK_DISABLE_KEYCHAIN").as_deref(),
+            std::env::var("SCENERY_DISABLE_KEYCHAIN").as_deref(),
             Ok("1"),
             "disable_real_keychain_for_tests' #[ctor] must run before any test in this binary"
         );
     }
 
-    /// RAII guard that (re-)asserts `VECTORHAWK_DISABLE_KEYCHAIN=1` for the
+    /// RAII guard that (re-)asserts `SCENERY_DISABLE_KEYCHAIN=1` for the
     /// duration of a test. Holds a global mutex so concurrent tests can't
     /// interleave their set/clear of the process-global env var.
     ///
@@ -1201,13 +1201,13 @@ mod tests {
     impl KeychainOff {
         fn enable() -> Self {
             let _g = KEYCHAIN_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            std::env::set_var("VECTORHAWK_DISABLE_KEYCHAIN", "1");
+            std::env::set_var("SCENERY_DISABLE_KEYCHAIN", "1");
             KeychainOff { _g }
         }
     }
     impl Drop for KeychainOff {
         fn drop(&mut self) {
-            std::env::set_var("VECTORHAWK_DISABLE_KEYCHAIN", "1");
+            std::env::set_var("SCENERY_DISABLE_KEYCHAIN", "1");
         }
     }
 

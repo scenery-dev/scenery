@@ -1,11 +1,11 @@
-//! F2 managed-paths pusher — writes VectorHawk-managed items into clients'
+//! F2 managed-paths pusher — writes Scenery-managed items into clients'
 //! native directories on install and removes them on deactivate.
 //!
 //! # What it writes
 //!
 //! | Item   | Destination                                           |
 //! |--------|-------------------------------------------------------|
-//! | Skill  | `~/.agents/skills/<slug>/` + `.vectorhawk-managed.json` marker, linked at `~/.claude/skills/<slug>` for Claude Code |
+//! | Skill  | `~/.agents/skills/<slug>/` + `.scenery-managed.json` marker, linked at `~/.claude/skills/<slug>` for Claude Code |
 //! | MCP    | Entry in `~/.claude.json` `mcpServers` block           |
 //!
 //! Plugin pushes are handled by `managed_paths::plugin_marketplace`
@@ -21,7 +21,7 @@
 //! # Env-var gate
 //!
 //! All public methods return `Ok(())` immediately when
-//! `VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER` is set in the environment.
+//! `SCENERY_DISABLE_FILESYSTEM_RECONCILER` is set in the environment.
 //! Callers do not need to guard this themselves.
 //!
 //! # Error policy
@@ -36,6 +36,10 @@ use super::marker::{
 use anyhow::{Context, Result};
 use fs2::FileExt;
 use rusqlite::Connection;
+use scenery_core::atomic_file;
+use scenery_core::restore_journal::{JournalEntry, JournalOp, JournalSource, RestoreJournal};
+use scenery_core::state::AppState;
+use scenery_mcp::ownership;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
@@ -44,21 +48,17 @@ use std::{
     sync::Arc,
 };
 use tracing::{debug, info, warn};
-use scenery_core::atomic_file;
-use scenery_core::restore_journal::{JournalEntry, JournalOp, JournalSource, RestoreJournal};
-use scenery_core::state::AppState;
-use scenery_mcp::ownership;
 
 // ── Env-var gate ──────────────────────────────────────────────────────────────
 
 /// Return `true` when the filesystem reconciler is disabled.
 pub(crate) fn reconciler_disabled() -> bool {
-    std::env::var_os("VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER").is_some()
+    std::env::var_os("SCENERY_DISABLE_FILESYSTEM_RECONCILER").is_some()
 }
 
 // ── ManagedPathsPusher ────────────────────────────────────────────────────────
 
-/// Pushes VectorHawk-managed items into Claude Code's native directories.
+/// Pushes Scenery-managed items into Claude Code's native directories.
 ///
 /// Cheaply cloneable — the only fields are two paths.
 pub struct ManagedPathsPusher {
@@ -78,7 +78,7 @@ impl ManagedPathsPusher {
     /// Restore-journal handle rooted at this pusher's data dir.
     ///
     /// F2 pushes always append with `backup_path = None`: the pushed
-    /// artifact only ever worked because VectorHawk put it there
+    /// artifact only ever worked because Scenery put it there
     /// (`source = managed` / `brokered`), so uninstall removes it outright
     /// rather than restoring from a backup — see `JournalSource`.
     fn journal(&self) -> RestoreJournal {
@@ -107,7 +107,7 @@ impl ManagedPathsPusher {
     /// The function:
     /// 1. Creates the target directory.
     /// 2. Writes SKILL.md + referenced files atomically (temp → rename per file).
-    /// 3. Writes a `.vectorhawk-managed.json` marker into the directory.
+    /// 3. Writes a `.scenery-managed.json` marker into the directory.
     /// 4. Upserts the `managed_path_markers` SQLite row.
     pub fn push_skill(
         &self,
@@ -129,24 +129,24 @@ impl ManagedPathsPusher {
         // the pre-v1.0.51 installer's versioned dir resurrecting itself on
         // the next reconcile).
         //
-        // But `~/.agents/skills` is a SHARED root, not VectorHawk's private
+        // But `~/.agents/skills` is a SHARED root, not Scenery's private
         // one: `npx skills`, Cursor and Codex users all write here, and
         // `discoveries.rs` scans it precisely because it is user-populated. So
         // ownership must be established before unlinking, exactly as
         // `links::link_dir` does for a real directory at the Claude path.
         //
-        // VectorHawk never puts a symlink at the canonical path itself — it
+        // Scenery never puts a symlink at the canonical path itself — it
         // writes a real directory — so a link here is presumed foreign unless
-        // it resolves to content carrying our `.vectorhawk-managed.json`
+        // it resolves to content carrying our `.scenery-managed.json`
         // marker. Refuse rather than clobber; the slug collision is the
         // caller's problem to report, and the user's link survives.
         //
         // No backup is taken: removing a link destroys no data (its target is
         // untouched), matching `link_dir`'s own stale-link handling.
         if skill_dir.is_symlink() {
-            if !ownership::is_vectorhawk_managed(&skill_dir) {
+            if !ownership::is_scenery_managed(&skill_dir) {
                 anyhow::bail!(
-                    "pusher: refusing to replace the symlink at {} — not VectorHawk-managed. \
+                    "pusher: refusing to replace the symlink at {} — not Scenery-managed. \
                      Slug '{slug}' collides with user content in the shared \
                      ~/.agents/skills root.",
                     skill_dir.display()
@@ -160,19 +160,19 @@ impl ManagedPathsPusher {
             })?;
             debug!(
                 slug,
-                "pusher: replaced a VectorHawk-managed symlink with a real managed dir"
+                "pusher: replaced a Scenery-managed symlink with a real managed dir"
             );
-        } else if skill_dir.is_dir() && !ownership::is_vectorhawk_managed(&skill_dir) {
+        } else if skill_dir.is_dir() && !ownership::is_scenery_managed(&skill_dir) {
             // The more common shape of the same collision: `npx skills`,
             // Cursor and Codex all create real directories at the canonical
             // path, and `discoveries.rs` deliberately reports them without
             // adopting them, so they legitimately sit here unmanaged forever.
             // Annexing one here would overwrite its SKILL.md, stamp it with
             // our marker, and prime it for a later remove_skill to
-            // `remove_dir_all` content VectorHawk never wrote — refuse rather
+            // `remove_dir_all` content Scenery never wrote — refuse rather
             // than clobber, exactly as the symlink branch above does.
             anyhow::bail!(
-                "pusher: refusing to replace the directory at {} — not VectorHawk-managed. \
+                "pusher: refusing to replace the directory at {} — not Scenery-managed. \
                  Slug '{slug}' collides with user content in the shared \
                  ~/.agents/skills root.",
                 skill_dir.display()
@@ -215,14 +215,14 @@ impl ManagedPathsPusher {
         // Write file marker into the skill directory.
         let now_ts = chrono::Utc::now().to_rfc3339();
         write_file_marker(&skill_dir, installation_id, &sha256, &now_ts)
-            .context("pusher: failed to write .vectorhawk-managed.json for skill")?;
+            .context("pusher: failed to write .scenery-managed.json for skill")?;
 
         // Upsert SQLite marker.
         let path_key = skill_dir.to_string_lossy().to_string();
         self.upsert_db_marker(&path_key, "skill", slug, installation_id, &sha256, &now_ts)
             .context("pusher: failed to upsert managed_path_markers for skill")?;
 
-        // Restore journal: this directory only exists because VectorHawk put
+        // Restore journal: this directory only exists because Scenery put
         // it there (source=managed) — uninstall removes it outright, no
         // backup needed.
         self.journal_push(
@@ -238,7 +238,7 @@ impl ManagedPathsPusher {
         //
         // Ownership at the link path is decided by the marker file alone —
         // `link_dir` replaces a real directory there only when it carries
-        // `.vectorhawk-managed.json`, and refuses otherwise. That is an
+        // `.scenery-managed.json`, and refuses otherwise. That is an
         // existence check on disk, deliberately NOT cross-checked against
         // `managed_path_markers`.
         //
@@ -248,11 +248,11 @@ impl ManagedPathsPusher {
         // matching row — a cross-check would refuse to relink and leave Claude
         // Code pointed at stale content instead of finishing the cleanup. The
         // filesystem marker is the source of truth here (see
-        // `ownership::is_vectorhawk_managed`); SQLite is an index, and an
+        // `ownership::is_scenery_managed`); SQLite is an index, and an
         // index that can disagree with the thing it indexes must not be the
         // one holding the safety property.
         //
-        // Note the marker proves only that VectorHawk *wrote* the directory,
+        // Note the marker proves only that Scenery *wrote* the directory,
         // not that its current content is reproducible — which is why
         // `link_dir` backs up before replacing, rather than relying on this
         // call's `skill_md_bytes` being able to recreate it.
@@ -276,9 +276,9 @@ impl ManagedPathsPusher {
     /// Order matters (F13): the link and the directory go first, the
     /// `managed_path_markers` row last. The row is the only trusted proof that
     /// a directory is ours — discovery and F1 adoption ignore the
-    /// `.vectorhawk-managed.json` file — so a crash mid-removal must never
+    /// `.scenery-managed.json` file — so a crash mid-removal must never
     /// leave our directory on disk without its row, or the next scan would
-    /// report (and F1 would re-adopt) VectorHawk's own leftover. With this
+    /// report (and F1 would re-adopt) Scenery's own leftover. With this
     /// order a crash leaves either the row plus (part of) the directory —
     /// retried here, or classified by drift — or the row alone, which drift
     /// retires as DELETED.
@@ -307,7 +307,7 @@ impl ManagedPathsPusher {
             ownership::ensure_not_native(&skill_dir)?;
             // Same ownership rule as push_skill's guard and `links::unlink_dir`:
             // a real directory here is removed only when it is ours — it
-            // carries the `.vectorhawk-managed.json` marker, or our own DB row
+            // carries the `.scenery-managed.json` marker, or our own DB row
             // sits at this exact path (a retry after a crash may find the
             // marker file already deleted). Without this, a slug collision
             // that push_skill refused to annex would still be destroyed here.
@@ -319,12 +319,10 @@ impl ManagedPathsPusher {
                 is_already_marked(&conn, &path_key)
                     .context("pusher: failed to check managed_path_markers")?
             };
-            if !skill_dir.is_symlink()
-                && !row_present
-                && !ownership::is_vectorhawk_managed(&skill_dir)
+            if !skill_dir.is_symlink() && !row_present && !ownership::is_scenery_managed(&skill_dir)
             {
                 anyhow::bail!(
-                    "pusher: refusing to remove the directory at {} — not VectorHawk-managed.",
+                    "pusher: refusing to remove the directory at {} — not Scenery-managed.",
                     skill_dir.display()
                 );
             }
@@ -360,7 +358,7 @@ impl ManagedPathsPusher {
     ///
     /// The entry shape written is:
     /// ```json
-    /// { "command": "vectorhawk", "args": ["mcp", "serve", "--server", "<slug>"] }
+    /// { "command": "scenery", "args": ["mcp", "serve", "--server", "<slug>"] }
     /// ```
     ///
     /// The function holds an exclusive file lock on `~/.claude.json` for the
@@ -375,7 +373,7 @@ impl ManagedPathsPusher {
     /// credential-brokered servers routed through the gateway (has a
     /// `gateway_url`), `false` for directly-configured (`server_config`)
     /// servers. Either way the entry is `source=brokered`/`managed` — this
-    /// pushed key only ever worked through VectorHawk, so uninstall removes
+    /// pushed key only ever worked through Scenery, so uninstall removes
     /// it outright rather than restoring it.
     pub fn push_mcp(
         &self,
@@ -390,7 +388,7 @@ impl ManagedPathsPusher {
         let claude_json = resolve_claude_json()?;
 
         let entry_value = serde_json::json!({
-            "command": "vectorhawk",
+            "command": "scenery",
             "args": ["mcp", "serve", "--server", slug],
         });
 
@@ -496,7 +494,7 @@ impl ManagedPathsPusher {
             .context("pusher: failed to check managed_path_markers")?;
 
         if already {
-            // Refresh the hash: VectorHawk just wrote this content, and the
+            // Refresh the hash: Scenery just wrote this content, and the
             // path+hash ownership check (F13) must keep recognising it.
             conn.execute(
                 "UPDATE managed_path_markers SET source_sha256 = ?1 WHERE path = ?2",
@@ -558,7 +556,7 @@ impl ManagedPathsPusher {
 ///
 /// This heals machines whose native skill dirs were removed out-of-band — e.g.
 /// the v1.0.67 cleanup pass that (incorrectly) deleted installed skills along
-/// with VectorHawk's own command-skills. Going forward it also self-heals any
+/// with Scenery's own command-skills. Going forward it also self-heals any
 /// user-installed skill dir that gets deleted while the daemon is down, and —
 /// since the pivot to `~/.agents/skills` — any active skill that only has a
 /// stale/legacy path at the old Claude location: `push_skill`'s link step
@@ -682,7 +680,7 @@ pub async fn push_adopted_discovery(
 }
 
 /// Recursively walk `dir`, appending `(relative_path, bytes)` for every file
-/// except `SKILL.md` and `.vectorhawk-managed.json`. Errors on individual
+/// except `SKILL.md` and `.scenery-managed.json`. Errors on individual
 /// reads are skipped silently — adoption is best-effort.
 fn collect_extras(root: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) {
     let entries = match fs::read_dir(dir) {
@@ -696,7 +694,7 @@ fn collect_extras(root: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) {
             None => continue,
         };
         if path.is_file() {
-            if name == "SKILL.md" || name == ".vectorhawk-managed.json" {
+            if name == "SKILL.md" || name == ".scenery-managed.json" {
                 continue;
             }
             if let Ok(rel) = path.strip_prefix(root) {
@@ -723,7 +721,7 @@ fn resolve_skills_dir() -> Result<PathBuf> {
     Ok(resolve_home()?.join(".agents").join("skills"))
 }
 
-/// Where Claude Code looks: `~/.claude/skills/`. VectorHawk places only
+/// Where Claude Code looks: `~/.claude/skills/`. Scenery places only
 /// symlinks here — never real content.
 fn resolve_claude_link_dir() -> Result<PathBuf> {
     Ok(resolve_home()?.join(".claude").join("skills"))
@@ -733,7 +731,7 @@ fn resolve_claude_link_dir() -> Result<PathBuf> {
 /// `~/.agents/skills/<slug>/SKILL.md` exists.
 ///
 /// Used by the adopt-publish takeover flow (`managed_paths::takeover`) to
-/// confirm the VectorHawk-managed replacement actually landed before removing
+/// confirm the Scenery-managed replacement actually landed before removing
 /// the original discovered `source_path` it is replacing.
 pub fn managed_skill_present(slug: &str) -> Result<bool> {
     let skills_dir = resolve_skills_dir()?;

@@ -28,8 +28,8 @@ fn seed_managed_copy(fake_home: &Path, slug: &str) {
     fs::write(skill_dir.join("SKILL.md"), b"---\nname: x\n---\n").unwrap();
 }
 
-/// A discovery `source_path` that is genuinely **not** VectorHawk's own write
-/// location: an extra scan root supplied via `VECTORHAWK_EXTRA_SKILL_ROOTS`
+/// A discovery `source_path` that is genuinely **not** Scenery's own write
+/// location: an extra scan root supplied via `SCENERY_EXTRA_SKILL_ROOTS`
 /// (see [`crate::managed_paths::discoveries::extra_roots`]).
 ///
 /// This is the only shape of discovery whose takeover legitimately removes
@@ -191,7 +191,7 @@ fn perform_if_pending_noops_when_source_is_the_canonical_destination() {
         b"---\nname: hello-world\n---\nfreshly pushed managed content\n",
     )
     .unwrap();
-    fs::write(canonical.join(".vectorhawk-managed.json"), b"{}").unwrap();
+    fs::write(canonical.join(".scenery-managed.json"), b"{}").unwrap();
 
     // The SSE handler recorded this path back when it was still the user's
     // own discovered copy.
@@ -213,7 +213,7 @@ fn perform_if_pending_noops_when_source_is_the_canonical_destination() {
         "the managed copy must be byte-for-byte untouched"
     );
     assert!(
-        canonical.join(".vectorhawk-managed.json").exists(),
+        canonical.join(".scenery-managed.json").exists(),
         "the marker must survive so drift keeps recognising the skill as ours"
     );
     assert_eq!(
@@ -230,7 +230,7 @@ fn perform_if_pending_noops_when_source_is_the_canonical_destination() {
     );
 }
 
-/// A pre-VectorHawk installer left a *symlink* at the discovered
+/// A pre-Scenery installer left a *symlink* at the discovered
 /// `source_path` (e.g. pointing into a shared marketplace checkout). Takeover
 /// must unlink the symlink itself, never follow it and delete the target.
 #[test]

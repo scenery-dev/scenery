@@ -6,10 +6,10 @@
 //!
 //! # Must match `tools/list`
 //!
-//! The management tools (`vectorhawk_list`, `vectorhawk_search`,
-//! `vectorhawk_mcp_catalog`, `vectorhawk_mcp_request`) are hidden from
+//! The management tools (`scenery_list`, `scenery_search`,
+//! `scenery_mcp_catalog`, `scenery_mcp_request`) are hidden from
 //! `tools/list` by default — see `tools::build_tool_list`'s doc comment —
-//! and only surface when `VECTORHAWK_EXPOSE_BUILTIN_TOOLS=1` and/or the user
+//! and only surface when `SCENERY_EXPOSE_BUILTIN_TOOLS=1` and/or the user
 //! is logged in. Naming one of them here when it isn't actually exposed
 //! sends the AI client looking for a tool that doesn't exist. Every mention
 //! below is therefore gated on `exposed_tool_names`, which callers must
@@ -26,7 +26,7 @@ use scenery_core::managed::ManagedConfig;
 ///
 /// `logged_in` should be `true` when the user has valid auth tokens for the
 /// configured registry. When `false` and a registry URL is present, a nudge
-/// to call `vectorhawk_login` is prepended so Claude surfaces it immediately.
+/// to call `scenery_login` is prepended so Claude surfaces it immediately.
 ///
 /// `exposed_tool_names` is the exact set of tool names `tools/list` returns
 /// for this session (e.g. from `tools::build_tool_list`, mapped to just the
@@ -45,14 +45,14 @@ pub fn build_instructions(
 
     let has_tool = |name: &str| exposed_tool_names.iter().any(|n| n == name);
 
-    // Only nudge toward `vectorhawk_login` when it's actually exposed —
+    // Only nudge toward `scenery_login` when it's actually exposed —
     // `tools::build_tool_list` omits it whenever no registry URL is
     // configured at all, in which case there is nothing to log into and
     // naming the tool here would be exactly the bug this module exists to
     // prevent.
-    let login_nudge = if !logged_in && has_tool("vectorhawk_login") {
-        "⚠️ You are not logged in to the VectorHawk registry. \
-         Call `vectorhawk_login` to authenticate — this unlocks skill search, \
+    let login_nudge = if !logged_in && has_tool("scenery_login") {
+        "⚠️ You are not logged in to the Scenery registry. \
+         Call `scenery_login` to authenticate — this unlocks skill search, \
          install, publish, and governance features. "
     } else {
         ""
@@ -62,7 +62,7 @@ pub fn build_instructions(
 
     let Some(managed) = managed else {
         return format!(
-            "{login_nudge}VectorHawk runner — governed AI platform{mode_suffix}.{discovery_hint}"
+            "{login_nudge}Scenery runner — governed AI platform{mode_suffix}.{discovery_hint}"
         )
         .trim()
         .to_string();
@@ -71,11 +71,9 @@ pub fn build_instructions(
     let mut out = login_nudge.to_string();
 
     match managed.org.as_deref() {
-        Some(org) => out.push_str(&format!(
-            "VectorHawk runner — managed by {org}{mode_suffix}. "
-        )),
+        Some(org) => out.push_str(&format!("Scenery runner — managed by {org}{mode_suffix}. ")),
         None => out.push_str(&format!(
-            "VectorHawk runner — managed deployment{mode_suffix}. "
+            "Scenery runner — managed deployment{mode_suffix}. "
         )),
     }
 
@@ -85,8 +83,8 @@ pub fn build_instructions(
                 out.push_str(custom);
                 out.push(' ');
             }
-            None if has_tool("vectorhawk_mcp_request") => out.push_str(
-                "Tool installations require approval. Use vectorhawk_mcp_request \
+            None if has_tool("scenery_mcp_request") => out.push_str(
+                "Tool installations require approval. Use scenery_mcp_request \
                  to request a new MCP server through governance; direct install \
                  via /mcp bypasses controls. ",
             ),
@@ -101,7 +99,7 @@ pub fn build_instructions(
     out.trim().to_string()
 }
 
-/// Build the trailing "use vectorhawk_list / _search / _mcp_catalog"
+/// Build the trailing "use scenery_list / _search / _mcp_catalog"
 /// sentence, including only the clauses for tools actually present in
 /// `exposed_tool_names`. Returns an empty string (not even a leading space)
 /// when none of the three are exposed, so callers can append it unconditionally.
@@ -109,14 +107,14 @@ fn build_discovery_hint(exposed_tool_names: &[String]) -> String {
     let has_tool = |name: &str| exposed_tool_names.iter().any(|n| n == name);
 
     let mut clauses: Vec<&str> = Vec::new();
-    if has_tool("vectorhawk_list") {
-        clauses.push("vectorhawk_list to show installed skills");
+    if has_tool("scenery_list") {
+        clauses.push("scenery_list to show installed skills");
     }
-    if has_tool("vectorhawk_search") {
-        clauses.push("vectorhawk_search to find more");
+    if has_tool("scenery_search") {
+        clauses.push("scenery_search to find more");
     }
-    if has_tool("vectorhawk_mcp_catalog") {
-        clauses.push("vectorhawk_mcp_catalog to browse approved MCP servers");
+    if has_tool("scenery_mcp_catalog") {
+        clauses.push("scenery_mcp_catalog to browse approved MCP servers");
     }
 
     if clauses.is_empty() {
@@ -148,22 +146,22 @@ mod tests {
     }
 
     /// Every built-in tool this module ever mentions, exposed — the
-    /// `VECTORHAWK_EXPOSE_BUILTIN_TOOLS=1` + logged-in surface. Tests about
+    /// `SCENERY_EXPOSE_BUILTIN_TOOLS=1` + logged-in surface. Tests about
     /// other concerns (org naming, mode label, login nudge) use this so
     /// they aren't incidentally testing the gating behaviour too.
     fn all_tools() -> Vec<String> {
         names(&[
-            "vectorhawk_list",
-            "vectorhawk_search",
-            "vectorhawk_mcp_catalog",
-            "vectorhawk_mcp_request",
-            "vectorhawk_login",
+            "scenery_list",
+            "scenery_search",
+            "scenery_mcp_catalog",
+            "scenery_mcp_request",
+            "scenery_login",
         ])
     }
 
     /// The real-world default surface: builtins hidden, nothing exposed
     /// beyond installed skills (irrelevant to instructions text) and
-    /// possibly `vectorhawk_login`.
+    /// possibly `scenery_login`.
     fn no_builtins() -> Vec<String> {
         Vec::new()
     }
@@ -181,7 +179,7 @@ mod tests {
         let m = cfg(None, None, true);
         let s = build_instructions(Some(&m), "daemon", true, &all_tools());
         assert!(s.contains("managed deployment"), "got: {s}");
-        assert!(s.contains("vectorhawk_mcp_request"), "got: {s}");
+        assert!(s.contains("scenery_mcp_request"), "got: {s}");
     }
 
     #[test]
@@ -201,7 +199,7 @@ mod tests {
         let s = build_instructions(Some(&m), "daemon", true, &all_tools());
         assert!(s.contains("Contact security@acme.com"), "got: {s}");
         assert!(
-            !s.contains("Use vectorhawk_mcp_request to request a new MCP server"),
+            !s.contains("Use scenery_mcp_request to request a new MCP server"),
             "default copy should be replaced by the custom message; got: {s}"
         );
     }
@@ -233,7 +231,7 @@ mod tests {
     #[test]
     fn not_logged_in_prepends_nudge() {
         let s = build_instructions(None, "daemon", false, &all_tools());
-        assert!(s.contains("vectorhawk_login"), "got: {s}");
+        assert!(s.contains("scenery_login"), "got: {s}");
         assert!(s.contains("not logged in"), "got: {s}");
     }
 
@@ -241,23 +239,19 @@ mod tests {
     fn logged_in_omits_nudge() {
         let s = build_instructions(None, "daemon", true, &all_tools());
         assert!(!s.contains("not logged in"), "got: {s}");
-        assert!(!s.contains("vectorhawk_login"), "got: {s}");
+        assert!(!s.contains("scenery_login"), "got: {s}");
     }
 
     // ── Bug: instructions must never name a tool tools/list doesn't expose ──
 
-    /// The real default surface: builtins hidden (`VECTORHAWK_EXPOSE_BUILTIN_TOOLS`
+    /// The real default surface: builtins hidden (`SCENERY_EXPOSE_BUILTIN_TOOLS`
     /// unset). Unmanaged mode's generic copy previously always named
-    /// vectorhawk_list/_search/_mcp_catalog regardless of what was actually
+    /// scenery_list/_search/_mcp_catalog regardless of what was actually
     /// exposed.
     #[test]
     fn unmanaged_default_surface_names_no_hidden_builtin_tools() {
         let s = build_instructions(None, "daemon", true, &no_builtins());
-        for tool in [
-            "vectorhawk_list",
-            "vectorhawk_search",
-            "vectorhawk_mcp_catalog",
-        ] {
+        for tool in ["scenery_list", "scenery_search", "scenery_mcp_catalog"] {
             assert!(
                 !s.contains(tool),
                 "instructions must not name '{tool}' when it isn't exposed; got: {s}"
@@ -266,16 +260,16 @@ mod tests {
     }
 
     /// Managed mode's governance block previously always named
-    /// vectorhawk_mcp_request even when builtins were hidden.
+    /// scenery_mcp_request even when builtins were hidden.
     #[test]
     fn managed_default_surface_names_no_hidden_builtin_tools() {
         let m = cfg(Some("Acme Corp"), None, true);
         let s = build_instructions(Some(&m), "daemon", true, &no_builtins());
         for tool in [
-            "vectorhawk_list",
-            "vectorhawk_search",
-            "vectorhawk_mcp_catalog",
-            "vectorhawk_mcp_request",
+            "scenery_list",
+            "scenery_search",
+            "scenery_mcp_catalog",
+            "scenery_mcp_request",
         ] {
             assert!(
                 !s.contains(tool),
@@ -293,21 +287,21 @@ mod tests {
     /// Only the exposed subset is named — not an all-or-nothing switch.
     #[test]
     fn discovery_hint_names_only_the_exposed_subset() {
-        let s = build_instructions(None, "daemon", true, &names(&["vectorhawk_search"]));
-        assert!(s.contains("vectorhawk_search"), "got: {s}");
-        assert!(!s.contains("vectorhawk_list"), "got: {s}");
-        assert!(!s.contains("vectorhawk_mcp_catalog"), "got: {s}");
+        let s = build_instructions(None, "daemon", true, &names(&["scenery_search"]));
+        assert!(s.contains("scenery_search"), "got: {s}");
+        assert!(!s.contains("scenery_list"), "got: {s}");
+        assert!(!s.contains("scenery_mcp_catalog"), "got: {s}");
     }
 
     /// Surface state: no registry URL configured at all. `logged_in` is
     /// always `false` in that case (nothing to be logged into), and
-    /// `tools::build_tool_list` never adds `vectorhawk_login` without a
+    /// `tools::build_tool_list` never adds `scenery_login` without a
     /// registry URL either — so the nudge must not mention it.
     #[test]
     fn no_registry_configured_omits_login_nudge_entirely() {
         let s = build_instructions(None, "daemon", false, &no_builtins());
         assert!(
-            !s.contains("vectorhawk_login"),
+            !s.contains("scenery_login"),
             "must not nudge toward a login tool that isn't exposed; got: {s}"
         );
         assert!(
@@ -319,8 +313,8 @@ mod tests {
     #[test]
     fn fully_exposed_surface_still_names_every_builtin() {
         let s = build_instructions(None, "daemon", true, &all_tools());
-        assert!(s.contains("vectorhawk_list"), "got: {s}");
-        assert!(s.contains("vectorhawk_search"), "got: {s}");
-        assert!(s.contains("vectorhawk_mcp_catalog"), "got: {s}");
+        assert!(s.contains("scenery_list"), "got: {s}");
+        assert!(s.contains("scenery_search"), "got: {s}");
+        assert!(s.contains("scenery_mcp_catalog"), "got: {s}");
     }
 }

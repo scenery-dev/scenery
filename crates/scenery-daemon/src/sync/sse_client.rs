@@ -174,7 +174,7 @@ pub async fn run(
                         streak = post_refresh_unauthorized_streak,
                         "SSE: repeated 401s immediately after a successful token \
                          refresh — treating as revoked/invalid account, not an \
-                         expired token. Run `vectorhawk auth login` to \
+                         expired token. Run `scenery auth login` to \
                          re-authenticate."
                     );
                     return;
@@ -219,9 +219,9 @@ pub async fn run(
                 // "device_revoked"}) — permanent for this device_uuid/id,
                 // per revocation-model-decisions (2026-10-06). Retrying
                 // can never succeed again; there is no admin "restore"
-                // any more, only a deliberate `vectorhawk auth pair` that
+                // any more, only a deliberate `scenery auth pair` that
                 // mints a brand-new device identity. Clear the local
-                // device_uuid/device_id now so: (a) `vectorhawk auth
+                // device_uuid/device_id now so: (a) `scenery auth
                 // status`/`doctor` can tell the user plainly what
                 // happened and what to do, and (b) the daemon's own
                 // unattended register-on-startup path never again
@@ -239,7 +239,7 @@ pub async fn run(
                 }
                 info!(
                     "SSE: device revoked by admin — stopping sync. \
-                     Run `vectorhawk auth pair` to re-pair as a new device."
+                     Run `scenery auth pair` to re-pair as a new device."
                 );
                 return;
             }
@@ -252,9 +252,9 @@ pub async fn run(
                     warn!(error = %e, "SSE: failed to persist device-revoked state locally");
                 }
                 info!(
-                    "SSE: your VectorHawk account was revoked by an admin — stopping sync. \
-                     After an admin reinstates it, run `vectorhawk auth login` then \
-                     `vectorhawk auth pair`."
+                    "SSE: your Scenery account was revoked by an admin — stopping sync. \
+                     After an admin reinstates it, run `scenery auth login` then \
+                     `scenery auth pair`."
                 );
                 return;
             }
@@ -892,7 +892,7 @@ pub enum SyncEvent {
         mcp_server_id: Uuid,
     },
     /// Install a governed plugin as a self-contained Claude Code plugin
-    /// (registered in the local `vectorhawk` marketplace, bundling its skills).
+    /// (registered in the local `scenery` marketplace, bundling its skills).
     InstallPlugin {
         installation_id: Uuid,
         plugin_slug: String,

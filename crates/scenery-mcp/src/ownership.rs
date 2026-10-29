@@ -1,11 +1,11 @@
 //! Ownership & origin classification — the single source of truth for deciding
 //! whether a piece of on-disk Claude Code content is **Anthropic-native**
-//! (strictly out of scope for VectorHawk), **VectorHawk-managed** (we own it),
+//! (strictly out of scope for Scenery), **Scenery-managed** (we own it),
 //! or **custom** (user/third-party content eligible for adoption & governance).
 //!
 //! # Why this module exists
 //!
-//! VectorHawk must *never* enumerate, modify, reconcile, or delete Claude Code's
+//! Scenery must *never* enumerate, modify, reconcile, or delete Claude Code's
 //! own first-party skills/plugins/tools, while it *must* auto-adopt and govern
 //! everything else. Historically the "is this ours / is this native?" rule was
 //! implemented ad-hoc in several places (the daemon reconciler, the shim
@@ -35,8 +35,8 @@
 //! **custom** and eligible for adoption.
 //!
 //! MCP servers live as JSON keys in `~/.claude.json`; they cannot carry a
-//! sidecar marker, so for them the canonical VectorHawk key *is* the marker: the
-//! only VectorHawk-owned key is `vectorhawk`; every other key is custom.
+//! sidecar marker, so for them the canonical Scenery key *is* the marker: the
+//! only Scenery-owned key is `scenery`; every other key is custom.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -46,15 +46,15 @@ use tracing::warn;
 
 // ── Canonical constants (single source of truth) ────────────────────────────────
 
-/// Sidecar file written next to every VectorHawk-managed skill/plugin directory.
-pub const MANAGED_MARKER_FILENAME: &str = ".vectorhawk-managed.json";
+/// Sidecar file written next to every Scenery-managed skill/plugin directory.
+pub const MANAGED_MARKER_FILENAME: &str = ".scenery-managed.json";
 
 /// Subdirectory names under `~/.claude/plugins/` that are Anthropic plumbing and
 /// must never be touched by the reconciler.
 pub const EXCLUDED_PLUGIN_DIRS: &[&str] = &["marketplaces", "cache", "data"];
 
-/// The only `~/.claude.json` `mcpServers` key that VectorHawk owns.
-pub const VECTORHAWK_MCP_KEY: &str = "vectorhawk";
+/// The only `~/.claude.json` `mcpServers` key that Scenery owns.
+pub const SCENERY_MCP_KEY: &str = "scenery";
 
 /// The GitHub repo slug that uniquely identifies Anthropic's official plugin
 /// marketplace in `known_marketplaces.json`.
@@ -65,15 +65,15 @@ pub const ANTHROPIC_AUTHOR_NAME: &str = "Anthropic";
 
 // ── Origin ──────────────────────────────────────────────────────────────────────
 
-/// The provenance of a piece of Claude Code content, as far as VectorHawk cares.
+/// The provenance of a piece of Claude Code content, as far as Scenery cares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Origin {
     /// Anthropic first-party content. Strictly out of scope — never touch.
     AnthropicNative,
     /// User / third-party content. Eligible for adoption & governance.
     Custom,
-    /// Already adopted and owned by VectorHawk (has a marker).
-    VectorHawkManaged,
+    /// Already adopted and owned by Scenery (has a marker).
+    SceneryManaged,
 }
 
 // ── Path helpers ────────────────────────────────────────────────────────────────
@@ -99,7 +99,7 @@ pub fn agents_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".agents"))
 }
 
-/// Resolve `~/.agents/skills/` — the canonical location for VectorHawk-managed
+/// Resolve `~/.agents/skills/` — the canonical location for Scenery-managed
 /// skills. Cursor, Codex, and Gemini CLI all scan this natively; Claude Code
 /// does not, and receives a symlink under `~/.claude/skills/` instead.
 pub fn agents_skills_dir() -> Option<PathBuf> {
@@ -116,12 +116,12 @@ pub fn claude_json_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".claude.json"))
 }
 
-// ── Marker / VectorHawk-managed ─────────────────────────────────────────────────
+// ── Marker / Scenery-managed ─────────────────────────────────────────────────
 
-/// True iff `dir` contains a `.vectorhawk-managed.json` marker — the single
-/// positive test for "VectorHawk owns this directory". Filesystem is the source
+/// True iff `dir` contains a `.scenery-managed.json` marker — the single
+/// positive test for "Scenery owns this directory". Filesystem is the source
 /// of truth; this does not consult SQLite.
-pub fn is_vectorhawk_managed(dir: &Path) -> bool {
+pub fn is_scenery_managed(dir: &Path) -> bool {
     dir.join(MANAGED_MARKER_FILENAME).exists()
 }
 
@@ -130,9 +130,9 @@ pub fn is_excluded_plugin_dir(dir_name: &str) -> bool {
     EXCLUDED_PLUGIN_DIRS.contains(&dir_name)
 }
 
-/// True iff `key` is the VectorHawk-owned `mcpServers` key.
-pub fn is_vectorhawk_mcp_key(key: &str) -> bool {
-    key == VECTORHAWK_MCP_KEY
+/// True iff `key` is the Scenery-owned `mcpServers` key.
+pub fn is_scenery_mcp_key(key: &str) -> bool {
+    key == SCENERY_MCP_KEY
 }
 
 // ── known_marketplaces.json parsing ─────────────────────────────────────────────
@@ -217,12 +217,12 @@ pub fn author_is_anthropic(value: &Value) -> bool {
 /// on-disk directory for a marker check.
 ///
 /// Order of precedence:
-/// 1. A VectorHawk marker in `plugin_dir` → [`Origin::VectorHawkManaged`].
+/// 1. A Scenery marker in `plugin_dir` → [`Origin::SceneryManaged`].
 /// 2. Official marketplace **and** relative source **and** Anthropic author →
 ///    [`Origin::AnthropicNative`].
 /// 3. Otherwise → [`Origin::Custom`].
 pub fn classify_plugin(marketplace_name: &str, entry: &Value, plugin_dir: Option<&Path>) -> Origin {
-    let marker_present = plugin_dir.map(is_vectorhawk_managed).unwrap_or(false);
+    let marker_present = plugin_dir.map(is_scenery_managed).unwrap_or(false);
     classify_plugin_with(
         is_official_marketplace(marketplace_name),
         entry,
@@ -233,7 +233,7 @@ pub fn classify_plugin(marketplace_name: &str, entry: &Value, plugin_dir: Option
 /// Pure classifier core — no filesystem access. See [`classify_plugin`].
 pub fn classify_plugin_with(is_official: bool, entry: &Value, marker_present: bool) -> Origin {
     if marker_present {
-        return Origin::VectorHawkManaged;
+        return Origin::SceneryManaged;
     }
     if is_official && plugin_source_is_relative(entry) && author_is_anthropic(entry) {
         return Origin::AnthropicNative;
@@ -306,7 +306,7 @@ pub fn is_anthropic_native_in(
 }
 
 /// Guard for mutation sites under `~/.claude/`: returns `Err` if `path` is
-/// Anthropic-native content that VectorHawk must never touch.
+/// Anthropic-native content that Scenery must never touch.
 pub fn ensure_not_native(path: &Path) -> anyhow::Result<()> {
     if is_anthropic_native_path(path) {
         anyhow::bail!(
@@ -319,7 +319,7 @@ pub fn ensure_not_native(path: &Path) -> anyhow::Result<()> {
 
 // ── ~/.claude.json mcpServers ────────────────────────────────────────────────────
 
-/// Read `~/.claude.json` and return the set of **native** (non-`vectorhawk`)
+/// Read `~/.claude.json` and return the set of **native** (non-`scenery`)
 /// `mcpServers` keys.
 ///
 /// These keys represent MCP backends the AI client reaches directly, so the
@@ -333,7 +333,7 @@ pub fn native_mcp_keys_from_claude_json() -> HashSet<String> {
     }
 }
 
-/// Read a specific `claude.json` path and return its native (non-`vectorhawk`)
+/// Read a specific `claude.json` path and return its native (non-`scenery`)
 /// `mcpServers` keys. Fail-open: empty set on missing/malformed. See
 /// [`native_mcp_keys_from_claude_json`].
 pub fn native_mcp_keys_at(claude_json: &Path) -> HashSet<String> {
@@ -346,7 +346,7 @@ pub fn native_mcp_keys_at(claude_json: &Path) -> HashSet<String> {
     let mut out = HashSet::new();
     if let Some(map) = root.get("mcpServers").and_then(|v| v.as_object()) {
         for key in map.keys() {
-            if !is_vectorhawk_mcp_key(key) {
+            if !is_scenery_mcp_key(key) {
                 out.insert(key.clone());
             }
         }

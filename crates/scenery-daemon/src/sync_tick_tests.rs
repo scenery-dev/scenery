@@ -9,11 +9,6 @@
 use camino::Utf8PathBuf;
 use mockito::Server;
 use rusqlite::Connection;
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
-};
 use scenery_core::{
     audit::SqliteAuditBuffer,
     ratings::{get_unsynced_ratings, record_rating},
@@ -21,6 +16,11 @@ use scenery_core::{
     state::AppState,
 };
 use scenery_mcp::tools::UpdateCheckCache;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use crate::managed_paths::ENV_MUTEX;
 use crate::run_sync_tick;
@@ -176,7 +176,7 @@ fn gap04_update_cache_empty_when_no_installed_skills() {
 
 // ── bug-revoke-loop: revocation snapshot reconcile with NO reconciler ────────
 
-/// `vectorhawk mcp sync` (`cmd_mcp_sync`) is a one-shot CLI invocation with
+/// `scenery mcp sync` (`cmd_mcp_sync`) is a one-shot CLI invocation with
 /// no reconciler running — it always calls `run_sync_tick` with
 /// `snapshot_tx = None` (there is no `SyncController`/event channel to feed
 /// outside the long-running daemon). Before this fix, the entire snapshot
@@ -193,7 +193,7 @@ fn revocation_snapshot_applied_even_with_no_reconciler_present() {
     let state = AppState::bootstrap_in(root.clone()).unwrap();
 
     // A device_id must be on disk for `run_sync_tick` to even attempt the
-    // snapshot fetch (mirrors a real paired device; `vectorhawk mcp sync`
+    // snapshot fetch (mirrors a real paired device; `scenery mcp sync`
     // on an unpaired box has nothing to reconcile).
     state
         .set_sync_state("device_id", "mcp-sync-device")
@@ -205,13 +205,8 @@ fn revocation_snapshot_applied_even_with_no_reconciler_present() {
     // `fetch_sync_snapshot` requires an auth token to be set on the
     // RegistryClient — step 0 of `run_sync_tick` does that FROM the stored
     // tokens row, so one must exist for this path to even reach the fetch.
-    scenery_core::auth::save_tokens(
-        &state,
-        &registry_url,
-        "fake-access-tok",
-        "fake-refresh-tok",
-    )
-    .unwrap();
+    scenery_core::auth::save_tokens(&state, &registry_url, "fake-access-tok", "fake-refresh-tok")
+        .unwrap();
 
     let _approved_mock = server
         .mock("GET", "/api/runner/approved-servers")
@@ -262,7 +257,7 @@ fn revocation_snapshot_applied_even_with_no_reconciler_present() {
     assert!(
         !scenery_core::revocation::is_revoked(&state, "skill", "ghost-skill", Some("1.0.0"))
             .unwrap(),
-        "a `vectorhawk mcp sync` tick with no reconciler must still apply \
+        "a `scenery mcp sync` tick with no reconciler must still apply \
          the durable revocation list and lift the stale local gate"
     );
 
@@ -290,13 +285,8 @@ fn org_policy_snapshot_flips_the_caller_supplied_atomic() {
 
     let mut server = Server::new();
     let registry_url = server.url();
-    scenery_core::auth::save_tokens(
-        &state,
-        &registry_url,
-        "fake-access-tok",
-        "fake-refresh-tok",
-    )
-    .unwrap();
+    scenery_core::auth::save_tokens(&state, &registry_url, "fake-access-tok", "fake-refresh-tok")
+        .unwrap();
 
     let _approved_mock = server
         .mock("GET", "/api/runner/approved-servers")
@@ -369,13 +359,8 @@ fn org_policy_snapshot_absent_key_leaves_flag_untouched() {
 
     let mut server = Server::new();
     let registry_url = server.url();
-    scenery_core::auth::save_tokens(
-        &state,
-        &registry_url,
-        "fake-access-tok",
-        "fake-refresh-tok",
-    )
-    .unwrap();
+    scenery_core::auth::save_tokens(&state, &registry_url, "fake-access-tok", "fake-refresh-tok")
+        .unwrap();
 
     let _approved_mock = server
         .mock("GET", "/api/runner/approved-servers")
@@ -521,7 +506,7 @@ fn gap05_no_upload_when_no_ratings() {
 
 // ── GAP-06: Unmanaged server scan ─────────────────────────────────────────────
 
-/// When a synthetic AI client config contains a non-vectorhawk MCP server,
+/// When a synthetic AI client config contains a non-scenery MCP server,
 /// `run_sync_tick` should buffer an `unmanaged_server_detected` audit event.
 ///
 /// We inject a config file by writing a fake `~/.claude.json`-shaped file to a
@@ -538,7 +523,7 @@ fn gap06_unmanaged_server_buffered_as_audit_event() {
     let claude_json_path = fake_home.join(".claude.json");
     let config = serde_json::json!({
         "mcpServers": {
-            "vectorhawk": {"command": "vectorhawk", "args": ["mcp", "serve"]},
+            "scenery": {"command": "scenery", "args": ["mcp", "serve"]},
             "shadow-tool": {"command": "npx", "args": ["-y", "shadow-mcp-server"]}
         }
     });
@@ -621,7 +606,7 @@ fn gap06_unmanaged_server_buffered_as_audit_event() {
 }
 
 /// When all MCP servers in an AI client config are managed (i.e. only
-/// `vectorhawk`), no `unmanaged_server_detected` events are buffered.
+/// `scenery`), no `unmanaged_server_detected` events are buffered.
 #[test]
 fn gap06_no_events_when_all_servers_managed() {
     let root = temp_root("gap06-managed");
@@ -632,7 +617,7 @@ fn gap06_no_events_when_all_servers_managed() {
     let claude_json_path = fake_home.join(".claude.json");
     let config = serde_json::json!({
         "mcpServers": {
-            "vectorhawk": {"command": "vectorhawk", "args": ["mcp", "serve"]}
+            "scenery": {"command": "scenery", "args": ["mcp", "serve"]}
         }
     });
     std::fs::write(
@@ -688,7 +673,7 @@ fn gap06_no_events_when_all_servers_managed() {
 
     assert_eq!(
         count, 0,
-        "no unmanaged_server_detected events when only vectorhawk is configured"
+        "no unmanaged_server_detected events when only scenery is configured"
     );
 
     let _ = std::fs::remove_dir_all(&root);

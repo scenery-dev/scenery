@@ -234,7 +234,7 @@ mod tests {
         );
         let result = init_resp.result.unwrap();
         assert_eq!(result["protocolVersion"], "2024-11-05");
-        assert_eq!(result["serverInfo"]["name"], "vectorhawkd");
+        assert_eq!(result["serverInfo"]["name"], "scenery");
 
         // ── tools/list ──────────────────────────────────────────────────────
         let list_req = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#;

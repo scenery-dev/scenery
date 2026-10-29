@@ -28,7 +28,7 @@ pub const MCP_USER_ID_SYNC_STATE_KEY: &str = "mcp_user_id";
 const LEGACY_LOCAL_MCP_KEY_SYNC_STATE_KEY: &str = "mcp_local_key";
 
 /// Secrets-store name ([`crate::secret_file`]) of the per-user key for the
-/// local MCP HTTP resource server's `X-VectorHawk-Local-Key` header (H3 —
+/// local MCP HTTP resource server's `X-Scenery-Local-Key` header (H3 —
 /// defeats another OS user on this machine from reaching
 /// `127.0.0.1:<mcp_http_port>`, which has no same-user ACL the way the Unix
 /// socket does). `scenery-daemon::mcp_http` checks it on every request
@@ -47,7 +47,7 @@ const LEGACY_SECRETS_MOVED_SYNC_STATE_KEY: &str = "legacy_secrets_moved";
 /// this logs a warning when it does. Tests exercise the HTTP RS against a
 /// `mockito` `http://` server with this set; production registries are
 /// always `https://`.
-pub const MCP_HTTP_ALLOW_INSECURE_ISSUER_ENV: &str = "VECTORHAWK_MCP_HTTP_ALLOW_INSECURE_ISSUER";
+pub const MCP_HTTP_ALLOW_INSECURE_ISSUER_ENV: &str = "SCENERY_MCP_HTTP_ALLOW_INSECURE_ISSUER";
 
 /// M9: whether the local MCP HTTP resource server may be started — or its
 /// Claude Code config entry written — against `registry_url` as the OAuth
@@ -64,15 +64,15 @@ pub fn mcp_http_issuer_allowed(registry_url: &str) -> bool {
 
 /// Bootstrapped application state: root directory and SQLite path.
 ///
-/// The root directory is `~/Library/Application Support/VectorHawk/` on macOS
-/// and `$XDG_DATA_HOME/vectorhawk/` (defaulting to `~/.local/share/vectorhawk/`)
+/// The root directory is `~/Library/Application Support/Scenery/` on macOS
+/// and `$XDG_DATA_HOME/scenery/` (defaulting to `~/.local/share/scenery/`)
 /// on Linux. The daemon owns this state; the CLI reads it directly for now (M1
 /// will decide whether CLI goes through the socket or reads SQLite directly).
 #[derive(Clone)]
 pub struct AppState {
     pub root_dir: Utf8PathBuf,
     pub db_path: Utf8PathBuf,
-    /// Live-flippable kill switch for third-party (non-VectorHawk-brokered)
+    /// Live-flippable kill switch for third-party (non-Scenery-brokered)
     /// inference calls. Seeded from `sync_state` on startup via
     /// `seed_block_third_party_from_sync_state`; later tasks flip it in
     /// response to remote policy pushes without a daemon restart.
@@ -80,7 +80,7 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Resolve the platform-appropriate data directory (`<data_dir>/VectorHawk`)
+    /// Resolve the platform-appropriate data directory (`<data_dir>/Scenery`)
     /// without bootstrapping SQLite or creating any subdirectories.
     ///
     /// Uses `dirs::data_dir()` which returns:
@@ -94,7 +94,7 @@ impl AppState {
     pub fn resolve_root_dir() -> Result<Utf8PathBuf> {
         let base = dirs::data_dir()
             .context("failed to resolve platform data directory (HOME not set?)")?;
-        Utf8PathBuf::from_path_buf(base.join("VectorHawk"))
+        Utf8PathBuf::from_path_buf(base.join("Scenery"))
             .map_err(|p| anyhow::anyhow!("non-UTF-8 data dir path: {}", p.display()))
     }
 
@@ -309,15 +309,14 @@ impl AppState {
 
     /// Convenience: return the path where the daemon Unix socket is expected.
     ///
-    /// macOS: `~/Library/Application Support/VectorHawk/agent.sock`
-    /// Linux: `$XDG_RUNTIME_DIR/vectorhawk/agent.sock` (falls back to root_dir)
+    /// macOS: `~/Library/Application Support/Scenery/agent.sock`
+    /// Linux: `$XDG_RUNTIME_DIR/scenery/agent.sock` (falls back to root_dir)
     pub fn socket_path(&self) -> Utf8PathBuf {
         #[cfg(target_os = "linux")]
         {
             if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
-                let base = Utf8PathBuf::from_path_buf(
-                    std::path::PathBuf::from(runtime).join("vectorhawk"),
-                );
+                let base =
+                    Utf8PathBuf::from_path_buf(std::path::PathBuf::from(runtime).join("scenery"));
                 if let Ok(base) = base {
                     return base.join("agent.sock");
                 }
@@ -407,7 +406,7 @@ impl AppState {
     /// `context/2026-10-13-zero-cli-http-mcp-oauth-design.md`) is enabled
     /// for this daemon.
     ///
-    /// `VECTORHAWK_MCP_HTTP=0`/`false` (env, checked first so it always wins
+    /// `SCENERY_MCP_HTTP=0`/`false` (env, checked first so it always wins
     /// for an operator debugging a specific run) or
     /// `sync_state["mcp_http_enabled"]` set to `0`/`false` disables it.
     /// Default: **on**. Shared by `scenery-daemon::mcp_http` (which
@@ -417,7 +416,7 @@ impl AppState {
     /// the HTTP+OAuth entry) so both sides of that decision can never
     /// disagree about whether the feature is on.
     pub fn mcp_http_enabled(&self) -> bool {
-        if let Ok(v) = std::env::var("VECTORHAWK_MCP_HTTP") {
+        if let Ok(v) = std::env::var("SCENERY_MCP_HTTP") {
             return !(v == "0" || v.eq_ignore_ascii_case("false"));
         }
         match self.get_sync_state("mcp_http_enabled") {
@@ -427,7 +426,7 @@ impl AppState {
     }
 
     /// The per-user local key for the MCP HTTP resource server's
-    /// `X-VectorHawk-Local-Key` header (H3), generating and persisting one on
+    /// `X-Scenery-Local-Key` header (H3), generating and persisting one on
     /// first use. Stable across calls/processes — the daemon and `mcp setup`
     /// read the same [`LOCAL_MCP_KEY_SECRET`] file, so they always agree
     /// without an extra IPC round trip, and `mcp setup` re-running keeps the
@@ -450,7 +449,7 @@ impl AppState {
     }
 
     /// Generate a fresh local key and persist it, overwriting any existing
-    /// value — `vectorhawk mcp setup --rotate-local-key`. Any client config
+    /// value — `scenery mcp setup --rotate-local-key`. Any client config
     /// written with the previous key stops working against this daemon
     /// until it's rewritten with the new one.
     pub fn rotate_local_mcp_key(&self) -> Result<String> {
@@ -465,7 +464,7 @@ impl AppState {
     }
 
     /// Delete the local key, so the next [`Self::local_mcp_key`] generates a
-    /// new one. Used by `vectorhawk uninstall`.
+    /// new one. Used by `scenery uninstall`.
     pub fn clear_local_mcp_key(&self) -> Result<()> {
         secret_file::remove(self.root_dir.as_std_path(), LOCAL_MCP_KEY_SECRET)
             .context("failed to delete the local MCP key")
@@ -475,7 +474,7 @@ impl AppState {
     /// `device_uuid`, and [`MCP_USER_ID_SYNC_STATE_KEY`] (the local MCP HTTP
     /// resource server's cached bound-user-id).
     ///
-    /// M6: called by both `vectorhawk auth logout` and
+    /// M6: called by both `scenery auth logout` and
     /// [`AppState::mark_device_revoked`]. Without clearing `mcp_user_id` too,
     /// a user who logs out and a *different* user who logs in afterward
     /// would have their valid MCP access token rejected as `sub_mismatch`
@@ -491,7 +490,7 @@ impl AppState {
 
     /// Record that the backend revoked THIS device (device-revocation-v2):
     /// clears the local `device_uuid`/`device_id` identity and stamps
-    /// `device_revoked_at` for `vectorhawk auth status`/`doctor` to
+    /// `device_revoked_at` for `scenery auth status`/`doctor` to
     /// surface to the user.
     ///
     /// Deliberately does NOT itself trigger a new registration. Clearing
@@ -500,7 +499,7 @@ impl AppState {
     /// to resend — callers of THAT function are responsible for refusing
     /// to auto-generate and register a fresh identity on their own once
     /// `device_revoked_at` is set (see its doc comment), so a revoked
-    /// device can only come back through a deliberate `vectorhawk auth
+    /// device can only come back through a deliberate `scenery auth
     /// pair`, which is the only code path that both generates a new
     /// `device_uuid` AND calls [`AppState::clear_device_revoked`].
     ///
@@ -517,7 +516,7 @@ impl AppState {
     }
 
     /// Clear the `device_revoked_at` marker set by [`AppState::mark_device_revoked`].
-    /// Called once a fresh `vectorhawk auth pair` has established a new
+    /// Called once a fresh `scenery auth pair` has established a new
     /// device identity, so `auth status`/`doctor` stop reporting the old
     /// revocation against the (now different) device.
     pub fn clear_device_revoked(&self) -> Result<()> {
@@ -557,7 +556,7 @@ impl AppState {
     /// (`managed_paths_policy_update` / `inference_policy_update`) would.
     ///
     /// This is what lets a daemon that was offline (or a one-shot
-    /// `vectorhawk mcp sync`) during an admin toggle converge immediately on
+    /// `scenery mcp sync`) during an admin toggle converge immediately on
     /// reconnect/next tick, instead of staying stale until the next live
     /// toggle or a restart (Card 3 — org-policy snapshot reconcile).
     pub fn apply_org_policy_snapshot(
@@ -598,7 +597,7 @@ impl AppState {
     /// Used by the aggregator to filter out tools whose backend is already
     /// surfaced as a per-server entry in Claude Code — otherwise the AI
     /// client sees the same tool both natively (under its own server name)
-    /// and nested under the `vectorhawk` aggregator.
+    /// and nested under the `scenery` aggregator.
     pub fn list_managed_mcp_slugs(&self) -> Result<Vec<String>> {
         let conn = Connection::open(&self.db_path).context("failed to open state DB")?;
         let mut stmt = conn
@@ -722,7 +721,7 @@ impl AppState {
 
 impl AppState {
     /// Record that `slug` has a discovered `source_path` awaiting removal
-    /// ("takeover") once a real VectorHawk-managed install for that slug is
+    /// ("takeover") once a real Scenery-managed install for that slug is
     /// confirmed present on disk.
     ///
     /// Upsert — safe to call repeatedly for the same slug (e.g. on SSE
@@ -890,7 +889,7 @@ CREATE TABLE IF NOT EXISTS mcp_installations (
 /// F1: managed-paths reconciler marker table.
 ///
 /// Tracks every skill, plugin, and MCP entry that has been migrated into
-/// VectorHawk ownership.  The `path` column is the absolute filesystem path
+/// Scenery ownership.  The `path` column is the absolute filesystem path
 /// (or `<path>:<key>` virtual key for MCP entries) and serves as the
 /// idempotency key so re-runs are no-ops.
 const SCHEMA_F1_SQL: &str = r#"
@@ -913,7 +912,7 @@ CREATE TABLE IF NOT EXISTS skill_local_names (
 ///
 /// Records skills adopted from local discovery whose original `source_path`
 /// (e.g. `~/.agents/skills/<slug>`) has not yet been removed because a real
-/// VectorHawk-managed install was not confirmed present on disk at adopt
+/// Scenery-managed install was not confirmed present on disk at adopt
 /// time (outcome was `pending_review`, or the immediate publish+install had
 /// not yet completed). The row is deleted once takeover (source removal)
 /// completes — see `managed_paths::takeover` in the daemon crate.
@@ -1162,8 +1161,8 @@ mod tests {
         cleanup(&root);
     }
 
-    // macOS uses `~/Library/Application Support/VectorHawk/agent.sock`; Linux
-    // uses `$XDG_RUNTIME_DIR/vectorhawk/agent.sock` which is NOT under the data
+    // macOS uses `~/Library/Application Support/Scenery/agent.sock`; Linux
+    // uses `$XDG_RUNTIME_DIR/scenery/agent.sock` which is NOT under the data
     // root the test creates. Gate this assertion to macOS only — the equivalent
     // Linux assertion would have to introspect XDG_RUNTIME_DIR.
     #[cfg(target_os = "macos")]
@@ -1173,7 +1172,7 @@ mod tests {
         let state = AppState::bootstrap_in(root.clone()).expect("bootstrap");
         let sock = state.socket_path();
         assert!(
-            sock.as_str().contains("VectorHawk") || sock.as_str().contains("vh-state-tests"),
+            sock.as_str().contains("Scenery") || sock.as_str().contains("vh-state-tests"),
             "socket path should be under the data dir: {sock}"
         );
         cleanup(&root);
@@ -1380,7 +1379,7 @@ mod tests {
     }
 
     /// Serializes tests that mutate the process-global
-    /// `VECTORHAWK_MCP_HTTP_ALLOW_INSECURE_ISSUER` env var — only one test
+    /// `SCENERY_MCP_HTTP_ALLOW_INSECURE_ISSUER` env var — only one test
     /// in this binary touches it, but the guard documents the hazard for
     /// whoever adds the next one.
     static MCP_HTTP_ISSUER_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -1392,8 +1391,8 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         std::env::remove_var(MCP_HTTP_ALLOW_INSECURE_ISSUER_ENV);
 
-        assert!(mcp_http_issuer_allowed("https://dev.vectorhawk.ai"));
-        assert!(!mcp_http_issuer_allowed("http://dev.vectorhawk.ai"));
+        assert!(mcp_http_issuer_allowed("https://dev.scenery.dev"));
+        assert!(!mcp_http_issuer_allowed("http://dev.scenery.dev"));
         assert!(!mcp_http_issuer_allowed("http://127.0.0.1:1234"));
 
         std::env::set_var(MCP_HTTP_ALLOW_INSECURE_ISSUER_ENV, "1");

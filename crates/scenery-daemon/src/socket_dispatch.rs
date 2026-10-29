@@ -29,8 +29,8 @@
 //! # `notifications/tools/list_changed` (GAP-03)
 //!
 //! After any `tools/call` whose tool name is one of the mutating management
-//! tools (`vectorhawk_install`, `vectorhawk_uninstall`, `vectorhawk_update`,
-//! `vectorhawk_import`, `vectorhawk_mcp_install`, `vectorhawk_mcp_uninstall`),
+//! tools (`scenery_install`, `scenery_uninstall`, `scenery_update`,
+//! `scenery_import`, `scenery_mcp_install`, `scenery_mcp_uninstall`),
 //! the dispatch loop:
 //!
 //! 1. Writes a framed `notifications/tools/list_changed` frame to **this**
@@ -43,12 +43,6 @@
 //! the receiver and writes the notification frame whenever the channel fires.
 
 use anyhow::Result;
-use std::sync::Arc;
-use tokio::{
-    net::UnixStream,
-    sync::{broadcast, Notify},
-};
-use tracing::{debug, error, info, warn};
 use scenery_mcp::{
     backend::{read_framed, write_framed, Backend, RealBackend},
     protocol::{
@@ -56,6 +50,12 @@ use scenery_mcp::{
         INVALID_PARAMS, METHOD_NOT_FOUND, PARSE_ERROR,
     },
 };
+use std::sync::Arc;
+use tokio::{
+    net::UnixStream,
+    sync::{broadcast, Notify},
+};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     auth_dispatch::{
@@ -67,12 +67,12 @@ use crate::{
 
 /// Tool names whose successful dispatch should trigger `list_changed`.
 const MUTATING_TOOLS: &[&str] = &[
-    "vectorhawk_install",
-    "vectorhawk_uninstall",
-    "vectorhawk_update",
-    "vectorhawk_import",
-    "vectorhawk_mcp_install",
-    "vectorhawk_mcp_uninstall",
+    "scenery_install",
+    "scenery_uninstall",
+    "scenery_update",
+    "scenery_import",
+    "scenery_mcp_install",
+    "scenery_mcp_uninstall",
 ];
 
 /// Shared daemon context passed to every per-connection handler.
@@ -379,7 +379,7 @@ where
     let notification = serde_json::json!({
         "jsonrpc": "2.0",
         "method": "notifications/message",
-        "params": { "level": "info", "logger": "vectorhawk", "data": message },
+        "params": { "level": "info", "logger": "scenery", "data": message },
     });
     let body = match serde_json::to_vec(&notification) {
         Ok(b) => b,

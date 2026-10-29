@@ -4,7 +4,7 @@
 //! shelling out to `ps`/`lsof` and without signaling anything beyond the
 //! liveness/permission probe `kill(pid, 0)` already requires. See
 //! `daemon_takeover`'s module docs for how these answers feed the decision
-//! of whether another `vectorhawk daemon run` process is safe to take over.
+//! of whether another `scenery daemon run` process is safe to take over.
 //!
 //! # Why not `/proc` uniformly
 //!

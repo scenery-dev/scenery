@@ -1,4 +1,4 @@
-//! Automatic takeover of an older/stale `vectorhawk daemon run` process.
+//! Automatic takeover of an older/stale `scenery daemon run` process.
 //!
 //! # Why this exists
 //!
@@ -7,7 +7,7 @@
 //! incomplete: a daemon built before `instance_lock` (commit `3d45ddb`) and
 //! `binary_watch` (v1.0.94–96) holds neither of those, only the socket, and
 //! it never notices its own binary has been replaced. Such a daemon sits on
-//! the socket forever; every subsequent `vectorhawk daemon run` (a fresh
+//! the socket forever; every subsequent `scenery daemon run` (a fresh
 //! install, an upgrade, a crash-restart) refuses to start, and stale
 //! governance code keeps running. This module is the owner-approved fix:
 //! verify the holder, then take over automatically.
@@ -25,7 +25,7 @@
 //! A pid is only ever taken over when **all** of these hold:
 //! 1. it is not this process;
 //! 2. it shares this process's effective uid;
-//! 3. its argv matches `vectorhawk daemon run` **positionally** — see
+//! 3. its argv matches `scenery daemon run` **positionally** — see
 //!    [`cmdline_is_daemon_run`]'s doc comment for why this must never be a
 //!    substring test (a prior substring-matching version of this exact
 //!    check killed an innocent `bash -c ...` shell during live
@@ -41,7 +41,7 @@
 //!
 //! This is the single place that decision is made — [`verify_pid`] is
 //! called identically by `run_daemon` at startup (`lib.rs`) and by
-//! `vectorhawk daemon install` (`scenery-cli`'s `install/linux.rs` and
+//! `scenery daemon install` (`scenery-cli`'s `install/linux.rs` and
 //! `install/macos.rs`), so the rules above are enforced exactly once, not
 //! reimplemented per call site.
 
@@ -111,7 +111,7 @@ pub fn verify_pid<I: ProcessInspector>(
         .unwrap_or(false);
     if !argv_matches {
         return Verdict::Refuse(format!(
-            "pid {pid} does not look like a `vectorhawk daemon run` process — refusing"
+            "pid {pid} does not look like a `scenery daemon run` process — refusing"
         ));
     }
 
@@ -178,7 +178,7 @@ where
 }
 
 /// Given no socket connection to read peer credentials from, find the
-/// single `vectorhawk daemon run` process (same uid, not us) that is
+/// single `scenery daemon run` process (same uid, not us) that is
 /// plausibly holding the instance lock.
 ///
 /// Returns `Some(pid)` only when **exactly one** such candidate exists.
@@ -213,25 +213,25 @@ pub fn resolve_unique_daemon_run_pid<I: ProcessInspector>(
 /// Given the raw, NUL-separated argv bytes of a process (Linux
 /// `/proc/<pid>/cmdline` shape, or the equivalent reconstructed by
 /// `process_probe` on macOS from `KERN_PROCARGS2`), report whether it is a
-/// `vectorhawk daemon run` invocation (with or without trailing args such
+/// `scenery daemon run` invocation (with or without trailing args such
 /// as `--foreground`).
 ///
 /// Matches **positionally on argv**, not by substring: `argv[0]`'s basename
-/// must be exactly `vectorhawk` (argv[0] may be a bare name or an absolute
-/// path, e.g. `/home/linuxbrew/.linuxbrew/bin/vectorhawk`), `argv[1]` must
+/// must be exactly `scenery` (argv[0] may be a bare name or an absolute
+/// path, e.g. `/home/linuxbrew/.linuxbrew/bin/scenery`), `argv[1]` must
 /// be exactly `daemon`, and `argv[2]` must be exactly `run`. Trailing args
 /// are ignored.
 ///
 /// This is a hard requirement, not a style preference: an earlier version
 /// of this exact check (then duplicated across `reap_stray_daemons` and
 /// `kill_daemon_process` in the CLI installer) matched by substring against
-/// the whole cmdline blob (`contains("vectorhawk") && contains("daemon") &&
+/// the whole cmdline blob (`contains("scenery") && contains("daemon") &&
 /// contains("run"/"foreground")`), and that killed an innocent process
 /// during live verification — a `bash -c …` shell whose command line
-/// happened to mention `vectorhawk`, `daemon`, and `/run/user/1000/bus`
+/// happened to mention `scenery`, `daemon`, and `/run/user/1000/bus`
 /// nowhere near each other (commit `0a862ca`). Positional argv matching
 /// cannot be fooled by unrelated tokens elsewhere on the line, and it also
-/// naturally excludes `vectorhawk daemon install`/`restart` (the CLI
+/// naturally excludes `scenery daemon install`/`restart` (the CLI
 /// invocation doing the reaping/killing itself), since `argv[2]` there is
 /// `install`/`restart`, not `run`.
 ///
@@ -252,7 +252,7 @@ pub fn cmdline_is_daemon_run(raw: &[u8]) -> bool {
     };
 
     let basename = argv0.rsplit(|&b| b == b'/').next().unwrap_or(argv0);
-    basename == b"vectorhawk" && argv1 == b"daemon" && argv2 == b"run"
+    (basename == b"scenery" || basename == b"scn") && argv1 == b"daemon" && argv2 == b"run"
 }
 
 #[cfg(test)]

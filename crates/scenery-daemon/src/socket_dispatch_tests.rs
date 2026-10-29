@@ -3,13 +3,13 @@
 
 #![allow(clippy::unwrap_used)]
 
-use std::sync::Arc;
-use tokio::sync::{broadcast, Notify};
 use scenery_mcp::{
     aggregator::{BackendEntry, BackendRegistry, BackendTransport, ToolDefinition, ToolVisibility},
     backend::RealBackend,
     protocol::{JsonRpcRequest, METHOD_NOT_FOUND},
 };
+use std::sync::Arc;
+use tokio::sync::{broadcast, Notify};
 
 use crate::oauth_state::OAuthState;
 
@@ -103,7 +103,7 @@ async fn dispatch_initialize_returns_protocol_version() {
     );
     let result = resp.result.unwrap();
     assert_eq!(result["protocolVersion"], "2024-11-05");
-    assert_eq!(result["serverInfo"]["name"], "vectorhawkd");
+    assert_eq!(result["serverInfo"]["name"], "scenery");
     assert!(result["capabilities"]["tools"].is_object());
 }
 
@@ -202,15 +202,15 @@ async fn dispatch_auth_get_oauth_listener_port_returns_port() {
 #[tokio::test]
 async fn adoption_alert_frame_is_a_wellformed_mcp_notification() {
     let mut buf: Vec<u8> = Vec::new();
-    send_alert_frame(&mut buf, "VectorHawk adopted 3 tool(s)").await;
+    send_alert_frame(&mut buf, "Scenery adopted 3 tool(s)").await;
     let s = String::from_utf8_lossy(&buf);
     // Framing may add a length prefix/newline, but the JSON body is UTF-8.
     assert!(
         s.contains("\"method\":\"notifications/message\""),
         "got: {s}"
     );
-    assert!(s.contains("VectorHawk adopted 3 tool(s)"), "got: {s}");
-    assert!(s.contains("\"logger\":\"vectorhawk\""), "got: {s}");
+    assert!(s.contains("Scenery adopted 3 tool(s)"), "got: {s}");
+    assert!(s.contains("\"logger\":\"scenery\""), "got: {s}");
     assert!(s.contains("\"level\":\"info\""), "got: {s}");
 }
 

@@ -13,7 +13,7 @@
 //!   within 3 seconds. The AI client surfaces the error to the user.
 //!
 //! This test:
-//!   1. Spawns `vectorhawk daemon run` (daemon) and `vectorhawk mcp serve` (shim).
+//!   1. Spawns `scenery daemon run` (daemon) and `scenery mcp serve` (shim).
 //!   2. Performs a successful `initialize` + `tools/list` round-trip via
 //!      the daemon socket path (confirming the live path works).
 //!   3. Kills the daemon with SIGKILL (hard kill).
@@ -68,11 +68,11 @@ fn daemon_socket_path() -> PathBuf {
     #[cfg(target_os = "linux")]
     {
         if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
-            return PathBuf::from(runtime).join("vectorhawk").join("agent.sock");
+            return PathBuf::from(runtime).join("scenery").join("agent.sock");
         }
     }
     let data_dir = dirs::data_dir().expect("dirs::data_dir() should succeed");
-    data_dir.join("VectorHawk").join("agent.sock")
+    data_dir.join("Scenery").join("agent.sock")
 }
 
 fn wait_for_socket(path: &std::path::Path, timeout: Duration) -> bool {
@@ -113,9 +113,9 @@ fn send_rpc(
 }
 
 fn kill_stale_daemon() {
-    // `-x vectorhawk` for exact process-name match — see m0_acceptance::kill_stale_daemon
+    // `-x scenery` for exact process-name match — see m0_acceptance::kill_stale_daemon
     // for why `-f` was wrong on Linux.
-    let _ = Command::new("pkill").args(["-x", "vectorhawk"]).status();
+    let _ = Command::new("pkill").args(["-x", "scenery"]).status();
     std::thread::sleep(Duration::from_millis(300));
 }
 
@@ -155,16 +155,16 @@ fn libc_sigkill() -> i32 {
 #[test]
 #[ignore = "requires pre-built release binaries — run cargo build --workspace --release first"]
 fn ac4_daemon_kill_shim_returns_daemon_required_error_within_3s() {
-    let daemon_bin = release_bin("vectorhawk");
-    let shim_bin = release_bin("vectorhawk");
+    let daemon_bin = release_bin("scenery");
+    let shim_bin = release_bin("scenery");
 
     assert!(
         daemon_bin.exists(),
-        "vectorhawk binary not found at {daemon_bin:?} — run cargo build --workspace --release"
+        "scenery binary not found at {daemon_bin:?} — run cargo build --workspace --release"
     );
     assert!(
         shim_bin.exists(),
-        "vectorhawk binary not found at {shim_bin:?} — run cargo build --workspace --release"
+        "scenery binary not found at {shim_bin:?} — run cargo build --workspace --release"
     );
 
     let socket_path = daemon_socket_path();
@@ -178,7 +178,7 @@ fn ac4_daemon_kill_shim_returns_daemon_required_error_within_3s() {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("failed to spawn vectorhawk daemon run");
+        .expect("failed to spawn scenery daemon run");
 
     let socket_appeared = wait_for_socket(&socket_path, Duration::from_secs(5));
     if !socket_appeared {
@@ -193,7 +193,7 @@ fn ac4_daemon_kill_shim_returns_daemon_required_error_within_3s() {
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .expect("failed to spawn vectorhawk mcp serve");
+        .expect("failed to spawn scenery mcp serve");
 
     let mut stdin = shim.stdin.take().expect("shim stdin");
     let stdout_raw = shim.stdout.take().expect("shim stdout");
@@ -328,13 +328,13 @@ fn ac4_daemon_kill_shim_returns_daemon_required_error_within_3s() {
 /// Not marked `#[ignore]` — runs without any external binaries.
 #[tokio::test]
 async fn embedded_backend_accepts_hybrid_model_client() {
-    use std::io::Cursor;
-    use std::sync::Arc;
     use scenery_core::model::{MockModelClient, ModelClient};
     use scenery_mcp::{
         backend::{Backend, EmbeddedBackend},
         sampling::{HybridModelClient, McpSamplingClient},
     };
+    use std::io::Cursor;
+    use std::sync::Arc;
 
     // Build a McpSamplingClient that immediately returns an EOF so that if
     // any sampling request is ever attempted it fails cleanly rather than

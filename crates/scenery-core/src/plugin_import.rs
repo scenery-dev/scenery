@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
+use scenery_manifest::{PluginCommand, PluginMcpServer, PluginUserConfigEntry};
 use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
-use scenery_manifest::{PluginCommand, PluginMcpServer, PluginUserConfigEntry};
 
 /// Recognized external plugin formats that can be imported.
 #[derive(Debug, PartialEq)]
@@ -126,10 +126,10 @@ fn read_mcp_servers_from_file(mcp_file: &Utf8Path) -> Result<Vec<PluginMcpServer
     Ok(servers)
 }
 
-/// Import a Claude Code plugin directory into VectorHawk plugin format.
+/// Import a Claude Code plugin directory into Scenery plugin format.
 ///
 /// Reads `.claude-plugin/plugin.json`, converts MCP servers, copies skill
-/// SKILL.md files as commands, and writes a VectorHawk `plugin.json` to
+/// SKILL.md files as commands, and writes a Scenery `plugin.json` to
 /// `{output_dir}/{plugin_id}/`.
 pub fn import_claude_code_plugin(
     plugin_dir: &Utf8Path,
@@ -255,7 +255,7 @@ pub fn import_claude_code_plugin(
             HashMap::new()
         };
 
-    // Serialize to VectorHawk plugin.json
+    // Serialize to Scenery plugin.json
     let plugin_json = serde_json::json!({
         "schema_version": "1.0",
         "id": plugin_id,
@@ -320,13 +320,13 @@ impl<R: std::io::Seek> std::io::Seek for ReadBudget<R> {
     }
 }
 
-/// Import a `.mcpb` Desktop Extension into VectorHawk plugin format.
+/// Import a `.mcpb` Desktop Extension into Scenery plugin format.
 ///
 /// A `.mcpb` file is a ZIP archive containing a `manifest.json` that
 /// describes the MCP server. Only `manifest.json` is read (capped at
 /// [`MAX_MANIFEST_BYTES`]); no other entry is decompressed or extracted, so a
 /// zip bomb elsewhere in the archive is never inflated. Archives listing more
-/// than [`MAX_MCPB_ENTRIES`] entries are rejected. Writes a VectorHawk
+/// than [`MAX_MCPB_ENTRIES`] entries are rejected. Writes a Scenery
 /// `plugin.json` to `{output_dir}/{plugin_id}/`.
 pub fn import_mcpb(mcpb_path: &Utf8Path, output_dir: &Utf8Path) -> Result<Utf8PathBuf> {
     let file = fs::File::open(mcpb_path).with_context(|| format!("failed to open {mcpb_path}"))?;
@@ -467,7 +467,7 @@ mod tests {
 
     #[test]
     fn derive_plugin_id_converts_name_to_slug() {
-        assert_eq!(derive_plugin_id("VectorHawk"), "vectorhawk");
+        assert_eq!(derive_plugin_id("Scenery"), "scenery");
         assert_eq!(derive_plugin_id("My Workflow Plugin"), "my-workflow-plugin");
         assert_eq!(derive_plugin_id("  --leading--  "), "leading");
         assert_eq!(derive_plugin_id("A.B.C"), "a-b-c");
@@ -528,7 +528,7 @@ mod tests {
     // ── import_claude_code_plugin ─────────────────────────────────────────────
 
     #[test]
-    fn import_claude_code_creates_vectorhawk_plugin() {
+    fn import_claude_code_creates_scenery_plugin() {
         let src = temp_root("cc-src");
         let out = temp_root("cc-out");
         fs::create_dir_all(&out).expect("create output dir");

@@ -1,6 +1,6 @@
 //! Card 1 — CLI direct-execution Block Third-Party Inference enforcement.
 //!
-//! `vectorhawk skill run` (and any other direct-execution command that
+//! `scenery skill run` (and any other direct-execution command that
 //! performs real inference) must fail closed under the org policy exactly
 //! like the daemon does. `AppState::bootstrap()` always starts the
 //! `block_third_party_inference` atomic at `false`; only an explicit
@@ -19,11 +19,11 @@
 //! re-verified here at the CLI wiring layer).
 
 use super::{cli_inference_client, NoCloudChannel};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use scenery_core::model::{ModelClient, ModelRequest};
 use scenery_core::ollama::OllamaClient;
 use scenery_core::state::AppState;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 fn temp_state() -> AppState {
     let dir = tempfile::tempdir().expect("tempdir");

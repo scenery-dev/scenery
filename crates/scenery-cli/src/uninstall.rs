@@ -1,4 +1,4 @@
-//! `vectorhawk uninstall` — remove VectorHawk and restore the host to as close
+//! `scenery uninstall` — remove Scenery and restore the host to as close
 //! to its pre-install state as possible, leaving **nothing broken behind**.
 //!
 //! Design invariant (see board card "unified uninstall command"):
@@ -11,13 +11,13 @@
 //! external mutation the runner made is unwound in reverse, and the result is
 //! summarized in a **restore report** with three sections:
 //!
-//! * **REMOVED (completely)** — tools that only worked *via* VectorHawk (gateway-
+//! * **REMOVED (completely)** — tools that only worked *via* Scenery (gateway-
 //!   brokered MCP servers, IT-curated managed skills/plugins). Their client-config
 //!   entries are deleted entirely so no dead entry is left behind, and each is
 //!   listed with enough detail (name, transport, upstream) for the user to re-add
 //!   it against their own configuration.
 //! * **KEPT (unregistered)** — the user's *own* tools VH only audited. Left in
-//!   place, untouched, simply no longer governed by VectorHawk.
+//!   place, untouched, simply no longer governed by Scenery.
 //! * **RESTORED** — items VH took over that pre-existed on the machine (native
 //!   `~/.claude` takeovers, adopted originals), put back where they were.
 //!
@@ -29,28 +29,28 @@
 //! pre-journal DB/marker-file heuristics remain as a best-effort fallback.
 
 use anyhow::{Context, Result};
+use scenery_core::restore_journal::{JournalEntry, JournalSource, RestoreJournal};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
-use scenery_core::restore_journal::{JournalEntry, JournalSource, RestoreJournal};
 
-/// Flags for `vectorhawk uninstall`.
+/// Flags for `scenery uninstall`.
 #[derive(Debug, Default)]
 pub struct UninstallOpts {
     /// Skip the confirmation prompt.
     pub yes: bool,
-    /// Also delete the VectorHawk data directory (state.db, installed skills,
+    /// Also delete the Scenery data directory (state.db, installed skills,
     /// cache) and the OS-keychain auth token. Off by default so a re-install can
     /// pick up where it left off.
     pub purge: bool,
     /// Print the plan and report but make no changes.
     pub dry_run: bool,
-    /// Where to write the report file. Defaults to `~/VectorHawk-uninstall-<ts>`.
+    /// Where to write the report file. Defaults to `~/Scenery-uninstall-<ts>`.
     pub report_dir: Option<PathBuf>,
     /// Registry base URL, for the backend device-deprovision call.
     pub registry_url: String,
 }
 
-/// One tool that only worked via VectorHawk and was removed outright.
+/// One tool that only worked via Scenery and was removed outright.
 #[derive(Debug, Serialize)]
 pub struct RemovedItem {
     pub name: String,
@@ -107,7 +107,7 @@ pub async fn run(opts: UninstallOpts) -> Result<()> {
     // ── 1. Plan (read-only): classify everything before mutating anything. ──
     let plan = build_plan(&mut report).context("failed to inspect current install")?;
 
-    // Show the plan and, unless --yes, confirm. A user demoing VectorHawk needs
+    // Show the plan and, unless --yes, confirm. A user demoing Scenery needs
     // to see *exactly* what will and won't survive before committing.
     print_plan(&plan, &report);
     if opts.dry_run {
@@ -137,7 +137,7 @@ pub async fn run(opts: UninstallOpts) -> Result<()> {
     // Native `~/.claude` takeovers + adopted originals from the restore journal.
     restore_from_journal(&journal_entries, &mut report);
 
-    // ── 4. Strip every client-config entry VectorHawk wrote. ──
+    // ── 4. Strip every client-config entry Scenery wrote. ──
     strip_client_configs(&plan, &journal_entries, &mut report);
 
     // ── 5. Remove managed skills/plugins VH pushed into ~/.claude. ──
@@ -187,7 +187,7 @@ async fn stop_daemons(report: &mut RestoreReport) -> Result<()> {
 
 /// Clear the tokens for `registry_url` and every other registry this machine
 /// signed in to, the device session, and the H3 local key. Uninstall is not
-/// `auth logout`: no VectorHawk secret may stay behind on the machine.
+/// `auth logout`: no Scenery secret may stay behind on the machine.
 async fn sign_out_everywhere(registry_url: &str, report: &mut RestoreReport) {
     use scenery_core::auth::{clear_tokens, load_all_tokens};
     use scenery_core::{secret_file, state::AppState};
@@ -282,7 +282,7 @@ fn build_plan(report: &mut RestoreReport) -> Result<Plan> {
     use scenery_core::state::AppState;
     use scenery_mcp::setup::{detect_ai_clients, detect_unmanaged_servers};
 
-    let state = AppState::bootstrap().context("failed to open VectorHawk state")?;
+    let state = AppState::bootstrap().context("failed to open Scenery state")?;
     let installs = state.list_mcp_installs().unwrap_or_default();
     let brokered: Vec<_> = installs
         .into_iter()
@@ -295,7 +295,7 @@ fn build_plan(report: &mut RestoreReport) -> Result<Plan> {
         report.kept.push(KeptItem {
             name: u.server_name,
             location: u.client_name,
-            note: "your own server — left in place, no longer audited by VectorHawk".into(),
+            note: "your own server — left in place, no longer audited by Scenery".into(),
         });
     }
 
@@ -305,7 +305,7 @@ fn build_plan(report: &mut RestoreReport) -> Result<Plan> {
     })
 }
 
-/// Remove VH's shim key (`vectorhawk`) AND every brokered per-slug key from each
+/// Remove VH's shim key (`scenery`) AND every brokered per-slug key from each
 /// client config, so nothing that points at the now-absent runner is left.
 ///
 /// The exact (file, JSON key) a brokered install touched is derived from the
@@ -317,14 +317,14 @@ fn build_plan(report: &mut RestoreReport) -> Result<Plan> {
 /// cover (pre-journal installs, a lost entry) fall back to the old best-effort
 /// sweep across every detected client.
 fn strip_client_configs(plan: &Plan, journal_entries: &[JournalEntry], report: &mut RestoreReport) {
-    use std::collections::HashSet;
     use scenery_mcp::setup::remove_mcp_entry;
+    use std::collections::HashSet;
 
     // VH's own shim entry — always stripped from every detected client.
     for client in &plan.clients {
         if let Err(e) = remove_mcp_entry(client) {
             report.warnings.push(format!(
-                "{}: could not remove the vectorhawk entry ({}): {e:#}",
+                "{}: could not remove the scenery entry ({}): {e:#}",
                 client.name,
                 client.config_path.display()
             ));
@@ -448,7 +448,7 @@ fn reinstall_hint(row: &scenery_core::state::McpInstallRow) -> String {
         row.package_source.clone()
     };
     format!(
-        "Re-add '{}' from {} (auth: {}). Credentials were brokered by VectorHawk \
+        "Re-add '{}' from {} (auth: {}). Credentials were brokered by Scenery \
          and were never stored on this machine — supply your own.",
         row.mcp_server_name, src, row.auth_type
     )
@@ -496,7 +496,7 @@ fn remove_managed_artifacts(_plan: &Plan, report: &mut RestoreReport) {
                     name,
                     kind: RemovedKind::ManagedSkill,
                     reinstall_hint:
-                        "VectorHawk slash command — nothing to re-add; it only existed for VectorHawk."
+                        "Scenery slash command — nothing to re-add; it only existed for Scenery."
                             .into(),
                     stripped_from: vec!["~/.claude/skills".into()],
                 });
@@ -546,14 +546,14 @@ fn remove_managed_artifacts(_plan: &Plan, report: &mut RestoreReport) {
 }
 
 /// Remove every top-level entry under `base` that carries a
-/// `.vectorhawk-managed.json` marker (F2 pushed it there). Directories
+/// `.scenery-managed.json` marker (F2 pushed it there). Directories
 /// without the marker are the user's own and are left completely alone —
 /// they're reported as KEPT via `detect_unmanaged_servers` for MCP, but for
 /// skills/plugins there's no separate detector today, so they're simply
 /// untouched and unlisted.
 ///
 /// Symlinked entries are unlinked but **not** reported: since the pivot to
-/// `~/.agents/skills`, a marked symlink is only ever an alias VectorHawk
+/// `~/.agents/skills`, a marked symlink is only ever an alias Scenery
 /// created for a client that cannot read the canonical root, and the real
 /// content it points at is reported by that root's own sweep. Reporting both
 /// would double-count one skill; `stripped_from` on the canonical entry names
@@ -608,7 +608,7 @@ fn remove_marked_dirs(
                     name,
                     kind,
                     reinstall_hint:
-                        "Pushed by your organization's VectorHawk policy — nothing to re-add; \
+                        "Pushed by your organization's Scenery policy — nothing to re-add; \
                          ask IT if you still need it."
                             .into(),
                     stripped_from: stripped_from.iter().map(|s| (*s).to_string()).collect(),
@@ -618,7 +618,7 @@ fn remove_marked_dirs(
                 // Not managed — the user's own directory. Leave it alone.
             }
             Err(e) => report.warnings.push(format!(
-                "could not read the VectorHawk marker for '{}': {e:#}",
+                "could not read the Scenery marker for '{}': {e:#}",
                 path.display()
             )),
         }
@@ -636,7 +636,7 @@ fn load_journal_entries(report: &mut RestoreReport) -> Vec<JournalEntry> {
         Ok(s) => s,
         Err(e) => {
             report.warnings.push(format!(
-                "could not open VectorHawk state to read the restore journal — some \
+                "could not open Scenery state to read the restore journal — some \
                  items may not be restored/removed precisely: {e:#}"
             ));
             return Vec::new();
@@ -699,14 +699,14 @@ fn restore_from_journal(entries: &[JournalEntry], report: &mut RestoreReport) {
             from_backup: entry
                 .backup_path
                 .clone()
-                .unwrap_or_else(|| "(nothing — it did not exist before VectorHawk)".into()),
+                .unwrap_or_else(|| "(nothing — it did not exist before Scenery)".into()),
         });
     }
 }
 
 /// Perform the filesystem side effect for one restorable journal entry: copy
 /// `backup_path` → `target_path`, or — when `backup_path` is `None`, meaning
-/// `target_path` did not exist before VectorHawk touched it — delete
+/// `target_path` did not exist before Scenery touched it — delete
 /// `target_path` outright rather than fabricate a restore.
 fn restore_one_entry(entry: &JournalEntry) -> Result<()> {
     let target = Path::new(&entry.target_path);
@@ -761,7 +761,7 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Delete the VectorHawk data directory + logs + lock file + keychain token
+/// Delete the Scenery data directory + logs + lock file + keychain token
 /// (`--purge`). Best-effort beyond the data directory itself: a missing log
 /// dir, an absent lock file, or an unavailable keychain must not fail the
 /// purge — `auth logout` (step 6 of `run`) already released the token row
@@ -775,14 +775,14 @@ fn purge_data_dir() -> Result<()> {
     }
 
     if let Some(home) = dirs_home() {
-        // macOS: `vectorhawk daemon install` points the LaunchAgent's
-        // StandardOut/ErrorPath at `~/Library/Logs/VectorHawk/` (see
+        // macOS: `scenery daemon install` points the LaunchAgent's
+        // StandardOut/ErrorPath at `~/Library/Logs/Scenery/` (see
         // `install/macos.rs::log_dir`). Linux has no equivalent file — the
         // systemd user unit's stdout/stderr go to the journal
-        // (`journalctl --user -u vectorhawk-agent`), not a log directory.
+        // (`journalctl --user -u scenery`), not a log directory.
         #[cfg(target_os = "macos")]
         {
-            let logs_dir = home.join("Library").join("Logs").join("VectorHawk");
+            let logs_dir = home.join("Library").join("Logs").join("Scenery");
             if logs_dir.exists() {
                 let _ = std::fs::remove_dir_all(&logs_dir);
             }
@@ -797,13 +797,13 @@ fn purge_data_dir() -> Result<()> {
     Ok(())
 }
 
-/// Best-effort deletion of every `com.vectorhawk.agent` keychain item.
+/// Best-effort deletion of every `com.scenery.agent` keychain item.
 /// `clear_tokens` deletes the item for each registry `state.db` still knows
 /// about; an item for a registry whose row is gone would survive that, so
 /// this sweeps the service via the platform's own CLI rather than pulling
 /// the `keyring` crate into this binary. `security delete-generic-password`
 /// removes one matching item per call, hence the loop. Never fails, and
-/// leaves the keychain alone when `VECTORHAWK_DISABLE_KEYCHAIN` is set.
+/// leaves the keychain alone when `SCENERY_DISABLE_KEYCHAIN` is set.
 #[cfg(target_os = "macos")]
 fn delete_keychain_items() {
     if scenery_core::auth::keychain_disabled() {
@@ -811,7 +811,7 @@ fn delete_keychain_items() {
     }
     for _ in 0..64 {
         let deleted = std::process::Command::new("security")
-            .args(["delete-generic-password", "-s", "com.vectorhawk.agent"])
+            .args(["delete-generic-password", "-s", "com.scenery.agent"])
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false);
@@ -842,9 +842,9 @@ fn write_report(report: &RestoreReport, opts: &UninstallOpts) -> Result<ReportPa
         .unwrap_or_else(|| PathBuf::from("."));
     // Stable, sortable basename. Timestamp is supplied by the caller/env rather
     // than Date::now so the report path is deterministic in tests.
-    let stamp = std::env::var("VECTORHAWK_UNINSTALL_STAMP").unwrap_or_else(|_| "latest".into());
-    let md = dir.join(format!("VectorHawk-uninstall-{stamp}.md"));
-    let json = dir.join(format!("VectorHawk-uninstall-{stamp}.json"));
+    let stamp = std::env::var("SCENERY_UNINSTALL_STAMP").unwrap_or_else(|_| "latest".into());
+    let md = dir.join(format!("Scenery-uninstall-{stamp}.md"));
+    let json = dir.join(format!("Scenery-uninstall-{stamp}.json"));
     std::fs::write(&md, render_markdown(report)).with_context(|| format!("writing {md:?}"))?;
     std::fs::write(&json, serde_json::to_string_pretty(report)?)
         .with_context(|| format!("writing {json:?}"))?;
@@ -852,18 +852,18 @@ fn write_report(report: &RestoreReport, opts: &UninstallOpts) -> Result<ReportPa
 }
 
 fn render_markdown(r: &RestoreReport) -> String {
-    let mut s = String::from("# VectorHawk uninstall — restore report\n\n");
+    let mut s = String::from("# Scenery uninstall — restore report\n\n");
     s.push_str(
-        "VectorHawk has been removed. This report records exactly what changed so \
+        "Scenery has been removed. This report records exactly what changed so \
          your system is left in as close to its original state as possible.\n\n",
     );
 
     s.push_str("## Removed completely\n\n");
     if r.removed.is_empty() {
-        s.push_str("_Nothing — no VectorHawk-managed tools were installed._\n\n");
+        s.push_str("_Nothing — no Scenery-managed tools were installed._\n\n");
     } else {
         s.push_str(
-            "These only worked *through* VectorHawk, so they were removed entirely \
+            "These only worked *through* Scenery, so they were removed entirely \
              (no broken entries left behind). To get them back, re-add them on your \
              own configuration:\n\n",
         );
@@ -873,7 +873,7 @@ fn render_markdown(r: &RestoreReport) -> String {
         s.push('\n');
     }
 
-    s.push_str("## Kept (no longer managed by VectorHawk)\n\n");
+    s.push_str("## Kept (no longer managed by Scenery)\n\n");
     if r.kept.is_empty() {
         s.push_str("_None._\n\n");
     } else {
@@ -908,9 +908,9 @@ fn render_markdown(r: &RestoreReport) -> String {
 }
 
 fn print_plan(plan: &Plan, report: &RestoreReport) {
-    println!("VectorHawk uninstall plan:");
+    println!("Scenery uninstall plan:");
     println!(
-        "  • {} brokered MCP server(s) will be removed completely (they can't run without VectorHawk).",
+        "  • {} brokered MCP server(s) will be removed completely (they can't run without Scenery).",
         plan.brokered.len()
     );
     println!(
@@ -918,14 +918,14 @@ fn print_plan(plan: &Plan, report: &RestoreReport) {
         report.kept.len()
     );
     println!(
-        "  • The vectorhawk entry will be stripped from {} AI client config(s).",
+        "  • The scenery entry will be stripped from {} AI client config(s).",
         plan.clients.len()
     );
     println!("  • The background service will be stopped and removed.");
 }
 
 fn print_summary(report: &RestoreReport, paths: &ReportPaths) {
-    println!("\nDone. VectorHawk removed.");
+    println!("\nDone. Scenery removed.");
     println!(
         "  Removed completely: {}   Kept (unregistered): {}   Restored: {}",
         report.removed.len(),
@@ -962,16 +962,16 @@ fn dirs_home() -> Option<PathBuf> {
 // redirects `HOME` to a throwaway temp dir first, following the same
 // `with_fake_home` + mutex convention as `scenery-mcp/src/setup.rs` and
 // `scenery-daemon/src/managed_paths/pusher_tests.rs`. This keeps the
-// developer's real `$HOME` and `~/Library/Application Support/VectorHawk`
+// developer's real `$HOME` and `~/Library/Application Support/Scenery`
 // completely untouched — no test here ever mutates them.
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
     use scenery_core::restore_journal::{JournalOp, JournalSource, RestoreJournal};
     use scenery_core::state::{AppState, McpInstallRow};
     use scenery_mcp::setup::{ClientConfig, ConfigFormat};
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     /// Serializes every test in this module that mutates the process-global
     /// `HOME` env var.
@@ -1006,7 +1006,7 @@ mod tests {
 
     // ── sign out everywhere ─────────────────────────────────────────────────
 
-    /// Uninstall must leave no VectorHawk secret behind: the tokens for
+    /// Uninstall must leave no Scenery secret behind: the tokens for
     /// every registry this machine signed in to (not just the configured
     /// one) and the H3 local key.
     /// Uninstall deprovisions the paired device (refreshing an expired access
@@ -1020,9 +1020,9 @@ mod tests {
         let _guard = HOME_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = temp_dir("sign-out-deprovision");
         let original_home = std::env::var_os("HOME");
-        let original_keychain = std::env::var_os("VECTORHAWK_DISABLE_KEYCHAIN");
+        let original_keychain = std::env::var_os("SCENERY_DISABLE_KEYCHAIN");
         std::env::set_var("HOME", &tmp);
-        std::env::set_var("VECTORHAWK_DISABLE_KEYCHAIN", "1");
+        std::env::set_var("SCENERY_DISABLE_KEYCHAIN", "1");
 
         let mut server = mockito::Server::new_async().await;
         let url = server.url();
@@ -1072,8 +1072,8 @@ mod tests {
             None => std::env::remove_var("HOME"),
         }
         match original_keychain {
-            Some(v) => std::env::set_var("VECTORHAWK_DISABLE_KEYCHAIN", v),
-            None => std::env::remove_var("VECTORHAWK_DISABLE_KEYCHAIN"),
+            Some(v) => std::env::set_var("SCENERY_DISABLE_KEYCHAIN", v),
+            None => std::env::remove_var("SCENERY_DISABLE_KEYCHAIN"),
         }
         let _ = fs::remove_dir_all(&tmp);
 
@@ -1095,9 +1095,9 @@ mod tests {
         let _guard = HOME_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = temp_dir("sign-out-everywhere");
         let original_home = std::env::var_os("HOME");
-        let original_keychain = std::env::var_os("VECTORHAWK_DISABLE_KEYCHAIN");
+        let original_keychain = std::env::var_os("SCENERY_DISABLE_KEYCHAIN");
         std::env::set_var("HOME", &tmp);
-        std::env::set_var("VECTORHAWK_DISABLE_KEYCHAIN", "1");
+        std::env::set_var("SCENERY_DISABLE_KEYCHAIN", "1");
 
         let mut report = RestoreReport::default();
         let outcome: anyhow::Result<(usize, bool)> = async {
@@ -1120,8 +1120,8 @@ mod tests {
             None => std::env::remove_var("HOME"),
         }
         match original_keychain {
-            Some(v) => std::env::set_var("VECTORHAWK_DISABLE_KEYCHAIN", v),
-            None => std::env::remove_var("VECTORHAWK_DISABLE_KEYCHAIN"),
+            Some(v) => std::env::set_var("SCENERY_DISABLE_KEYCHAIN", v),
+            None => std::env::remove_var("SCENERY_DISABLE_KEYCHAIN"),
         }
         let _ = fs::remove_dir_all(&tmp);
 
@@ -1199,7 +1199,7 @@ mod tests {
             server_config: None,
             auth_type: "oauth".to_string(),
             gateway_server_id: None,
-            gateway_url: Some("https://gateway.vectorhawk.ai/mcp/slack".to_string()),
+            gateway_url: Some("https://gateway.scenery.dev/mcp/slack".to_string()),
         }
     }
 
@@ -1213,8 +1213,8 @@ mod tests {
             &config_path,
             serde_json::to_string_pretty(&serde_json::json!({
                 "mcpServers": {
-                    "vectorhawk": {"command": "vectorhawk", "args": ["mcp", "serve"]},
-                    "slack-mcp": {"command": "vectorhawk", "args": ["mcp", "serve", "--server", "slack-mcp"]},
+                    "scenery": {"command": "scenery", "args": ["mcp", "serve"]},
+                    "slack-mcp": {"command": "scenery", "args": ["mcp", "serve", "--server", "slack-mcp"]},
                     "my-own-server": {"command": "my-tool", "args": []}
                 }
             }))
@@ -1254,8 +1254,8 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
         let servers = after["mcpServers"].as_object().unwrap();
         assert!(
-            !servers.contains_key("vectorhawk"),
-            "vectorhawk shim entry must be gone"
+            !servers.contains_key("scenery"),
+            "scenery shim entry must be gone"
         );
         assert!(
             !servers.contains_key("slack-mcp"),
@@ -1318,10 +1318,10 @@ mod tests {
     #[test]
     fn restore_from_journal_with_no_backup_deletes_target_instead_of_restoring() {
         let dir = temp_dir("restore-delete");
-        let target_path = dir.join("vectorhawk-created.txt");
-        fs::write(&target_path, b"VectorHawk put this here").unwrap();
+        let target_path = dir.join("scenery-created.txt");
+        fs::write(&target_path, b"Scenery put this here").unwrap();
 
-        // Native source, no backup_path -> target did not exist pre-VectorHawk.
+        // Native source, no backup_path -> target did not exist pre-Scenery.
         let entry = JournalEntry::new(
             JournalOp::FileDelete,
             JournalSource::Native,
@@ -1373,7 +1373,7 @@ mod tests {
         // good entry from being restored.
         let dir = temp_dir("restore-partial-failure");
         let backup_path = dir.join("backup.txt");
-        fs::write(&backup_path, b"pre-vectorhawk content").unwrap();
+        fs::write(&backup_path, b"pre-scenery content").unwrap();
         let target_path = dir.join("target.txt");
 
         let good_entry = JournalEntry::new(
@@ -1395,7 +1395,7 @@ mod tests {
 
         assert_eq!(
             fs::read(&target_path).unwrap(),
-            b"pre-vectorhawk content",
+            b"pre-scenery content",
             "the good entry must still be restored despite the bad one"
         );
         assert_eq!(
@@ -1566,7 +1566,7 @@ mod tests {
         let config_path = fake_home.join(".claude.json");
         let original_content = serde_json::to_string_pretty(&serde_json::json!({
             "mcpServers": {
-                "vectorhawk": {"command": "vectorhawk", "args": ["mcp", "serve"]},
+                "scenery": {"command": "scenery", "args": ["mcp", "serve"]},
                 "my-own-server": {"command": "my-tool", "args": []}
             }
         }))
@@ -1591,7 +1591,7 @@ mod tests {
             purge: false,
             dry_run: true,
             report_dir: Some(report_dir.clone()),
-            registry_url: "https://app.vectorhawk.invalid".to_string(),
+            registry_url: "https://app.scenery.invalid".to_string(),
         })
         .await;
 
@@ -1614,9 +1614,9 @@ mod tests {
             "dry-run must not touch managed skill content"
         );
 
-        let stamp = std::env::var("VECTORHAWK_UNINSTALL_STAMP").unwrap_or_else(|_| "latest".into());
+        let stamp = std::env::var("SCENERY_UNINSTALL_STAMP").unwrap_or_else(|_| "latest".into());
         assert!(report_dir
-            .join(format!("VectorHawk-uninstall-{stamp}.md"))
+            .join(format!("Scenery-uninstall-{stamp}.md"))
             .exists());
 
         let _ = fs::remove_dir_all(&fake_home);

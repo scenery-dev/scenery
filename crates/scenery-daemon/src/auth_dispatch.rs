@@ -1,6 +1,6 @@
 //! JSON-RPC dispatch handlers for `auth/*` methods.
 //!
-//! These methods are called by `vectorhawk auth login` (M3.3) over the existing
+//! These methods are called by `scenery auth login` (M3.3) over the existing
 //! Unix socket.  They live in a separate module to keep `socket_dispatch.rs`
 //! focused on the MCP tool-call path.
 //!
@@ -21,10 +21,10 @@
 
 use std::sync::Arc;
 
-use serde::Deserialize;
-use tracing::debug;
 use scenery_core::state::AppState;
 use scenery_mcp::protocol::{JsonRpcError, JsonRpcResponse, INTERNAL_ERROR, INVALID_PARAMS};
+use serde::Deserialize;
+use tracing::debug;
 
 use crate::oauth_state::OAuthState;
 use crate::SyncController;
@@ -148,7 +148,7 @@ pub async fn handle_wait_for_callback(
 
 /// Handle `auth/reload`.
 ///
-/// Called by `vectorhawk auth login` / `auth pair` / `auth token` right after
+/// Called by `scenery auth login` / `auth pair` / `auth token` right after
 /// saving new credentials.  Idempotently registers this device and starts the
 /// SSE sync subsystem so freshly-authenticated daemons begin syncing without a
 /// restart.  Returns `{"sync_active": bool}` — `false` means credentials are
@@ -183,10 +183,9 @@ pub async fn handle_get_portal_session(
     let state = state.clone();
     let registry_url = registry_url.to_string();
 
-    let stored = tokio::task::spawn_blocking(move || {
-        scenery_core::auth::load_tokens(&state, &registry_url)
-    })
-    .await;
+    let stored =
+        tokio::task::spawn_blocking(move || scenery_core::auth::load_tokens(&state, &registry_url))
+            .await;
 
     let stored = match stored {
         Ok(Ok(Some(tokens))) => tokens,

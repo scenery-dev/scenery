@@ -10,11 +10,11 @@ use anyhow::{Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use rusqlite::{Connection, OptionalExtension};
+use scenery_manifest::SkillPackage;
 use semver::Version;
 use sha2::{Digest, Sha256};
 use tar::Archive;
 use tracing::info;
-use scenery_manifest::SkillPackage;
 
 /// Silently update `skill_id` to `policy.target_version` if the currently
 /// installed version is below `policy.minimum_allowed_version`.
@@ -81,7 +81,7 @@ pub fn install_from_registry(
     };
 
     // Revoke overrides desired state everywhere a skill can be installed —
-    // this is the single choke point `vectorhawk skill install`, the
+    // this is the single choke point `scenery skill install`, the
     // auto-updater (`auto_update_if_needed` below), and the governance
     // install paths (`mcp_governance`, `tools.rs`) all funnel through, so
     // one check here covers all of them. The SSE/snapshot-driven reconciler
@@ -553,7 +553,7 @@ mod tests {
         fs::write(
             root.join("SKILL.md"),
             format!(
-                "---\nname: Test Skill\ndescription: A test skill.\nmetadata:\n  vectorhawk:\n    version: {version}\n    publisher: skillclub\n    permissions:\n      filesystem: none\n      network: none\n      clipboard: none\n    execution:\n      sandbox: strict\n      timeout_ms: 30000\n      memory_mb: 256\n    workflow_ref: ./workflow.yaml\n---\n\nDo the thing.\n"
+                "---\nname: Test Skill\ndescription: A test skill.\nmetadata:\n  scenery:\n    version: {version}\n    publisher: scenery\n    permissions:\n      filesystem: none\n      network: none\n      clipboard: none\n    execution:\n      sandbox: strict\n      timeout_ms: 30000\n      memory_mb: 256\n    workflow_ref: ./workflow.yaml\n---\n\nDo the thing.\n"
             ),
         )
         .unwrap();

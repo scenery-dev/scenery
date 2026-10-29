@@ -1,11 +1,11 @@
-//! Round-trip integration test: build a synthetic VectorHawk plugin, export it
+//! Round-trip integration test: build a synthetic Scenery plugin, export it
 //! as a `.mcpb` archive, then import it back and assert the MCP server
 //! configuration is faithfully preserved.
 
 use camino::Utf8PathBuf;
+use scenery_core::{plugin_export, plugin_import};
 use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
-use scenery_core::{plugin_export, plugin_import};
 
 fn temp_dir(label: &str) -> Utf8PathBuf {
     let nanos = SystemTime::now()

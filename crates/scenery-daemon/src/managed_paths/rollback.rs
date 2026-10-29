@@ -2,7 +2,7 @@
 //!
 //! Provides two entry points:
 //!
-//! - [`list_backups`] — enumerate `<home>/.claude/.vectorhawk-backup/*/manifest.json`
+//! - [`list_backups`] — enumerate `<home>/.claude/.scenery-backup/*/manifest.json`
 //!   and return a summary for each completed backup run.
 //! - [`rollback`] — restore one backup run (or a single slug within it) to its
 //!   original path, remove the F2 SQLite marker, and notify the backend.
@@ -15,12 +15,12 @@
 use crate::managed_paths::migrator::{BackupManifest, ManifestItem};
 use anyhow::{Context, Result};
 use rusqlite::Connection;
+use scenery_core::{auth::load_all_tokens, state::AppState};
 use std::{
     fs,
     path::{Path, PathBuf},
 };
 use tracing::{debug, info, warn};
-use scenery_core::{auth::load_all_tokens, state::AppState};
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -53,7 +53,7 @@ pub struct RollbackError {
 
 // ── list_backups ──────────────────────────────────────────────────────────────
 
-/// Enumerate all backup runs under `<home>/.claude/.vectorhawk-backup/`.
+/// Enumerate all backup runs under `<home>/.claude/.scenery-backup/`.
 ///
 /// Returns one [`BackupSummary`] per subdirectory that contains a readable
 /// `manifest.json`.  Directories without a manifest or with an unparseable
@@ -61,7 +61,7 @@ pub struct RollbackError {
 ///
 /// The returned slice is sorted in ascending timestamp order (oldest first).
 pub fn list_backups(home: &Path) -> Result<Vec<BackupSummary>> {
-    let backup_base = home.join(".claude").join(".vectorhawk-backup");
+    let backup_base = home.join(".claude").join(".scenery-backup");
 
     if !backup_base.exists() {
         return Ok(vec![]);
@@ -157,7 +157,7 @@ pub async fn rollback(
     ts: &str,
     slug_filter: Option<&str>,
 ) -> Result<RollbackReport> {
-    let backup_root = home.join(".claude").join(".vectorhawk-backup").join(ts);
+    let backup_root = home.join(".claude").join(".scenery-backup").join(ts);
 
     let manifest_path = backup_root.join("manifest.json");
 
@@ -656,7 +656,7 @@ mod tests {
     #[test]
     fn list_backups_skips_dirs_without_manifest() {
         let home = make_home();
-        let backup_base = home.path().join(".claude").join(".vectorhawk-backup");
+        let backup_base = home.path().join(".claude").join(".scenery-backup");
         fs::create_dir_all(backup_base.join("2025-01-01T000000Z")).unwrap();
 
         let result = list_backups(home.path()).unwrap();
@@ -669,7 +669,7 @@ mod tests {
     #[test]
     fn list_backups_parses_manifest_and_returns_summary() {
         let home = make_home();
-        let backup_base = home.path().join(".claude").join(".vectorhawk-backup");
+        let backup_base = home.path().join(".claude").join(".scenery-backup");
         let run_dir = backup_base.join("2025-06-01T120000Z");
         fs::create_dir_all(&run_dir).unwrap();
 
@@ -699,7 +699,7 @@ mod tests {
     #[test]
     fn list_backups_sorts_ascending_by_ts() {
         let home = make_home();
-        let backup_base = home.path().join(".claude").join(".vectorhawk-backup");
+        let backup_base = home.path().join(".claude").join(".scenery-backup");
 
         for ts in &[
             "2025-06-03T000000Z",
@@ -732,7 +732,7 @@ mod tests {
     #[tokio::test]
     async fn rollback_restores_files_from_backup_dir() {
         let home = make_home();
-        let backup_base = home.path().join(".claude").join(".vectorhawk-backup");
+        let backup_base = home.path().join(".claude").join(".scenery-backup");
         let ts = "2025-06-10T000000Z";
         let run_dir = backup_base.join(ts);
 
@@ -761,7 +761,7 @@ mod tests {
         append_manifest_item(&run_dir, ts, item).unwrap();
 
         // Bootstrap a minimal AppState with a temp DB (no SQLite ops for this test).
-        let db_dir = home.path().join(".vectorhawk");
+        let db_dir = home.path().join(".scenery");
         fs::create_dir_all(&db_dir).unwrap();
         let db_path = camino::Utf8PathBuf::from(db_dir.join("state.db").to_string_lossy().as_ref());
         // Create minimal SQLite tables so delete_db_marker doesn't crash.
@@ -783,7 +783,7 @@ mod tests {
             )),
         };
 
-        let report = rollback(&state, "https://app.vectorhawk.ai", home.path(), ts, None)
+        let report = rollback(&state, "https://app.scenery.dev", home.path(), ts, None)
             .await
             .unwrap();
 
@@ -830,11 +830,7 @@ mod tests {
     async fn rollback_undoes_an_adoption_that_was_migrated_to_the_agents_dir() {
         let home = make_home();
         let ts = "2025-07-19T000000Z";
-        let run_dir = home
-            .path()
-            .join(".claude")
-            .join(".vectorhawk-backup")
-            .join(ts);
+        let run_dir = home.path().join(".claude").join(".scenery-backup").join(ts);
         let slug = "adopted-skill";
 
         // The user's pre-adoption content, as F1 backed it up.
@@ -848,7 +844,7 @@ mod tests {
         let canonical = home.path().join(".agents").join("skills").join(slug);
         fs::create_dir_all(&canonical).unwrap();
         fs::write(canonical.join("SKILL.md"), b"the F2-managed adoption").unwrap();
-        fs::write(canonical.join(".vectorhawk-managed.json"), b"{}").unwrap();
+        fs::write(canonical.join(".scenery-managed.json"), b"{}").unwrap();
         fs::create_dir_all(claude_path.parent().unwrap()).unwrap();
         std::os::unix::fs::symlink(&canonical, &claude_path).unwrap();
         assert!(claude_path.is_symlink() && claude_path.is_dir());
@@ -865,7 +861,7 @@ mod tests {
         };
         append_manifest_item(&run_dir, ts, item).unwrap();
 
-        let db_dir = home.path().join(".vectorhawk");
+        let db_dir = home.path().join(".scenery");
         fs::create_dir_all(&db_dir).unwrap();
         let db_path = camino::Utf8PathBuf::from(db_dir.join("state.db").to_string_lossy().as_ref());
         let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -893,7 +889,7 @@ mod tests {
             )),
         };
 
-        let report = rollback(&state, "https://app.vectorhawk.ai", home.path(), ts, None)
+        let report = rollback(&state, "https://app.scenery.dev", home.path(), ts, None)
             .await
             .unwrap();
 
@@ -941,7 +937,7 @@ mod tests {
     #[tokio::test]
     async fn rollback_with_slug_filter_only_touches_one_item() {
         let home = make_home();
-        let backup_base = home.path().join(".claude").join(".vectorhawk-backup");
+        let backup_base = home.path().join(".claude").join(".scenery-backup");
         let ts = "2025-06-11T000000Z";
         let run_dir = backup_base.join(ts);
 
@@ -966,7 +962,7 @@ mod tests {
         }
 
         // Minimal AppState.
-        let db_dir = home.path().join(".vectorhawk");
+        let db_dir = home.path().join(".scenery");
         fs::create_dir_all(&db_dir).unwrap();
         let db_path = camino::Utf8PathBuf::from(db_dir.join("state.db").to_string_lossy().as_ref());
         let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -988,7 +984,7 @@ mod tests {
 
         let report = rollback(
             &state,
-            "https://app.vectorhawk.ai",
+            "https://app.scenery.dev",
             home.path(),
             ts,
             Some("skill-a"),
@@ -1026,7 +1022,7 @@ mod tests {
     #[tokio::test]
     async fn rollback_reports_catalog_delete_failure_in_errors() {
         let home = make_home();
-        let backup_base = home.path().join(".claude").join(".vectorhawk-backup");
+        let backup_base = home.path().join(".claude").join(".scenery-backup");
         let ts = "2025-06-12T000000Z";
         let run_dir = backup_base.join(ts);
 
@@ -1049,7 +1045,7 @@ mod tests {
         append_manifest_item(&run_dir, ts, item).unwrap();
 
         // Minimal AppState with a token stored so load_bearer_token returns Some.
-        let db_dir = home.path().join(".vectorhawk");
+        let db_dir = home.path().join(".scenery");
         fs::create_dir_all(&db_dir).unwrap();
         let db_path = camino::Utf8PathBuf::from(db_dir.join("state.db").to_string_lossy().as_ref());
         let conn = rusqlite::Connection::open(&db_path).unwrap();

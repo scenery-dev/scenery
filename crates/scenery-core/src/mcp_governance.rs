@@ -1,7 +1,4 @@
 //! MCP fleet governance: approved server fetching, caching, and audit buffering.
-//!
-//! Ported from `skillrunner-core::mcp_governance`. Branding references updated
-//! to VectorHawk; no semantic changes.
 
 use crate::state::AppState;
 use anyhow::{Context, Result};
@@ -189,8 +186,7 @@ fn unix_now() -> u64 {
 // These are the registry API calls that tools.rs needs. The real HTTP
 // implementations land in M1.4 when `HttpRegistryClient` is fully wired.
 // For now, the methods are declared here as free functions that accept a
-// base_url string and make blocking HTTP calls directly (matching the
-// skillrunner pattern where RegistryClient was a concrete struct).
+// base_url string and make blocking HTTP calls directly.
 //
 // M1.4 note: once `HttpRegistryClient` gains these methods on the trait,
 // this module can delegate to the trait rather than duplicating HTTP code.
@@ -427,8 +423,8 @@ pub fn install_from_registry(
 /// (`POST /api/installations`) and poll local SQLite for the daemon's
 /// reconciler to confirm the skill landed the same way a portal-driven
 /// install does — i.e. via `push_skill_to_claude` into `~/.claude/skills`
-/// with a `.vectorhawk-managed.json` marker — rather than only in
-/// VectorHawk's private, Claude-invisible store.
+/// with a `.scenery-managed.json` marker — rather than only in
+/// Scenery's private, Claude-invisible store.
 ///
 /// Returns the installed version once the reconciler marks the skill
 /// `active`.
@@ -563,7 +559,7 @@ fn install_via_desired_state_with_timing(
         .with_context(|| format!("failed to reach registry at {url}"))?;
 
     if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-        anyhow::bail!("session expired — use vectorhawk_login to re-authenticate");
+        anyhow::bail!("session expired — use scenery_login to re-authenticate");
     }
     if !resp.status().is_success() {
         let status = resp.status();
@@ -585,7 +581,7 @@ fn install_via_desired_state_with_timing(
         if std::time::Instant::now() >= deadline {
             anyhow::bail!(
                 "timed out waiting for '{skill_id}' to install — the daemon may not be \
-                 running or reachable. Check `vectorhawk sync status`."
+                 running or reachable. Check `scenery sync status`."
             );
         }
 
@@ -603,7 +599,7 @@ fn install_via_desired_state_with_timing(
             Some((status, _)) if status == "error" => {
                 anyhow::bail!(
                     "install of '{skill_id}' encountered an error — run \
-                     `vectorhawk sync status` for details"
+                     `scenery sync status` for details"
                 );
             }
             _ => {

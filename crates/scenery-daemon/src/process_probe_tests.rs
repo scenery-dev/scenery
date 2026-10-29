@@ -118,11 +118,11 @@ fn all_pids_includes_our_own_child() {
 fn exe_replaced_or_deleted_is_false_for_our_own_still_running_binary() {
     // `exe_replaced_or_deleted` compares a pid's backing executable against
     // `binary_watch::resolve_watch_path()` — the currently-installed
-    // `vectorhawk` binary. That comparison is only meaningful for pids that
-    // already passed the `vectorhawk daemon run` argv check (an unrelated
+    // `scenery` binary. That comparison is only meaningful for pids that
+    // already passed the `scenery daemon run` argv check (an unrelated
     // binary like `sleep` will always "mismatch" our own exe, which is not
     // a bug — it is simply not this function's intended input domain). The
-    // one case this test can check without spawning a fake `vectorhawk`
+    // one case this test can check without spawning a fake `scenery`
     // process: our own still-running pid must never read back as stale,
     // since it is by definition running from the path it resolves to.
     let our_pid = std::process::id();
@@ -136,7 +136,7 @@ fn exe_replaced_or_deleted_is_false_for_our_own_still_running_binary() {
 #[test]
 fn exe_replaced_or_deleted_does_not_panic_on_an_unrelated_process() {
     // Contract check only: calling this on a pid outside its intended
-    // domain (not a verified `vectorhawk daemon run`) must still return
+    // domain (not a verified `scenery daemon run`) must still return
     // cleanly, never panic — callers are protected from acting on it by
     // `verify_pid`'s prior argv gate, not by this function refusing to run.
     let mut child = spawn_dummy_child();
@@ -181,22 +181,19 @@ mod macos_argv_parsing {
 
     #[test]
     fn parses_argv_matching_daemon_run() {
-        let buf = build_buffer(
-            "/opt/homebrew/bin/vectorhawk",
-            &["vectorhawk", "daemon", "run"],
-        );
+        let buf = build_buffer("/opt/homebrew/bin/scenery", &["scenery", "daemon", "run"]);
         let argv = parse_kern_procargs2(&buf).expect("should parse");
-        assert_eq!(argv, b"vectorhawk\0daemon\0run");
+        assert_eq!(argv, b"scenery\0daemon\0run");
     }
 
     #[test]
     fn parses_argv_with_trailing_flag() {
         let buf = build_buffer(
-            "/opt/homebrew/bin/vectorhawk",
-            &["vectorhawk", "daemon", "run", "--foreground"],
+            "/opt/homebrew/bin/scenery",
+            &["scenery", "daemon", "run", "--foreground"],
         );
         let argv = parse_kern_procargs2(&buf).expect("should parse");
-        assert_eq!(argv, b"vectorhawk\0daemon\0run\0--foreground");
+        assert_eq!(argv, b"scenery\0daemon\0run\0--foreground");
         assert!(crate::daemon_takeover::cmdline_is_daemon_run(&argv));
     }
 

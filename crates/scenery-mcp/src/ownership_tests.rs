@@ -30,18 +30,18 @@ fn excluded_plugin_dirs_match() {
 }
 
 #[test]
-fn only_vectorhawk_key_is_owned() {
-    assert!(is_vectorhawk_mcp_key("vectorhawk"));
-    assert!(!is_vectorhawk_mcp_key("slack"));
-    assert!(!is_vectorhawk_mcp_key("Vectorhawk"));
+fn only_scenery_key_is_owned() {
+    assert!(is_scenery_mcp_key("scenery"));
+    assert!(!is_scenery_mcp_key("slack"));
+    assert!(!is_scenery_mcp_key("Scenery"));
 }
 
 #[test]
-fn marker_presence_decides_vectorhawk_managed() {
+fn marker_presence_decides_scenery_managed() {
     let dir = tempfile::tempdir().unwrap();
-    assert!(!is_vectorhawk_managed(dir.path()));
+    assert!(!is_scenery_managed(dir.path()));
     std::fs::write(dir.path().join(MANAGED_MARKER_FILENAME), "{}").unwrap();
-    assert!(is_vectorhawk_managed(dir.path()));
+    assert!(is_scenery_managed(dir.path()));
 }
 
 // ── marketplace.json entry parsing ──────────────────────────────────────────────
@@ -134,7 +134,7 @@ fn marker_wins_over_native_signals() {
     });
     assert_eq!(
         classify_plugin_with(true, &entry, true),
-        Origin::VectorHawkManaged
+        Origin::SceneryManaged
     );
 }
 
@@ -216,14 +216,14 @@ fn fail_safe_when_marketplaces_unreadable() {
 // ── native_mcp_keys_at ──────────────────────────────────────────────────────────
 
 #[test]
-fn native_mcp_keys_excludes_vectorhawk_only() {
+fn native_mcp_keys_excludes_scenery_only() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join(".claude.json");
     std::fs::write(
         &path,
         json!({
             "mcpServers": {
-                "vectorhawk": { "command": "vectorhawk" },
+                "scenery": { "command": "scenery" },
                 "slack": { "command": "npx" },
                 "jira": { "command": "npx" },
             }
@@ -240,7 +240,7 @@ fn native_mcp_keys_excludes_vectorhawk_only() {
     for k in expected.keys() {
         assert!(keys.contains(k), "missing key {k}");
     }
-    assert!(!keys.contains("vectorhawk"));
+    assert!(!keys.contains("scenery"));
 }
 
 #[test]

@@ -67,7 +67,7 @@ fn query_version_parses_a_crafted_initialize_response() {
             "id": "vh-takeover-probe",
             "result": {
                 "protocolVersion": "2024-11-05",
-                "serverInfo": { "name": "vectorhawkd", "version": "1.0.42" },
+                "serverInfo": { "name": "scenery", "version": "1.0.42" },
                 "capabilities": { "tools": {} }
             }
         });

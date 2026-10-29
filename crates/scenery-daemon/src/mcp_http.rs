@@ -17,7 +17,7 @@
 //!   ever sent — a real MCP client (Claude Code) never sends `Origin`; a
 //!   malicious web page always does. See [`ORIGIN_ALLOWLIST`] if that changes.
 //! - Every `POST /mcp` call requires the H3 per-user local key
-//!   (`X-VectorHawk-Local-Key`, constant-time compared), checked before
+//!   (`X-Scenery-Local-Key`, constant-time compared), checked before
 //!   anything else on this route — deliberately NOT required on the PRM GET
 //!   routes (Claude Code's own OAuth helper process never sends it; see
 //!   `build_router`).
@@ -29,7 +29,7 @@
 //!   re-paired.
 //! - Port is chosen once and persisted (`sync_state["mcp_http_port"]`) —
 //!   never hopped silently on a later run, since the Claude Code config
-//!   written by `vectorhawk mcp setup` pins the port number.
+//!   written by `scenery mcp setup` pins the port number.
 //!
 //! # First-run device login (§3.5)
 //!
@@ -57,9 +57,6 @@ use axum::{
     Router,
 };
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
-use serde::{Deserialize, Serialize};
-use tokio::{net::TcpListener, task::JoinHandle};
-use tracing::{error, info, warn};
 use scenery_core::{
     auth::{decode_jwt_sub, load_tokens, save_tokens},
     state::{self, AppState},
@@ -67,6 +64,9 @@ use scenery_core::{
 use scenery_mcp::protocol::{
     with_client_meta, JsonRpcRequest, JsonRpcResponse, CLAUDE_CODE_CLIENT_NAME, PARSE_ERROR,
 };
+use serde::{Deserialize, Serialize};
+use tokio::{net::TcpListener, task::JoinHandle};
+use tracing::{error, info, warn};
 
 use crate::DaemonContext;
 
@@ -94,14 +94,14 @@ const SYNC_STATE_USER_KEY: &str = state::MCP_USER_ID_SYNC_STATE_KEY;
 /// `build_router`'s comment for why. Header *names* are case-insensitive by
 /// HTTP spec and the underlying `http`/`hyper` stack already normalizes
 /// incoming names before this is looked up, so a client sending
-/// `X-VectorHawk-Local-Key` or any other casing matches this lowercase
+/// `X-Scenery-Local-Key` or any other casing matches this lowercase
 /// constant equally.
-const LOCAL_KEY_HEADER: &str = "x-vectorhawk-local-key";
+const LOCAL_KEY_HEADER: &str = "x-scenery-local-key";
 
 /// Frozen per §8 — overrides the design doc's §3.4 "aud = this RS resource".
-const JWT_AUDIENCE: &str = "urn:vectorhawk:local-mcp";
+const JWT_AUDIENCE: &str = "urn:scenery:local-mcp";
 /// The only client this resource server accepts tokens for (§8/§3.2 — no DCR).
-const JWT_CLIENT_ID: &str = "vectorhawk-claude-code";
+const JWT_CLIENT_ID: &str = "scenery-claude-code";
 /// Scope every valid MCP access token must carry.
 const JWT_REQUIRED_SCOPE: &str = "mcp";
 /// Clock skew allowance for `exp`/`nbf`, matching the task's "≤60s skew".
@@ -135,12 +135,12 @@ const ORIGIN_ALLOWLIST: &[&str] = &[];
 /// held — `run_daemon` satisfies this by construction (this is wired in
 /// after that lock is acquired at the top of `run_daemon`).
 pub async fn start_listener(ctx: DaemonContext) -> Result<Option<(SocketAddr, JoinHandle<()>)>> {
-    // `AppState::mcp_http_enabled` (VECTORHAWK_MCP_HTTP env / sync_state
+    // `AppState::mcp_http_enabled` (SCENERY_MCP_HTTP env / sync_state
     // override, default on) is shared with `scenery-cli`'s `mcp setup`
     // so both sides of the "is HTTP+OAuth in play" decision read the exact
     // same flag.
     if !ctx.state.mcp_http_enabled() {
-        info!("mcp http: disabled (VECTORHAWK_MCP_HTTP / mcp_http_enabled) — stdio-only");
+        info!("mcp http: disabled (SCENERY_MCP_HTTP / mcp_http_enabled) — stdio-only");
         return Ok(None);
     }
 
@@ -152,7 +152,7 @@ pub async fn start_listener(ctx: DaemonContext) -> Result<Option<(SocketAddr, Jo
         error!(
             registry_url = %ctx.registry_url,
             "mcp http: refusing to start — issuer/registry URL is not https:// (M9). \
-             Set VECTORHAWK_MCP_HTTP_ALLOW_INSECURE_ISSUER=1 to override for local dev \
+             Set SCENERY_MCP_HTTP_ALLOW_INSECURE_ISSUER=1 to override for local dev \
              only — never in production. Staying stdio-only."
         );
         return Ok(None);
@@ -178,7 +178,7 @@ fn check_issuer_scheme(registry_url: &str) -> bool {
     if allowed && !registry_url.starts_with("https://") {
         warn!(
             registry_url,
-            "mcp http: VECTORHAWK_MCP_HTTP_ALLOW_INSECURE_ISSUER=1 — serving the local MCP \
+            "mcp http: SCENERY_MCP_HTTP_ALLOW_INSECURE_ISSUER=1 — serving the local MCP \
              HTTP resource server against a non-https issuer. NEVER set this in production; \
              JWKS and token validation happen over plaintext HTTP while this is set."
         );
@@ -296,11 +296,11 @@ async fn bind_listener(
         let reverted = on_pinned_port_conflict(state, port, claude_json)?;
         if reverted {
             let msg = format!(
-                "VectorHawk's local port {port} was taken by another program, so Claude \
-                 Code was switched back to the standard VectorHawk connection and the \
-                 local key was replaced. Run `vectorhawk mcp setup` to restore browser \
+                "Scenery's local port {port} was taken by another program, so Claude \
+                 Code was switched back to the standard Scenery connection and the \
+                 local key was replaced. Run `scenery mcp setup` to restore browser \
                  sign-in. If you didn't expect this, tell IT — another user on this \
-                 machine may have tried to intercept VectorHawk."
+                 machine may have tried to intercept Scenery."
             );
             if let Ok(mut guard) = pending_alert.lock() {
                 let combined = match guard.take() {
@@ -349,11 +349,12 @@ fn on_pinned_port_conflict(
     claude_json: Option<&std::path::Path>,
 ) -> Result<bool> {
     let reverted = match claude_json {
-        Some(path) => scenery_mcp::setup::revert_claude_code_http_entry(path, port)
-            .unwrap_or_else(|e| {
+        Some(path) => {
+            scenery_mcp::setup::revert_claude_code_http_entry(path, port).unwrap_or_else(|e| {
                 error!(error = %e, "mcp http: failed to point Claude Code back at stdio");
                 false
-            }),
+            })
+        }
         None => false,
     };
     state
@@ -385,7 +386,7 @@ struct McpHttpState {
     /// Bound port, needed to build the exact `Host`/PRM/`WWW-Authenticate`
     /// values this listener must check or emit.
     port: u16,
-    /// H3 per-user local key. Compared against the `X-VectorHawk-Local-Key`
+    /// H3 per-user local key. Compared against the `X-Scenery-Local-Key`
     /// header on every request, constant-time, before any Host/Origin-
     /// -passed request reaches auth or dispatch.
     local_key: String,
@@ -544,7 +545,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// H3: require an exact, constant-time match of the `X-VectorHawk-Local-Key`
+/// H3: require an exact, constant-time match of the `X-Scenery-Local-Key`
 /// header before any other `/mcp` route logic runs — in particular before
 /// token validation and before the first-run device-exchange flow, both of
 /// which live further in (inside `handle_mcp_post`). Scoped to the `/mcp`

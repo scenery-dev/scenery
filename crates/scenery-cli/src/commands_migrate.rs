@@ -1,12 +1,12 @@
-//! `vectorhawk migrate` — inspect and roll back F1 managed-paths uplifts.
+//! `scenery migrate` — inspect and roll back F1 managed-paths uplifts.
 //!
 //! Subcommands:
 //!
 //! ```text
-//! vectorhawk migrate list-backups
+//! scenery migrate list-backups
 //!     List all backup runs with timestamp, item count, and a slug preview.
 //!
-//! vectorhawk migrate rollback --ts <ts> [--slug <slug>] [--yes]
+//! scenery migrate rollback --ts <ts> [--slug <slug>] [--yes]
 //!     Restore items from a backup run.  Prompts for confirmation unless --yes.
 //! ```
 
@@ -18,7 +18,7 @@ use scenery_daemon::managed_paths::{list_backups, rollback};
 
 // ── CLI types ─────────────────────────────────────────────────────────────────
 
-/// `vectorhawk migrate` subcommand tree.
+/// `scenery migrate` subcommand tree.
 #[derive(Debug, Subcommand)]
 pub enum MigrateCommand {
     /// List all managed-paths backup runs with timestamp and item count.
@@ -46,7 +46,7 @@ pub enum MigrateCommand {
         /// Registry base URL — used to call backend cleanup endpoints.
         #[arg(
             long,
-            env = "VECTORHAWK_REGISTRY_URL",
+            env = "SCENERY_REGISTRY_URL",
             default_value = DEFAULT_REGISTRY_URL
         )]
         registry_url: String,
@@ -95,7 +95,7 @@ async fn cmd_list_backups() -> Result<()> {
         println!("{:<26} {:>6}  {}", s.ts, s.item_count, preview_str);
     }
 
-    println!("\nTo roll back: vectorhawk migrate rollback --ts <TIMESTAMP>");
+    println!("\nTo roll back: scenery migrate rollback --ts <TIMESTAMP>");
     Ok(())
 }
 
@@ -113,7 +113,7 @@ async fn cmd_rollback(ts: &str, slug: Option<&str>, yes: bool, registry_url: &st
         };
 
         eprint!(
-            "This will restore {scope} to their original paths and remove them from VectorHawk governance.\n\
+            "This will restore {scope} to their original paths and remove them from Scenery governance.\n\
              Proceed? [y/N] "
         );
 

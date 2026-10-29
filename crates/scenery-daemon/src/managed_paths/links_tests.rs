@@ -82,11 +82,11 @@ fn link_dir_refuses_to_clobber_a_real_directory() {
 fn link_dir_replaces_its_own_prior_copy_materialisation() {
     // Simulates the Windows-without-Developer-Mode fallback: `link_path` is
     // a real directory (not a symlink) carrying the
-    // `.vectorhawk-managed.json` marker that `copy_tree` would have copied
+    // `.scenery-managed.json` marker that `copy_tree` would have copied
     // in from the canonical directory. `link_dir` must recognise this as
     // its own prior work and replace it rather than bailing out — and must
     // back the directory up first, since the marker proves only that
-    // VectorHawk wrote it, not that its content is still reproducible.
+    // Scenery wrote it, not that its content is still reproducible.
     //
     // `$HOME` is redirected because the backup root is derived from it; the
     // shared mutex keeps that from racing other env-mutating tests.
@@ -95,7 +95,7 @@ fn link_dir_replaces_its_own_prior_copy_materialisation() {
     fs::create_dir_all(&link_path).unwrap();
     fs::write(link_path.join("SKILL.md"), b"stale copy").unwrap();
     fs::write(
-        link_path.join(".vectorhawk-managed.json"),
+        link_path.join(".scenery-managed.json"),
         br#"{"marker_version":1,"installation_id":null,"source_sha256":"abc","migrated_at":"2026-01-01T00:00:00Z"}"#,
     )
     .unwrap();
@@ -122,7 +122,7 @@ fn link_dir_replaces_its_own_prior_copy_materialisation() {
     );
 
     // The replaced directory is recoverable from the backup root, under the
-    // same `.vectorhawk-backup/<ts>/` convention the F1 migrator uses.
+    // same `.scenery-backup/<ts>/` convention the F1 migrator uses.
     let backed_up = find_link_backup(fake_home.path(), "demo")
         .expect("link_dir must back up the directory it removes");
     assert_eq!(fs::read(backed_up.join("SKILL.md")).unwrap(), b"stale copy");
@@ -130,7 +130,7 @@ fn link_dir_replaces_its_own_prior_copy_materialisation() {
     drop(tmp);
 }
 
-/// The `.vectorhawk-managed.json` sidecar the pusher writes into every
+/// The `.scenery-managed.json` sidecar the pusher writes into every
 /// canonical skill dir, which `copy_tree` necessarily carries into a copy.
 const MARKER: &[u8] = br#"{"marker_version":1,"installation_id":null,"source_sha256":"abc","migrated_at":"2026-01-01T00:00:00Z"}"#;
 
@@ -146,13 +146,13 @@ fn link_dir_does_not_churn_backups_when_the_copy_already_matches_canonical() {
     // before any symlink is attempted.
     let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let (_tmp, canonical, link_path) = fixture();
-    fs::write(canonical.join(".vectorhawk-managed.json"), MARKER).unwrap();
+    fs::write(canonical.join(".scenery-managed.json"), MARKER).unwrap();
 
     // Materialise `link_path` as a byte-identical copy of canonical — exactly
     // what the copy fallback leaves behind.
     fs::create_dir_all(&link_path).unwrap();
     fs::write(link_path.join("SKILL.md"), b"---\nname: demo\n---\n").unwrap();
-    fs::write(link_path.join(".vectorhawk-managed.json"), MARKER).unwrap();
+    fs::write(link_path.join(".scenery-managed.json"), MARKER).unwrap();
 
     let fake_home = tempfile::tempdir().unwrap();
     let prev_home = std::env::var_os("HOME");
@@ -176,7 +176,7 @@ fn link_dir_does_not_churn_backups_when_the_copy_already_matches_canonical() {
         !fake_home
             .path()
             .join(".claude")
-            .join(".vectorhawk-backup")
+            .join(".scenery-backup")
             .exists(),
         "an identical copy must never be backed up — this is the unbounded churn bug"
     );
@@ -194,10 +194,10 @@ fn link_dir_still_replaces_a_copy_that_has_diverged() {
     // runs, so a stale copy can never persist past the next content change.
     let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let (_tmp, canonical, link_path) = fixture();
-    fs::write(canonical.join(".vectorhawk-managed.json"), MARKER).unwrap();
+    fs::write(canonical.join(".scenery-managed.json"), MARKER).unwrap();
     fs::create_dir_all(&link_path).unwrap();
     fs::write(link_path.join("SKILL.md"), b"---\nname: demo\n---\nOLD").unwrap();
-    fs::write(link_path.join(".vectorhawk-managed.json"), MARKER).unwrap();
+    fs::write(link_path.join(".scenery-managed.json"), MARKER).unwrap();
 
     let fake_home = tempfile::tempdir().unwrap();
     let prev_home = std::env::var_os("HOME");
@@ -227,10 +227,10 @@ fn link_dir_treats_a_copy_with_an_extra_file_as_diverged() {
     // identical, or content the copy alone carries would be silently kept.
     let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let (_tmp, canonical, link_path) = fixture();
-    fs::write(canonical.join(".vectorhawk-managed.json"), MARKER).unwrap();
+    fs::write(canonical.join(".scenery-managed.json"), MARKER).unwrap();
     fs::create_dir_all(&link_path).unwrap();
     fs::write(link_path.join("SKILL.md"), b"---\nname: demo\n---\n").unwrap();
-    fs::write(link_path.join(".vectorhawk-managed.json"), MARKER).unwrap();
+    fs::write(link_path.join(".scenery-managed.json"), MARKER).unwrap();
     fs::write(link_path.join("extra.txt"), b"only in the copy").unwrap();
 
     let fake_home = tempfile::tempdir().unwrap();
@@ -255,10 +255,10 @@ fn link_dir_treats_a_copy_with_an_extra_file_as_diverged() {
     );
 }
 
-/// Locate `~/.claude/.vectorhawk-backup/<ts>/links/<name>` without hardcoding
+/// Locate `~/.claude/.scenery-backup/<ts>/links/<name>` without hardcoding
 /// the run timestamp.
 fn find_link_backup(home: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
-    let base = home.join(".claude").join(".vectorhawk-backup");
+    let base = home.join(".claude").join(".scenery-backup");
     for run in fs::read_dir(base).ok()? {
         let candidate = run.ok()?.path().join("links").join(name);
         if candidate.is_dir() {
@@ -279,7 +279,7 @@ fn link_dir_refuses_to_remove_when_the_backup_cannot_be_made() {
     fs::create_dir_all(&link_path).unwrap();
     fs::write(link_path.join("SKILL.md"), b"stale copy").unwrap();
     fs::write(
-        link_path.join(".vectorhawk-managed.json"),
+        link_path.join(".scenery-managed.json"),
         br#"{"marker_version":1,"installation_id":null,"source_sha256":"abc","migrated_at":"2026-01-01T00:00:00Z"}"#,
     )
     .unwrap();
@@ -352,7 +352,7 @@ fn unlink_dir_refuses_to_delete_an_unmanaged_real_dir() {
     let (_tmp, canonical, link_path) = fixture();
 
     // A user's own skill directory sitting where the Claude link would go —
-    // no `.vectorhawk-managed.json`, so not ours.
+    // no `.scenery-managed.json`, so not ours.
     fs::create_dir_all(&link_path).unwrap();
     fs::write(link_path.join("SKILL.md"), b"user-authored, never ours").unwrap();
 
@@ -381,7 +381,7 @@ fn unlink_dir_refuses_to_delete_an_unmanaged_real_dir() {
 }
 
 /// The `LinkMode::Copy` steady state: a real directory at the link path that
-/// VectorHawk *did* materialise (it carries the marker). `unlink_dir` may
+/// Scenery *did* materialise (it carries the marker). `unlink_dir` may
 /// remove it — but, like every other destructive step on this branch, only
 /// after backing it up, since a marker proves we wrote it, not that its
 /// current content is still reproducible.
@@ -397,11 +397,11 @@ fn unlink_dir_backs_up_a_managed_real_dir_before_removing_it() {
 
     fs::create_dir_all(&link_path).unwrap();
     fs::write(link_path.join("SKILL.md"), b"a copy-mode materialisation").unwrap();
-    fs::write(link_path.join(".vectorhawk-managed.json"), b"{}").unwrap();
+    fs::write(link_path.join(".scenery-managed.json"), b"{}").unwrap();
 
     let result = unlink_dir(&link_path);
 
-    let backup_root = fake_home.join(".claude").join(".vectorhawk-backup");
+    let backup_root = fake_home.join(".claude").join(".scenery-backup");
     let recovered: Vec<_> = fs::read_dir(&backup_root)
         .map(|rd| {
             rd.flatten()

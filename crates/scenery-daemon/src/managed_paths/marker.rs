@@ -1,4 +1,4 @@
-//! Managed-path marker: read/write `.vectorhawk-managed.json` for skills and
+//! Managed-path marker: read/write `.scenery-managed.json` for skills and
 //! plugins, and read/write `managed_path_markers` SQLite rows for MCP entries.
 //!
 //! For skills and plugins the marker lives next to the skill/plugin directory
@@ -7,15 +7,15 @@
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
+use scenery_mcp::ownership::MANAGED_MARKER_FILENAME;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tracing::warn;
-use scenery_mcp::ownership::MANAGED_MARKER_FILENAME;
 
-/// Current schema version for `.vectorhawk-managed.json`.
+/// Current schema version for `.scenery-managed.json`.
 pub const MARKER_FILE_VERSION: u32 = 1;
 
-/// Contents of `.vectorhawk-managed.json` written next to each managed
+/// Contents of `.scenery-managed.json` written next to each managed
 /// skill/plugin directory.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManagedMarkerFile {
@@ -41,7 +41,7 @@ pub struct ManagedPathMarker {
 
 // ── File marker (skill / plugin) ──────────────────────────────────────────────
 
-/// Write `.vectorhawk-managed.json` into `dir_path`.
+/// Write `.scenery-managed.json` into `dir_path`.
 pub fn write_file_marker(
     dir_path: &Path,
     installation_id: Option<&str>,
@@ -56,7 +56,7 @@ pub fn write_file_marker(
     };
 
     let json = serde_json::to_string_pretty(&marker)
-        .context("failed to serialise .vectorhawk-managed.json")?;
+        .context("failed to serialise .scenery-managed.json")?;
 
     let marker_path = dir_path.join(MANAGED_MARKER_FILENAME);
     std::fs::write(&marker_path, json)
@@ -65,7 +65,7 @@ pub fn write_file_marker(
     Ok(())
 }
 
-/// Read `.vectorhawk-managed.json` from `dir_path`.
+/// Read `.scenery-managed.json` from `dir_path`.
 ///
 /// Returns `None` if the file does not exist (not yet managed).
 /// Returns `Err` only for I/O or JSON parse errors; a version mismatch is
@@ -86,7 +86,7 @@ pub fn read_file_marker(dir_path: &Path) -> Result<Option<ManagedMarkerFile>> {
             warn!(
                 path = %marker_path.display(),
                 error = %e,
-                "managed_paths/marker: malformed .vectorhawk-managed.json — treating as absent"
+                "managed_paths/marker: malformed .scenery-managed.json — treating as absent"
             );
             Ok(None)
         }
@@ -146,11 +146,11 @@ pub fn is_already_marked(conn: &Connection, path: &str) -> Result<bool> {
 
 // ── DB-backed ownership (F13) ─────────────────────────────────────────────────
 
-/// Whether a skill/plugin directory is VectorHawk-managed according to the
+/// Whether a skill/plugin directory is Scenery-managed according to the
 /// authoritative `managed_path_markers` table.
 ///
-/// The `.vectorhawk-managed.json` sidecar is deliberately NOT consulted: any
-/// skill author can ship one. Only a row VectorHawk itself wrote, at this
+/// The `.scenery-managed.json` sidecar is deliberately NOT consulted: any
+/// skill author can ship one. Only a row Scenery itself wrote, at this
 /// exact canonical path, counts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DbOwnership {

@@ -8,7 +8,7 @@
 //! wrapper), a slow tool call will stall all other concurrent calls because the
 //! single executor thread is occupied.
 //!
-//! This test proves the invariant: a fast management call (`vectorhawk_list`)
+//! This test proves the invariant: a fast management call (`scenery_list`)
 //! returns within 100 ms even while 4 concurrent slow tool calls (each sleeping
 //! 1.5 s in a stub stdio backend) are in flight.
 //!
@@ -20,7 +20,7 @@
 //!
 //! The daemon backend registry is currently a stub-only registry (real stdio
 //! backend registration is a M1.3 feature). Therefore, this test validates the
-//! fast-path management tool dispatch (`vectorhawk_list`) against the shim's
+//! fast-path management tool dispatch (`scenery_list`) against the shim's
 //! own dispatch loop rather than the daemon's backend dispatch. The critical
 //! property is that the shim's current-thread async loop is not blocked by
 //! the slow backend calls that go through `spawn_blocking` in the aggregator.
@@ -76,11 +76,11 @@ fn daemon_socket_path() -> PathBuf {
     #[cfg(target_os = "linux")]
     {
         if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
-            return PathBuf::from(runtime).join("vectorhawk").join("agent.sock");
+            return PathBuf::from(runtime).join("scenery").join("agent.sock");
         }
     }
     let data_dir = dirs::data_dir().expect("dirs::data_dir() should succeed");
-    data_dir.join("VectorHawk").join("agent.sock")
+    data_dir.join("Scenery").join("agent.sock")
 }
 
 fn wait_for_socket(path: &std::path::Path, timeout: Duration) -> bool {
@@ -106,9 +106,9 @@ fn kill_child(child: &mut Child) {
 }
 
 fn kill_stale_daemon() {
-    // `-x vectorhawk` for exact process-name match — see m0_acceptance::kill_stale_daemon
+    // `-x scenery` for exact process-name match — see m0_acceptance::kill_stale_daemon
     // for why `-f` was wrong on Linux.
-    let _ = Command::new("pkill").args(["-x", "vectorhawk"]).status();
+    let _ = Command::new("pkill").args(["-x", "scenery"]).status();
     std::thread::sleep(Duration::from_millis(300));
 }
 
@@ -171,16 +171,16 @@ fn send_rpc(
 #[test]
 #[ignore = "requires pre-built release binaries — run cargo build --workspace --release first"]
 fn m1_fifty_concurrent_tool_calls_no_deadlock() {
-    let daemon_bin = release_bin("vectorhawk");
-    let shim_bin = release_bin("vectorhawk");
+    let daemon_bin = release_bin("scenery");
+    let shim_bin = release_bin("scenery");
 
     assert!(
         daemon_bin.exists(),
-        "vectorhawk binary not found at {daemon_bin:?} — run cargo build --workspace --release"
+        "scenery binary not found at {daemon_bin:?} — run cargo build --workspace --release"
     );
     assert!(
         shim_bin.exists(),
-        "vectorhawk binary not found at {shim_bin:?} — run cargo build --workspace --release"
+        "scenery binary not found at {shim_bin:?} — run cargo build --workspace --release"
     );
 
     let socket_path = daemon_socket_path();
@@ -193,7 +193,7 @@ fn m1_fifty_concurrent_tool_calls_no_deadlock() {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("failed to spawn vectorhawk daemon run");
+        .expect("failed to spawn scenery daemon run");
 
     let socket_appeared = wait_for_socket(&socket_path, Duration::from_secs(5));
     if !socket_appeared {
@@ -212,7 +212,7 @@ fn m1_fifty_concurrent_tool_calls_no_deadlock() {
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .expect("failed to spawn vectorhawk mcp serve");
+        .expect("failed to spawn scenery mcp serve");
 
     let mut primary_stdin = primary_shim.stdin.take().expect("shim stdin");
     let primary_stdout_raw = primary_shim.stdout.take().expect("shim stdout");
@@ -291,7 +291,7 @@ fn m1_fifty_concurrent_tool_calls_no_deadlock() {
                     .stdout(Stdio::piped())
                     .stderr(Stdio::null())
                     .spawn()
-                    .expect("spawn vectorhawk mcp serve");
+                    .expect("spawn scenery mcp serve");
 
                 let mut stdin = shim.stdin.take().expect("stdin");
                 let stdout_raw = shim.stdout.take().expect("stdout");
@@ -422,7 +422,7 @@ fn m1_fifty_concurrent_tool_calls_no_deadlock() {
 /// M1 spawn_blocking acceptance — slow blocking backend must not head-of-line
 /// block independent calls.
 ///
-/// The daemon is spawned with `VECTORHAWK_STUB_LATENCY_MS=1500`, which causes
+/// The daemon is spawned with `SCENERY_STUB_LATENCY_MS=1500`, which causes
 /// the stub backend's dispatch to perform a 1.5 s `std::thread::sleep` wrapped
 /// in `tokio::task::spawn_blocking`. This simulates a real slow backend (such
 /// as a stdio MCP server with high latency) without requiring a fixture binary.
@@ -440,16 +440,16 @@ fn m1_fifty_concurrent_tool_calls_no_deadlock() {
 #[test]
 #[ignore = "requires pre-built release binaries — run cargo build --workspace --release first"]
 fn m1_slow_backend_does_not_block_independent_calls() {
-    let daemon_bin = release_bin("vectorhawk");
-    let shim_bin = release_bin("vectorhawk");
+    let daemon_bin = release_bin("scenery");
+    let shim_bin = release_bin("scenery");
 
     assert!(
         daemon_bin.exists(),
-        "vectorhawk binary not found at {daemon_bin:?} — run cargo build --workspace --release"
+        "scenery binary not found at {daemon_bin:?} — run cargo build --workspace --release"
     );
     assert!(
         shim_bin.exists(),
-        "vectorhawk binary not found at {shim_bin:?} — run cargo build --workspace --release"
+        "scenery binary not found at {shim_bin:?} — run cargo build --workspace --release"
     );
 
     let socket_path = daemon_socket_path();
@@ -461,11 +461,11 @@ fn m1_slow_backend_does_not_block_independent_calls() {
     // dispatch will sleep 1.5 s in spawn_blocking.
     let mut daemon = Command::new(&daemon_bin)
         .args(["daemon", "run"])
-        .env("VECTORHAWK_STUB_LATENCY_MS", "1500")
+        .env("SCENERY_STUB_LATENCY_MS", "1500")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("failed to spawn vectorhawk daemon run");
+        .expect("failed to spawn scenery daemon run");
 
     let socket_appeared = wait_for_socket(&socket_path, Duration::from_secs(5));
     if !socket_appeared {
@@ -483,7 +483,7 @@ fn m1_slow_backend_does_not_block_independent_calls() {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .expect("spawn vectorhawk mcp serve (probe)");
+            .expect("spawn scenery mcp serve (probe)");
         let mut stdin = probe.stdin.take().expect("stdin");
         let stdout_raw = probe.stdout.take().expect("stdout");
         let mut stdout = std::io::BufReader::new(stdout_raw);
@@ -527,7 +527,7 @@ fn m1_slow_backend_does_not_block_independent_calls() {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
                 .spawn()
-                .expect("spawn vectorhawk mcp serve (slow-call)");
+                .expect("spawn scenery mcp serve (slow-call)");
             let mut stdin = shim.stdin.take().expect("stdin");
             let stdout_raw = shim.stdout.take().expect("stdout");
             let mut stdout = std::io::BufReader::new(stdout_raw);
@@ -571,7 +571,7 @@ fn m1_slow_backend_does_not_block_independent_calls() {
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn vectorhawk mcp serve (fast probe)");
+        .expect("spawn scenery mcp serve (fast probe)");
     let mut fast_stdin = fast_shim.stdin.take().expect("stdin");
     let fast_stdout_raw = fast_shim.stdout.take().expect("stdout");
     let mut fast_stdout = std::io::BufReader::new(fast_stdout_raw);

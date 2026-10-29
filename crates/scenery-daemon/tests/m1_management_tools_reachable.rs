@@ -1,15 +1,15 @@
 //! GAP-01 regression test — management tools must be reachable through the daemon.
 //!
 //! Before this fix, `RealBackend::list_tools` returned only the stub echo/ping
-//! tools from `BackendRegistry`. The `vectorhawk_*` management tools defined in
+//! tools from `BackendRegistry`. The `scenery_*` management tools defined in
 //! `scenery_mcp::tools::build_tool_list` were never called, so AI clients
 //! never saw them.
 //!
 //! This test:
-//!   1. Spawns `vectorhawk daemon run` and `vectorhawk mcp serve`.
+//!   1. Spawns `scenery daemon run` and `scenery mcp serve`.
 //!   2. Performs an `initialize` + `tools/list` round-trip via the shim.
-//!   3. Asserts that ALL expected `vectorhawk_*` management tools are present.
-//!   4. Sends `tools/call` with `vectorhawk_list` and asserts no error.
+//!   3. Asserts that ALL expected `scenery_*` management tools are present.
+//!   4. Sends `tools/call` with `scenery_list` and asserts no error.
 //!
 //! # Running
 //!
@@ -46,11 +46,11 @@ fn daemon_socket_path() -> PathBuf {
     #[cfg(target_os = "linux")]
     {
         if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
-            return PathBuf::from(runtime).join("vectorhawk").join("agent.sock");
+            return PathBuf::from(runtime).join("scenery").join("agent.sock");
         }
     }
     let data_dir = dirs::data_dir().expect("dirs::data_dir() should succeed");
-    data_dir.join("VectorHawk").join("agent.sock")
+    data_dir.join("Scenery").join("agent.sock")
 }
 
 fn wait_for_socket(path: &Path, timeout: Duration) -> bool {
@@ -89,27 +89,27 @@ fn send_rpc(
 }
 
 fn kill_stale_daemon() {
-    let _ = Command::new("pkill").args(["-x", "vectorhawk"]).status();
+    let _ = Command::new("pkill").args(["-x", "scenery"]).status();
     std::thread::sleep(Duration::from_millis(300));
 }
 
-/// GAP-01 regression: all `vectorhawk_*` management tools must appear in
-/// `tools/list` and `vectorhawk_list` must be callable without error.
+/// GAP-01 regression: all `scenery_*` management tools must appear in
+/// `tools/list` and `scenery_list` must be callable without error.
 ///
 /// Marked `#[ignore]` — requires pre-built release binaries.
 #[test]
 #[ignore = "requires pre-built release binaries — run cargo build --workspace --release first"]
 fn gap01_management_tools_present_and_callable() {
-    let daemon_bin = release_bin("vectorhawk");
-    let shim_bin = release_bin("vectorhawk");
+    let daemon_bin = release_bin("scenery");
+    let shim_bin = release_bin("scenery");
 
     assert!(
         daemon_bin.exists(),
-        "vectorhawk binary not found at {daemon_bin:?} — run cargo build --workspace --release"
+        "scenery binary not found at {daemon_bin:?} — run cargo build --workspace --release"
     );
     assert!(
         shim_bin.exists(),
-        "vectorhawk binary not found at {shim_bin:?} — run cargo build --workspace --release"
+        "scenery binary not found at {shim_bin:?} — run cargo build --workspace --release"
     );
 
     let socket_path = daemon_socket_path();
@@ -121,7 +121,7 @@ fn gap01_management_tools_present_and_callable() {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("failed to spawn vectorhawk daemon run");
+        .expect("failed to spawn scenery daemon run");
 
     let socket_appeared = wait_for_socket(&socket_path, Duration::from_secs(5));
     if !socket_appeared {
@@ -135,7 +135,7 @@ fn gap01_management_tools_present_and_callable() {
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .expect("failed to spawn vectorhawk mcp serve");
+        .expect("failed to spawn scenery mcp serve");
 
     let mut stdin = shim.stdin.take().expect("shim stdin");
     let stdout_raw = shim.stdout.take().expect("shim stdout");
@@ -189,14 +189,14 @@ fn gap01_management_tools_present_and_callable() {
 
     // GAP-01: all management tools must be present
     let required_tools = [
-        "vectorhawk_list",
-        "vectorhawk_search",
-        "vectorhawk_install",
-        "vectorhawk_info",
-        "vectorhawk_validate",
-        "vectorhawk_import",
-        "vectorhawk_uninstall",
-        "vectorhawk_update",
+        "scenery_list",
+        "scenery_search",
+        "scenery_install",
+        "scenery_info",
+        "scenery_validate",
+        "scenery_import",
+        "scenery_uninstall",
+        "scenery_update",
     ];
     // These are only present when logged in; just assert the others
     for required in &required_tools {
@@ -206,7 +206,7 @@ fn gap01_management_tools_present_and_callable() {
         );
     }
 
-    // ── tools/call vectorhawk_list — must return without error ───────────────
+    // ── tools/call scenery_list — must return without error ───────────────
 
     let call_resp = send_rpc(
         &mut stdin,
@@ -216,7 +216,7 @@ fn gap01_management_tools_present_and_callable() {
             "id": 3,
             "method": "tools/call",
             "params": {
-                "name": "vectorhawk_list",
+                "name": "scenery_list",
                 "arguments": {}
             }
         }),
@@ -224,17 +224,17 @@ fn gap01_management_tools_present_and_callable() {
     assert_eq!(call_resp["id"], 3);
     assert!(
         call_resp.get("result").is_some() && call_resp.get("error").is_none(),
-        "vectorhawk_list call must succeed; got: {call_resp}"
+        "scenery_list call must succeed; got: {call_resp}"
     );
 
     let content = call_resp["result"]["content"]
         .as_array()
         .expect("result.content must be an array");
-    assert!(!content.is_empty(), "vectorhawk_list must return content");
+    assert!(!content.is_empty(), "scenery_list must return content");
 
     // is_error must not be true
     let is_error = call_resp["result"]["isError"].as_bool().unwrap_or(false);
-    assert!(!is_error, "vectorhawk_list must not return isError=true");
+    assert!(!is_error, "scenery_list must not return isError=true");
 
     // ── Cleanup ───────────────────────────────────────────────────────────────
 
