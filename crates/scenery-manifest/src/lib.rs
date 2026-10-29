@@ -1067,7 +1067,7 @@ You are an expert text analyst.
 
     #[test]
     fn skill_md_minimal_loads_and_derives_id() {
-        let root = temp_root("skill-md-minimal");
+        let root = temp_root("hello-world");
         write_minimal_skill_md(&root);
 
         let pkg = SkillPackage::load_from_dir(&root).expect("minimal SKILL.md should load");
@@ -1180,28 +1180,24 @@ You are an expert text analyst.
         // Load the AUTH1a real example skill from the examples directory.
         let root = Utf8PathBuf::from(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../examples/skills/skill-md-minimal"
+            "/../../examples/skills/minimal"
         ));
-        if !root.exists() {
-            return; // Skip if running in a context without the examples directory.
-        }
+        assert!(root.exists(), "example skill dir missing: {root}");
         let pkg = SkillPackage::load_from_dir(&root).expect("real minimal SKILL.md should load");
-        assert_eq!(pkg.manifest.id, "skill-md-minimal");
+        assert_eq!(pkg.manifest.id, "hello-world");
         assert_eq!(pkg.workflow.steps.len(), 1);
     }
 
     #[test]
     fn skill_md_real_complex_example_loads() {
-        // Load the AUTH1a complex example (has vh_workflow_ref and vh_schemas).
+        // Load the AUTH1a complex example (has workflow_ref and schemas).
         let root = Utf8PathBuf::from(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../examples/skills/skill-md-complex"
+            "/../../examples/skills/complex"
         ));
-        if !root.exists() {
-            return;
-        }
+        assert!(root.exists(), "example skill dir missing: {root}");
         let pkg = SkillPackage::load_from_dir(&root).expect("real complex SKILL.md should load");
-        assert_eq!(pkg.manifest.id, "skill-md-complex");
+        assert_eq!(pkg.manifest.id, "incident-triage");
         assert!(
             pkg.manifest.inputs_schema.is_some(),
             "complex skill should have inputs schema"
