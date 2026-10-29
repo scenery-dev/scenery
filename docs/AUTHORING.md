@@ -26,16 +26,18 @@ scenery skill publish my-skill/ --registry-url https://app.scenery.dev
 ---
 name: my-skill
 description: One sentence describing what this skill does.
-version: 0.1.0
-publisher: your-publisher-id
-vh_permissions:
-  network: none
-  filesystem: none
-  clipboard: none
-vh_execution:
-  timeout_ms: 30000
-  memory_mb: 256
-  sandbox: strict
+metadata:
+  scenery:
+    version: 0.1.0
+    publisher: your-publisher-id
+    permissions:
+      network: none
+      filesystem: none
+      clipboard: none
+    execution:
+      timeout_ms: 30000
+      memory_mb: 256
+      sandbox: strict
 ---
 
 # My Skill
@@ -50,21 +52,23 @@ Your system prompt goes here.
 | `name` | Lowercase alphanumeric with hyphens (e.g. `contract-compare`). Must be unique within your publisher namespace. |
 | `description` | 10–280 character description shown in the registry and as the MCP tool description. |
 
-## Optional `vh_*` Fields
+## Optional `metadata.scenery.*` Fields
 
-### `vh_version`
+All Scenery extensions nest under `metadata.scenery`. Top-level `vh_*` keys are rejected. The snippets below show the fields as they appear inside that block.
+
+### `version`
 Semver 2.0 string. Defaults to `0.1.0`. Increment when publishing an update.
 
-### `vh_publisher`
+### `publisher`
 Your publisher handle in the Scenery registry. Required for `skill publish`.
 Authenticate first with `scenery auth login`.
 
-### `vh_permissions`
+### `permissions`
 
 Controls what the skill runtime is allowed to do:
 
 ```yaml
-vh_permissions:
+permissions:
   network: none        # none | restricted | full
   filesystem: none     # none | read-only | full
   clipboard: none      # none | read | write | full
@@ -73,21 +77,21 @@ vh_permissions:
 Default for all fields is `none`. Org policy may block skills that request more
 than allowed.
 
-### `vh_execution`
+### `execution`
 
 ```yaml
-vh_execution:
+execution:
   timeout_ms: 30000    # 1000–600000 ms (default: 30000)
   memory_mb: 256       # 64–8192 MiB (default: 256)
   sandbox: strict      # strict | relaxed | unrestricted
 ```
 
-### `vh_triggers`
+### `triggers`
 
 Natural-language phrases the MCP dispatcher uses to route requests to this skill:
 
 ```yaml
-vh_triggers:
+triggers:
   - compare contracts
   - diff legal documents
   - review contract changes
@@ -96,25 +100,25 @@ vh_triggers:
 Up to 10 triggers, 3–200 characters each. Case-insensitive; duplicates are
 removed automatically.
 
-### `vh_workflow_ref`
+### `workflow_ref`
 
 Reference an external `workflow.yaml` for multi-step skills:
 
 ```yaml
-vh_workflow_ref: ./workflow.yaml
+workflow_ref: ./workflow.yaml
 ```
 
 When omitted, the runtime generates a single `llm` step from the Markdown body.
 
-### `vh_model`
+### `model`
 
-By default (when `vh_model` is omitted), the runner uses MCP sampling — the AI
-client's own model (Claude Sonnet, GPT-4o, etc.). Only set `vh_model` when the
+By default (when `model` is omitted), the runner uses MCP sampling — the AI
+client's own model (Claude Sonnet, GPT-4o, etc.). Only set `model` when the
 skill requires local inference, e.g. for sensitive data that must not leave the
 machine:
 
 ```yaml
-vh_model:
+model:
   provider: ollama        # ollama | mcp-sampling
   name: llama3.2
   prefer_local: true      # try Ollama first, fall back to MCP sampling
@@ -124,12 +128,12 @@ vh_model:
 `prefer_local: false` (the default) means: try MCP sampling first, fall back to
 Ollama if the client has no sampling capability.
 
-### `vh_schemas`
+### `schemas`
 
 Attach JSON Schema files for input/output validation:
 
 ```yaml
-vh_schemas:
+schemas:
   input: ./schemas/input.json
   output: ./schemas/output.json
 ```
@@ -138,7 +142,7 @@ vh_schemas:
 
 Everything after the `---` closing delimiter is the skill's system prompt.
 Keep it focused: describe the task, the expected input, and the required output
-format. Reference `vh_schemas.output` for structured output.
+format. Reference `metadata.scenery.schemas.output` for structured output.
 
 ## Multi-Step Skills
 
@@ -159,7 +163,7 @@ steps:
       output_schema: schemas/output.json
 ```
 
-Then reference it in your frontmatter with `vh_workflow_ref: ./workflow.yaml`.
+Then reference it in your frontmatter with `workflow_ref: ./workflow.yaml` under `metadata.scenery`.
 
 ## Examples
 
