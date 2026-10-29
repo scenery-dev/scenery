@@ -187,32 +187,32 @@ mod tests {
     #[test]
     fn explicit_argument_wins_over_env() {
         let result = resolve_pair_code(
-            Some("VH-ARG1"),
-            Some("VH-ENV1"),
+            Some("SCN-ARG1"),
+            Some("SCN-ENV1"),
             true,
             scripted_reader(vec![]),
         );
-        assert_eq!(result, Ok("VH-ARG1".to_string()));
+        assert_eq!(result, Ok("SCN-ARG1".to_string()));
     }
 
     #[test]
     fn env_used_when_no_argument_and_no_terminal() {
-        let result = resolve_pair_code(None, Some("VH-ENV1"), false, scripted_reader(vec![]));
-        assert_eq!(result, Ok("VH-ENV1".to_string()));
+        let result = resolve_pair_code(None, Some("SCN-ENV1"), false, scripted_reader(vec![]));
+        assert_eq!(result, Ok("SCN-ENV1".to_string()));
     }
 
     #[test]
     fn env_used_without_prompting_even_when_terminal_available() {
         // SCN_PAIR_CODE must work with no terminal at all, and shouldn't
         // require one either — it's used without prompting regardless.
-        let result = resolve_pair_code(None, Some("VH-ENV1"), true, scripted_reader(vec![]));
-        assert_eq!(result, Ok("VH-ENV1".to_string()));
+        let result = resolve_pair_code(None, Some("SCN-ENV1"), true, scripted_reader(vec![]));
+        assert_eq!(result, Ok("SCN-ENV1".to_string()));
     }
 
     #[test]
     fn prompt_used_when_no_argument_no_env_terminal_available() {
-        let result = resolve_pair_code(None, None, true, scripted_reader(vec!["VH-PROMPTED\n"]));
-        assert_eq!(result, Ok("VH-PROMPTED".to_string()));
+        let result = resolve_pair_code(None, None, true, scripted_reader(vec!["SCN-PROMPTED\n"]));
+        assert_eq!(result, Ok("SCN-PROMPTED".to_string()));
     }
 
     #[test]
@@ -250,9 +250,9 @@ mod tests {
             None,
             None,
             true,
-            scripted_reader(vec!["\n", "VH-SECOND-TRY\n"]),
+            scripted_reader(vec!["\n", "SCN-SECOND-TRY\n"]),
         );
-        assert_eq!(result, Ok("VH-SECOND-TRY".to_string()));
+        assert_eq!(result, Ok("SCN-SECOND-TRY".to_string()));
     }
 
     #[test]
@@ -276,20 +276,20 @@ mod tests {
             None,
             None,
             true,
-            scripted_reader(vec!["  VH-PADDED-CODE  \r\n"]),
+            scripted_reader(vec!["  SCN-PADDED-CODE  \r\n"]),
         );
-        assert_eq!(result, Ok("VH-PADDED-CODE".to_string()));
+        assert_eq!(result, Ok("SCN-PADDED-CODE".to_string()));
     }
 
     #[test]
     fn whitespace_and_trailing_cr_are_trimmed_from_env_value() {
         let result = resolve_pair_code(
             None,
-            Some("  VH-ENV-PADDED\r\n"),
+            Some("  SCN-ENV-PADDED\r\n"),
             false,
             scripted_reader(vec![]),
         );
-        assert_eq!(result, Ok("VH-ENV-PADDED".to_string()));
+        assert_eq!(result, Ok("SCN-ENV-PADDED".to_string()));
     }
 
     #[test]
@@ -298,8 +298,8 @@ mod tests {
             None,
             Some("   "),
             true,
-            scripted_reader(vec!["VH-FALLBACK\n"]),
+            scripted_reader(vec!["SCN-FALLBACK\n"]),
         );
-        assert_eq!(result, Ok("VH-FALLBACK".to_string()));
+        assert_eq!(result, Ok("SCN-FALLBACK".to_string()));
     }
 }

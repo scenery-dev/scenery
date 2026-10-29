@@ -519,9 +519,9 @@ fn auth_status_parses() {
 #[test]
 fn auth_pair_with_code_parses() {
     use super::{AuthCommand, Command};
-    match parse(&["auth", "pair", "VH-7X4K-9M2P"]).command {
+    match parse(&["auth", "pair", "SCN-7X4K-9M2P"]).command {
         Command::Auth(AuthCommand::Pair { code, .. }) => {
-            assert_eq!(code.as_deref(), Some("VH-7X4K-9M2P"));
+            assert_eq!(code.as_deref(), Some("SCN-7X4K-9M2P"));
         }
         other => panic!("expected Auth(Pair), got {other:?}"),
     }

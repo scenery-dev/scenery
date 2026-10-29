@@ -416,7 +416,7 @@ pub enum AuthCommand {
     /// prompt, if a terminal is available; otherwise the command exits
     /// non-zero with an error naming both escapes.
     Pair {
-        /// The pairing code shown in the portal (e.g. VH-7X4K-9M2P).
+        /// The pairing code shown in the portal (e.g. SCN-7X4K-9M2P).
         /// Optional: falls back to SCN_PAIR_CODE, then an interactive
         /// prompt when a terminal is available.
         code: Option<String>,
