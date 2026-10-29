@@ -40,7 +40,7 @@ camino = "1"
 libc = "0.2"
 semver = { version = "1", features = ["serde"] }
 tempfile = "3"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 flate2 = "1"
 tar = "0.4"
 base64 = "0.22"
