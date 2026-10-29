@@ -388,6 +388,8 @@ fn localize_skill_names(event: SyncEvent, state: &AppState) -> SyncEvent {
     }
 }
 
+// Event handler fans out over shared reconciler state; grouping into a struct is churn without clarity.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_event(
     event: SyncEvent,
     state: &Arc<AppState>,
