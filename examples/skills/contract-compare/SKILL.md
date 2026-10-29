@@ -2,9 +2,9 @@
 name: contract-compare
 description: Compare two contracts, summarize changes, and assess risk level.
 metadata:
-  vectorhawk:
+  scenery:
     version: 0.3.0
-    publisher: skillclub
+    publisher: scenery
     permissions:
       network: none
       filesystem: read-only

@@ -2,9 +2,9 @@
 name: pr-summary
 description: Summarize a GitHub pull request diff into a concise plain-English description.
 metadata:
-  vectorhawk:
+  scenery:
     version: 0.2.0
-    publisher: vectorhawk-examples
+    publisher: scenery-examples
     permissions:
       network: none
       filesystem: none

@@ -2,9 +2,9 @@
 name: incident-triage
 description: Triage a production incident — classify severity, extract affected systems, and draft an initial incident report.
 metadata:
-  vectorhawk:
+  scenery:
     version: 1.0.0
-    publisher: vectorhawk-examples
+    publisher: scenery-examples
     permissions:
       network: none
       filesystem: none
