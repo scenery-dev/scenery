@@ -1,13 +1,13 @@
-# ci.yml — VectorHawk runner CI
+# ci.yml — Scenery runner CI
 #
 # fmt + clippy + unit tests on every push / PR. Complements release.yml
 # (which only builds tagged releases and ran no tests).
 #
 # Tests run SINGLE-THREADED: several daemon tests mutate process-global env
-# vars (HOME, VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER) that production code
+# vars (HOME, SCENERY_DISABLE_FILESYSTEM_RECONCILER) that production code
 # reads, so they race under the default parallel test runner. Single-threaded
 # execution sidesteps that without per-test serialization.
-# VECTORHAWK_DISABLE_KEYCHAIN=1 keeps auth-token tests off any real keychain.
+# SCENERY_DISABLE_KEYCHAIN=1 keeps auth-token tests off any real keychain.
 
 name: ci
 
@@ -30,7 +30,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  VECTORHAWK_DISABLE_KEYCHAIN: "1"
+  SCENERY_DISABLE_KEYCHAIN: "1"
   CARGO_TERM_COLOR: always
 
 jobs:

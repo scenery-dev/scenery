@@ -54,29 +54,31 @@ jobs:
       - name: strip binary (macOS)
         if: runner.os == 'macOS'
         run: |
-          strip target/${{ matrix.target }}/release/vectorhawk
+          strip target/${{ matrix.target }}/release/scenery
 
       - name: strip binary (Linux)
         if: runner.os == 'Linux'
         run: |
-          strip target/${{ matrix.target }}/release/vectorhawk
+          strip target/${{ matrix.target }}/release/scenery
 
       - name: package tarball
         shell: bash
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           TRIPLE="${{ matrix.target }}"
-          ARCHIVE_NAME="vectorhawk-${VERSION}-${TRIPLE}.tar.gz"
+          ARCHIVE_NAME="scenery-${VERSION}-${TRIPLE}.tar.gz"
 
           STAGING_DIR="$(mktemp -d)"
-          PKG_DIR="${STAGING_DIR}/vectorhawk-${VERSION}-${TRIPLE}"
+          PKG_DIR="${STAGING_DIR}/scenery-${VERSION}-${TRIPLE}"
           mkdir -p "${PKG_DIR}"
 
-          cp target/${TRIPLE}/release/vectorhawk "${PKG_DIR}/"
+          cp target/${TRIPLE}/release/scenery "${PKG_DIR}/"
+          # `scn` is a short alias: a symlink to `scenery` inside the archive.
+          ln -s scenery "${PKG_DIR}/scn"
           cp LICENSE "${PKG_DIR}/"
           cp README.md "${PKG_DIR}/"
 
-          tar -czf "${ARCHIVE_NAME}" -C "${STAGING_DIR}" "vectorhawk-${VERSION}-${TRIPLE}"
+          tar -czf "${ARCHIVE_NAME}" -C "${STAGING_DIR}" "scenery-${VERSION}-${TRIPLE}"
 
           # Write GNU sha256sum-compatible single-line checksum file.
           # Format: "<hash>  <filename>" (two spaces between hash and name).

@@ -1,5 +1,5 @@
 #!/bin/sh
-# VectorHawk runner installer
+# Scenery runner installer
 # Run with:  curl -fsSL https://install.scenery.dev | sh
 # Or read first: curl -fsSL https://install.scenery.dev | less
 
@@ -28,8 +28,8 @@ for _arg in "$@"; do
     esac
 done
 
-[ "${VECTORHAWK_NO_MODIFY_PATH:-0}" = "1" ] && NO_MODIFY_PATH=1
-[ "${VECTORHAWK_VERBOSE:-0}"        = "1" ] && VERBOSE=1
+[ "${SCENERY_NO_MODIFY_PATH:-0}" = "1" ] && NO_MODIFY_PATH=1
+[ "${SCENERY_VERBOSE:-0}"        = "1" ] && VERBOSE=1
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -52,8 +52,8 @@ case "${OS}:${ARCH}" in
     Darwin:x86_64)  TRIPLE="x86_64-apple-darwin" ;;
     Linux:x86_64)   TRIPLE="x86_64-unknown-linux-gnu" ;;
     *)
-        log_error "VectorHawk does not yet support ${OS}/${ARCH}."
-        log_error "See https://github.com/scenery-dev/sceneryd for supported platforms."
+        log_error "Scenery does not yet support ${OS}/${ARCH}."
+        log_error "See https://github.com/scenery-dev/scenery for supported platforms."
         exit 1
         ;;
 esac
@@ -98,10 +98,10 @@ sha256_of() {
 # Resolve version
 # ---------------------------------------------------------------------------
 
-GITHUB_API="https://api.github.com/repos/scenery-dev/sceneryd/releases/latest"
+GITHUB_API="https://api.github.com/repos/scenery-dev/scenery/releases/latest"
 
-if [ -n "${VECTORHAWK_VERSION:-}" ]; then
-    TAG="${VECTORHAWK_VERSION}"
+if [ -n "${SCENERY_VERSION:-}" ]; then
+    TAG="${SCENERY_VERSION}"
     VERSION="${TAG#v}"
 else
     log "Fetching latest release..."
@@ -113,14 +113,14 @@ else
         TAG="$(printf '%s' "${_JSON}" | grep -o '"tag_name": *"[^"]*"' | sed 's/"tag_name": *"//;s/"//')"
     fi
 
-    [ -z "${TAG}" ] && { log_error "Could not determine latest version. Set VECTORHAWK_VERSION=vX.Y.Z to override."; exit 1; }
+    [ -z "${TAG}" ] && { log_error "Could not determine latest version. Set SCENERY_VERSION=vX.Y.Z to override."; exit 1; }
     VERSION="${TAG#v}"
 fi
 
 log_verbose "Version: ${TAG} (${VERSION})"
 
-TARBALL="vectorhawk-${VERSION}-${TRIPLE}.tar.gz"
-TARBALL_URL="https://github.com/scenery-dev/sceneryd/releases/download/${TAG}/${TARBALL}"
+TARBALL="scenery-${VERSION}-${TRIPLE}.tar.gz"
+TARBALL_URL="https://github.com/scenery-dev/scenery/releases/download/${TAG}/${TARBALL}"
 
 # ---------------------------------------------------------------------------
 # Install location
@@ -138,17 +138,17 @@ log_verbose "Install directory: ${INSTALL_DIR}"
 # Skip if already up to date
 # ---------------------------------------------------------------------------
 
-VH_BIN="${INSTALL_DIR}/vectorhawk"
+SCENERY_BIN="${INSTALL_DIR}/scenery"
 
 _PREV_VERSION=""
-if [ -x "${VH_BIN}" ]; then
-    _CURRENT="$("${VH_BIN}" --version 2>/dev/null | grep -o '[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*' | head -1 || true)"
+if [ -x "${SCENERY_BIN}" ]; then
+    _CURRENT="$("${SCENERY_BIN}" --version 2>/dev/null | grep -o '[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*' | head -1 || true)"
     if [ "${_CURRENT}" = "${VERSION}" ]; then
-        log "vectorhawk ${VERSION} is already installed."
+        log "scenery ${VERSION} is already installed."
         if [ "${NO_SETUP}" = "0" ]; then
             log ""
-            "${VH_BIN}" daemon install 2>/dev/null || true
-            "${VH_BIN}" mcp setup     2>/dev/null || true
+            "${SCENERY_BIN}" daemon install 2>/dev/null || true
+            "${SCENERY_BIN}" mcp setup     2>/dev/null || true
         fi
         exit 0
     fi
@@ -162,7 +162,7 @@ fi
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "${TMPDIR}"' EXIT INT TERM
 
-log "Downloading vectorhawk ${VERSION} for ${TRIPLE}..."
+log "Downloading scenery ${VERSION} for ${TRIPLE}..."
 download_url "${TARBALL_URL}" "${TMPDIR}/${TARBALL}"
 
 # ---------------------------------------------------------------------------
@@ -181,7 +181,7 @@ fi
 
 _ACTUAL="$(sha256_of "${TMPDIR}/${TARBALL}" | tr '[:upper:]' '[:lower:]')" || {
     log_error "No SHA-256 tool (sha256sum, shasum, or openssl) found — cannot verify the download."
-    log_error "Install one and retry, or use Homebrew: brew tap scenery-dev/tap && brew trust scenery-dev/tap && brew install vectorhawk"
+    log_error "Install one and retry, or use Homebrew: brew tap scenery-dev/tap && brew trust scenery-dev/tap && brew install scenery-dev/tap/scenery"
     exit 1
 }
 
@@ -199,9 +199,9 @@ tar -xzf "${TMPDIR}/${TARBALL}" -C "${TMPDIR}"
 
 mkdir -p "${INSTALL_DIR}"
 
-for _bin in vectorhawk; do
+for _bin in scenery; do
     # Support both flat tarballs (./binary) and subdirectoried ones
-    # (vectorhawk-VERSION-TRIPLE/binary) by searching after extraction.
+    # (scenery-VERSION-TRIPLE/binary) by searching after extraction.
     _src="$(find "${TMPDIR}" -name "${_bin}" -type f | head -1)"
     if [ -z "${_src}" ]; then
         log_error "Expected binary not in tarball: ${_bin}"
@@ -212,6 +212,12 @@ for _bin in vectorhawk; do
     chmod 755 "${INSTALL_DIR}/${_bin}"
     log_verbose "Installed ${_bin}"
 done
+
+# `scn` is a short alias for `scenery`: a symlink next to the binary. The
+# binary resolves symlinks (current_exe), so `scn` behaves identically.
+ln -sf scenery "${INSTALL_DIR}/scn.tmp"
+mv "${INSTALL_DIR}/scn.tmp" "${INSTALL_DIR}/scn"
+log_verbose "Installed scn -> scenery"
 
 # ---------------------------------------------------------------------------
 # PATH
@@ -231,13 +237,13 @@ if [ "${_on_path}" = "0" ] && [ "${SYSTEM_INSTALL}" = "0" ] && [ "${NO_MODIFY_PA
 
     if [ -n "${_RC}" ]; then
         if ! grep -qF "${INSTALL_DIR}" "${_RC}" 2>/dev/null; then
-            printf '\n# Added by VectorHawk installer\n%s\n' "${_LINE}" >> "${_RC}"
+            printf '\n# Added by Scenery installer\n%s\n' "${_LINE}" >> "${_RC}"
             log "Added ${INSTALL_DIR} to PATH in ${_RC}."
         fi
         export PATH="${INSTALL_DIR}:${PATH}"
     else
         log ""
-        log "Add this to your shell config to put vectorhawk on PATH:"
+        log "Add this to your shell config to put scenery on PATH:"
         log "    export PATH=\"${INSTALL_DIR}:\$PATH\""
     fi
 fi
@@ -247,14 +253,14 @@ fi
 # ---------------------------------------------------------------------------
 
 log ""
-log "vectorhawk ${VERSION} installed to ${INSTALL_DIR}."
+log "scenery ${VERSION} installed to ${INSTALL_DIR}."
 log ""
 
 # ---------------------------------------------------------------------------
 # Pairing helpers
 # ---------------------------------------------------------------------------
 
-# `vectorhawk auth pair` accepts a bare (code-less) invocation starting in
+# `scenery auth pair` accepts a bare (code-less) invocation starting in
 # this version — older installed binaries require the code as a required
 # positional argument and fail with a missing-argument error if it's
 # omitted.
@@ -322,15 +328,15 @@ if [ "${NO_SETUP}" = "0" ]; then
     if [ -n "${_PREV_VERSION}" ] && [ "${_PREV_VERSION}" != "${VERSION}" ] && command -v systemctl >/dev/null 2>&1; then
         XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
         export XDG_RUNTIME_DIR
-        systemctl --user restart vectorhawk-agent.service 2>/dev/null || true
+        systemctl --user restart scenery.service 2>/dev/null || true
     fi
-    "${VH_BIN}" daemon install || {
-        log "  (daemon start deferred — run 'vectorhawk daemon install' after logging in)"
+    "${SCENERY_BIN}" daemon install || {
+        log "  (daemon start deferred — run 'scenery daemon install' after logging in)"
     }
 
     log "Configuring AI clients..."
-    "${VH_BIN}" mcp setup || {
-        log "  (client config deferred — run 'vectorhawk mcp setup' in your login shell)"
+    "${SCENERY_BIN}" mcp setup || {
+        log "  (client config deferred — run 'scenery mcp setup' in your login shell)"
     }
 
     log ""
@@ -344,37 +350,37 @@ if [ "${NO_SETUP}" = "0" ]; then
     if ! version_at_least "${_PAIR_MIN_VERSION}" "${VERSION#v}"; then
         log "To finish setup, pair this device: find the code on the portal's device"
         log "setup screen (open the catalog page), then run:"
-        log "  vectorhawk auth pair <code>"
+        log "  scenery auth pair <code>"
     else
         log "Checking authentication..."
-        if "${VH_BIN}" auth status >/dev/null 2>&1; then
+        if "${SCENERY_BIN}" auth status >/dev/null 2>&1; then
             _AUTHENTICATED=1
             log "Already authenticated — skipping pairing."
         else
-            if [ -n "${VH_PAIR_CODE:-}" ]; then
+            if [ -n "${SCN_PAIR_CODE:-}" ]; then
                 # Unattended path (MDM / Intune / Jamf): the CLI reads
-                # VH_PAIR_CODE itself. No prompt, no terminal needed — this
+                # SCN_PAIR_CODE itself. No prompt, no terminal needed — this
                 # is the only pairing path that works with no tty at all.
-                log "Pairing this device using VH_PAIR_CODE..."
-                if "${VH_BIN}" auth pair; then
+                log "Pairing this device using SCN_PAIR_CODE..."
+                if "${SCENERY_BIN}" auth pair; then
                     _AUTHENTICATED=1
                 else
-                    log "  (pairing failed — run 'vectorhawk auth pair <code>' manually when ready)"
+                    log "  (pairing failed — run 'scenery auth pair <code>' manually when ready)"
                 fi
             elif terminal_available; then
                 log "Pairing this device — find the code on the portal's device setup screen"
                 log "(open the catalog page; if this device isn't registered yet, you'll see it there)."
-                if "${VH_BIN}" auth pair < /dev/tty; then
+                if "${SCENERY_BIN}" auth pair < /dev/tty; then
                     _AUTHENTICATED=1
                 else
-                    log "  (pairing failed or declined — run 'vectorhawk auth pair <code>' manually when ready)"
+                    log "  (pairing failed or declined — run 'scenery auth pair <code>' manually when ready)"
                 fi
             else
-                # No terminal (CI/MDM without VH_PAIR_CODE) — best-effort
+                # No terminal (CI/MDM without SCN_PAIR_CODE) — best-effort
                 # only, never blocks the install.
                 log "To finish setup, pair this device: find the code on the portal's device"
                 log "setup screen (open the catalog page), then run:"
-                log "  vectorhawk auth pair <code>"
+                log "  scenery auth pair <code>"
             fi
         fi
     fi
@@ -384,12 +390,12 @@ if [ "${NO_SETUP}" = "0" ]; then
         log "Done. Restart Claude Code (or your AI client) to pick up the new setup."
     else
         log "Done. Restart Claude Code (or your AI client), then call the"
-        log "vectorhawk_login tool (or run 'vectorhawk auth pair <code>') to authenticate."
+        log "scenery_login tool (or run 'scenery auth pair <code>') to authenticate."
     fi
 else
     log "Skipped daemon install and mcp setup (--no-setup)."
     log "Run when ready:"
-    log "  vectorhawk daemon install"
-    log "  vectorhawk mcp setup"
-    log "  vectorhawk auth pair <code>"
+    log "  scenery daemon install"
+    log "  scenery mcp setup"
+    log "  scenery auth pair <code>"
 fi
