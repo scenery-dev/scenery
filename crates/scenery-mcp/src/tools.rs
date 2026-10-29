@@ -1248,7 +1248,7 @@ pub fn handle_login_with_oauth(
                              Then open the URL above. Keep the tunnel open until done.\n\n\
                              **Option B — Personal Access Token (easier for SSH):**\n\
                              1. Open https://app.scenery.dev/portal/settings\n\
-                             2. Create a token (starts with `vh_pat_`)\n\
+                             2. Create a token (starts with `scn_pat_`)\n\
                              3. Run: `scenery auth token` and paste the token at the prompt"
                         )
                     };

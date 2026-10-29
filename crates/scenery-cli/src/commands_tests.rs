@@ -556,7 +556,7 @@ fn auth_token_rejects_token_on_the_command_line() {
     // A PAT in argv is visible to other local users via `ps` /
     // /proc/<pid>/cmdline and is saved in shell history.
     assert!(
-        try_parse(&["auth", "token", "vh_pat_should_not_be_accepted"]).is_err(),
+        try_parse(&["auth", "token", "scn_pat_should_not_be_accepted"]).is_err(),
         "auth token must not accept the PAT as a positional argument"
     );
 }

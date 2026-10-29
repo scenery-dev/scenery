@@ -403,7 +403,7 @@ impl AuthClient {
     /// to use a potentially-expired token.
     pub fn needs_refresh(access_token: &str) -> bool {
         // PATs are long-lived credentials revoked via the portal — never expire via JWT mechanism.
-        if access_token.starts_with("vh_pat_") {
+        if access_token.starts_with("scn_pat_") {
             return false;
         }
         match decode_jwt_exp(access_token) {
