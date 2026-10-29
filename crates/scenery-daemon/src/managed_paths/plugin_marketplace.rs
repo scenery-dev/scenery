@@ -284,6 +284,79 @@ pub fn uninstall_plugin_bundle(slug: &str) -> Result<()> {
     Ok(())
 }
 
+/// Remove the whole `scenery` marketplace from `~/.claude`: every
+/// `<slug>@scenery` plugin (registry + enabledPlugins entries), the
+/// marketplace source dir, the install cache, and our `scenery` keys in
+/// `known_marketplaces.json` and `settings.json` (`extraKnownMarketplaces`).
+/// Every other key/marketplace (e.g. `claude-plugins-official`) is left
+/// intact. Used by full `scenery uninstall`; deliberately ignores the
+/// reconciler killswitch since the user asked for removal. Idempotent.
+/// Returns the plugin slugs that were registered or present.
+pub fn uninstall_marketplace() -> Result<Vec<String>> {
+    let home = home()?;
+    let mp = marketplace_dir(&home);
+    let suffix = format!("@{MARKETPLACE_NAME}");
+    let mut slugs: std::collections::BTreeSet<String> =
+        read_bundled_record(&mp).into_keys().collect();
+    let installed = plugins_dir(&home).join("installed_plugins.json");
+    if let Some(root) = read_json(&installed) {
+        if let Some(plugins) = root.get("plugins").and_then(Value::as_object) {
+            slugs.extend(
+                plugins
+                    .keys()
+                    .filter_map(|k| k.strip_suffix(suffix.as_str()))
+                    .map(str::to_string),
+            );
+        }
+    }
+    if let Ok(rd) = fs::read_dir(mp.join("plugins")) {
+        slugs.extend(
+            rd.flatten()
+                .filter(|e| e.path().is_dir())
+                .map(|e| e.file_name().to_string_lossy().to_string()),
+        );
+    }
+
+    edit_json(&installed, |root| {
+        if let Some(plugins) = root.get_mut("plugins").and_then(Value::as_object_mut) {
+            plugins.retain(|k, _| !k.ends_with(suffix.as_str()));
+        }
+    })?;
+    edit_json(
+        &plugins_dir(&home).join("known_marketplaces.json"),
+        |root| {
+            if let Some(obj) = root.as_object_mut() {
+                obj.remove(MARKETPLACE_NAME);
+            }
+        },
+    )?;
+    edit_json(&home.join(".claude").join("settings.json"), |root| {
+        if let Some(enabled) = root
+            .get_mut("enabledPlugins")
+            .and_then(Value::as_object_mut)
+        {
+            enabled.retain(|k, _| !k.ends_with(suffix.as_str()));
+        }
+        if let Some(extra) = root
+            .get_mut("extraKnownMarketplaces")
+            .and_then(Value::as_object_mut)
+        {
+            extra.remove(MARKETPLACE_NAME);
+        }
+    })?;
+    for dir in [
+        mp.clone(),
+        plugins_dir(&home).join("cache").join(MARKETPLACE_NAME),
+    ] {
+        if dir.exists() {
+            fs::remove_dir_all(&dir)
+                .with_context(|| format!("plugin_marketplace: remove {dir:?}"))?;
+        }
+    }
+    info!("plugin_marketplace: removed the scenery marketplace");
+    Ok(slugs.into_iter().collect())
+}
+
 // ── Bundled registry skills record ──────────────────────────────────────────
 
 fn bundled_record_path(mp: &Path) -> PathBuf {

@@ -543,6 +543,33 @@ fn remove_managed_artifacts(_plan: &Plan, report: &mut RestoreReport) {
         &["~/.claude/plugins"],
         report,
     );
+
+    // Our `scenery` plugin marketplace (dir, cache, known_marketplaces.json,
+    // settings.json, `<slug>@scenery` registry entries). Other marketplaces
+    // are never touched.
+    match scenery_daemon::managed_paths::uninstall_marketplace() {
+        Ok(slugs) => {
+            for name in slugs {
+                // A plugin already reported by the marked-dir sweep above is
+                // not listed twice.
+                if report.removed.iter().any(|r| r.name == name) {
+                    continue;
+                }
+                report.removed.push(RemovedItem {
+                    name,
+                    kind: RemovedKind::ManagedPlugin,
+                    reinstall_hint:
+                        "Pushed by your organization's Scenery policy — nothing to re-add; \
+                         ask IT if you still need it."
+                            .into(),
+                    stripped_from: vec!["~/.claude/plugins".into()],
+                });
+            }
+        }
+        Err(e) => report.warnings.push(format!(
+            "failed to remove the Scenery plugin marketplace: {e:#}"
+        )),
+    }
 }
 
 /// Remove every top-level entry under `base` that carries a
@@ -1477,6 +1504,81 @@ mod tests {
                 .removed
                 .iter()
                 .any(|r| r.name == "marked-skill" && matches!(r.kind, RemovedKind::ManagedSkill)));
+        });
+        let _ = fs::remove_dir_all(&fake_home);
+    }
+
+    #[test]
+    fn remove_managed_artifacts_removes_scenery_marketplace_but_keeps_others() {
+        let fake_home = temp_dir("marketplace-sweep");
+        with_fake_home(&fake_home, || {
+            let claude = fake_home.join(".claude");
+            let plugins = claude.join("plugins");
+            let w = |p: PathBuf, v: serde_json::Value| {
+                fs::create_dir_all(p.parent().unwrap()).unwrap();
+                fs::write(p, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
+            };
+            let ours = plugins.join("marketplaces/scenery/plugins/acme/.claude-plugin");
+            fs::create_dir_all(&ours).unwrap();
+            fs::create_dir_all(plugins.join("cache/scenery/acme/1.0.0")).unwrap();
+            let official = plugins.join("marketplaces/claude-plugins-official/keep");
+            fs::create_dir_all(&official).unwrap();
+            fs::create_dir_all(plugins.join("cache/claude-plugins-official/x")).unwrap();
+            w(
+                plugins.join("known_marketplaces.json"),
+                serde_json::json!({
+                "scenery": {"source": "dir"}, "claude-plugins-official": {"source": "github"}}),
+            );
+            w(
+                plugins.join("installed_plugins.json"),
+                serde_json::json!({
+                "version": 2, "plugins": {"acme@scenery": [{"version": "1.0.0"}],
+                "other@claude-plugins-official": [{"version": "2"}]}}),
+            );
+            w(
+                claude.join("settings.json"),
+                serde_json::json!({
+                "theme": "dark",
+                "enabledPlugins": {"acme@scenery": true, "other@claude-plugins-official": true},
+                "extraKnownMarketplaces": {"scenery": {}, "claude-plugins-official": {}}}),
+            );
+
+            let plan = Plan {
+                brokered: vec![],
+                clients: vec![],
+            };
+            let mut report = RestoreReport::default();
+            remove_managed_artifacts(&plan, &mut report);
+
+            assert!(!plugins.join("marketplaces/scenery").exists());
+            assert!(!plugins.join("cache/scenery").exists());
+            assert!(official.exists());
+            assert!(plugins.join("cache/claude-plugins-official/x").exists());
+            let read = |p: PathBuf| -> serde_json::Value {
+                serde_json::from_slice(&fs::read(p).unwrap()).unwrap()
+            };
+            let known = read(plugins.join("known_marketplaces.json"));
+            assert!(known.get("scenery").is_none());
+            assert!(known.get("claude-plugins-official").is_some());
+            let inst = read(plugins.join("installed_plugins.json"));
+            assert!(inst["plugins"].get("acme@scenery").is_none());
+            assert!(inst["plugins"]
+                .get("other@claude-plugins-official")
+                .is_some());
+            let settings = read(claude.join("settings.json"));
+            assert_eq!(settings["theme"], "dark");
+            assert!(settings["extraKnownMarketplaces"].get("scenery").is_none());
+            assert!(settings["extraKnownMarketplaces"]
+                .get("claude-plugins-official")
+                .is_some());
+            assert!(settings["enabledPlugins"].get("acme@scenery").is_none());
+            assert!(settings["enabledPlugins"]
+                .get("other@claude-plugins-official")
+                .is_some());
+            assert!(report
+                .removed
+                .iter()
+                .any(|r| r.name == "acme" && matches!(r.kind, RemovedKind::ManagedPlugin)));
         });
         let _ = fs::remove_dir_all(&fake_home);
     }
