@@ -201,6 +201,7 @@ Type=simple
 Environment="PATH=/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin"
 Environment="RUST_LOG=info"
 {registry_env_line}ExecStart={bin_str} daemon run --foreground
+UMask=0077
 Restart=always
 RestartSec=2
 LogRateLimitIntervalSec=30
@@ -1193,6 +1194,13 @@ mod tests {
     // D1 board card: INFO logging on by default via the unit file, plus a
     // per-unit rate-limit backstop on the (crash-only) stderr stream that
     // still reaches journald.
+    #[test]
+    fn unit_sets_owner_only_umask() {
+        let unit = render_unit(Path::new("/usr/local/bin/scenery"), None).unwrap();
+        let service = unit.split("[Service]").nth(1).expect("[Service] section");
+        assert!(service.contains("\nUMask=0077\n"), "unit:\n{unit}");
+    }
+
     #[test]
     fn unit_sets_rust_log_info() {
         let unit = render_unit(Path::new("/home/linuxbrew/.linuxbrew/bin/scenery"), None).unwrap();
