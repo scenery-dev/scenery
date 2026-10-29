@@ -26,7 +26,7 @@
 #   AC2: `auth login` exits code 2 with daemon-required message (daemon down).
 #   AC3: Registry CLI auth endpoints — responsibility of the registry repo pytest suite.
 #   AC4: Refresh loop module presence (`refresh_one_tick`, `refresh_loop_tests`).
-#   AC5: `vectorhawk doctor` reports `OAuth listener:` line.
+#   AC5: `scenery doctor` reports `OAuth listener:` line.
 #   AC6: Concurrency test — two concurrent flows, no cross-contamination.
 #   AC7: No regressions — M0/M1/M2 gates pass.
 #   AC8: Embedded fallback parity — daemon-down exits code 2 (same as AC2).
@@ -34,8 +34,8 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CLI_BIN="${REPO_ROOT}/target/release/vectorhawk"
-DAEMON_BIN="${REPO_ROOT}/target/release/vectorhawk"
+CLI_BIN="${REPO_ROOT}/target/release/scenery"
+DAEMON_BIN="${REPO_ROOT}/target/release/scenery"
 
 if [[ -t 1 ]]; then
     GREEN="\033[0;32m"; RED="\033[0;31m"; YELLOW="\033[0;33m"; RESET="\033[0m"
@@ -92,11 +92,11 @@ trap cleanup_gate_daemon EXIT INT TERM
 # Kill any stale daemon and remove a leftover socket from a previous gate run.
 # Required when this script is chained from another gate (e.g. m4_acceptance.sh).
 case "$(uname -s)" in
-    Darwin) _M3_INIT_SOCK="${HOME}/Library/Application Support/VectorHawk/agent.sock" ;;
-    Linux)  _M3_INIT_SOCK="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/vectorhawk/agent.sock" ;;
-    *)      _M3_INIT_SOCK="${HOME}/.local/share/vectorhawk/agent.sock" ;;
+    Darwin) _M3_INIT_SOCK="${HOME}/Library/Application Support/Scenery/agent.sock" ;;
+    Linux)  _M3_INIT_SOCK="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/scenery/agent.sock" ;;
+    *)      _M3_INIT_SOCK="${HOME}/.local/share/scenery/agent.sock" ;;
 esac
-pkill -x vectorhawk 2>/dev/null || true
+pkill -x scenery 2>/dev/null || true
 rm -f "${_M3_INIT_SOCK}" 2>/dev/null || true
 unset _M3_INIT_SOCK
 
@@ -109,16 +109,16 @@ daemon_socket_path() {
     if [[ "${OS}" == "Linux" ]]; then
         local runtime_dir="${XDG_RUNTIME_DIR:-}"
         if [[ -n "${runtime_dir}" ]]; then
-            echo "${runtime_dir}/vectorhawk/agent.sock"
+            echo "${runtime_dir}/scenery/agent.sock"
             return
         fi
     fi
     # macOS and Linux fallback.
     local data_dir
     if [[ "${OS}" == "Darwin" ]]; then
-        data_dir="${HOME}/Library/Application Support/VectorHawk"
+        data_dir="${HOME}/Library/Application Support/Scenery"
     else
-        data_dir="${HOME}/.local/share/VectorHawk"
+        data_dir="${HOME}/.local/share/Scenery"
     fi
     echo "${data_dir}/agent.sock"
 }
@@ -178,14 +178,14 @@ PYEOF
 # ── Banner ────────────────────────────────────────────────────────────────────
 
 echo ""
-echo "VectorHawk M3 Acceptance Gate"
+echo "Scenery M3 Acceptance Gate"
 echo "=============================="
 echo ""
 
 # ── Preflight ─────────────────────────────────────────────────────────────────
 
 if [[ ! -x "${CLI_BIN}" ]]; then
-    echo "ERROR: vectorhawk binary not built: ${CLI_BIN}" >&2
+    echo "ERROR: scenery binary not built: ${CLI_BIN}" >&2
     echo "" >&2
     echo "Run: cargo build --workspace --release" >&2
     echo "" >&2
@@ -193,7 +193,7 @@ if [[ ! -x "${CLI_BIN}" ]]; then
 fi
 
 if [[ ! -x "${DAEMON_BIN}" ]]; then
-    echo "ERROR: vectorhawkd binary not built: ${DAEMON_BIN}" >&2
+    echo "ERROR: scenery binary not built: ${DAEMON_BIN}" >&2
     echo "" >&2
     echo "Run: cargo build --workspace --release" >&2
     echo "" >&2
@@ -279,8 +279,8 @@ fi
 
 # ── Kill any stale daemon from previous runs ──────────────────────────────────
 
-if pgrep -x vectorhawk >/dev/null 2>&1; then
-    pkill -x vectorhawk 2>/dev/null || true
+if pgrep -x scenery >/dev/null 2>&1; then
+    pkill -x scenery 2>/dev/null || true
     sleep 0.5
 fi
 
@@ -426,7 +426,7 @@ fi
 echo "AC3: registry endpoints (registry repo pytest suite) ..."
 record "SKIP" \
     'AC3: /portal/auth/cli/authorize + /portal/auth/cli/token endpoints' \
-    "registry-side implementation; verified by skillclub-registry/backend/tests/test_cli_auth.py"
+    "registry-side implementation; verified by scenery-backend/backend/tests/test_cli_auth.py"
 
 # ── AC4: refresh loop source presence ────────────────────────────────────────
 

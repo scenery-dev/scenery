@@ -1,10 +1,10 @@
-# CLAUDE.md — vectorhawkd
+# CLAUDE.md — scenery (runner)
 
 This file provides guidance to Claude Code (claude.ai/code) when working in this repo.
 
 ## Task Tracking — read this to understand project state
 
-**All tasks are tracked on the GitHub Project board, not in this file.** It is the single source of truth for what's planned, in flight, and done across every VectorHawk repo.
+**All tasks are tracked on the GitHub Project board, not in this file.** It is the single source of truth for what's planned, in flight, and done across every Scenery repo.
 
 - **Board:** Scenery Roadmap → https://github.com/orgs/scenery-dev/projects/1 (org-level, private)
 - **Status flow:** Backlog → Todo → In Progress → Blocked → Done
@@ -25,7 +25,7 @@ gh project view 1 --owner scenery-dev --web
 
 ## What this is
 
-`vectorhawkd` is the **VectorHawk runner** — a per-user local Rust agent that delivers governed AI tools and skills to AI clients over MCP. It is the successor to `../skillrunner/` (now archived). The architecture pivot from per-AI-client stdio child process to long-running daemon + thin shim is documented in:
+`scenery` is the **Scenery runner** — a per-user local Rust agent that delivers governed AI tools and skills to AI clients over MCP. The architecture (long-running daemon + thin per-client shim) is documented in:
 
 - `../context/RUN1_DAEMON_PIVOT_DECISION.md`
 - `../context/RUN1_DAEMON_SPEC.md`
@@ -33,21 +33,20 @@ gh project view 1 --owner scenery-dev --web
 
 ## Naming
 
-- Internal / code / repo: `vectorhawkd`
-- Public / marketing / user-facing docs: "the VectorHawk runner" or "the runner"
-- Single shipped binary: `vectorhawk` (from `scenery-cli`) — what users actually type.
-  - `vectorhawk daemon run` starts the long-running daemon (previously a standalone `vectorhawkd` binary).
-  - `vectorhawk mcp serve` is the MCP relay/shim (previously a standalone `scenery-shim` binary).
-  - `vectorhawkd` is the repo/workspace name only, not a binary name.
+- Repo / workspace / crates: `scenery` (`scenery-{manifest,core,mcp,daemon,shim,cli}`).
+- Public / marketing / user-facing docs: "the Scenery runner" or "the runner".
+- Single shipped binary: `scenery` (from `scenery-cli`) — what users actually type. `scn` is a short alias: a symlink to `scenery` placed next to it by every install path (release tarball, `scripts/install.sh`, the Homebrew formula's `bin.install_symlink`). The binary resolves symlinks via `current_exe`, so `scn` behaves identically.
+  - `scenery daemon run` starts the long-running daemon.
+  - `scenery mcp serve` is the MCP relay/shim.
 
 ## Architecture (M0 target)
 
 ```
-AI client  --stdio MCP JSON-RPC-->  vectorhawk mcp serve  (shim, ~5 MB RSS)
+AI client  --stdio MCP JSON-RPC-->  scenery mcp serve  (shim, ~5 MB RSS)
                                               |
                                               | Unix socket / named pipe
                                               v
-                                        vectorhawkd  (daemon, ~40 MB RSS idle)
+                                        scenery  (daemon, ~40 MB RSS idle)
                                               |
                                   ┌───────────┼────────────┐
                                   v           v            v
@@ -62,12 +61,12 @@ AI client  --stdio MCP JSON-RPC-->  vectorhawk mcp serve  (shim, ~5 MB RSS)
 
 ```
 crates/
-├── scenery-manifest/   library — manifest types, ports skillrunner-manifest
-├── scenery-core/       library — state, installer, registry, policy, executor (ports skillrunner-core)
-├── scenery-mcp/        library — MCP protocol, aggregator, Backend trait (ports skillrunner-mcp protocol/tools/aggregator/sampling/setup)
-├── scenery-daemon/     library — daemon entry point (scenery_daemon::run_daemon); reused by vectorhawk CLI via `daemon run`
-├── scenery-shim/       library — stdio↔socket relay entry point (scenery_shim::run_shim); reused by vectorhawk CLI via `mcp serve`
-└── scenery-cli/        binary — vectorhawk (the only shipped binary; embeds daemon + shim via `daemon run` / `mcp serve` subcommands)
+├── scenery-manifest/   library — manifest types
+├── scenery-core/       library — state, installer, registry, policy, executor
+├── scenery-mcp/        library — MCP protocol, aggregator, Backend trait, client setup
+├── scenery-daemon/     library — daemon entry point (scenery_daemon::run_daemon); reused by the CLI via `daemon run`
+├── scenery-shim/       library — stdio↔socket relay entry point (scenery_shim::run_shim); reused by the CLI via `mcp serve`
+└── scenery-cli/        binary — scenery (the only shipped binary; embeds daemon + shim via `daemon run` / `mcp serve`)
 ```
 
 ## Build & dev
@@ -97,18 +96,8 @@ Before writing code:
 - Daemon under load: <100 MB RSS
 - Shim: <8 MB RSS, <30 ms cold start, ~2–3 MB stripped binary
 
-## Source for porting
-
-Existing code at `../skillrunner/crates/`:
-- `skillrunner-manifest/` → `scenery-manifest/` (rename only)
-- `skillrunner-core/` → `scenery-core/` (rename only; SQLite paths change `SkillClub/SkillRunner/` → `VectorHawk/`)
-- `skillrunner-mcp/protocol.rs`, `tools.rs`, `aggregator.rs`, `sampling.rs`, `setup.rs` → `scenery-mcp/`
-- `skillrunner-mcp/server.rs` → split: dispatch loop into `scenery-mcp` as a `Server<B: Backend>` generic; daemon uses `SocketBackend`-equivalent + real backend; shim uses `SocketBackend` (relay) with `EmbeddedBackend` fallback
-- `skillrunner-cli/` → `scenery-cli/` (rename + new `mcp serve` becomes the shim, new `daemon run/install/uninstall` subcommands)
-
 ## What is NOT in M0 scope
 
-- Full feature parity with skillrunner. The spike proves the architecture works.
 - Windows support (deferred to M2/M3).
 - LaunchAgent/systemd unit packaging (deferred to M2).
 - OAuth callback listener (deferred to M3).
@@ -119,8 +108,8 @@ Existing code at `../skillrunner/crates/`:
 ## What MUST be in M0
 
 1. Workspace builds (`cargo build` green).
-2. `vectorhawkd` daemon boots, listens on a Unix socket at `~/Library/Application Support/VectorHawk/agent.sock` (mac) / `$XDG_RUNTIME_DIR/vectorhawk/agent.sock` (Linux), holds at least one stub backend MCP connection.
-3. `vectorhawk mcp serve` (shim) connects to the socket, relays an MCP `initialize` handshake + `tools/list` + ≥5 `tools/call` invocations from a real AI client (Claude Code preferred).
-4. Killing the daemon mid-session causes the shim to surface a JSON-RPC error (code -32001) containing the `vectorhawk daemon install` hint within 3 seconds. (M0 originally accepted silent in-process fallback; M4 changed the contract — see `context/RUN1_M4_STREAMS.md`.)
+2. `scenery` daemon boots, listens on a Unix socket at `~/Library/Application Support/Scenery/agent.sock` (mac) / `$XDG_RUNTIME_DIR/scenery/agent.sock` (Linux), holds at least one stub backend MCP connection.
+3. `scenery mcp serve` (shim) connects to the socket, relays an MCP `initialize` handshake + `tools/list` + ≥5 `tools/call` invocations from a real AI client (Claude Code preferred).
+4. Killing the daemon mid-session causes the shim to surface a JSON-RPC error (code -32001) containing the `scenery daemon install` hint within 3 seconds. (M0 originally accepted silent in-process fallback; M4 changed the contract — see `context/RUN1_M4_STREAMS.md`.)
 5. Daemon idle RSS measured ≤50 MB on macOS arm64. Linux measurement deferred-but-not-blocking.
-6. `mcp setup` (or equivalent) demonstrates that the AI client config entry would be `command = "vectorhawk", args = ["mcp", "serve"]` — same shape as skillrunner today.
+6. `mcp setup` (or equivalent) demonstrates that the AI client config entry would be `command = "scenery", args = ["mcp", "serve"]`.

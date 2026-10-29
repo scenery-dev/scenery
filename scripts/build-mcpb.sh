@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the vectorhawk binary and package it as a .mcpb Desktop Extension
+# Build the scenery binary and package it as a .mcpb Desktop Extension
 # for Claude Desktop one-click install.
 #
 # Usage:
@@ -22,12 +22,12 @@ REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 TARGET=""          # empty = native (no --target flag passed to cargo)
 OUTPUT_DIR="$REPO_ROOT/dist"
 
-PACKAGE_NAME="vectorhawk-runner"
-DISPLAY_NAME="VectorHawk Runner"
+PACKAGE_NAME="scenery-runner"
+DISPLAY_NAME="Scenery Runner"
 VERSION="1.0.1"
-DESCRIPTION="VectorHawk Runner — local AI skill runtime and MCP aggregator for portable skills, tool namespacing, and multi-client setup."
-AUTHOR_NAME="VectorHawk"
-AUTHOR_URL="https://vectorhawk.io"
+DESCRIPTION="Scenery Runner — local AI skill runtime and MCP aggregator for portable skills, tool namespacing, and multi-client setup."
+AUTHOR_NAME="Scenery"
+AUTHOR_URL="https://scenery.dev"
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -109,9 +109,9 @@ PLATFORM="$(derive_platform "$TARGET")"
 binary_path() {
   local target="${1:-}"
   if [[ -n "$target" ]]; then
-    echo "$REPO_ROOT/target/$target/release/vectorhawk"
+    echo "$REPO_ROOT/target/$target/release/scenery"
   else
-    echo "$REPO_ROOT/target/release/vectorhawk"
+    echo "$REPO_ROOT/target/release/scenery"
   fi
 }
 
@@ -119,7 +119,7 @@ binary_path() {
 # Build
 # ---------------------------------------------------------------------------
 
-echo "==> Building vectorhawk (release) for platform: $PLATFORM"
+echo "==> Building scenery (release) for platform: $PLATFORM"
 
 cd "$REPO_ROOT"
 
@@ -164,22 +164,22 @@ cat > "$STAGE_DIR/manifest.json" <<JSON
   },
   "server": {
     "transport": "stdio",
-    "command": "./bin/vectorhawk",
+    "command": "./bin/scenery",
     "args": ["mcp", "serve"]
   }
 }
 JSON
 
 # 2. Copy binary and ensure it is executable
-cp "$BINARY" "$STAGE_DIR/bin/vectorhawk"
-chmod +x "$STAGE_DIR/bin/vectorhawk"
+cp "$BINARY" "$STAGE_DIR/bin/scenery"
+chmod +x "$STAGE_DIR/bin/scenery"
 
 # 3. Strip the binary to reduce size.
 #    The release profile already sets `strip = true` via rustc, but an
 #    explicit strip pass catches any remaining debug sections on platforms
 #    where the Rust linker strip is incomplete.
 if command -v strip &>/dev/null; then
-  strip "$STAGE_DIR/bin/vectorhawk" 2>/dev/null || true
+  strip "$STAGE_DIR/bin/scenery" 2>/dev/null || true
 fi
 
 # ---------------------------------------------------------------------------
@@ -193,7 +193,7 @@ MCPB_PATH="$OUTPUT_DIR/$MCPB_NAME"
 echo "==> Creating archive: $MCPB_NAME"
 
 # Build the ZIP from inside the stage dir so paths inside the archive are
-# relative (manifest.json at root, bin/vectorhawk inside bin/).
+# relative (manifest.json at root, bin/scenery inside bin/).
 (
   cd "$STAGE_DIR"
   zip -r "$MCPB_PATH" .
