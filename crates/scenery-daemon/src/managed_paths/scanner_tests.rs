@@ -244,7 +244,8 @@ fn marketplace_walk_skips_native_adopts_custom() {
         "code-review",
         r#"{"name":"code-review","author":{"name":"Anthropic"}}"#,
     );
-    // Custom: external plugin within the official marketplace → adopted.
+    // Native: external plugin within the official marketplace → also skipped
+    // (the whole official marketplace is off-limits).
     write_marketplace_plugin(
         &plugins,
         "claude-plugins-official",
@@ -264,12 +265,15 @@ fn marketplace_walk_skips_native_adopts_custom() {
     let items = scan_plugin_marketplaces(&plugins).unwrap();
     let slugs: std::collections::HashSet<&str> = items.iter().map(|i| i.slug.as_str()).collect();
 
-    assert_eq!(items.len(), 2, "got: {slugs:?}");
-    assert!(slugs.contains("github"));
+    assert_eq!(items.len(), 1, "got: {slugs:?}");
     assert!(slugs.contains("acme-tool"));
     assert!(
         !slugs.contains("code-review"),
         "native plugin must be skipped"
+    );
+    assert!(
+        !slugs.contains("github"),
+        "external plugin in the official marketplace must be skipped"
     );
     assert!(items.iter().all(|i| i.kind == ItemKind::Plugin));
 }

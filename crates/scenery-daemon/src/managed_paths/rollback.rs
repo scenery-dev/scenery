@@ -438,6 +438,11 @@ fn restore_item(
     slug: &str,
     home: &Path,
 ) -> Result<()> {
+    // Never write into (or delete from) Anthropic's official marketplace, even
+    // if an old backup manifest lists it.
+    if matches!(kind, "skill" | "plugin") {
+        scenery_mcp::ownership::ensure_not_native(original_path)?;
+    }
     if !backup_path.exists() {
         anyhow::bail!(
             "restore_item: backup does not exist: {}",

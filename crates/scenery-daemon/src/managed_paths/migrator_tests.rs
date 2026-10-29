@@ -1166,3 +1166,82 @@ fn copy_dir_recursive_copies_nested_files() {
         "world"
     );
 }
+
+/// Helpers for the marketplace-adoption tests below.
+fn marketplace_plugin_item(home: &std::path::Path, mkt: &str, slug: &str) -> MigrationItem {
+    let dir = home
+        .join(".claude/plugins/marketplaces")
+        .join(mkt)
+        .join("external_plugins")
+        .join(slug);
+    fs::create_dir_all(dir.join(".claude-plugin")).unwrap();
+    let manifest = dir.join(".claude-plugin/plugin.json");
+    fs::write(&manifest, format!(r#"{{"name":"{slug}"}}"#)).unwrap();
+    MigrationItem {
+        kind: ItemKind::Plugin,
+        slug: slug.to_string(),
+        source_path: dir,
+        files: vec![manifest],
+        canonical_hash: "h".to_string(),
+        payload: serde_json::json!({"manifest_json": {"name": slug}}),
+    }
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // HOME is process-global; serialised via ENV_MUTEX
+async fn external_plugin_in_official_marketplace_is_not_adopted_but_third_party_is() {
+    let _env = crate::managed_paths::ENV_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let plugins = home.join(".claude/plugins");
+    let mut known = serde_json::Map::new();
+    for (name, repo) in [
+        (
+            "claude-plugins-official",
+            "anthropics/claude-plugins-official",
+        ),
+        ("acme-mp", "acme/acme-mp"),
+    ] {
+        known.insert(
+            name.to_string(),
+            serde_json::json!({
+                "source": {"source": "github", "repo": repo},
+                "installLocation": plugins.join("marketplaces").join(name),
+            }),
+        );
+    }
+    fs::create_dir_all(&plugins).unwrap();
+    fs::write(
+        plugins.join("known_marketplaces.json"),
+        serde_json::Value::Object(known).to_string(),
+    )
+    .unwrap();
+    let official = marketplace_plugin_item(&home, "claude-plugins-official", "github");
+    let custom = marketplace_plugin_item(&home, "acme-mp", "acme-tool");
+
+    let (state, _g) = temp_state();
+    let prev_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", &home);
+    let client = reqwest::Client::new();
+    let backup_root = tmp.path().join("backup");
+    let off = migrate_item(&official, &backup_root, &state, "http://unused", &client).await;
+    let cus = migrate_item(&custom, &backup_root, &state, "http://unused", &client).await;
+    if let Some(v) = prev_home {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+
+    assert!(
+        !off.unwrap(),
+        "official-marketplace plugin must not be adopted"
+    );
+    assert!(!official.source_path.join(".scenery-managed.json").exists());
+    assert!(
+        cus.unwrap(),
+        "third-party marketplace plugin stays adoptable"
+    );
+    assert!(custom.source_path.join(".scenery-managed.json").exists());
+}

@@ -620,3 +620,72 @@ fn quarantine_mcp_keeps_snapshot_and_claude_json_owner_only() {
     let snap: serde_json::Value = serde_json::from_slice(&fs::read(&dest).unwrap()).unwrap();
     assert_eq!(snap["env"]["API_KEY"], "drifted-secret");
 }
+
+/// Fake `$HOME` whose `known_marketplaces.json` lists the official marketplace
+/// and an unrelated one. Returns the external plugin dir inside the official one.
+fn home_with_official_external_plugin(td: &TempDir) -> (PathBuf, PathBuf) {
+    let home = td.path().join("home");
+    let plugins = home.join(".claude/plugins");
+    let mut known = serde_json::Map::new();
+    for (name, repo) in [
+        (
+            "claude-plugins-official",
+            "anthropics/claude-plugins-official",
+        ),
+        ("acme-mp", "acme/acme-mp"),
+    ] {
+        known.insert(
+            name.to_string(),
+            serde_json::json!({
+                "source": {"source": "github", "repo": repo},
+                "installLocation": plugins.join("marketplaces").join(name),
+            }),
+        );
+    }
+    fs::create_dir_all(&plugins).unwrap();
+    fs::write(
+        plugins.join("known_marketplaces.json"),
+        serde_json::Value::Object(known).to_string(),
+    )
+    .unwrap();
+    let ext = plugins.join("marketplaces/claude-plugins-official/external_plugins/github");
+    fs::create_dir_all(&ext).unwrap();
+    fs::write(ext.join("plugin.txt"), "x").unwrap();
+    (home, ext)
+}
+
+#[test]
+fn drift_refuses_to_quarantine_or_remove_external_plugin_in_official_marketplace() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let td = TempDir::new().unwrap();
+    let (home, ext) = home_with_official_external_plugin(&td);
+    let prev_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", &home);
+
+    let outcome = DriftOutcome {
+        slug: "github".to_string(),
+        kind: "plugin".to_string(),
+        path: ext.to_string_lossy().to_string(),
+        expected_hash: "x".to_string(),
+        current_hash: Some("y".to_string()),
+        status: DriftStatus::Drifted,
+    };
+    let q = quarantine_item(&outcome);
+    let r = remove_path_for(&ManagedPathMarker {
+        path: ext.to_string_lossy().to_string(),
+        kind: "plugin".to_string(),
+        slug: "github".to_string(),
+        installation_id: None,
+        source_sha256: "x".to_string(),
+        migrated_at: "t".to_string(),
+    });
+    if let Some(v) = prev_home {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+
+    assert!(q.is_err(), "quarantine must refuse");
+    assert!(r.is_err(), "remove must refuse");
+    assert_eq!(fs::read_to_string(ext.join("plugin.txt")).unwrap(), "x");
+}
