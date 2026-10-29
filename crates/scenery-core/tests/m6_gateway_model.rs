@@ -39,9 +39,9 @@ fn gateway_successful_provider_response() {
         .with_header("content-type", "application/json")
         .with_body(
             r#"{
-                "vh_tier": "provider",
-                "vh_provider": "anthropic",
-                "vh_cost_usd": 0.00045,
+                "scenery_tier": "provider",
+                "scenery_provider": "anthropic",
+                "scenery_cost_usd": 0.00045,
                 "usage": { "input_tokens": 100, "output_tokens": 50 },
                 "content": [{ "type": "text", "text": "hello" }]
             }"#,
@@ -134,7 +134,7 @@ fn gateway_401_returns_expired_token_error() {
     let _ = std::fs::remove_dir_all(&state_root);
 }
 
-/// Test 4: gateway returns vh_tier="internal" → ModelSource::Internal.
+/// Test 4: gateway returns scenery_tier="internal" → ModelSource::Internal.
 #[test]
 fn gateway_internal_tier_maps_to_internal_source() {
     let mut server = mockito::Server::new();
@@ -145,9 +145,9 @@ fn gateway_internal_tier_maps_to_internal_source() {
         .with_header("content-type", "application/json")
         .with_body(
             r#"{
-                "vh_tier": "internal",
-                "vh_provider": "phi-3",
-                "vh_cost_usd": 0.0,
+                "scenery_tier": "internal",
+                "scenery_provider": "phi-3",
+                "scenery_cost_usd": 0.0,
                 "usage": { "input_tokens": 20, "output_tokens": 10 },
                 "content": [{ "type": "text", "text": "internal response" }]
             }"#,
@@ -167,7 +167,7 @@ fn gateway_internal_tier_maps_to_internal_source() {
     let _ = std::fs::remove_dir_all(&state_root);
 }
 
-/// Test 5: gateway returns vh_tier="local" → ModelSource::Local.
+/// Test 5: gateway returns scenery_tier="local" → ModelSource::Local.
 #[test]
 fn gateway_local_tier_maps_to_local_source() {
     let mut server = mockito::Server::new();
@@ -178,9 +178,9 @@ fn gateway_local_tier_maps_to_local_source() {
         .with_header("content-type", "application/json")
         .with_body(
             r#"{
-                "vh_tier": "local",
-                "vh_provider": "llama3",
-                "vh_cost_usd": 0.0,
+                "scenery_tier": "local",
+                "scenery_provider": "llama3",
+                "scenery_cost_usd": 0.0,
                 "usage": { "input_tokens": 5, "output_tokens": 3 },
                 "content": [{ "type": "text", "text": "local response" }]
             }"#,

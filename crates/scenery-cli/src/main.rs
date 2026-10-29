@@ -383,7 +383,7 @@ pub enum AuthCommand {
 
     /// Save a Personal Access Token for headless / CI environments.
     ///
-    /// Create a vh_pat_... token in the Scenery portal, then run
+    /// Create a scn_pat_... token in the Scenery portal, then run
     /// `scenery auth token` and paste it at the hidden prompt, or pipe
     /// it in on stdin, e.g. `scenery auth token < pat.txt`.
     ///
@@ -391,7 +391,7 @@ pub enum AuthCommand {
     /// are visible to other local users in the process list and are kept
     /// in shell history.
     ///
-    /// Or set SCENERY_TOKEN=<vh_pat_...> and restart the daemon.
+    /// Or set SCENERY_TOKEN=<scn_pat_...> and restart the daemon.
     Token {
         #[arg(
             long,
@@ -3769,11 +3769,7 @@ async fn cmd_skill_publish(
     println!(
         "Published '{}' v{}",
         resp.frontmatter.name,
-        resp.frontmatter
-            .version
-            .as_deref()
-            .or(resp.frontmatter.vh_version.as_deref())
-            .unwrap_or("?")
+        resp.frontmatter.version.as_deref().unwrap_or("?")
     );
     println!("Content hash: {}", resp.content_hash);
     if !resp.warnings.is_empty() {
@@ -4370,7 +4366,7 @@ async fn cmd_auth_login(registry_url: &str) -> Result<()> {
         println!();
         println!("Option B — Personal Access Token (no tunnel needed):");
         println!("  1. Open https://app.scenery.dev/portal/settings in your browser.");
-        println!("  2. Create a token (starts with vh_pat_...).");
+        println!("  2. Create a token (starts with scn_pat_...).");
         println!("  3. Run:  scenery auth token   (paste the token at the prompt)");
         println!();
     } else {
@@ -4550,7 +4546,7 @@ async fn revoke_session(
     let Some(tokens) = load_tokens(state, registry_url).ok().flatten() else {
         return;
     };
-    if tokens.refresh_token.is_empty() || tokens.access_token.starts_with("vh_pat_") {
+    if tokens.refresh_token.is_empty() || tokens.access_token.starts_with("scn_pat_") {
         return;
     }
     // Built inside spawn_blocking: reqwest's blocking client can't be built
@@ -4640,9 +4636,9 @@ async fn cmd_auth_token(registry_url: &str) -> Result<()> {
     let token = token_input::read_token_live().map_err(|e| anyhow::anyhow!(e))?;
     let token = token.as_str();
 
-    if !token.starts_with("vh_pat_") {
+    if !token.starts_with("scn_pat_") {
         anyhow::bail!(
-            "token must start with 'vh_pat_'. \
+            "token must start with 'scn_pat_'. \
              Create one in the Scenery portal under Settings → Access Tokens."
         );
     }

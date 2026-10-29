@@ -78,16 +78,10 @@ pub struct CompileFrontmatterSummary {
     pub description: String,
     #[serde(default)]
     pub license: Option<String>,
-    // Canonical names (registry v1.0.18+).
     #[serde(default)]
     pub version: Option<String>,
     #[serde(default)]
     pub publisher: Option<String>,
-    // Legacy names kept for backwards compat with older registry responses.
-    #[serde(default)]
-    pub vh_version: Option<String>,
-    #[serde(default)]
-    pub vh_publisher: Option<String>,
 }
 
 /// A single field-level error from a 422 compile response.
@@ -940,7 +934,7 @@ impl RegistryClient {
     /// Deliberately sends NO `Authorization` header. The backend guards this
     /// route with `_optional_api_key`, which treats a missing header as
     /// "anonymous" but 401s on any Bearer token that isn't `sk_`-prefixed.
-    /// `self.auth_token` is the portal OAuth JWT (or a `vh_pat_...` PAT) set
+    /// `self.auth_token` is the portal OAuth JWT (or a `scn_pat_...` PAT) set
     /// by `auth login` — never an `sk_` key — so attaching it here always
     /// broke this call for a logged-in user. The response itself doesn't
     /// vary by caller identity (see backend `routers/runner.py::get_skill_preinstall`,
@@ -1768,7 +1762,7 @@ mod tests {
     /// The backend's `/skills/{id}/preinstall` route is guarded by
     /// `_optional_api_key`, which 401s on any Bearer token that isn't
     /// `sk_`-prefixed. The runner's stored `auth_token` is the portal
-    /// OAuth JWT (or a `vh_pat_...` token) — never an `sk_` key — so
+    /// OAuth JWT (or a `scn_pat_...` token) — never an `sk_` key — so
     /// attaching it here must not happen; the call must be unauthenticated.
     #[test]
     fn fetch_preinstall_governance_sends_no_authorization_header_when_logged_in() {
