@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working in this
 
 **All tasks are tracked on the GitHub Project board, not in this file.** It is the single source of truth for what's planned, in flight, and done across every VectorHawk repo.
 
-- **Board:** VectorHawk Roadmap → https://github.com/orgs/vectorhawk/projects/1 (org-level, private)
+- **Board:** Scenery Roadmap → https://github.com/orgs/scenery-dev/projects/1 (org-level, private)
 - **Status flow:** Backlog → Todo → In Progress → Blocked → Done
 - **Component field:** `runner` · `backend` · `gateway` · `portal` · `harness` · `site` — runner work in this repo uses `runner`.
 
@@ -14,13 +14,13 @@ At the start of a session, list open tasks to orient yourself; when you pick up 
 
 ```bash
 # Runner tasks, current state
-gh project item-list 1 --owner vectorhawk
+gh project item-list 1 --owner scenery-dev
 
 # File a new task
-gh project item-create 1 --owner vectorhawk --title "..." --body "..."
+gh project item-create 1 --owner scenery-dev --title "..." --body "..."
 
 # Open the board
-gh project view 1 --owner vectorhawk --web
+gh project view 1 --owner scenery-dev --web
 ```
 
 ## What this is
