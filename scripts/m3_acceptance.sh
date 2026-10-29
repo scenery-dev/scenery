@@ -104,7 +104,7 @@ unset _M3_INIT_SOCK
 
 OS="$(uname -s)"
 
-# Return the daemon socket path, mirroring the logic in vectorhawkd-core.
+# Return the daemon socket path, mirroring the logic in scenery-core.
 daemon_socket_path() {
     if [[ "${OS}" == "Linux" ]]; then
         local runtime_dir="${XDG_RUNTIME_DIR:-}"
@@ -431,8 +431,8 @@ record "SKIP" \
 # ── AC4: refresh loop source presence ────────────────────────────────────────
 
 echo "AC4: checking refresh loop source presence ..."
-DAEMON_LIB="${REPO_ROOT}/crates/vectorhawkd-daemon/src/lib.rs"
-REFRESH_TESTS="${REPO_ROOT}/crates/vectorhawkd-daemon/src/refresh_loop_tests.rs"
+DAEMON_LIB="${REPO_ROOT}/crates/scenery-daemon/src/lib.rs"
+REFRESH_TESTS="${REPO_ROOT}/crates/scenery-daemon/src/refresh_loop_tests.rs"
 
 if grep -q "refresh_one_tick" "${DAEMON_LIB}" \
    && [[ -f "${REFRESH_TESTS}" ]] \
@@ -452,7 +452,7 @@ echo "AC6: running concurrency integration test (m3_concurrency) ..."
 
 CONCURRENCY_LOG="${REPO_ROOT}/target/m3-concurrency-test.log"
 
-if cargo test --release -p vectorhawkd-cli --test m3_concurrency \
+if cargo test --release -p scenery-cli --test m3_concurrency \
         -- --include-ignored --nocapture 2>"${CONCURRENCY_LOG}"; then
     record "PASS" \
         'AC6: concurrency — two flows, no cross-contamination, collision handled' \

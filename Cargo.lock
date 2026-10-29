@@ -2382,6 +2382,178 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
+name = "scenery-cli"
+version = "1.0.115"
+dependencies = [
+ "anyhow",
+ "camino",
+ "chrono",
+ "clap",
+ "dirs",
+ "flate2",
+ "hex",
+ "libc",
+ "mockito",
+ "reqwest 0.12.28",
+ "rolling-file",
+ "rusqlite",
+ "scenery-core",
+ "scenery-daemon",
+ "scenery-manifest",
+ "scenery-mcp",
+ "scenery-shim",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tar",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "scenery-core"
+version = "1.0.115"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "camino",
+ "chrono",
+ "ctor",
+ "dirs",
+ "flate2",
+ "fs2",
+ "getrandom 0.2.17",
+ "hex",
+ "jsonschema",
+ "keyring",
+ "mockito",
+ "reqwest 0.12.28",
+ "rusqlite",
+ "scenery-manifest",
+ "semver",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "tar",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "url",
+ "urlencoding",
+ "uuid",
+ "zip",
+]
+
+[[package]]
+name = "scenery-daemon"
+version = "1.0.115"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "camino",
+ "chrono",
+ "clap",
+ "ctor",
+ "dirs",
+ "flate2",
+ "fs2",
+ "futures",
+ "hex",
+ "jsonwebtoken",
+ "libc",
+ "mockito",
+ "reqwest 0.12.28",
+ "rusqlite",
+ "scenery-core",
+ "scenery-manifest",
+ "scenery-mcp",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tar",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "zip",
+]
+
+[[package]]
+name = "scenery-manifest"
+version = "1.0.115"
+dependencies = [
+ "anyhow",
+ "camino",
+ "semver",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "scenery-mcp"
+version = "1.0.115"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "camino",
+ "ctor",
+ "dirs",
+ "flate2",
+ "futures",
+ "hex",
+ "jsonc-parser",
+ "mockito",
+ "reqwest 0.12.28",
+ "rusqlite",
+ "scenery-core",
+ "scenery-manifest",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tar",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "toml_edit",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "scenery-shim"
+version = "1.0.115"
+dependencies = [
+ "anyhow",
+ "dirs",
+ "scenery-mcp",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3174,178 +3346,6 @@ name = "vcpkg"
 version = "0.2.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
-
-[[package]]
-name = "vectorhawkd-cli"
-version = "1.0.115"
-dependencies = [
- "anyhow",
- "camino",
- "chrono",
- "clap",
- "dirs",
- "flate2",
- "hex",
- "libc",
- "mockito",
- "reqwest 0.12.28",
- "rolling-file",
- "rusqlite",
- "semver",
- "serde",
- "serde_json",
- "sha2",
- "tar",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "uuid",
- "vectorhawkd-core",
- "vectorhawkd-daemon",
- "vectorhawkd-manifest",
- "vectorhawkd-mcp",
- "vectorhawkd-shim",
-]
-
-[[package]]
-name = "vectorhawkd-core"
-version = "1.0.115"
-dependencies = [
- "anyhow",
- "async-trait",
- "base64 0.22.1",
- "camino",
- "chrono",
- "ctor",
- "dirs",
- "flate2",
- "fs2",
- "getrandom 0.2.17",
- "hex",
- "jsonschema",
- "keyring",
- "mockito",
- "reqwest 0.12.28",
- "rusqlite",
- "semver",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha2",
- "tar",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "url",
- "urlencoding",
- "uuid",
- "vectorhawkd-manifest",
- "zip",
-]
-
-[[package]]
-name = "vectorhawkd-daemon"
-version = "1.0.115"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum",
- "base64 0.22.1",
- "camino",
- "chrono",
- "clap",
- "ctor",
- "dirs",
- "flate2",
- "fs2",
- "futures",
- "hex",
- "jsonwebtoken",
- "libc",
- "mockito",
- "reqwest 0.12.28",
- "rusqlite",
- "semver",
- "serde",
- "serde_json",
- "sha2",
- "tar",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "vectorhawkd-core",
- "vectorhawkd-manifest",
- "vectorhawkd-mcp",
- "zip",
-]
-
-[[package]]
-name = "vectorhawkd-manifest"
-version = "1.0.115"
-dependencies = [
- "anyhow",
- "camino",
- "semver",
- "serde",
- "serde_json",
- "serde_yaml",
- "tempfile",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "vectorhawkd-mcp"
-version = "1.0.115"
-dependencies = [
- "anyhow",
- "async-trait",
- "bytes",
- "camino",
- "ctor",
- "dirs",
- "flate2",
- "futures",
- "hex",
- "jsonc-parser",
- "mockito",
- "reqwest 0.12.28",
- "rusqlite",
- "semver",
- "serde",
- "serde_json",
- "sha2",
- "tar",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "toml_edit",
- "tracing",
- "url",
- "uuid",
- "vectorhawkd-core",
- "vectorhawkd-manifest",
-]
-
-[[package]]
-name = "vectorhawkd-shim"
-version = "1.0.115"
-dependencies = [
- "anyhow",
- "dirs",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "vectorhawkd-mcp",
-]
 
 [[package]]
 name = "version_check"

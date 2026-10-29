@@ -1,0 +1,1175 @@
+//! F-Tier2: Report-only discovery for non-canonical skill roots.
+//!
+//! Scans extra roots (`~/.agents/skills/`, `~/.pi/agent/skills/`, and any
+//! paths in `VECTORHAWK_EXTRA_SKILL_ROOTS`) for skills that are NOT already
+//! verifiably managed (exact path + hash in `managed_path_markers`; F13).
+//! Found items are POSTed to the backend in a single batch so the portal can
+//! present them to the user for optional adoption.
+//!
+//! **This module is REPORT-ONLY.** It never writes markers, never moves files,
+//! and never takes any local action. If the POST fails the daemon continues
+//! without error.
+//!
+//! # MCP discoveries (runner task R2)
+//!
+//! Runner task R1 (`super::mcp_discovery`) built a read-only scanner for
+//! shadow MCP servers configured in AI clients outside VectorHawk governance,
+//! but stopped short of reporting them — this module is where that happens.
+//! [`run_once`] now calls both scans — [`collect_discoveries`] for skills and
+//! [`mcp_discovery::collect_mcp_discoveries`] for MCP entries, merged via
+//! [`collect_all_discoveries`] — and POSTs the combined result in one
+//! [`DiscoveriesBody`] batch to the same `/portal/managed-paths/discoveries`
+//! endpoint, using the same interval/kick/debounce machinery skills already
+//! use. Each [`super::mcp_discovery::McpDiscoveryItem`] is mapped onto
+//! [`DiscoveryItem`] via [`mcp_item_to_discovery_item`]: its already-
+//! allowlisted, already-`~`-masked `detail`/`source_path` (see
+//! `mcp_discovery`'s privacy doc) are carried across verbatim — nothing here
+//! re-adds raw args, commands, URLs, or env values.
+//!
+//! This is additive-only against the backend as it stands today
+//! (`portal_managed_paths_discoveries.py`): `DiscoveryItem.detail` is already
+//! `dict[str, Any] | None = None`, and `managed_path_discoveries.kind`'s
+//! CHECK constraint already allows `'skill' | 'plugin' | 'mcp'` — an older or
+//! unmodified backend accepts a `kind="mcp"` item in the same batch as
+//! `kind="skill"` items today (verified by reading
+//! `backend/app/routers/portal_managed_paths_discoveries.py` and
+//! `backend/app/models/managed_path_discovery.py`, both read-only from this
+//! repo); `upload_discoveries` processes each item in the batch
+//! independently, so one item's `kind` can never cause the whole batch (or a
+//! sibling skill item) to be rejected.
+//!
+//! ## Killswitch
+//!
+//! Setting `VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER=1` makes `run_once` a
+//! no-op.
+//!
+//! ## Cadence
+//!
+//! Runs periodically (default 300 s). Override with
+//! `VECTORHAWK_DISCOVERIES_INTERVAL_SECS`. The killswitch is checked inside
+//! `run_once` on every tick, so the loop itself need not duplicate the check.
+
+use anyhow::{Context, Result};
+use rusqlite::Connection;
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use tokio::{sync::Notify, time::interval};
+use tracing::{debug, info, warn};
+use scenery_core::{auth::load_all_tokens, state::AppState};
+use scenery_mcp::setup::ClientConfig;
+
+use super::marker::{db_ownership, DbOwnership};
+use super::mcp_discovery;
+
+const ENV_DISABLE: &str = "VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER";
+const ENV_EXTRA_ROOTS: &str = "VECTORHAWK_EXTRA_SKILL_ROOTS";
+const ENV_INTERVAL: &str = "VECTORHAWK_DISCOVERIES_INTERVAL_SECS";
+const DEFAULT_INTERVAL_SECS: u64 = 300;
+
+/// Minimum elapsed time between kick-triggered scans. A kick that arrives
+/// within this window of the previous scan is silently dropped so that rapid
+/// client reconnects don't trigger a burst of scans.
+const KICK_DEBOUNCE: Duration = Duration::from_secs(10);
+
+// ── Public types ──────────────────────────────────────────────────────────────
+
+/// One discovered item that may be reported to the backend.
+#[derive(Debug, Clone, Serialize)]
+pub struct DiscoveryItem {
+    pub kind: String,
+    pub slug: String,
+    pub source_path: String,
+    pub canonical_hash: String,
+    /// Kind-specific metadata. `None` for ordinary skill items;
+    /// `{"suspicious": true, "suspicious_reason": ...}` for a skill that
+    /// claims to be VectorHawk-managed but fails the DB check (see
+    /// [`collect_discoveries`]); `Some(...)` for `kind="mcp"` items, holding
+    /// the JSON-serialized, already-allowlisted
+    /// [`super::mcp_discovery::McpDiscoveryDetail`] — see
+    /// [`mcp_item_to_discovery_item`]. The backend's `DiscoveryItem` schema
+    /// already accepts an optional `detail` object and its `kind` check
+    /// constraint already allows `'mcp'`, so this is additive on both ends
+    /// (see the module-level MCP-wiring doc below).
+    pub detail: Option<serde_json::Value>,
+}
+
+/// Top-level reporter: wraps state + registry URL. Cheaply clonable via `Arc`.
+pub struct DiscoveriesScanner {
+    state: Arc<AppState>,
+    registry_url: String,
+    kick: Arc<Notify>,
+}
+
+impl DiscoveriesScanner {
+    pub fn new(state: Arc<AppState>, registry_url: String, kick: Arc<Notify>) -> Self {
+        Self {
+            state,
+            registry_url,
+            kick,
+        }
+    }
+
+    /// Run discovery once. Delegates to the free function.
+    pub async fn run_once(&self) -> Result<usize> {
+        run_once(Arc::clone(&self.state), self.registry_url.clone()).await
+    }
+
+    /// Spawn the discoveries loop on the current tokio runtime.
+    ///
+    /// Wakes on two signals:
+    /// - A periodic ticker (default 300 s, override via
+    ///   `VECTORHAWK_DISCOVERIES_INTERVAL_SECS`). Ticker fires always trigger a
+    ///   scan.
+    /// - A `kick` notification (fired when the MCP shim's `initialize` handshake
+    ///   succeeds). Kicks are debounced: if a kick arrives within `KICK_DEBOUNCE`
+    ///   (10 s) of the previous scan it is silently dropped. This prevents a burst
+    ///   of rapid reconnects from triggering multiple concurrent scans.
+    ///
+    /// The killswitch (`VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER`) is checked
+    /// inside `run_once` on every iteration.
+    pub fn spawn_loop(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let kick = Arc::clone(&self.kick);
+        tokio::spawn(async move {
+            let secs = parse_interval_secs();
+            info!(
+                interval_secs = secs,
+                "discoveries: periodic scanner spawned (kick-on-initialize enabled)"
+            );
+            let mut ticker = interval(Duration::from_secs(secs));
+
+            // Start far in the past so the first kick (or first tick) always runs.
+            let mut last_scan_at = Instant::now()
+                .checked_sub(Duration::from_secs(3600))
+                .unwrap_or_else(Instant::now);
+
+            loop {
+                enum Trigger {
+                    Tick,
+                    Kick,
+                }
+
+                let trigger = tokio::select! {
+                    _ = ticker.tick() => Trigger::Tick,
+                    _ = kick.notified() => Trigger::Kick,
+                };
+
+                if should_skip_debounced_kick(
+                    matches!(trigger, Trigger::Kick),
+                    last_scan_at.elapsed(),
+                ) {
+                    debug!(
+                        elapsed_ms = last_scan_at.elapsed().as_millis() as u64,
+                        "discoveries: kick debounced — skipping scan"
+                    );
+                    continue;
+                }
+
+                last_scan_at = Instant::now();
+                debug!("discoveries: starting scan");
+                match self.run_once().await {
+                    Ok(0) => debug!("discoveries: no new items found"),
+                    Ok(n) => info!(
+                        count = n,
+                        "discoveries: reported new skill items to backend"
+                    ),
+                    Err(e) => warn!(error = %e, "discoveries: scan failed (non-fatal)"),
+                }
+            }
+        })
+    }
+}
+
+// ── Debounce helper (pure, testable) ─────────────────────────────────────────
+
+/// Return `true` when a kick-triggered scan should be skipped because the
+/// previous scan ran too recently.
+///
+/// The ticker arm always returns `false` (never skipped). The kick arm returns
+/// `true` only when `elapsed < KICK_DEBOUNCE`.
+pub fn should_skip_debounced_kick(trigger_is_kick: bool, elapsed: Duration) -> bool {
+    trigger_is_kick && elapsed < KICK_DEBOUNCE
+}
+
+// ── Free-function entry point (testable) ──────────────────────────────────────
+
+/// Scan extra roots and every detected AI client, filter already-managed
+/// slugs/entries, POST the merged batch (skills + MCP).
+///
+/// Returns the count of items reported (0 when no new discoveries or when
+/// killswitch is active).
+pub async fn run_once(state: Arc<AppState>, registry_url: String) -> Result<usize> {
+    if reconciler_disabled() {
+        debug!("discoveries: VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER set — skipping");
+        return Ok(0);
+    }
+
+    // The daemon runs on a current-thread Tokio executor (see the
+    // spawn_blocking discipline doc at the top of `lib.rs`) — any blocking
+    // call here stalls every concurrent shim connection. `extra_roots()` +
+    // `detect_ai_clients()` (per-client `Path::exists()` checks) +
+    // `collect_all_discoveries` (skill-dir walks, MCP config file reads in
+    // JSON/JSONC/TOML, SHA-256 hashing, and `managed_path_markers` SQLite
+    // lookups via `rusqlite`) are all synchronous I/O, so the whole
+    // collection step is wrapped in `spawn_blocking`, the same way the
+    // registry sync loop wraps `run_sync_tick`.
+    let items = {
+        let state_for_scan = Arc::clone(&state);
+        let registry_url_for_scan = registry_url.clone();
+        tokio::task::spawn_blocking(move || {
+            let roots = extra_roots();
+            let clients = scenery_mcp::setup::detect_ai_clients();
+            collect_all_discoveries(&roots, &clients, &state_for_scan, &registry_url_for_scan)
+        })
+        .await
+        .unwrap_or_default()
+    };
+
+    if items.is_empty() {
+        debug!("discoveries: no new items found");
+        return Ok(0);
+    }
+
+    let count = items.len();
+    let http_client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "discoveries: failed to build HTTP client — skipping POST");
+            return Ok(0);
+        }
+    };
+
+    post_discoveries(&items, &state, &registry_url, &http_client).await;
+
+    Ok(count)
+}
+
+// ── Root resolution ───────────────────────────────────────────────────────────
+
+/// Build the list of extra roots to scan for *unmanaged* skills.
+///
+/// Always includes `~/.agents/skills/` (if it exists) — note this is now also
+/// VectorHawk's own canonical write location, so the scan filters out
+/// directories with a matching `managed_path_markers` row (path + hash).
+///
+/// Also always includes `~/.pi/agent/skills/` — Pi (the pi coding agent,
+/// github.com/earendil-works/pi) already scans `~/.agents/skills/` natively
+/// (per `packages/coding-agent/docs/skills.md`'s "Locations" section), so
+/// governed skills reach it with no adapter work. It additionally has its
+/// own user-level skill root that only Pi reads, so unmanaged skills placed
+/// there directly (not via `~/.agents/skills/`) would otherwise never be
+/// reported. `collect_discoveries` skips roots that don't exist, so this is
+/// a no-op scan on machines without Pi installed.
+///
+/// Also includes any paths from `VECTORHAWK_EXTRA_SKILL_ROOTS`.
+pub fn extra_roots() -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+
+    if let Some(home) = dirs::home_dir() {
+        roots.push(home.join(".agents").join("skills"));
+        roots.push(home.join(".pi").join("agent").join("skills"));
+    }
+
+    if let Ok(extra) = std::env::var(ENV_EXTRA_ROOTS) {
+        for part in extra.split(',') {
+            let trimmed = part.trim();
+            if !trimmed.is_empty() {
+                roots.push(PathBuf::from(trimmed));
+            }
+        }
+    }
+
+    roots
+}
+
+// ── Scan ──────────────────────────────────────────────────────────────────────
+
+/// Scan all `roots`, skip roots that do not exist, and return every skill that
+/// is not *verifiably* VectorHawk-managed.
+///
+/// F13: "managed" means a `managed_path_markers` row of `kind='skill'` at this
+/// exact canonical path whose hash matches the on-disk SKILL.md — never a
+/// slug match, and never the `.vectorhawk-managed.json` file (which any skill
+/// author can ship). Items that look managed but fail that check are reported
+/// with a `detail.suspicious_reason`:
+///
+/// - `"unverified_managed_marker"` — carries a marker file but has no row.
+/// - `"managed_hash_mismatch"` — has a row, but its content does not match.
+pub fn collect_discoveries(roots: &[PathBuf], state: &AppState) -> Vec<DiscoveryItem> {
+    let mut items: Vec<DiscoveryItem> = Vec::new();
+
+    let conn = match Connection::open(&state.db_path) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "discoveries: cannot open state DB — reporting nothing");
+            return items;
+        }
+    };
+
+    for root in roots {
+        if !root.exists() {
+            debug!(root = %root.display(), "discoveries: root does not exist — skipping");
+            continue;
+        }
+
+        match scan_root(root) {
+            Ok(found) => {
+                for mut item in found {
+                    let path = Path::new(&item.source_path);
+                    let reason = match db_ownership(&conn, "skill", path) {
+                        DbOwnership::Verified => {
+                            debug!(slug = %item.slug, "discoveries: verified managed — skipping");
+                            continue;
+                        }
+                        DbOwnership::HashMismatch => Some("managed_hash_mismatch"),
+                        DbOwnership::Untracked => {
+                            scenery_mcp::ownership::is_vectorhawk_managed(path)
+                                .then_some("unverified_managed_marker")
+                        }
+                    };
+                    if let Some(reason) = reason {
+                        warn!(
+                            slug = %item.slug,
+                            path = %item.source_path,
+                            reason,
+                            "discoveries: skill claims to be VectorHawk-managed but is not verifiable — reporting as suspicious"
+                        );
+                        item.detail = Some(serde_json::json!({
+                            "suspicious": true,
+                            "suspicious_reason": reason,
+                        }));
+                    }
+                    items.push(item);
+                }
+            }
+            Err(e) => {
+                warn!(root = %root.display(), error = %e, "discoveries: scan failed — skipping root");
+            }
+        }
+    }
+
+    items
+}
+
+/// Merge skill discoveries (scanned from `roots`, via [`collect_discoveries`])
+/// with MCP discoveries (scanned from `clients`, via
+/// [`mcp_discovery::collect_mcp_discoveries`]) into one batch.
+///
+/// Kept as a free function taking explicit `clients` (rather than calling
+/// `scenery_mcp::setup::detect_ai_clients()` internally) so it's testable
+/// with fixture [`ClientConfig`]s, the same way `collect_mcp_discoveries`
+/// itself is — no need to redirect the process-global `$HOME`. Production
+/// call sites ([`run_once`]) pass `detect_ai_clients()`'s real result.
+pub fn collect_all_discoveries(
+    roots: &[PathBuf],
+    clients: &[ClientConfig],
+    state: &AppState,
+    registry_url: &str,
+) -> Vec<DiscoveryItem> {
+    let mut items = collect_discoveries(roots, state);
+    items.extend(
+        mcp_discovery::collect_mcp_discoveries(clients, state, registry_url)
+            .into_iter()
+            .map(mcp_item_to_discovery_item),
+    );
+    items
+}
+
+/// Map an already-redacted [`mcp_discovery::McpDiscoveryItem`] onto the
+/// generalized [`DiscoveryItem`] the batch POST uses. Carries `kind`, `slug`,
+/// `source_path` (already `~`-masked), and `canonical_hash` across verbatim,
+/// and JSON-serializes the already-allowlisted `detail` struct into
+/// `DiscoveryItem.detail` — never re-derives anything from raw args/commands/
+/// URLs/env here.
+fn mcp_item_to_discovery_item(item: mcp_discovery::McpDiscoveryItem) -> DiscoveryItem {
+    let detail = serde_json::to_value(&item.detail).ok();
+    DiscoveryItem {
+        kind: item.kind,
+        slug: item.slug,
+        source_path: item.source_path,
+        canonical_hash: item.canonical_hash,
+        detail,
+    }
+}
+
+/// Scan one root directory and return a `DiscoveryItem` per subdir containing
+/// `SKILL.md`.
+fn scan_root(root: &Path) -> Result<Vec<DiscoveryItem>> {
+    let entries = fs::read_dir(root)
+        .with_context(|| format!("discoveries: failed to read dir {}", root.display()))?;
+
+    let mut items = Vec::new();
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                warn!(error = %e, "discoveries: error reading dir entry — skipping");
+                continue;
+            }
+        };
+
+        let path = entry.path();
+
+        let meta = match fs::metadata(&path) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(path = %path.display(), error = %e, "discoveries: cannot stat entry — skipping");
+                continue;
+            }
+        };
+
+        if !meta.is_dir() {
+            continue;
+        }
+
+        // No ownership decision here (F13): `~/.agents/skills/` is also
+        // VectorHawk's own write location, but a `.vectorhawk-managed.json`
+        // file proves nothing — `collect_discoveries` checks the DB row.
+
+        let slug = match path.file_name().and_then(|n| n.to_str()) {
+            Some(s) => s.to_string(),
+            None => {
+                warn!(path = %path.display(), "discoveries: non-UTF-8 dir name — skipping");
+                continue;
+            }
+        };
+
+        let skill_md = path.join("SKILL.md");
+        if !skill_md.exists() {
+            continue;
+        }
+
+        let skill_md_bytes = match fs::read(&skill_md) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(slug = %slug, error = %e, "discoveries: cannot read SKILL.md — skipping");
+                continue;
+            }
+        };
+
+        let canonical_hash = hex_sha256(&skill_md_bytes);
+        // Deliberately NOT `~`-masked, unlike `mcp_discovery`'s
+        // `McpDiscoveryItem::source_path`. Investigated per the brief's note
+        // to mask every uploaded source_path uniformly; confirmed (review
+        // round 4) that skill/plugin source_path is dereferenced as a real
+        // filesystem path downstream on both take/adopt paths — e.g.
+        // `pusher::push_skill`, `takeover::remove_source_path`, the F1
+        // migrator, and `publish.rs` all read or act on this exact absolute
+        // path — so masking it here would silently break adopt/takeover.
+        // MCP's `source_path` has no such downstream dereference (the
+        // backend only ever displays/dedupes it), which is why only it gets
+        // masked. Left absolute intentionally, not an oversight.
+        let source_path = path.to_string_lossy().to_string();
+
+        items.push(DiscoveryItem {
+            kind: "skill".to_string(),
+            slug,
+            source_path,
+            canonical_hash,
+            detail: None,
+        });
+    }
+
+    Ok(items)
+}
+
+// ── HTTP report ───────────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+struct DiscoveriesBody {
+    device_id: Option<String>,
+    items: Vec<DiscoveryItem>,
+}
+
+/// POST the batch to the backend. Logs warnings on failure but never returns
+/// an error — this function is best-effort.
+async fn post_discoveries(
+    items: &[DiscoveryItem],
+    state: &AppState,
+    registry_url: &str,
+    http_client: &reqwest::Client,
+) {
+    let token = access_token_for(state, registry_url).await;
+
+    if token.is_empty() {
+        debug!("discoveries: no auth token — skipping POST (will try again next daemon start)");
+        return;
+    }
+
+    let device_id = state.get_sync_state("device_id").ok().flatten();
+
+    let body = DiscoveriesBody {
+        device_id,
+        items: items.to_vec(),
+    };
+
+    let url = format!(
+        "{}/portal/managed-paths/discoveries",
+        registry_url.trim_end_matches('/')
+    );
+
+    let resp = match http_client
+        .post(&url)
+        .bearer_auth(token)
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(error = %e, "discoveries: POST failed — will retry on next daemon start");
+            return;
+        }
+    };
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        warn!(%status, body = %text, "discoveries: backend rejected discovery batch");
+        return;
+    }
+
+    info!(
+        count = items.len(),
+        "discoveries: batch reported to backend"
+    );
+}
+
+// ── Auth helper ───────────────────────────────────────────────────────────────
+
+async fn access_token_for(state: &AppState, registry_url: &str) -> String {
+    let reg = registry_url.to_string();
+    let state_view = state.clone();
+
+    tokio::task::spawn_blocking(move || {
+        load_all_tokens(&state_view)
+            .ok()
+            .and_then(|rows| {
+                rows.into_iter()
+                    .find(|r| r.registry_url == reg)
+                    .map(|r| r.access_token)
+            })
+            .unwrap_or_default()
+    })
+    .await
+    .unwrap_or_default()
+}
+
+// ── SHA-256 helper ────────────────────────────────────────────────────────────
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
+/// Parse the scan interval from `VECTORHAWK_DISCOVERIES_INTERVAL_SECS`.
+/// Falls back to `DEFAULT_INTERVAL_SECS` (300) for any invalid or zero value.
+fn parse_interval_secs() -> u64 {
+    match std::env::var(ENV_INTERVAL) {
+        Err(_) => DEFAULT_INTERVAL_SECS,
+        Ok(raw) => match raw.parse::<u64>() {
+            Ok(n) if n > 0 => n,
+            Ok(_) => {
+                warn!(
+                    env = ENV_INTERVAL,
+                    "discoveries: interval must be > 0; using default {}s", DEFAULT_INTERVAL_SECS
+                );
+                DEFAULT_INTERVAL_SECS
+            }
+            Err(_) => {
+                warn!(
+                    env = ENV_INTERVAL,
+                    value = %raw,
+                    "discoveries: failed to parse interval; using default {}s",
+                    DEFAULT_INTERVAL_SECS
+                );
+                DEFAULT_INTERVAL_SECS
+            }
+        },
+    }
+}
+
+fn reconciler_disabled() -> bool {
+    std::env::var_os(ENV_DISABLE).is_some()
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+    use crate::managed_paths::ENV_MUTEX;
+    use std::fs;
+    use scenery_core::state::AppState;
+    use scenery_mcp::setup::ConfigFormat;
+
+    /// Bootstrap a minimal AppState in a temp dir. Returns both the state and
+    /// the `TempDir` guard so the caller keeps the dir alive.
+    fn temp_state() -> (AppState, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let state = AppState::bootstrap_in(root).unwrap();
+        (state, tmp)
+    }
+
+    /// Write a minimal SKILL.md at `root/<slug>/SKILL.md` and return the slug dir.
+    fn write_skill(root: &Path, slug: &str) -> PathBuf {
+        let dir = root.join(slug);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("SKILL.md"), format!("---\nname: {slug}\n---\n")).unwrap();
+        dir
+    }
+
+    // ── 1. Scans extra root and returns skill items ────────────────────────────
+
+    #[test]
+    fn scans_extra_root_and_returns_skill_md_items() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+
+        write_skill(&root, "alpha");
+        write_skill(&root, "beta");
+        // Plain file — must be skipped.
+        fs::write(root.join("README.md"), "hi").unwrap();
+        // Dir without SKILL.md — must be skipped.
+        fs::create_dir_all(root.join("no-skill-md")).unwrap();
+
+        let (state, _guard) = temp_state();
+        let items = collect_discoveries(&[root], &state);
+
+        assert_eq!(items.len(), 2, "expected exactly 2 skills");
+        let slugs: Vec<&str> = items.iter().map(|i| i.slug.as_str()).collect();
+        assert!(slugs.contains(&"alpha"), "alpha missing");
+        assert!(slugs.contains(&"beta"), "beta missing");
+        for item in &items {
+            assert_eq!(item.kind, "skill");
+            assert!(!item.canonical_hash.is_empty());
+            assert!(!item.source_path.is_empty());
+        }
+    }
+
+    // ── 2. Skips slugs already in managed_path_markers ────────────────────────
+
+    #[test]
+    fn skips_slugs_already_in_managed_path_markers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+
+        write_skill(&root, "managed-skill");
+        write_skill(&root, "new-skill");
+
+        let (state, _guard) = temp_state();
+
+        // Pre-insert a marker for managed-skill.
+        {
+            let conn = Connection::open(&state.db_path).unwrap();
+            conn.execute(
+                "INSERT INTO managed_path_markers \
+                 (path, kind, slug, installation_id, source_sha256, migrated_at) \
+                 VALUES (?1, 'skill', ?2, NULL, ?3, '2026-01-01T000000Z')",
+                rusqlite::params![
+                    root.join("managed-skill").to_string_lossy().to_string(),
+                    "managed-skill",
+                    hex_sha256(b"---\nname: managed-skill\n---\n"),
+                ],
+            )
+            .unwrap();
+        }
+
+        let items = collect_discoveries(&[root], &state);
+
+        assert_eq!(
+            items.len(),
+            1,
+            "only the unmanaged skill should be returned"
+        );
+        assert_eq!(items[0].slug, "new-skill");
+    }
+
+    // ── 3. Skips root that does not exist ─────────────────────────────────────
+
+    #[test]
+    fn skips_root_that_does_not_exist() {
+        let (state, _guard) = temp_state();
+        let phantom = PathBuf::from("/tmp/vectorhawk-discoveries-phantom-root-xyzzy-9999");
+
+        // Must not panic, must return empty vec.
+        let items = collect_discoveries(&[phantom], &state);
+        assert!(items.is_empty());
+    }
+
+    // ── 4. Respects VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER ─────────────────
+
+    #[test]
+    fn respects_disable_env_var() {
+        // This mutates the process-global VECTORHAWK_DISABLE_FILESYSTEM_RECONCILER
+        // env var, which other tests (e.g. adopt_publish's) read indirectly via
+        // `reconciler_disabled()` — take the shared cross-file mutex so this
+        // window can't be observed mid-test by an unrelated thread.
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var(ENV_DISABLE, "1");
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        write_skill(&root, "some-skill");
+
+        let (state, _guard) = temp_state();
+
+        // We test the killswitch gate directly via the sync helper.
+        let disabled = reconciler_disabled();
+
+        unsafe {
+            std::env::remove_var(ENV_DISABLE);
+        }
+
+        assert!(
+            disabled,
+            "reconciler_disabled() must return true when env var is set"
+        );
+
+        // Verify that collect_discoveries itself still works once the var is gone.
+        let items = collect_discoveries(&[root], &state);
+        assert_eq!(items.len(), 1);
+    }
+
+    // ── 5. Canonical hash is sha256 of SKILL.md bytes ─────────────────────────
+
+    #[test]
+    fn canonical_hash_matches_sha256_of_skill_md() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let content = "---\nname: hash-test\n---\n";
+        write_skill(&root, "hash-test");
+        // Overwrite with known content.
+        fs::write(root.join("hash-test").join("SKILL.md"), content).unwrap();
+
+        let (state, _guard) = temp_state();
+        let items = collect_discoveries(&[root], &state);
+
+        assert_eq!(items.len(), 1);
+        let expected = hex_sha256(content.as_bytes());
+        assert_eq!(items[0].canonical_hash, expected);
+    }
+
+    // ── 6. parse_interval_secs — env-var parsing ──────────────────────────────
+
+    #[test]
+    fn parse_interval_secs_unset_returns_default() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var(ENV_INTERVAL);
+        }
+        assert_eq!(parse_interval_secs(), DEFAULT_INTERVAL_SECS);
+    }
+
+    #[test]
+    fn parse_interval_secs_valid_value() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var(ENV_INTERVAL, "60");
+        }
+        let result = parse_interval_secs();
+        unsafe {
+            std::env::remove_var(ENV_INTERVAL);
+        }
+        assert_eq!(result, 60);
+    }
+
+    #[test]
+    fn parse_interval_secs_zero_returns_default() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var(ENV_INTERVAL, "0");
+        }
+        let result = parse_interval_secs();
+        unsafe {
+            std::env::remove_var(ENV_INTERVAL);
+        }
+        assert_eq!(result, DEFAULT_INTERVAL_SECS);
+    }
+
+    #[test]
+    fn parse_interval_secs_garbage_returns_default() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var(ENV_INTERVAL, "garbage");
+        }
+        let result = parse_interval_secs();
+        unsafe {
+            std::env::remove_var(ENV_INTERVAL);
+        }
+        assert_eq!(result, DEFAULT_INTERVAL_SECS);
+    }
+
+    #[test]
+    fn parse_interval_secs_negative_returns_default() {
+        // "-1" does not parse as u64, so it falls through to the Err branch.
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var(ENV_INTERVAL, "-1");
+        }
+        let result = parse_interval_secs();
+        unsafe {
+            std::env::remove_var(ENV_INTERVAL);
+        }
+        assert_eq!(result, DEFAULT_INTERVAL_SECS);
+    }
+
+    // ── 7. should_skip_debounced_kick — pure debounce logic ───────────────────
+
+    #[test]
+    fn debounce_tick_never_skipped() {
+        // Ticker always runs regardless of elapsed time.
+        assert!(!should_skip_debounced_kick(false, Duration::ZERO));
+        assert!(!should_skip_debounced_kick(false, Duration::from_millis(1)));
+        assert!(!should_skip_debounced_kick(false, Duration::from_secs(5)));
+        assert!(!should_skip_debounced_kick(false, Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn debounce_kick_within_window_is_skipped() {
+        // A kick fired less than KICK_DEBOUNCE (10 s) after the previous scan
+        // must be suppressed.
+        assert!(should_skip_debounced_kick(true, Duration::ZERO));
+        assert!(should_skip_debounced_kick(true, Duration::from_secs(1)));
+        assert!(should_skip_debounced_kick(
+            true,
+            Duration::from_millis(9_999)
+        ));
+    }
+
+    #[test]
+    fn debounce_kick_exactly_at_window_boundary_runs() {
+        // At exactly KICK_DEBOUNCE the kick should be allowed through (elapsed
+        // is not strictly less than the window).
+        assert!(!should_skip_debounced_kick(true, KICK_DEBOUNCE));
+    }
+
+    #[test]
+    fn debounce_kick_after_window_runs() {
+        // A kick fired well after the debounce window must always proceed.
+        assert!(!should_skip_debounced_kick(true, Duration::from_secs(11)));
+        assert!(!should_skip_debounced_kick(true, Duration::from_secs(60)));
+        assert!(!should_skip_debounced_kick(true, Duration::from_secs(3600)));
+    }
+
+    // ── 8. F13: ownership comes from the DB row, never the marker file ──────
+
+    fn insert_skill_row(state: &AppState, path: &Path, slug: &str, sha: &str) {
+        let conn = Connection::open(&state.db_path).unwrap();
+        conn.execute(
+            "INSERT INTO managed_path_markers \
+             (path, kind, slug, installation_id, source_sha256, migrated_at) \
+             VALUES (?1, 'skill', ?2, NULL, ?3, '2026-01-01T00:00:00Z')",
+            rusqlite::params![path.to_string_lossy().to_string(), slug, sha],
+        )
+        .unwrap();
+    }
+
+    fn forge_marker(dir: &Path) {
+        fs::write(
+            dir.join(".vectorhawk-managed.json"),
+            br#"{"marker_version":1,"installation_id":null,"source_sha256":"abc","migrated_at":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+    }
+
+    fn suspicious_reason(item: &DiscoveryItem) -> Option<String> {
+        item.detail
+            .as_ref()
+            .and_then(|d| d.get("suspicious_reason"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    }
+
+    #[test]
+    fn forged_marker_without_db_row_is_reported_as_suspicious() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("skills");
+        let forged = write_skill(&root, "forged-skill");
+        forge_marker(&forged);
+        write_skill(&root, "foreign-skill");
+
+        let (state, _guard) = temp_state();
+        let items = collect_discoveries(&[root], &state);
+        let mut slugs: Vec<&str> = items.iter().map(|d| d.slug.as_str()).collect();
+        slugs.sort();
+        assert_eq!(slugs, vec!["foreign-skill", "forged-skill"]);
+
+        let forged_item = items.iter().find(|i| i.slug == "forged-skill").unwrap();
+        assert_eq!(
+            suspicious_reason(forged_item).as_deref(),
+            Some("unverified_managed_marker")
+        );
+        let foreign_item = items.iter().find(|i| i.slug == "foreign-skill").unwrap();
+        assert!(foreign_item.detail.is_none());
+    }
+
+    /// Reusing a managed slug in another root must not hide a skill: the
+    /// already-managed check is keyed on path, not slug.
+    #[test]
+    fn managed_slug_at_a_different_path_is_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let managed_root = tmp.path().join("managed");
+        let real = write_skill(&managed_root, "pdf");
+        let (state, _guard) = temp_state();
+        insert_skill_row(&state, &real, "pdf", &hex_sha256(b"---\nname: pdf\n---\n"));
+
+        let pi_root = tmp.path().join("pi-skills");
+        let shadow = write_skill(&pi_root, "pdf");
+        fs::write(shadow.join("SKILL.md"), "---\nname: pdf\n---\nevil").unwrap();
+
+        let items = collect_discoveries(&[pi_root], &state);
+        assert_eq!(items.len(), 1, "same-slug skill elsewhere must be reported");
+        assert_eq!(items[0].slug, "pdf");
+    }
+
+    #[test]
+    fn managed_dir_with_matching_row_and_hash_is_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("skills");
+        let ours = write_skill(&root, "ours");
+        forge_marker(&ours); // a real managed dir carries the marker too
+        let (state, _guard) = temp_state();
+        insert_skill_row(
+            &state,
+            &ours,
+            "ours",
+            &hex_sha256(b"---\nname: ours\n---\n"),
+        );
+
+        let items = collect_discoveries(&[root], &state);
+        assert!(
+            items.is_empty(),
+            "verified managed skill must be skipped: {items:?}"
+        );
+    }
+
+    /// Row keyed on a non-canonical spelling of the same directory (e.g. a
+    /// symlinked root) still matches after canonicalisation.
+    #[test]
+    fn managed_dir_reached_through_a_symlinked_root_is_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real_root = tmp.path().join("real");
+        let ours = write_skill(&real_root, "ours");
+        let (state, _guard) = temp_state();
+        insert_skill_row(
+            &state,
+            &ours,
+            "ours",
+            &hex_sha256(b"---\nname: ours\n---\n"),
+        );
+        let link_root = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real_root, &link_root).unwrap();
+
+        let items = collect_discoveries(&[link_root], &state);
+        assert!(items.is_empty(), "{items:?}");
+    }
+
+    #[test]
+    fn managed_dir_with_hash_mismatch_is_reported_as_suspicious() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("skills");
+        let ours = write_skill(&root, "ours");
+        forge_marker(&ours);
+        let (state, _guard) = temp_state();
+        insert_skill_row(&state, &ours, "ours", "0000");
+
+        let items = collect_discoveries(&[root], &state);
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            suspicious_reason(&items[0]).as_deref(),
+            Some("managed_hash_mismatch")
+        );
+    }
+
+    // ── 9. R2: merged batch contains both a skill and an MCP item ─────────────
+
+    #[test]
+    fn merges_skill_and_mcp_items_into_one_batch() {
+        // Skill side: one foreign skill dir in an extra root.
+        let skill_root_tmp = tempfile::tempdir().unwrap();
+        let skill_root = skill_root_tmp.path().to_path_buf();
+        write_skill(&skill_root, "foreign-skill");
+
+        // MCP side: one foreign Cursor entry, via a fixture ClientConfig —
+        // no need to redirect $HOME (see collect_all_discoveries's doc).
+        let mcp_tmp = tempfile::tempdir().unwrap();
+        let config_path = mcp_tmp.path().join("mcp.json");
+        fs::write(
+            &config_path,
+            serde_json::to_vec(&serde_json::json!({
+                "mcpServers": {
+                    "linear-mcp": {"command": "npx", "args": ["-y", "linear-mcp"]}
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let client = ClientConfig {
+            name: "Cursor".to_string(),
+            config_path,
+            mcp_key: "mcpServers".to_string(),
+            already_configured: false,
+            format: ConfigFormat::Json,
+        };
+
+        let (state, _guard) = temp_state();
+        let items = collect_all_discoveries(
+            &[skill_root],
+            &[client],
+            &state,
+            "https://app.vectorhawk.ai",
+        );
+
+        assert_eq!(
+            items.len(),
+            2,
+            "expected exactly one skill item and one mcp item"
+        );
+
+        let skill_item = items
+            .iter()
+            .find(|i| i.kind == "skill")
+            .expect("skill item present in merged batch");
+        assert_eq!(skill_item.slug, "foreign-skill");
+        assert!(
+            skill_item.detail.is_none(),
+            "skill items carry no detail blob"
+        );
+
+        let mcp_item = items
+            .iter()
+            .find(|i| i.kind == "mcp")
+            .expect("mcp item present in merged batch");
+        assert_eq!(mcp_item.slug, "Cursor:linear-mcp");
+        let detail = mcp_item
+            .detail
+            .as_ref()
+            .expect("mcp items must carry a detail blob");
+        assert_eq!(detail["client_name"], "Cursor");
+        assert_eq!(detail["server_key"], "linear-mcp");
+        assert_eq!(detail["package_identifier"], "linear-mcp");
+        // The allowlist contract (mcp_discovery.rs) must survive the mapping
+        // into DiscoveryItem unchanged: no raw args/command/env value ever
+        // appears in the serialized batch.
+        let serialized = serde_json::to_string(&items).unwrap();
+        assert!(!serialized.contains("\"args\""));
+        assert!(!serialized.contains("\"command\""));
+        assert!(!serialized.contains("\"env\""));
+    }
+
+    // ── 10. R2: full batch payload never leaks secrets from an MCP fixture ────
+
+    #[test]
+    fn batch_payload_never_leaks_secrets_from_mcp_fixture() {
+        // A config file "full of secrets" per the brief: a bearer-style env
+        // value, a space-separated --token flag/value pair, and a URL with
+        // userinfo + a secret query-string token. Asserts the actual
+        // DiscoveriesBody-shaped payload (device_id + items, exactly what
+        // gets POSTed) never contains any of these secret strings anywhere.
+        let mcp_tmp = tempfile::tempdir().unwrap();
+        let config_path = mcp_tmp.path().join("mcp.json");
+        fs::write(
+            &config_path,
+            serde_json::to_vec(&serde_json::json!({
+                "mcpServers": {
+                    "leaky-mcp": {
+                        "command": "custom-mcp",
+                        "args": ["--token", "OPAQUEBATCHSECRETVALUE"],
+                        "env": {"API_KEY": "sk-batchtestsecretvalue"}
+                    },
+                    "remote-leaky": {
+                        "url": "https://svc-user:s3cr3t-batch-pass@mcp.example.com/sse?refresh_token=RTOKENBATCHSECRET",
+                        "headers": {"Authorization": "Bearer HEADERBATCHSECRETVALUE"}
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let client = ClientConfig {
+            name: "Cursor".to_string(),
+            config_path,
+            mcp_key: "mcpServers".to_string(),
+            already_configured: false,
+            format: ConfigFormat::Json,
+        };
+
+        let (state, _guard) = temp_state();
+        let items = collect_all_discoveries(&[], &[client], &state, "https://app.vectorhawk.ai");
+        assert_eq!(items.len(), 2, "both leaky-mcp and remote-leaky reported");
+
+        // Build the exact upload payload shape post_discoveries serializes.
+        let body = DiscoveriesBody {
+            device_id: Some("test-device-id".to_string()),
+            items,
+        };
+        let serialized = serde_json::to_string(&body).unwrap();
+
+        for secret in [
+            "OPAQUEBATCHSECRETVALUE",
+            "sk-batchtestsecretvalue",
+            "svc-user",
+            "s3cr3t-batch-pass",
+            "RTOKENBATCHSECRET",
+            "refresh_token",
+            "HEADERBATCHSECRETVALUE",
+            "Bearer HEADERBATCHSECRETVALUE",
+            "--token",
+        ] {
+            assert!(
+                !serialized.contains(secret),
+                "secret {secret:?} must never appear in the serialized upload payload: {serialized}"
+            );
+        }
+    }
+
+    // ── 11. extra_roots includes Pi's own skill dir ─────────────────────────────
+
+    #[test]
+    fn extra_roots_includes_pi_skill_dir() {
+        // Pi (pi coding agent, github.com/earendil-works/pi) scans skills from
+        // two global locations: `~/.agents/skills/` (already covered above) and
+        // its own `~/.pi/agent/skills/` — see
+        // packages/coding-agent/docs/skills.md ("Locations" section) in that
+        // repo. Unmanaged skills that live only under the Pi-specific root
+        // would never be reported without this entry.
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let fake_home = tempfile::tempdir().unwrap();
+        let prev_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", fake_home.path());
+        }
+
+        let roots = extra_roots();
+
+        match prev_home {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+
+        assert!(
+            roots.contains(&fake_home.path().join(".agents").join("skills")),
+            "expected ~/.agents/skills in extra_roots, got {roots:?}"
+        );
+        assert!(
+            roots.contains(&fake_home.path().join(".pi").join("agent").join("skills")),
+            "expected ~/.pi/agent/skills in extra_roots, got {roots:?}"
+        );
+    }
+}

@@ -197,4 +197,4 @@ If the scan returns a risky verdict, the import is blocked unless you pass
 ## Schema Reference
 
 The full JSON Schema for SKILL.md frontmatter is at:
-`crates/vectorhawkd-manifest/schemas/skill_md_frontmatter.json`
+`crates/scenery-manifest/schemas/skill_md_frontmatter.json`

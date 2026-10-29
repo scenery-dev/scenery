@@ -128,7 +128,7 @@ fi
 # ── AC3: Real backend MCP round-trip ─────────────────────────────────────────
 
 echo "AC3: real backend MCP round-trip (m1_multi_shim test) ..."
-if cargo test --release -p vectorhawkd-daemon --test m1_multi_shim \
+if cargo test --release -p scenery-daemon --test m1_multi_shim \
         -- --ignored 2>&1 | grep -q "test result: ok. 1 passed"; then
     record "PASS" 'AC3: real backend tools/list + tools/call round-trip' \
         "m1_multi_shim test passed"
@@ -140,7 +140,7 @@ fi
 # ── AC4: Tool budget enforcement ─────────────────────────────────────────────
 
 echo "AC4: tool budget constants ..."
-AGGREGATOR_FILE="${REPO_ROOT}/crates/vectorhawkd-mcp/src/aggregator.rs"
+AGGREGATOR_FILE="${REPO_ROOT}/crates/scenery-mcp/src/aggregator.rs"
 if grep -qE "TOOL_BUDGET_TOTAL[[:space:]]*[:=]" "${AGGREGATOR_FILE}" \
    && grep -qE "RESERVED_SLOTS[[:space:]]*[:=]" "${AGGREGATOR_FILE}"; then
     # Pick the value AFTER the `=` sign to avoid any digits in type annotations.
@@ -167,7 +167,7 @@ echo "AC5: audit pipeline (validated by m1_multi_shim audit assertion) ..."
 # this also passes — they share the same test. If we can confirm the
 # RealBackend::call_tool path emits audit events via spawn_blocking, that's
 # the load-bearing source of truth.
-BACKEND_FILE="${REPO_ROOT}/crates/vectorhawkd-mcp/src/backend.rs"
+BACKEND_FILE="${REPO_ROOT}/crates/scenery-mcp/src/backend.rs"
 if grep -q "spawn_blocking" "${BACKEND_FILE}" \
    && grep -q "tool_called" "${BACKEND_FILE}" \
    && grep -q "audit.record" "${BACKEND_FILE}"; then
@@ -181,7 +181,7 @@ fi
 # ── AC6: Policy 7-day offline grace ──────────────────────────────────────────
 
 echo "AC6: policy 7-day offline grace ..."
-REGISTRY_FILE="${REPO_ROOT}/crates/vectorhawkd-core/src/registry.rs"
+REGISTRY_FILE="${REPO_ROOT}/crates/scenery-core/src/registry.rs"
 if grep -qE "604800|7.*day" "${REGISTRY_FILE}" \
    && grep -q "HttpPolicyClient" "${REGISTRY_FILE}"; then
     record "PASS" 'AC6: policy 7-day offline grace' \
@@ -194,7 +194,7 @@ fi
 # ── AC7: Registry sync loop (300s) ───────────────────────────────────────────
 
 echo "AC7: registry sync loop interval ..."
-DAEMON_LIB="${REPO_ROOT}/crates/vectorhawkd-daemon/src/lib.rs"
+DAEMON_LIB="${REPO_ROOT}/crates/scenery-daemon/src/lib.rs"
 if grep -qE "SYNC_INTERVAL_SECS[[:space:]]*[:=]" "${DAEMON_LIB}"; then
     # Pick the value AFTER the `=` sign so a `u64` type annotation
     # doesn't get parsed as `64`.
@@ -246,7 +246,7 @@ fi
 # ── AC10: Compute budget ─────────────────────────────────────────────────────
 
 echo "AC10: compute budget (idle + load + shim size) ..."
-# Platform-aware socket path (mirrors AppState::socket_path() in vectorhawkd-core).
+# Platform-aware socket path (mirrors AppState::socket_path() in scenery-core).
 case "$(uname)" in
     Darwin) SOCKET_PATH="${HOME}/Library/Application Support/VectorHawk/agent.sock" ;;
     Linux)  SOCKET_PATH="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/vectorhawk/agent.sock" ;;
@@ -288,7 +288,7 @@ rm -f "${SOCKET_PATH}"
 VECTORHAWK_SIZE_BYTES="$(stat -f%z "${SHIM_BIN}" 2>/dev/null || stat -c%s "${SHIM_BIN}" 2>/dev/null)"
 VECTORHAWK_SIZE_MB=$((VECTORHAWK_SIZE_BYTES / 1048576))
 
-# The separate vectorhawkd-shim binary no longer exists; mcp serve is now a
+# The separate scenery-shim binary no longer exists; mcp serve is now a
 # subcommand of the unified vectorhawk binary. Idle/load RSS budgets still apply.
 # The <=6 MB shim-binary budget is informational only for the unified binary.
 if [[ "${IDLE_RSS_MB}" -le 50 ]] \
@@ -303,7 +303,7 @@ fi
 # ── AC11: Mid-session daemon-kill regression (M0 AC4 / M4 contract) ──────────
 
 echo "AC11: daemon-kill regression (M0 AC4 / M4 error contract) ..."
-if cargo test --release -p vectorhawkd-daemon --test m0_daemon_kill \
+if cargo test --release -p scenery-daemon --test m0_daemon_kill \
         -- --ignored 2>&1 | grep -q "test result: ok. 1 passed"; then
     record "PASS" 'AC11: M0 daemon-kill regression (M4 error contract)' \
         "m0_daemon_kill test passed"
@@ -317,7 +317,7 @@ fi
 echo "AC12: spawn_blocking discipline (slow backend does not block) ..."
 # Run blocking_io_stress with --test-threads=1 to avoid socket contention
 # between the two tests in this binary.
-if cargo test --release -p vectorhawkd-daemon --test m1_blocking_io_stress \
+if cargo test --release -p scenery-daemon --test m1_blocking_io_stress \
         -- --ignored --test-threads=1 2>&1 | grep -q "test result: ok. 2 passed"; then
     record "PASS" 'AC12: spawn_blocking discipline' \
         "both blocking-io stress tests passed"

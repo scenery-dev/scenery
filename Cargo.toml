@@ -1,21 +1,21 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/vectorhawkd-manifest",
-    "crates/vectorhawkd-core",
-    "crates/vectorhawkd-mcp",
-    "crates/vectorhawkd-daemon",
-    "crates/vectorhawkd-shim",
-    "crates/vectorhawkd-cli",
+    "crates/scenery-manifest",
+    "crates/scenery-core",
+    "crates/scenery-mcp",
+    "crates/scenery-daemon",
+    "crates/scenery-shim",
+    "crates/scenery-cli",
 ]
 
 [workspace.package]
 version = "1.0.115"
 edition = "2021"
 rust-version = "1.75"
-authors = ["VectorHawk"]
+authors = ["Scenery"]
 license = "Apache-2.0"
-repository = "https://github.com/scenery-dev/sceneryd"
+repository = "https://github.com/scenery-dev/scenery"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "rt", "macros", "io-util", "net", "fs", "time", "sync", "signal", "process"] }

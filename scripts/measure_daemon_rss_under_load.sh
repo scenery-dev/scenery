@@ -57,7 +57,7 @@ fi
 # ── Run the M5 stress test (captures peak RSS to target/m5-daemon-rss-under-load.txt) ─
 
 echo "INFO: running m5_stress_multi_shim integration test (this takes ~10-15 s) ..."
-if ! cargo test --release -p vectorhawkd-daemon --test m5_stress_multi_shim \
+if ! cargo test --release -p scenery-daemon --test m5_stress_multi_shim \
         -- --include-ignored --nocapture 2>&1; then
     echo "FAIL: m5_stress_multi_shim test failed — cannot measure under-load RSS" >&2
     exit 1

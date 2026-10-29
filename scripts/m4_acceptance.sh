@@ -145,7 +145,7 @@ fi
 
 echo "AC3+AC5: source grep for EmbeddedBackend constructions in shim production code ..."
 
-SHIM_SRC="${REPO_ROOT}/crates/vectorhawkd-shim/src/lib.rs"
+SHIM_SRC="${REPO_ROOT}/crates/scenery-shim/src/lib.rs"
 
 # Strip out lines under `#[cfg(test)]` mod blocks. Simplest check: look for
 # `EmbeddedBackend::` in lib.rs. The shim's production code path no longer
@@ -175,7 +175,7 @@ fi
 echo "AC4: m0_daemon_kill asserts daemon-required error contract ..."
 
 if grep -nE -- '-32001|DAEMON_UNREACHABLE|daemon-required' \
-        "${REPO_ROOT}/crates/vectorhawkd-daemon/tests/m0_daemon_kill.rs" >/dev/null 2>&1; then
+        "${REPO_ROOT}/crates/scenery-daemon/tests/m0_daemon_kill.rs" >/dev/null 2>&1; then
     record "PASS" "AC4: m0_daemon_kill asserts new error contract" \
         "test source references -32001 / daemon-required"
 else

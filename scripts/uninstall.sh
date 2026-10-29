@@ -11,7 +11,7 @@
 # JSON handling works with either `jq` or `python3` (config stripping must
 # never be skipped just because jq is missing — see edit_json_del_keys below).
 #
-# Mirror of the tier-1 command — keep in sync with crates/vectorhawkd-cli/src/uninstall.rs.
+# Mirror of the tier-1 command — keep in sync with crates/scenery-cli/src/uninstall.rs.
 # Ship a copy in homebrew-tap so `curl … | bash` works even after `brew uninstall`.
 #
 # Usage:

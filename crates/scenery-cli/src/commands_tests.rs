@@ -1,0 +1,1005 @@
+//! Clap parsing smoke tests for the `vectorhawk` CLI.
+//!
+//! Kept separate from production code so `#[allow(clippy::unwrap_used)]` stays
+//! out of the production modules.
+#![allow(clippy::unwrap_used)]
+
+use super::Cli;
+use clap::Parser;
+
+fn parse(args: &[&str]) -> Cli {
+    Cli::try_parse_from(["vectorhawk"].iter().chain(args).copied()).unwrap()
+}
+
+fn try_parse(args: &[&str]) -> Result<Cli, clap::Error> {
+    Cli::try_parse_from(["vectorhawk"].iter().chain(args).copied())
+}
+
+// ── doctor ────────────────────────────────────────────────────────────────────
+
+#[test]
+fn doctor_parses() {
+    use super::Command;
+    // Clear any inherited VECTORHAWK_REGISTRY_URL so this test doesn't
+    // depend on the user's shell — Doctor::registry_url is wired with
+    // `#[arg(env = "VECTORHAWK_REGISTRY_URL")]`, and the test's intent
+    // is "no CLI flag → field is None", not "no env var".
+    //
+    // SAFETY: env mutation is process-global; this test is fast and
+    // doesn't share state with other parallel tests because it doesn't
+    // re-set the var.
+    unsafe { std::env::remove_var("VECTORHAWK_REGISTRY_URL") };
+    match parse(&["doctor"]).command {
+        Command::Doctor { registry_url } => {
+            assert!(
+                registry_url.is_none(),
+                "expected None, got {registry_url:?}"
+            );
+        }
+        other => panic!("expected Doctor, got {other:?}"),
+    }
+}
+
+#[test]
+fn doctor_with_registry_url_parses() {
+    use super::Command;
+    match parse(&["doctor", "--registry-url", "http://localhost:8000"]).command {
+        Command::Doctor { registry_url } => {
+            assert_eq!(registry_url.as_deref(), Some("http://localhost:8000"));
+        }
+        other => panic!("expected Doctor, got {other:?}"),
+    }
+}
+
+// ── skill subcommands ─────────────────────────────────────────────────────────
+
+#[test]
+fn skill_list_parses() {
+    use super::{Command, SkillCommand};
+    match parse(&["skill", "list"]).command {
+        Command::Skill(SkillCommand::List) => {}
+        other => panic!("expected Skill(List), got {other:?}"),
+    }
+}
+
+#[test]
+fn skill_install_local_path_parses() {
+    use super::{Command, SkillCommand};
+    unsafe { std::env::remove_var("VECTORHAWK_REGISTRY_URL") };
+    match parse(&["skill", "install", "./my-skill"]).command {
+        Command::Skill(SkillCommand::Install {
+            skill_ref,
+            link,
+            registry_url,
+            all_devices,
+            version,
+        }) => {
+            assert_eq!(skill_ref, "./my-skill");
+            assert!(!link);
+            assert!(registry_url.is_none());
+            assert!(!all_devices);
+            assert!(version.is_none());
+        }
+        other => panic!("expected Skill(Install), got {other:?}"),
+    }
+}
+
+#[test]
+fn skill_install_registry_id_parses() {
+    use super::{Command, SkillCommand};
+    unsafe { std::env::remove_var("VECTORHAWK_REGISTRY_URL") };
+    match parse(&["skill", "install", "contract-compare"]).command {
+        Command::Skill(SkillCommand::Install {
+            skill_ref,
+            link,
+            registry_url,
+            all_devices,
+            version,
+        }) => {
+            assert_eq!(skill_ref, "contract-compare");
+            assert!(!link);
+            assert!(registry_url.is_none());
+            assert!(!all_devices);
+            assert!(version.is_none());
+        }
+        other => panic!("expected Skill(Install), got {other:?}"),
+    }
+}
+
+#[test]
+fn skill_install_registry_url_flag_parses() {
+    use super::{Command, SkillCommand};
+    match parse(&[
+        "skill",
+        "install",
+        "contract-compare",
+        "--registry-url",
+        "http://localhost:8000",
+    ])
+    .command
+    {
+        Command::Skill(SkillCommand::Install {
+            skill_ref,
+            registry_url,
+            ..
+        }) => {
+            assert_eq!(skill_ref, "contract-compare");
+            assert_eq!(registry_url.as_deref(), Some("http://localhost:8000"));
+        }
+        other => panic!("expected Skill(Install), got {other:?}"),
+    }
+}
+
+#[test]
+fn skill_install_link_flag_parses() {
+    use super::{Command, SkillCommand};
+    unsafe { std::env::remove_var("VECTORHAWK_REGISTRY_URL") };
+    match parse(&["skill", "install", "./my-skill", "--link"]).command {
+        Command::Skill(SkillCommand::Install {
+            skill_ref: _, link, ..
+        }) => {
+            assert!(link);
+        }
+        other => panic!("expected Skill(Install), got {other:?}"),
+    }
+}
+
+#[test]
+fn skill_install_all_devices_flag_parses() {
+    use super::{Command, SkillCommand};
+    unsafe { std::env::remove_var("VECTORHAWK_REGISTRY_URL") };
+    // Default: device-scoped (all_devices = false).
+    match parse(&["skill", "install", "contract-compare"]).command {
+        Command::Skill(SkillCommand::Install { all_devices, .. }) => {
+            assert!(!all_devices);
+        }
+        other => panic!("expected Skill(Install), got {other:?}"),
+    }
+    // --all-devices opts back into the fan-out-to-every-device behaviour.
+    match parse(&["skill", "install", "contract-compare", "--all-devices"]).command {
+        Command::Skill(SkillCommand::Install { all_devices, .. }) => {
+            assert!(all_devices);
+        }
+        other => panic!("expected Skill(Install), got {other:?}"),
+    }
+}
+
+#[test]
+fn skill_install_version_flag_parses() {
+    use super::{Command, SkillCommand};
+    // Default: no --version → None, so the backend resolves to latest.
+    match parse(&["skill", "install", "contract-compare"]).command {
+        Command::Skill(SkillCommand::Install { version, .. }) => {
+            assert!(version.is_none());
+        }
+        other => panic!("expected Skill(Install), got {other:?}"),
+    }
+    // --version pins to a specific registry version.
+    match parse(&["skill", "install", "contract-compare", "--version", "1.2.3"]).command {
+        Command::Skill(SkillCommand::Install { version, .. }) => {
+            assert_eq!(version.as_deref(), Some("1.2.3"));
+        }
+        other => panic!("expected Skill(Install), got {other:?}"),
+    }
+}
+
+#[test]
+fn skill_info_parses() {
+    use super::{Command, SkillCommand};
+    match parse(&["skill", "info", "my-skill"]).command {
+        Command::Skill(SkillCommand::Info { id }) => {
+            assert_eq!(id, "my-skill");
+        }
+        other => panic!("expected Skill(Info), got {other:?}"),
+    }
+}
+
+#[test]
+fn skill_run_parses() {
+    use super::{Command, SkillCommand};
+    match parse(&["skill", "run", "my-skill", "--input", "input.json"]).command {
+        Command::Skill(SkillCommand::Run {
+            id,
+            input,
+            stub,
+            model,
+        }) => {
+            assert_eq!(id, "my-skill");
+            assert_eq!(input.as_str(), "input.json");
+            assert!(!stub);
+            assert!(model.is_none());
+        }
+        other => panic!("expected Skill(Run), got {other:?}"),
+    }
+}
+
+#[test]
+fn skill_run_stub_parses() {
+    use super::{Command, SkillCommand};
+    match parse(&[
+        "skill",
+        "run",
+        "my-skill",
+        "--input",
+        "input.json",
+        "--stub",
+    ])
+    .command
+    {
+        Command::Skill(SkillCommand::Run { stub, .. }) => {
+            assert!(stub);
+        }
+        other => panic!("expected Skill(Run), got {other:?}"),
+    }
+}
+
+#[test]
+fn skill_import_parses() {
+    use super::{Command, SkillCommand};
+    match parse(&["skill", "import", "SKILL.md"]).command {
+        Command::Skill(SkillCommand::Import {
+            path,
+            registry_url: _,
+            confirm_risky: _,
+            accept_suggestions: _,
+            skip_metadata: _,
+        }) => {
+            assert_eq!(path.as_str(), "SKILL.md");
+        }
+        other => panic!("expected Skill(Import), got {other:?}"),
+    }
+}
+
+#[test]
+fn skill_validate_parses() {
+    use super::{Command, SkillCommand};
+    match parse(&["skill", "validate", "./bundle"]).command {
+        Command::Skill(SkillCommand::Validate { path }) => {
+            assert_eq!(path.as_str(), "./bundle");
+        }
+        other => panic!("expected Skill(Validate), got {other:?}"),
+    }
+}
+
+// ── skill update ──────────────────────────────────────────────────────────────
+
+#[test]
+fn skill_update_with_id_parses() {
+    use super::{Command, SkillCommand};
+    unsafe { std::env::remove_var("VECTORHAWK_REGISTRY_URL") };
+    match parse(&["skill", "update", "my-skill"]).command {
+        Command::Skill(SkillCommand::Update {
+            id,
+            all,
+            registry_url,
+        }) => {
+            assert_eq!(id.as_deref(), Some("my-skill"));
+            assert!(!all);
+            // Default URL is filled in from the arg default_value.
+            assert_eq!(registry_url.as_deref(), Some("https://app.scenery.dev"));
+        }
+        other => panic!("expected Skill(Update), got {other:?}"),
+    }
+}
+
+#[test]
+fn skill_update_all_parses() {
+    use super::{Command, SkillCommand};
+    unsafe { std::env::remove_var("VECTORHAWK_REGISTRY_URL") };
+    match parse(&["skill", "update", "--all"]).command {
+        Command::Skill(SkillCommand::Update { id, all, .. }) => {
+            assert!(id.is_none());
+            assert!(all);
+        }
+        other => panic!("expected Skill(Update --all), got {other:?}"),
+    }
+}
+
+#[test]
+fn skill_update_with_registry_url_parses() {
+    use super::{Command, SkillCommand};
+    match parse(&[
+        "skill",
+        "update",
+        "my-skill",
+        "--registry-url",
+        "http://localhost:8000",
+    ])
+    .command
+    {
+        Command::Skill(SkillCommand::Update {
+            id, registry_url, ..
+        }) => {
+            assert_eq!(id.as_deref(), Some("my-skill"));
+            assert_eq!(registry_url.as_deref(), Some("http://localhost:8000"));
+        }
+        other => panic!("expected Skill(Update), got {other:?}"),
+    }
+}
+
+// ── decide_update_action unit tests ──────────────────────────────────────────
+
+#[test]
+fn decide_update_action_upgrades_when_newer() {
+    use semver::Version;
+    let installed = Version::parse("1.0.0").unwrap();
+    let latest = Some(Version::parse("1.1.0").unwrap());
+    let action = super::decide_update_action(&installed, latest);
+    assert_eq!(
+        action,
+        super::UpdateAction::Upgrade {
+            latest: Version::parse("1.1.0").unwrap()
+        }
+    );
+}
+
+#[test]
+fn decide_update_action_skips_when_same_version() {
+    use semver::Version;
+    let installed = Version::parse("2.0.0").unwrap();
+    let latest = Some(Version::parse("2.0.0").unwrap());
+    let action = super::decide_update_action(&installed, latest);
+    assert_eq!(action, super::UpdateAction::AlreadyUpToDate);
+}
+
+#[test]
+fn decide_update_action_skips_when_installed_is_ahead() {
+    use semver::Version;
+    let installed = Version::parse("1.5.0").unwrap();
+    let latest = Some(Version::parse("1.4.0").unwrap());
+    let action = super::decide_update_action(&installed, latest);
+    assert_eq!(action, super::UpdateAction::AlreadyUpToDate);
+}
+
+#[test]
+fn decide_update_action_no_versions_when_none() {
+    use semver::Version;
+    let installed = Version::parse("1.0.0").unwrap();
+    let action = super::decide_update_action(&installed, None);
+    assert_eq!(action, super::UpdateAction::NoVersions);
+}
+
+#[test]
+fn decide_update_action_upgrades_on_patch_bump() {
+    use semver::Version;
+    let installed = Version::parse("0.3.0").unwrap();
+    let latest = Some(Version::parse("0.3.1").unwrap());
+    let action = super::decide_update_action(&installed, latest);
+    assert_eq!(
+        action,
+        super::UpdateAction::Upgrade {
+            latest: Version::parse("0.3.1").unwrap()
+        }
+    );
+}
+
+// ── write_all_client_entries unit tests ────────────────────────────────────────
+// Review finding (S4 fix round 1): `cmd_mcp_setup`'s per-client loop used to
+// propagate the first client's `write_mcp_entry` error with `?`, aborting the
+// whole `mcp setup` run and leaving every client after it in iteration order
+// unconfigured — e.g. one Codex user's malformed `config.toml` blocked Claude
+// Code/Cursor/etc. from getting configured too. `write_all_client_entries` is
+// the extracted, injectable-`write` control flow so that's testable without
+// touching the filesystem or spinning up the daemon `cmd_mcp_setup` needs.
+
+fn fake_client(name: &str) -> scenery_mcp::setup::ClientConfig {
+    scenery_mcp::setup::ClientConfig {
+        name: name.to_string(),
+        config_path: std::path::PathBuf::from(format!("/fake/{name}/config")),
+        mcp_key: "mcpServers".to_string(),
+        already_configured: false,
+        format: scenery_mcp::setup::ConfigFormat::Json,
+    }
+}
+
+fn fake_client_already_configured(name: &str) -> scenery_mcp::setup::ClientConfig {
+    scenery_mcp::setup::ClientConfig {
+        already_configured: true,
+        ..fake_client(name)
+    }
+}
+
+#[test]
+fn write_all_client_entries_reports_already_configured_without_calling_write() {
+    let clients = vec![fake_client_already_configured("A")];
+    let mut calls = 0;
+    let outcomes = super::write_all_client_entries(&clients, |_| {
+        calls += 1;
+        Ok(())
+    });
+    assert_eq!(outcomes, vec![super::ClientOutcome::AlreadyConfigured]);
+    assert_eq!(
+        calls, 0,
+        "already-configured clients must not be re-written"
+    );
+}
+
+#[test]
+fn write_all_client_entries_all_succeed() {
+    let clients = vec![fake_client("A"), fake_client("B"), fake_client("C")];
+    let outcomes = super::write_all_client_entries(&clients, |_| Ok(()));
+    assert_eq!(
+        outcomes,
+        vec![
+            super::ClientOutcome::Wrote,
+            super::ClientOutcome::Wrote,
+            super::ClientOutcome::Wrote,
+        ]
+    );
+}
+
+#[test]
+fn write_all_client_entries_one_failure_does_not_abort_the_rest() {
+    // The exact bug from the review finding: client B's write fails (think:
+    // a Codex config.toml with `mcp_servers` set to a non-table value). A
+    // and C — every other client — must still be attempted and succeed.
+    let clients = vec![fake_client("A"), fake_client("B"), fake_client("C")];
+    let outcomes = super::write_all_client_entries(&clients, |c| {
+        if c.name == "B" {
+            anyhow::bail!(
+                "config.toml already has a top-level `mcp_servers` key that isn't a table"
+            );
+        }
+        Ok(())
+    });
+    assert_eq!(outcomes.len(), 3);
+    assert_eq!(
+        outcomes[0],
+        super::ClientOutcome::Wrote,
+        "A must still succeed"
+    );
+    assert!(
+        matches!(&outcomes[1], super::ClientOutcome::Failed(msg) if msg.contains("isn't a table")),
+        "B's failure must be captured, not propagated: {:?}",
+        outcomes[1]
+    );
+    assert_eq!(
+        outcomes[2],
+        super::ClientOutcome::Wrote,
+        "C must still be attempted and succeed even though B failed"
+    );
+}
+
+#[test]
+fn write_all_client_entries_multiple_failures_all_captured() {
+    let clients = vec![fake_client("A"), fake_client("B"), fake_client("C")];
+    let outcomes = super::write_all_client_entries(&clients, |c| {
+        if c.name == "A" || c.name == "C" {
+            anyhow::bail!("boom: {}", c.name);
+        }
+        Ok(())
+    });
+    assert!(matches!(&outcomes[0], super::ClientOutcome::Failed(m) if m.contains("boom: A")));
+    assert_eq!(outcomes[1], super::ClientOutcome::Wrote);
+    assert!(matches!(&outcomes[2], super::ClientOutcome::Failed(m) if m.contains("boom: C")));
+}
+
+// ── auth subcommands ──────────────────────────────────────────────────────────
+
+#[test]
+fn auth_login_parses() {
+    use super::{AuthCommand, Command};
+    match parse(&["auth", "login"]).command {
+        Command::Auth(AuthCommand::Login { registry_url }) => {
+            assert_eq!(registry_url, "https://app.scenery.dev");
+        }
+        other => panic!("expected Auth(Login), got {other:?}"),
+    }
+}
+
+#[test]
+fn auth_login_with_registry_url_parses() {
+    use super::{AuthCommand, Command};
+    match parse(&["auth", "login", "--registry-url", "http://localhost:8000"]).command {
+        Command::Auth(AuthCommand::Login { registry_url }) => {
+            assert_eq!(registry_url, "http://localhost:8000");
+        }
+        other => panic!("expected Auth(Login), got {other:?}"),
+    }
+}
+
+#[test]
+fn auth_logout_parses() {
+    use super::{AuthCommand, Command};
+    match parse(&["auth", "logout"]).command {
+        Command::Auth(AuthCommand::Logout { .. }) => {}
+        other => panic!("expected Auth(Logout), got {other:?}"),
+    }
+}
+
+#[test]
+fn auth_status_parses() {
+    use super::{AuthCommand, Command};
+    match parse(&["auth", "status"]).command {
+        Command::Auth(AuthCommand::Status { .. }) => {}
+        other => panic!("expected Auth(Status), got {other:?}"),
+    }
+}
+
+#[test]
+fn auth_pair_with_code_parses() {
+    use super::{AuthCommand, Command};
+    match parse(&["auth", "pair", "VH-7X4K-9M2P"]).command {
+        Command::Auth(AuthCommand::Pair { code, .. }) => {
+            assert_eq!(code.as_deref(), Some("VH-7X4K-9M2P"));
+        }
+        other => panic!("expected Auth(Pair), got {other:?}"),
+    }
+}
+
+#[test]
+fn auth_pair_without_code_parses() {
+    // The code argument is optional — resolution (env var / prompt / error)
+    // happens at runtime in `pair::resolve_pair_code`, not at parse time.
+    use super::{AuthCommand, Command};
+    match parse(&["auth", "pair"]).command {
+        Command::Auth(AuthCommand::Pair { code, .. }) => {
+            assert_eq!(code, None);
+        }
+        other => panic!("expected Auth(Pair), got {other:?}"),
+    }
+}
+
+#[test]
+fn auth_token_parses_without_a_token_argument() {
+    // The PAT is read from stdin / a hidden prompt at runtime
+    // (`token_input`), never from argv.
+    use super::{AuthCommand, Command};
+    match parse(&["auth", "token"]).command {
+        Command::Auth(AuthCommand::Token { .. }) => {}
+        other => panic!("expected Auth(Token), got {other:?}"),
+    }
+}
+
+#[test]
+fn auth_token_rejects_token_on_the_command_line() {
+    // A PAT in argv is visible to other local users via `ps` /
+    // /proc/<pid>/cmdline and is saved in shell history.
+    assert!(
+        try_parse(&["auth", "token", "vh_pat_should_not_be_accepted"]).is_err(),
+        "auth token must not accept the PAT as a positional argument"
+    );
+}
+
+// ── mcp subcommands ───────────────────────────────────────────────────────────
+
+#[test]
+fn mcp_serve_parses() {
+    use super::{Command, McpCommand};
+    match parse(&["mcp", "serve"]).command {
+        Command::Mcp(McpCommand::Serve { server: None }) => {}
+        other => panic!("expected Mcp(Serve {{ server: None }}), got {other:?}"),
+    }
+}
+
+#[test]
+fn mcp_setup_claude_code_parses() {
+    use super::{Command, McpCommand};
+    match parse(&["mcp", "setup", "--client", "claude-code"]).command {
+        Command::Mcp(McpCommand::Setup {
+            client,
+            dry_run,
+            rotate_local_key,
+        }) => {
+            assert_eq!(client.as_deref(), Some("claude-code"));
+            assert!(!dry_run);
+            assert!(!rotate_local_key);
+        }
+        other => panic!("expected Mcp(Setup), got {other:?}"),
+    }
+}
+
+#[test]
+fn mcp_setup_dry_run_parses() {
+    use super::{Command, McpCommand};
+    match parse(&["mcp", "setup", "--client", "claude-code", "--dry-run"]).command {
+        Command::Mcp(McpCommand::Setup {
+            client,
+            dry_run,
+            rotate_local_key,
+        }) => {
+            assert_eq!(client.as_deref(), Some("claude-code"));
+            assert!(dry_run);
+            assert!(!rotate_local_key);
+        }
+        other => panic!("expected Mcp(Setup), got {other:?}"),
+    }
+}
+
+#[test]
+fn mcp_setup_rotate_local_key_parses() {
+    use super::{Command, McpCommand};
+    match parse(&["mcp", "setup", "--rotate-local-key"]).command {
+        Command::Mcp(McpCommand::Setup {
+            rotate_local_key, ..
+        }) => {
+            assert!(rotate_local_key);
+        }
+        other => panic!("expected Mcp(Setup), got {other:?}"),
+    }
+}
+
+#[test]
+fn mcp_sync_parses() {
+    use super::{Command, McpCommand};
+    match parse(&["mcp", "sync"]).command {
+        Command::Mcp(McpCommand::Sync) => {}
+        other => panic!("expected Mcp(Sync), got {other:?}"),
+    }
+}
+
+#[test]
+fn mcp_backends_parses() {
+    use super::{Command, McpCommand};
+    match parse(&["mcp", "backends"]).command {
+        Command::Mcp(McpCommand::Backends) => {}
+        other => panic!("expected Mcp(Backends), got {other:?}"),
+    }
+}
+
+// ── daemon subcommands ────────────────────────────────────────────────────────
+
+#[test]
+fn daemon_run_foreground_parses() {
+    use super::{Command, DaemonCommand};
+    match parse(&["daemon", "run", "--foreground"]).command {
+        Command::Daemon(DaemonCommand::Run { foreground, .. }) => {
+            assert!(foreground);
+        }
+        other => panic!("expected Daemon(Run), got {other:?}"),
+    }
+}
+
+#[test]
+fn daemon_run_with_registry_url_parses() {
+    use super::{Command, DaemonCommand};
+    match parse(&[
+        "daemon",
+        "run",
+        "--foreground",
+        "--registry-url",
+        "http://localhost:8000",
+    ])
+    .command
+    {
+        Command::Daemon(DaemonCommand::Run {
+            foreground,
+            registry_url,
+            ..
+        }) => {
+            assert!(foreground);
+            assert_eq!(registry_url.as_deref(), Some("http://localhost:8000"));
+        }
+        other => panic!("expected Daemon(Run), got {other:?}"),
+    }
+}
+
+#[test]
+fn daemon_install_parses() {
+    use super::{Command, DaemonCommand};
+    match parse(&["daemon", "install"]).command {
+        Command::Daemon(DaemonCommand::Install) => {}
+        other => panic!("expected Daemon(Install), got {other:?}"),
+    }
+}
+
+#[test]
+fn daemon_uninstall_parses() {
+    use super::{Command, DaemonCommand};
+    match parse(&["daemon", "uninstall"]).command {
+        Command::Daemon(DaemonCommand::Uninstall) => {}
+        other => panic!("expected Daemon(Uninstall), got {other:?}"),
+    }
+}
+
+#[test]
+fn unknown_command_fails() {
+    assert!(try_parse(&["notacommand"]).is_err());
+}
+
+// ── daemon logging profile routing (D1) ────────────────────────────────────────
+//
+// `main()` picks the daemon's INFO/rotating-file logging profile vs. the
+// interactive CLI's WARN/stderr profile based on this predicate — see
+// `logging.rs` for the profiles themselves and
+// `rotates_and_bounds_total_log_size` for the rotation/cap behavior.
+
+#[test]
+fn is_daemon_foreground_true_only_for_daemon_run() {
+    use super::is_daemon_foreground;
+    assert!(is_daemon_foreground(&parse(&["daemon", "run"]).command));
+    assert!(is_daemon_foreground(
+        &parse(&["daemon", "run", "--foreground"]).command
+    ));
+    assert!(!is_daemon_foreground(&parse(&["doctor"]).command));
+    assert!(!is_daemon_foreground(
+        &parse(&["daemon", "install"]).command
+    ));
+    assert!(!is_daemon_foreground(
+        &parse(&["daemon", "uninstall"]).command
+    ));
+    assert!(!is_daemon_foreground(&parse(&["mcp", "serve"]).command));
+}
+
+// ── M3: doctor OAuth listener line ───────────────────────────────────────────
+
+/// AC5 (M3): `vectorhawk doctor` must emit an `OAuth listener:` line.
+///
+/// When the daemon is not running the line reads "not running".  The test
+// ── plugin subcommands ────────────────────────────────────────────────────────
+
+#[test]
+fn plugin_export_default_format_parses() {
+    use super::{Command, PluginCommand};
+    match parse(&["plugin", "export", "/some/plugin"]).command {
+        Command::Plugin(PluginCommand::Export {
+            path,
+            format,
+            output_dir,
+        }) => {
+            assert_eq!(path.as_str(), "/some/plugin");
+            assert_eq!(format, "mcpb");
+            assert!(output_dir.is_none());
+        }
+        other => panic!("expected Plugin::Export, got {other:?}"),
+    }
+}
+
+#[test]
+fn plugin_export_with_format_and_output_dir_parses() {
+    use super::{Command, PluginCommand};
+    match parse(&[
+        "plugin",
+        "export",
+        "/some/plugin",
+        "--format",
+        "claude-code",
+        "--output-dir",
+        "./dist",
+    ])
+    .command
+    {
+        Command::Plugin(PluginCommand::Export {
+            path,
+            format,
+            output_dir,
+        }) => {
+            assert_eq!(path.as_str(), "/some/plugin");
+            assert_eq!(format, "claude-code");
+            assert_eq!(output_dir.as_deref().map(|p| p.as_str()), Some("./dist"));
+        }
+        other => panic!("expected Plugin::Export, got {other:?}"),
+    }
+}
+
+#[test]
+fn plugin_import_parses() {
+    use super::{Command, PluginCommand};
+    match parse(&["plugin", "import", "/some/extension.mcpb"]).command {
+        Command::Plugin(PluginCommand::Import { path, output_dir }) => {
+            assert_eq!(path.as_str(), "/some/extension.mcpb");
+            assert!(output_dir.is_none());
+        }
+        other => panic!("expected Plugin::Import, got {other:?}"),
+    }
+}
+
+#[test]
+fn plugin_import_with_output_dir_parses() {
+    use super::{Command, PluginCommand};
+    match parse(&[
+        "plugin",
+        "import",
+        "/some/extension.mcpb",
+        "--output-dir",
+        "./out",
+    ])
+    .command
+    {
+        Command::Plugin(PluginCommand::Import { path, output_dir }) => {
+            assert_eq!(path.as_str(), "/some/extension.mcpb");
+            assert_eq!(output_dir.as_deref().map(|p| p.as_str()), Some("./out"));
+        }
+        other => panic!("expected Plugin::Import, got {other:?}"),
+    }
+}
+
+// ── doctor output check ───────────────────────────────────────────────────────
+
+/// exercises the output label — not the daemon state — so it does not require
+/// a live daemon.
+///
+/// Marked `#[ignore]` because it requires the release binary.
+#[test]
+#[ignore = "requires pre-built release binary — run cargo build --workspace --release first"]
+fn doctor_output_contains_oauth_listener_line() {
+    use std::{path::PathBuf, process::Command};
+
+    // Locate the release binary relative to CARGO_MANIFEST_DIR.
+    let manifest_dir =
+        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set by cargo");
+    let workspace_root = PathBuf::from(&manifest_dir)
+        .parent()
+        .expect("cli crate should have a parent")
+        .parent()
+        .expect("crates/ should have a parent (workspace root)")
+        .to_path_buf();
+    let cli_bin = workspace_root
+        .join("target")
+        .join("release")
+        .join("vectorhawk");
+
+    assert!(
+        cli_bin.exists(),
+        "vectorhawk release binary not found at {cli_bin:?} — run cargo build --workspace --release"
+    );
+
+    let output = Command::new(&cli_bin)
+        .args(["doctor"])
+        .output()
+        .expect("failed to spawn vectorhawk doctor");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        stdout.contains("OAuth listener:"),
+        "doctor output must contain 'OAuth listener:' line; got:\n{stdout}"
+    );
+}
+
+// ── publish helper unit tests ─────────────────────────────────────────────────
+
+#[test]
+fn needs_publisher_returns_true_when_missing() {
+    let md = "---\nname: foo\ndescription: bar\nversion: 0.1.0\n---\n\nPrompt.\n";
+    assert!(super::needs_publisher(md));
+}
+
+#[test]
+fn needs_publisher_returns_true_for_placeholder() {
+    let md =
+        "---\nname: foo\ndescription: bar\nversion: 0.1.0\npublisher: YOUR_PUBLISHER_ID\n---\n";
+    assert!(super::needs_publisher(md));
+}
+
+#[test]
+fn needs_publisher_returns_false_when_set() {
+    let md = "---\nname: foo\ndescription: bar\nversion: 0.1.0\npublisher: acme-corp\n---\n";
+    assert!(!super::needs_publisher(md));
+}
+
+#[test]
+fn inject_publisher_field_replaces_placeholder() {
+    let md = "---\nname: foo\ndescription: bar\npublisher: YOUR_PUBLISHER_ID\n---\n";
+    let patched = super::inject_publisher_field(md, "acme-corp");
+    assert!(patched.contains("publisher: acme-corp"));
+    assert!(!patched.contains("YOUR_PUBLISHER_ID"));
+}
+
+#[test]
+fn inject_publisher_field_inserts_after_description_when_missing() {
+    let md = "---\nname: foo\ndescription: bar\nversion: 0.1.0\n---\n";
+    let patched = super::inject_publisher_field(md, "acme-corp");
+    assert!(patched.contains("publisher: acme-corp"));
+    let desc_pos = patched.find("description:").unwrap();
+    let pub_pos = patched.find("publisher:").unwrap();
+    assert!(
+        pub_pos > desc_pos,
+        "publisher should appear after description"
+    );
+}
+
+// ── skill init / convert produce SKILL.md-conformant manifests ────────────────
+//
+// The SKILL.md format migration (see crates/scenery-manifest/src/skill_md.rs)
+// only allows `name`, `description`, `license` at the top level; everything
+// VectorHawk-specific must nest under `metadata.vectorhawk.*`. These tests run
+// each generator's actual output through the real manifest loader / validator
+// so drift like this can't happen silently again.
+
+#[tokio::test]
+async fn skill_init_produces_a_skill_md_that_the_manifest_loader_accepts() {
+    use scenery_manifest::SkillPackage;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let base = camino::Utf8Path::from_path(tmp.path()).unwrap();
+
+    super::cmd_skill_init("widget", Some(base))
+        .await
+        .expect("skill init should succeed");
+
+    let skill_dir = base.join("widget");
+    SkillPackage::load_from_dir(&skill_dir).expect(
+        "skill init's scaffolded SKILL.md must be loadable by the manifest parser \
+         (top-level vh_* keys are no longer valid — they must nest under metadata.vectorhawk)",
+    );
+}
+
+#[tokio::test]
+async fn skill_convert_produces_a_skill_md_that_passes_validation() {
+    use scenery_core::validator::validate_bundle;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = camino::Utf8Path::from_path(tmp.path()).unwrap();
+    let legacy_root = root.join("legacy-skill");
+
+    std::fs::create_dir_all(legacy_root.join("prompts")).unwrap();
+
+    let manifest_json = serde_json::json!({
+        "schema_version": "1.0",
+        "id": "legacy-skill",
+        "name": "Legacy Skill",
+        "version": "0.2.0",
+        "publisher": "acme",
+        "description": "Does the legacy thing.",
+        "license": "MIT",
+        "entrypoint": "prompts/system.txt",
+        "inputs_schema": null,
+        "outputs_schema": null,
+        "permissions": {
+            "filesystem": "read-only",
+            "network": "none",
+            "clipboard": "none"
+        },
+        "execution": {
+            "sandbox": "strict",
+            "timeout_ms": 45000,
+            "memory_mb": 512
+        },
+        "model_requirements": null,
+        "update": null,
+        "triggers": []
+    });
+    std::fs::write(
+        legacy_root.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest_json).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        legacy_root.join("prompts").join("system.txt"),
+        "Do the legacy thing.",
+    )
+    .unwrap();
+    // A workflow.yaml present means convert must emit metadata.vectorhawk.workflow_ref.
+    std::fs::write(
+        legacy_root.join("workflow.yaml"),
+        "name: legacy_skill\nsteps:\n  - id: run\n    type: llm\n    prompt: prompts/system.txt\n    inputs: {}\n",
+    )
+    .unwrap();
+
+    let output_dir = root.join("converted");
+
+    super::cmd_skill_convert(legacy_root, Some(output_dir.as_path()))
+        .await
+        .expect("skill convert should succeed");
+
+    let report = validate_bundle(&output_dir);
+    assert!(
+        report.all_passed(),
+        "converted SKILL.md failed validation: {:#?}",
+        report.checks
+    );
+}
+
+// ── M8 doctor: lsof output parsing ─────────────────────────────────────────
+
+#[test]
+fn parse_lsof_output_command_name_reads_first_data_row() {
+    let stdout = "COMMAND   PID  USER   FD   TYPE DEVICE SIZE/OFF NODE NAME\n\
+                  Claude    1234 adam   42u  IPv4 0x...      0t0  TCP 127.0.0.1:39150 (LISTEN)\n";
+    assert_eq!(
+        super::parse_lsof_output_command_name(stdout),
+        Some("Claude".to_string())
+    );
+}
+
+#[test]
+fn parse_lsof_output_command_name_none_for_header_only_output() {
+    let stdout = "COMMAND   PID  USER   FD   TYPE DEVICE SIZE/OFF NODE NAME\n";
+    assert_eq!(super::parse_lsof_output_command_name(stdout), None);
+}
+
+#[test]
+fn parse_lsof_output_command_name_none_for_empty_output() {
+    assert_eq!(super::parse_lsof_output_command_name(""), None);
+}

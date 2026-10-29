@@ -1,0 +1,89 @@
+[package]
+name = "scenery-daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "vectorhawkd — VectorHawk runner daemon"
+
+[lib]
+name = "scenery_daemon"
+path = "src/lib.rs"
+
+[dependencies]
+scenery-manifest = { path = "../scenery-manifest" }
+scenery-core = { path = "../scenery-core" }
+scenery-mcp = { path = "../scenery-mcp" }
+camino.workspace = true
+rusqlite.workspace = true
+semver.workspace = true
+
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+async-trait.workspace = true
+dirs.workspace = true
+uuid.workspace = true
+futures.workspace = true
+chrono.workspace = true
+zip.workspace = true
+flate2.workspace = true
+tar.workspace = true
+libc.workspace = true
+
+# Async HTTP client for SSE streaming and installation status reporting.
+reqwest.workspace = true
+
+# F1: managed-paths reconciler — SHA-256 hashing for canonical content fingerprints.
+sha2 = "0.10"
+hex = "0.4"
+
+# F2: managed-paths pusher — exclusive file lock on ~/.claude.json during
+# the read-modify-write cycle so concurrent daemon pushes cannot corrupt it.
+fs2 = "0.4"
+
+# OAuth callback HTTP listener — daemon-only dep (shim does not link axum).
+# axum 0.8 targets tokio 1.x, matching the workspace tokio version.
+# "json" is needed by the Phase 2 local MCP HTTP resource server to build
+# JSON-RPC/PRM responses the same way the rest of the daemon already does
+# (serde_json is already linked everywhere — this just enables the
+# extractor, no new transitive deps).
+axum = { version = "0.8", default-features = false, features = ["http1", "query", "tokio", "json"] }
+
+# ES256 JWT verification for the local MCP HTTP resource server (Phase 2
+# zero-CLI OAuth, §8 of the frozen interface contract). Well-maintained,
+# widely used. >= 10.3 for the type-confusion authorization-bypass fix
+# (GHSA, Dependabot 2026-10). 10.x makes the crypto backend explicit:
+# `rust_crypto` (pure Rust, no C toolchain needed for cross builds).
+# `use_pem` is for the tests' PEM signing keys; production builds JWKS
+# keys from their base64url `x`/`y` via `DecodingKey::from_ec_components`.
+jsonwebtoken = { version = "10.3", default-features = false, features = ["rust_crypto", "use_pem"] }
+
+# Imported plugins' binary files arrive base64-encoded from the registry.
+# Already linked through scenery-core.
+base64.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+dirs.workspace = true
+libc.workspace = true
+tempfile.workspace = true
+# Used by m1_multi_shim integration test to count audit_events rows directly.
+# Replaced a previous `sqlite3` CLI shellout that failed on Linux hosts
+# without the CLI installed. rusqlite is already in the workspace via
+# scenery-core, so this adds no extra build cost.
+rusqlite.workspace = true
+# reqwest used by oauth_listener unit tests to exercise the HTTP callback endpoint.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+mockito = "1"
+# See `refresh_loop_tests::disable_real_keychain_for_tests` — runs before any
+# `#[test]` in this crate's binary so the suite can never touch the real OS
+# keychain.
+ctor = "0.8"

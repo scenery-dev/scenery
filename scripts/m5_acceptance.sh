@@ -114,7 +114,7 @@ sleep 0.3
 rm -f "${SOCK_PATH}" 2>/dev/null || true
 
 STRESS_OUT="$(mktemp)"
-if cargo test --release -p vectorhawkd-daemon --test m5_stress_multi_shim \
+if cargo test --release -p scenery-daemon --test m5_stress_multi_shim \
         -- --include-ignored --nocapture >"${STRESS_OUT}" 2>&1; then
     record "PASS" "AC1: 5-shim 1000-call stress" "m5_stress_multi_shim returned 0"
 else
@@ -136,7 +136,7 @@ sleep 0.3
 rm -f "${SOCK_PATH}" 2>/dev/null || true
 
 KILL_OUT="$(mktemp)"
-if cargo test --release -p vectorhawkd-daemon --test m5_stress_kill \
+if cargo test --release -p scenery-daemon --test m5_stress_kill \
         -- --include-ignored --nocapture >"${KILL_OUT}" 2>&1; then
     record "PASS" "AC2: mid-load kill -32001 contract" "m5_stress_kill returned 0"
 else
