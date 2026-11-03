@@ -391,3 +391,52 @@ fn single_path_component_check_accepts_versions_and_rejects_traversal() {
         );
     }
 }
+
+fn with_home<R>(f: impl FnOnce(&std::path::Path) -> R) -> R {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    let prev = std::env::var_os("HOME");
+    std::env::set_var("HOME", home.path());
+    let r = f(home.path());
+    if let Some(v) = prev {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+    r
+}
+
+#[test]
+fn unparseable_user_settings_json_is_left_untouched_and_install_errors() {
+    with_home(|h| {
+        let settings = h.join(".claude/settings.json");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        let garbage = b"{ \"theme\": \"dark\", // user comment\n  oops";
+        std::fs::write(&settings, garbage).unwrap();
+
+        let err = install_plugin_bundle(&bundle()).unwrap_err();
+        assert!(format!("{err:#}").contains("not valid JSON"), "{err:#}");
+        assert_eq!(std::fs::read(&settings).unwrap(), garbage);
+    });
+}
+
+#[test]
+fn unparseable_installed_plugins_json_is_left_untouched_on_uninstall() {
+    with_home(|h| {
+        install_plugin_bundle(&bundle()).unwrap();
+        let installed = h.join(".claude/plugins/installed_plugins.json");
+        std::fs::write(&installed, b"not json at all").unwrap();
+
+        assert!(uninstall_plugin_bundle("superpowers").is_err());
+        assert_eq!(std::fs::read(&installed).unwrap(), b"not json at all");
+    });
+}
+
+#[test]
+fn absent_user_files_are_created() {
+    with_home(|h| {
+        install_plugin_bundle(&bundle()).unwrap();
+        assert!(h.join(".claude/settings.json").exists());
+        assert!(h.join(".claude/plugins/installed_plugins.json").exists());
+    });
+}

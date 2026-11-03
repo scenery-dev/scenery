@@ -809,17 +809,49 @@ pub fn canonical_projection_present(slug: &str) -> Result<bool> {
 /// Is the full projection of `slug` intact — canonical dir + marker AND the
 /// Claude link? Always `true` when the filesystem reconciler is disabled.
 pub fn projection_intact(slug: &str) -> Result<bool> {
+    Ok(projection_state(slug)? == ProjectionState::Intact)
+}
+
+/// Result of checking a skill's projection directly on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectionState {
+    /// Canonical dir + marker, and the Claude path is a symlink to it (or a
+    /// Scenery-marked copy), or the filesystem reconciler is disabled.
+    Intact,
+    /// A real directory Scenery does not own sits at the Claude link path.
+    LinkBlocked(PathBuf),
+    /// Missing or stale pieces; the daemon still has work to do.
+    Incomplete,
+}
+
+/// Direct, read-only check of `slug`'s projection (see [`ProjectionState`]).
+pub fn projection_state(slug: &str) -> Result<ProjectionState> {
     if reconciler_disabled() {
-        return Ok(true);
+        return Ok(ProjectionState::Intact);
     }
-    let home = resolve_home()?;
-    Ok(canonical_projection_present_in(&home, slug)
-        && home
-            .join(".claude")
-            .join("skills")
-            .join(slug)
-            .symlink_metadata()
-            .is_ok())
+    Ok(projection_state_in(&resolve_home()?, slug))
+}
+
+fn projection_state_in(home: &Path, slug: &str) -> ProjectionState {
+    if !canonical_projection_present_in(home, slug) {
+        return ProjectionState::Incomplete;
+    }
+    let canonical = home.join(".agents").join("skills").join(slug);
+    let link = home.join(".claude").join("skills").join(slug);
+    if link.is_symlink() {
+        return match super::links::link_is_intact(&canonical, &link) {
+            Ok(true) => ProjectionState::Intact,
+            _ => ProjectionState::Incomplete,
+        };
+    }
+    if link.exists() {
+        return if ownership::is_scenery_managed(&link) {
+            ProjectionState::Intact
+        } else {
+            ProjectionState::LinkBlocked(link)
+        };
+    }
+    ProjectionState::Incomplete
 }
 
 fn canonical_projection_present_in(home: &Path, slug: &str) -> bool {

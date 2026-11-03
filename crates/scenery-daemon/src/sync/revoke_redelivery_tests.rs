@@ -576,18 +576,17 @@ async fn partial_plugin_leftover_is_cleaned_on_redelivery() {
     assert_eq!(a[1]["repeat_pass"], true);
 }
 
-// ── Install of an already-installed skill still yields a fresh outcome ────────
+// ── No-op snapshot must not write outcomes ───────────────────────────────────
 
 #[test]
-fn snapshot_noop_for_an_installed_skill_records_a_fresh_projection_outcome() {
-    use crate::managed_paths::projection_outcome::{read_since, ProjectionOutcome};
+fn snapshot_noop_for_an_installed_skill_writes_no_projection_outcome() {
+    use crate::managed_paths::projection_outcome::read_since;
     use crate::sync::sse_client::InstallationRecord;
     let _home = FakeHome::new();
     let (_t, state) = new_state();
     seed_skill(&state, "same", "1.0.0", true);
     project(&state, "same");
     let since = chrono::Utc::now() - chrono::Duration::seconds(1);
-    assert_eq!(read_since(&state, "same", since).unwrap(), None);
 
     let events = super::build_derived_events_blocking(
         vec![InstallationRecord {
@@ -603,6 +602,7 @@ fn snapshot_noop_for_an_installed_skill_records_a_fresh_projection_outcome() {
     assert!(events.is_empty(), "nothing to install");
     assert_eq!(
         read_since(&state, "same", since).unwrap(),
-        Some(ProjectionOutcome::Ok)
+        None,
+        "the periodic diff must not churn sync_state"
     );
 }

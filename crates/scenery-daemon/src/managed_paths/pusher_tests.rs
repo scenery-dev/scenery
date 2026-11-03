@@ -1396,3 +1396,71 @@ fn remove_skill_reports_whether_it_removed_anything() {
         );
     });
 }
+
+// ── strict projection state ───────────────────────────────────────────────────
+
+fn canonical_with_marker(home: &std::path::Path, slug: &str) -> std::path::PathBuf {
+    let dir = home.join(".agents/skills").join(slug);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("SKILL.md"), "x").unwrap();
+    fs::write(dir.join(ownership::MANAGED_MARKER_FILENAME), "{}").unwrap();
+    dir
+}
+
+#[test]
+fn projection_state_intact_for_a_correct_symlink() {
+    let home = tempfile::tempdir().unwrap();
+    let dir = canonical_with_marker(home.path(), "demo");
+    let links = home.path().join(".claude/skills");
+    fs::create_dir_all(&links).unwrap();
+    super::super::links::link_dir(&dir, &links.join("demo")).unwrap();
+    assert_eq!(
+        projection_state_in(home.path(), "demo"),
+        ProjectionState::Intact
+    );
+}
+
+#[test]
+fn projection_state_foreign_real_dir_is_link_blocked_not_intact() {
+    let home = tempfile::tempdir().unwrap();
+    canonical_with_marker(home.path(), "demo");
+    let blocker = home.path().join(".claude/skills/demo");
+    fs::create_dir_all(&blocker).unwrap();
+    fs::write(blocker.join("SKILL.md"), "theirs").unwrap();
+    assert_eq!(
+        projection_state_in(home.path(), "demo"),
+        ProjectionState::LinkBlocked(blocker)
+    );
+}
+
+#[test]
+fn projection_state_marked_copy_is_intact_and_stale_or_missing_links_are_not() {
+    let home = tempfile::tempdir().unwrap();
+    canonical_with_marker(home.path(), "demo");
+    assert_eq!(
+        projection_state_in(home.path(), "demo"),
+        ProjectionState::Incomplete
+    );
+
+    let copy = home.path().join(".claude/skills/demo");
+    fs::create_dir_all(&copy).unwrap();
+    fs::write(copy.join(ownership::MANAGED_MARKER_FILENAME), "{}").unwrap();
+    assert_eq!(
+        projection_state_in(home.path(), "demo"),
+        ProjectionState::Intact
+    );
+    fs::remove_dir_all(&copy).unwrap();
+
+    // A symlink to somewhere else is stale.
+    let elsewhere = home.path().join("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    #[cfg(unix)]
+    {
+        fs::create_dir_all(home.path().join(".claude/skills")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &copy).unwrap();
+        assert_eq!(
+            projection_state_in(home.path(), "demo"),
+            ProjectionState::Incomplete
+        );
+    }
+}

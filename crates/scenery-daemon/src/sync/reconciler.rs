@@ -3662,30 +3662,7 @@ fn build_derived_events_blocking(
                 // emit an Install event anyway — the handler will short-
                 // circuit via check_version_local and PATCH "installed" with
                 // the snapshot's installation_id, converging the row.
-                if locally_satisfied && backend_in_sync {
-                    // No Install event will fire, but a `scenery skill install`
-                    // of this already-installed skill is waiting for an outcome
-                    // newer than its request. Re-record one, only when the
-                    // projection really is intact.
-                    let slug = record
-                        .local_slug
-                        .clone()
-                        .unwrap_or_else(|| state.skill_local_name(&record.skill_id));
-                    if crate::managed_paths::pusher::projection_intact(&slug).unwrap_or(false) {
-                        let _ = crate::managed_paths::projection_outcome::record(
-                            state,
-                            &record.skill_id,
-                            &crate::managed_paths::projection_outcome::ProjectionOutcome::Ok,
-                        );
-                        if slug != record.skill_id {
-                            let _ = crate::managed_paths::projection_outcome::record(
-                                state,
-                                &slug,
-                                &crate::managed_paths::projection_outcome::ProjectionOutcome::Ok,
-                            );
-                        }
-                    }
-                } else {
+                if !(locally_satisfied && backend_in_sync) {
                     events.push(SyncEvent::Install {
                         installation_id: record.installation_id,
                         skill_id: record.skill_id.clone(),
