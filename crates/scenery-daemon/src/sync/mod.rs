@@ -10,6 +10,7 @@
 //! operating in offline mode, `run` immediately returns `Ok(())`.
 
 pub mod reconciler;
+mod revoke_gate;
 pub mod sse_client;
 
 pub use reconciler::ReconcilerHandle;

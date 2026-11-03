@@ -605,10 +605,23 @@ async fn dispatch_event(
                         version: r.version.clone(),
                     })
                     .collect();
-                let replace_result = tokio::task::spawn_blocking(move || {
-                    revocation::replace_all(&state_for_replace, &entries)
-                })
-                .await;
+                // Decide what still needs teardown BEFORE the cache is
+                // replaced: an entry already cached whose artifact is gone was
+                // applied by an earlier snapshot/event and must be a no-op
+                // (no duplicate purge log or audit event).
+                let (replace_result, needs_apply) = {
+                    let n = entries.len();
+                    match tokio::task::spawn_blocking(move || {
+                        let needs =
+                            super::revoke_gate::entries_needing_apply(&state_for_replace, &entries);
+                        (revocation::replace_all(&state_for_replace, &entries), needs)
+                    })
+                    .await
+                    {
+                        Ok((r, needs)) => (Ok(r), needs),
+                        Err(e) => (Err(e), vec![true; n]),
+                    }
+                };
                 match replace_result {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => {
@@ -617,7 +630,10 @@ async fn dispatch_event(
                     Err(e) => warn!(error = %e, "reconciler: revocation snapshot task panicked"),
                 }
 
-                for rec in revs {
+                for (rec, apply) in revs.iter().zip(needs_apply) {
+                    if !apply {
+                        continue;
+                    }
                     spawn_revoke(
                         rec.artifact_type.clone(),
                         rec.artifact_key.clone(),
@@ -1818,7 +1834,7 @@ fn revoke_skill_locally(state: &AppState, skill_id: &str, version: Option<&str>)
 /// does when the install is pinned to that version, or is unpinned — an
 /// unpinned server may be running the revoked version, the same fail-closed
 /// rule the install gate in `handle_install_mcp` uses.
-fn mcp_revoke_applies(
+pub(super) fn mcp_revoke_applies(
     state: &AppState,
     mcp_server_id: &str,
     version: Option<&str>,

@@ -525,6 +525,77 @@ async fn snapshot_revocations_some_purges_a_locally_installed_skill() {
     cleanup(&root);
 }
 
+fn snapshot_revoking(key: &str) -> SyncEvent {
+    SyncEvent::Snapshot {
+        installations: vec![],
+        mcp_installations: None,
+        plugin_installations: vec![],
+        revocations: Some(vec![crate::sync::sse_client::RevocationRecord {
+            artifact_type: "skill".to_string(),
+            artifact_key: key.to_string(),
+            version: None,
+        }]),
+        org_policy: None,
+    }
+}
+
+fn revoked_audit_count(state: &AppState) -> i64 {
+    Connection::open(&state.db_path)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM audit_events WHERE event_type = 'skill_revoked'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+#[tokio::test]
+async fn redelivered_snapshot_does_not_reapply_an_already_applied_revoke() {
+    // A token refresh reconnects SSE and re-sends the full snapshot. The skill
+    // is already gone and the block cached, so nothing may run again.
+    let root = temp_root("snapshot-revocations-redelivered");
+    let state = Arc::new(AppState::bootstrap_in(root.clone()).unwrap());
+    seed_installed_skill(&state, "once-only", "1.0.0");
+    let reg = Arc::new(BackendRegistry::new());
+
+    dispatch(snapshot_revoking("once-only"), &state, &reg).await;
+    assert_eq!(revoked_audit_count(&state), 1);
+
+    dispatch(snapshot_revoking("once-only"), &state, &reg).await;
+    assert_eq!(
+        revoked_audit_count(&state),
+        1,
+        "an already-applied revoke must not emit a second audit event"
+    );
+    assert!(revocation_row_exists(&state, "skill", "once-only"));
+
+    cleanup(&root);
+}
+
+#[tokio::test]
+async fn cached_revoke_still_applies_when_the_skill_is_still_installed() {
+    // Block persisted (crash / failed teardown) but the skill is still on
+    // disk: the next snapshot must finish the job, not skip it as "seen".
+    let root = temp_root("snapshot-revocations-unfinished");
+    let state = Arc::new(AppState::bootstrap_in(root.clone()).unwrap());
+    scenery_core::revocation::upsert_revocation(&state, "skill", "half-done", None).unwrap();
+    seed_installed_skill(&state, "half-done", "1.0.0");
+    let install_root = state.root_dir.join("skills").join("half-done");
+
+    dispatch(
+        snapshot_revoking("half-done"),
+        &state,
+        &Arc::new(BackendRegistry::new()),
+    )
+    .await;
+
+    assert!(!install_root.exists(), "unfinished revoke must still apply");
+    assert_eq!(revoked_audit_count(&state), 1);
+
+    cleanup(&root);
+}
+
 // ── Install-time gate ──────────────────────────────────────────────────────────
 
 #[tokio::test]
