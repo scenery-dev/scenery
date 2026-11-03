@@ -56,6 +56,40 @@ pub(crate) fn reconciler_disabled() -> bool {
     std::env::var_os("SCENERY_DISABLE_FILESYSTEM_RECONCILER").is_some()
 }
 
+// ── Push outcome / refusal types ──────────────────────────────────────────────
+
+/// What a successful `push_skill` did beyond writing the canonical dir.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PushOutcome {
+    /// The `~/.claude/skills/<slug>` link could not be created (typically a
+    /// real, unmarked directory sits there). The canonical copy is live.
+    pub link_refused: Option<PathBuf>,
+}
+
+/// `push_skill` refused to overwrite content at `path` that Scenery does not
+/// own. Typed so callers can downcast and report the colliding path.
+#[derive(Debug)]
+pub struct CollisionRefused {
+    pub path: PathBuf,
+    pub what: &'static str,
+    pub slug: String,
+}
+
+impl std::fmt::Display for CollisionRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "pusher: refusing to replace the {} at {} — not Scenery-managed. \
+             Slug '{}' collides with user content in the shared ~/.agents/skills root.",
+            self.what,
+            self.path.display(),
+            self.slug
+        )
+    }
+}
+
+impl std::error::Error for CollisionRefused {}
+
 // ── ManagedPathsPusher ────────────────────────────────────────────────────────
 
 /// Pushes Scenery-managed items into Claude Code's native directories.
@@ -115,9 +149,9 @@ impl ManagedPathsPusher {
         installation_id: Option<&str>,
         skill_md_bytes: &[u8],
         referenced_files: &[(String, Vec<u8>)],
-    ) -> Result<()> {
+    ) -> Result<PushOutcome> {
         if reconciler_disabled() {
-            return Ok(());
+            return Ok(PushOutcome::default());
         }
 
         let skills_dir = resolve_skills_dir()?;
@@ -145,12 +179,11 @@ impl ManagedPathsPusher {
         // untouched), matching `link_dir`'s own stale-link handling.
         if skill_dir.is_symlink() {
             if !ownership::is_scenery_managed(&skill_dir) {
-                anyhow::bail!(
-                    "pusher: refusing to replace the symlink at {} — not Scenery-managed. \
-                     Slug '{slug}' collides with user content in the shared \
-                     ~/.agents/skills root.",
-                    skill_dir.display()
-                );
+                return Err(anyhow::Error::new(CollisionRefused {
+                    path: skill_dir.clone(),
+                    what: "symlink",
+                    slug: slug.to_string(),
+                }));
             }
             fs::remove_file(&skill_dir).with_context(|| {
                 format!(
@@ -171,12 +204,11 @@ impl ManagedPathsPusher {
             // our marker, and prime it for a later remove_skill to
             // `remove_dir_all` content Scenery never wrote — refuse rather
             // than clobber, exactly as the symlink branch above does.
-            anyhow::bail!(
-                "pusher: refusing to replace the directory at {} — not Scenery-managed. \
-                 Slug '{slug}' collides with user content in the shared \
-                 ~/.agents/skills root.",
-                skill_dir.display()
-            );
+            return Err(anyhow::Error::new(CollisionRefused {
+                path: skill_dir.clone(),
+                what: "directory",
+                slug: slug.to_string(),
+            }));
         }
 
         fs::create_dir_all(&skill_dir).with_context(|| {
@@ -257,17 +289,21 @@ impl ManagedPathsPusher {
         // `link_dir` backs up before replacing, rather than relying on this
         // call's `skill_md_bytes` being able to recreate it.
         let link_path = resolve_claude_link_dir()?.join(slug);
+        let mut outcome = PushOutcome::default();
         match super::links::link_dir(&skill_dir, &link_path) {
             Ok(mode) => debug!(slug, ?mode, "pusher: linked skill for Claude Code"),
-            Err(e) => warn!(
-                slug,
-                error = %e,
-                "pusher: failed to link skill for Claude Code — canonical copy is still live"
-            ),
+            Err(e) => {
+                warn!(
+                    slug,
+                    error = %e,
+                    "pusher: failed to link skill for Claude Code — canonical copy is still live"
+                );
+                outcome.link_refused = Some(link_path);
+            }
         }
 
         info!(slug, dest = %skill_dir.display(), "pusher: skill pushed to ~/.agents/skills/");
-        Ok(())
+        Ok(outcome)
     }
 
     /// Remove a skill from `~/.agents/skills/<slug>/`, dropping its
@@ -283,11 +319,14 @@ impl ManagedPathsPusher {
     /// retried here, or classified by drift — or the row alone, which drift
     /// retires as DELETED.
     ///
-    /// Idempotent — returns `Ok(())` if the directory is absent.
-    pub fn remove_skill(&self, slug: &str) -> Result<()> {
+    /// Idempotent — returns `Ok(false)` if there was nothing to remove (and
+    /// stays silent), `Ok(true)` if a link, directory or marker row was
+    /// actually removed.
+    pub fn remove_skill(&self, slug: &str) -> Result<bool> {
         if reconciler_disabled() {
-            return Ok(());
+            return Ok(false);
         }
+        let mut removed = false;
 
         let skills_dir = resolve_skills_dir()?;
         let skill_dir = skills_dir.join(slug);
@@ -297,8 +336,10 @@ impl ManagedPathsPusher {
         // a crash between the two leaves a dangling link rather than a live
         // link to deleted content.
         let link_path = resolve_claude_link_dir()?.join(slug);
-        if let Err(e) = super::links::unlink_dir(&link_path) {
-            warn!(slug, error = %e, "pusher: failed to unlink skill for Claude Code");
+        let link_present = link_path.symlink_metadata().is_ok();
+        match super::links::unlink_dir(&link_path) {
+            Ok(()) => removed |= link_present,
+            Err(e) => warn!(slug, error = %e, "pusher: failed to unlink skill for Claude Code"),
         }
 
         // Remove the canonical directory.
@@ -321,10 +362,15 @@ impl ManagedPathsPusher {
             };
             if !skill_dir.is_symlink() && !row_present && !ownership::is_scenery_managed(&skill_dir)
             {
-                anyhow::bail!(
-                    "pusher: refusing to remove the directory at {} — not Scenery-managed.",
-                    skill_dir.display()
+                // User content that is not ours is not something a teardown
+                // is supposed to remove, so this is not a failure: leave it
+                // and report what we did remove.
+                warn!(
+                    slug,
+                    path = %skill_dir.display(),
+                    "pusher: refusing to remove the directory — not Scenery-managed; left in place"
                 );
+                return Ok(removed);
             }
             if skill_dir.is_symlink() {
                 fs::remove_file(&skill_dir)
@@ -337,6 +383,7 @@ impl ManagedPathsPusher {
                     skill_dir.display()
                 )
             })?;
+            removed = true;
             info!(slug, "pusher: skill removed from ~/.agents/skills/");
         } else {
             debug!(
@@ -346,10 +393,11 @@ impl ManagedPathsPusher {
         }
 
         // Only now that nothing of ours is left on disk, drop the row.
-        self.delete_db_marker(&path_key)
+        removed |= self
+            .delete_db_marker(&path_key)
             .context("pusher: failed to delete managed_path_markers for skill")?;
 
-        Ok(())
+        Ok(removed)
     }
 
     // ── MCP ───────────────────────────────────────────────────────────────────
@@ -441,17 +489,19 @@ impl ManagedPathsPusher {
 
     /// Remove the `mcpServers.<slug>` entry from `~/.claude.json`.
     ///
-    /// Idempotent — returns `Ok(())` if the file or the entry is absent.
-    pub fn remove_mcp(&self, slug: &str) -> Result<()> {
+    /// Idempotent — returns `Ok(false)` (silently) if the file or the entry
+    /// is absent, `Ok(true)` if an entry or marker row was removed.
+    pub fn remove_mcp(&self, slug: &str) -> Result<bool> {
         if reconciler_disabled() {
-            return Ok(());
+            return Ok(false);
         }
 
         let claude_json = resolve_claude_json()?;
         let path_key = format!("{}:{}", claude_json.display(), slug);
 
         // Delete SQLite marker first.
-        self.delete_db_marker(&path_key)
+        let mut removed = self
+            .delete_db_marker(&path_key)
             .context("pusher: failed to delete managed_path_markers for mcp")?;
 
         if !claude_json.exists() {
@@ -459,20 +509,24 @@ impl ManagedPathsPusher {
                 slug,
                 "pusher: ~/.claude.json absent — nothing to remove (idempotent)"
             );
-            return Ok(());
+            return Ok(removed);
         }
 
+        let mut entry_present = false;
         modify_claude_json(&claude_json, |root| {
             if let Some(Value::Object(ref mut map)) = root.get_mut("mcpServers") {
-                map.remove(slug);
+                entry_present = map.remove(slug).is_some();
             }
         })
         .with_context(|| {
             format!("pusher: failed to modify ~/.claude.json for mcp removal slug={slug}")
         })?;
 
-        info!(slug, "pusher: MCP entry removed from ~/.claude.json");
-        Ok(())
+        removed |= entry_present;
+        if entry_present {
+            info!(slug, "pusher: MCP entry removed from ~/.claude.json");
+        }
+        Ok(removed)
     }
 
     // ── SQLite helpers ────────────────────────────────────────────────────────
@@ -522,15 +576,17 @@ impl ManagedPathsPusher {
         Ok(())
     }
 
-    fn delete_db_marker(&self, path: &str) -> Result<()> {
+    /// Returns whether a row was actually deleted.
+    fn delete_db_marker(&self, path: &str) -> Result<bool> {
         let conn = Connection::open(&self.db_path)
             .context("pusher: failed to open state DB for marker deletion")?;
-        conn.execute(
-            "DELETE FROM managed_path_markers WHERE path = ?1",
-            rusqlite::params![path],
-        )
-        .context("pusher: failed to delete managed_path_markers row")?;
-        Ok(())
+        let n = conn
+            .execute(
+                "DELETE FROM managed_path_markers WHERE path = ?1",
+                rusqlite::params![path],
+            )
+            .context("pusher: failed to delete managed_path_markers row")?;
+        Ok(n > 0)
     }
 }
 
@@ -606,7 +662,7 @@ pub fn push_missing_active_skills(state: &AppState, pusher: &ManagedPathsPusher)
         collect_extras(&active_dir, &active_dir, &mut refs);
 
         match pusher.push_skill(&skill_id, None, &bytes, &refs) {
-            Ok(()) => {
+            Ok(_) => {
                 healed += 1;
                 info!(skill_id, "heal: re-pushed missing installed skill dir");
             }
@@ -738,32 +794,21 @@ pub fn managed_skill_present(slug: &str) -> Result<bool> {
     Ok(skills_dir.join(slug).join("SKILL.md").exists())
 }
 
-/// Has the F2 pusher finished projecting `slug` onto disk — the managed dir
-/// with `SKILL.md` and its `.scenery-managed.json` marker under
-/// `~/.agents/skills/`, plus the `~/.claude/skills/<slug>` link?
+/// Is the canonical projection of `slug` on disk — `SKILL.md` plus the
+/// `.scenery-managed.json` marker under `~/.agents/skills/<slug>`?
 ///
 /// The daemon flips `installed_skills` to `active` BEFORE it pushes, so that
-/// row alone does not mean the files exist. `scenery skill install` waits on
-/// this so a script that checks the disk right after the command returns sees
-/// the install. Always `true` when the filesystem reconciler is disabled
-/// (nothing is ever projected, so there is nothing to wait for).
-pub fn native_projection_present(slug: &str) -> Result<bool> {
-    if reconciler_disabled() {
-        return Ok(true);
-    }
-    Ok(native_projection_present_in(&resolve_home()?, slug))
+/// row alone does not mean the files exist. The authoritative signal for
+/// `scenery skill install` is the outcome the daemon records
+/// (`projection_outcome`); this is only the fallback used when the daemon
+/// never reported one. Resolves `~` with the same function the pusher uses.
+pub fn canonical_projection_present(slug: &str) -> Result<bool> {
+    Ok(canonical_projection_present_in(&resolve_home()?, slug))
 }
 
-fn native_projection_present_in(home: &Path, slug: &str) -> bool {
+fn canonical_projection_present_in(home: &Path, slug: &str) -> bool {
     let dir = home.join(".agents").join("skills").join(slug);
-    dir.join("SKILL.md").exists()
-        && dir.join(ownership::MANAGED_MARKER_FILENAME).exists()
-        && home
-            .join(".claude")
-            .join("skills")
-            .join(slug)
-            .symlink_metadata()
-            .is_ok()
+    dir.join("SKILL.md").exists() && dir.join(ownership::MANAGED_MARKER_FILENAME).exists()
 }
 
 fn resolve_claude_json() -> Result<PathBuf> {

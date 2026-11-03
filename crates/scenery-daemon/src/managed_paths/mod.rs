@@ -45,6 +45,7 @@ pub mod migrator;
 pub mod native_cleanup;
 pub mod paths;
 pub mod plugin_marketplace;
+pub mod projection_outcome;
 pub mod publish;
 pub mod pusher;
 pub mod rollback;
@@ -82,7 +83,9 @@ pub use pusher::{push_missing_active_skills, ManagedPathsPusher};
 /// `~/.claude/skills/<slug>` link. Idempotent; call once at process start.
 pub fn register_core_hooks() {
     scenery_core::installer::register_skill_projection_remover(|state, slug| {
-        ManagedPathsPusher::new(state).remove_skill(slug)
+        ManagedPathsPusher::new(state)
+            .remove_skill(slug)
+            .map(|_| ())
     });
 }
 pub use rollback::{list_backups, rollback, BackupSummary, RollbackReport};
