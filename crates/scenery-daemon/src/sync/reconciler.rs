@@ -29,7 +29,7 @@ use std::{
     time::Duration,
 };
 use tokio::sync::{broadcast, mpsc};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::managed_paths::ManagedPathsPusher;
@@ -550,6 +550,7 @@ async fn dispatch_event(
                 install_tasks,
                 backend_registry,
                 pusher.as_ref().map(Arc::clone),
+                false,
             );
         }
         SyncEvent::Unrevoke {
@@ -609,17 +610,19 @@ async fn dispatch_event(
                 // replaced: an entry already cached whose artifact is gone was
                 // applied by an earlier snapshot/event and must be a no-op
                 // (no duplicate purge log or audit event).
-                let (replace_result, needs_apply) = {
+                let (replace_result, already_applied) = {
                     let n = entries.len();
                     match tokio::task::spawn_blocking(move || {
-                        let needs =
-                            super::revoke_gate::entries_needing_apply(&state_for_replace, &entries);
-                        (revocation::replace_all(&state_for_replace, &entries), needs)
+                        let seen = super::revoke_gate::entries_already_cached(
+                            &state_for_replace,
+                            &entries,
+                        );
+                        (revocation::replace_all(&state_for_replace, &entries), seen)
                     })
                     .await
                     {
-                        Ok((r, needs)) => (Ok(r), needs),
-                        Err(e) => (Err(e), vec![true; n]),
+                        Ok((r, seen)) => (Ok(r), seen),
+                        Err(e) => (Err(e), vec![false; n]),
                     }
                 };
                 match replace_result {
@@ -630,10 +633,12 @@ async fn dispatch_event(
                     Err(e) => warn!(error = %e, "reconciler: revocation snapshot task panicked"),
                 }
 
-                for (rec, apply) in revs.iter().zip(needs_apply) {
-                    if !apply {
-                        continue;
-                    }
+                // Teardown is idempotent and runs for EVERY entry on every
+                // snapshot — a previous attempt may have been partial (the
+                // client-projected content is removed non-fatally). The gate
+                // only silences the log line and audit event when a repeat
+                // pass finds nothing left to remove.
+                for (rec, seen) in revs.iter().zip(already_applied) {
                     spawn_revoke(
                         rec.artifact_type.clone(),
                         rec.artifact_key.clone(),
@@ -643,6 +648,7 @@ async fn dispatch_event(
                         install_tasks,
                         backend_registry,
                         pusher.as_ref().map(Arc::clone),
+                        seen,
                     );
                 }
             }
@@ -1564,6 +1570,13 @@ fn spawn_purge_plugin(
 ///    unconditionally — the backend wants to see every daemon converge,
 ///    not just the ones that had something locally to remove.
 ///
+/// `already_applied` is true for a snapshot redelivery of a revocation that
+/// was already in the local cache. Teardown still runs in full (an earlier
+/// pass may have been partial), but if it finds nothing to remove the
+/// `artifact revoked` log line and the audit event are suppressed. If it DOES
+/// remove something on such a repeat pass, it logs at WARN and audits with
+/// `repeat_pass: true`, since that means a previous attempt was incomplete.
+///
 /// Locked on the same key an install/deactivate for this artifact would
 /// use, so a revoke can never interleave with — and lose to — a concurrent
 /// install of the very thing it's removing.
@@ -1577,6 +1590,7 @@ fn spawn_revoke(
     install_tasks: &mut tokio::task::JoinSet<bool>,
     backend_registry: &Arc<BackendRegistry>,
     pusher: Option<Arc<ManagedPathsPusher>>,
+    already_applied: bool,
 ) {
     let lock_key = match artifact_type.as_str() {
         "plugin" => format!("plugin:{artifact_key}"),
@@ -1678,7 +1692,9 @@ fn spawn_revoke(
                             return Ok(false);
                         }
                     }
-                    crate::managed_paths::uninstall_plugin_bundle(&slug).map(|()| true)
+                    let present = crate::managed_paths::list_governed_plugins()?
+                        .contains_key(&slug);
+                    crate::managed_paths::uninstall_plugin_bundle(&slug).map(|()| present)
                 })
                 .await
                 {
@@ -1753,14 +1769,34 @@ fn spawn_revoke(
             }
         }
 
-        info!(
-            artifact_type = %artifact_type,
-            artifact_key = %artifact_key,
-            version = ?version,
-            removed_locally = changed,
-            stripped_from_plugins = ?stripped_from,
-            "reconciler: artifact revoked"
-        );
+        if already_applied && !changed {
+            // Redelivery of a revocation that is already fully applied.
+            debug!(
+                artifact_type = %artifact_type,
+                artifact_key = %artifact_key,
+                "reconciler: revocation already applied — nothing to remove"
+            );
+            return false;
+        }
+        if already_applied {
+            warn!(
+                artifact_type = %artifact_type,
+                artifact_key = %artifact_key,
+                version = ?version,
+                stripped_from_plugins = ?stripped_from,
+                "reconciler: repeat revoke pass removed leftover local content \
+                 (a previous teardown attempt was partial)"
+            );
+        } else {
+            info!(
+                artifact_type = %artifact_type,
+                artifact_key = %artifact_key,
+                version = ?version,
+                removed_locally = changed,
+                stripped_from_plugins = ?stripped_from,
+                "reconciler: artifact revoked"
+            );
+        }
 
         scenery_core::audit::write_audit_event_direct(
             &state.db_path,
@@ -1771,6 +1807,7 @@ fn spawn_revoke(
                     "artifact_key": artifact_key,
                     "version": version,
                     "removed_locally": changed,
+                    "repeat_pass": already_applied,
                     "stripped_from_plugins": stripped_from,
                 }),
             },
@@ -1787,8 +1824,7 @@ fn spawn_revoke(
 /// Returns whether anything was removed.
 fn revoke_skill_locally(state: &AppState, skill_id: &str, version: Option<&str>) -> Result<bool> {
     let Some(version) = version else {
-        purge_skill_blocking(state, skill_id)?;
-        return Ok(true);
+        return purge_skill_blocking(state, skill_id);
     };
     let conn = rusqlite::Connection::open(&state.db_path)
         .context("failed to open state DB for scoped revoke")?;
@@ -1800,8 +1836,7 @@ fn revoke_skill_locally(state: &AppState, skill_id: &str, version: Option<&str>)
         )
         .ok();
     if active.as_deref() == Some(version) {
-        purge_skill_blocking(state, skill_id)?;
-        return Ok(true);
+        return purge_skill_blocking(state, skill_id);
     }
 
     // The version arrives from the backend and is joined into a path that
@@ -1834,7 +1869,7 @@ fn revoke_skill_locally(state: &AppState, skill_id: &str, version: Option<&str>)
 /// does when the install is pinned to that version, or is unpinned — an
 /// unpinned server may be running the revoked version, the same fail-closed
 /// rule the install gate in `handle_install_mcp` uses.
-pub(super) fn mcp_revoke_applies(
+fn mcp_revoke_applies(
     state: &AppState,
     mcp_server_id: &str,
     version: Option<&str>,
@@ -2114,10 +2149,14 @@ async fn handle_install_mcp(
 /// catalog row, `mcp_server_name == ""`) — this function never reads the
 /// incoming record, only local state.
 ///
-/// Idempotent: calling this again for an already-torn-down `mcp_server_id`
-/// is a no-op (`delete_mcp_install` no-ops on a missing row) that returns
-/// `Ok(false)` and logs a WARN that the aggregator key could not be
-/// resolved.
+/// Idempotent and silent: calling this again for an already-torn-down
+/// `mcp_server_id` removes nothing and returns `Ok(false)`. The return value
+/// is "something was actually removed" (config entry, live backend or row).
+///
+/// Every step runs even if an earlier one fails; errors are collected and
+/// returned together at the end. Client-visible content (the `~/.claude.json`
+/// entry and the live backend) is removed before the row, so a failure never
+/// strands a live entry that can no longer be resolved.
 ///
 /// Shared by every path that learns an MCP install is gone:
 /// - the live `deactivate_mcp` SSE event and a snapshot record in
@@ -2136,49 +2175,74 @@ fn teardown_mcp_server_locally(
     backend_registry: &BackendRegistry,
     pusher: Option<&ManagedPathsPusher>,
 ) -> Result<bool> {
-    let aggregator_key = state
-        .list_mcp_installs()
-        .context("failed to read mcp_installations for teardown lookup")?
-        .into_iter()
-        .find(|r| r.mcp_server_id == mcp_server_id)
-        .map(|r| crate::mcp_server_slug(&r.mcp_server_name));
+    let mut removed = false;
+    let mut errors: Vec<String> = Vec::new();
 
-    state
-        .delete_mcp_install(mcp_server_id)
-        .context("failed to delete mcp_installations row")?;
-    write_managed_mcp_json(state)?;
-
-    let Some(key) = aggregator_key else {
-        warn!(
-            mcp_server_id,
-            "reconciler: could not resolve aggregator key for teardown \
-             (local row already gone) — stdio backend, if any, will remain \
-             visible until daemon restart"
-        );
-        return Ok(false);
+    let aggregator_key = match state.list_mcp_installs() {
+        Ok(rows) => rows
+            .into_iter()
+            .find(|r| r.mcp_server_id == mcp_server_id)
+            .map(|r| crate::mcp_server_slug(&r.mcp_server_name)),
+        Err(e) => {
+            errors.push(format!(
+                "failed to read mcp_installations for teardown lookup: {e:#}"
+            ));
+            None
+        }
     };
 
-    // F2: remove the per-server entry from ~/.claude.json.
-    if let Some(p) = pusher {
-        if let Err(e) = p.remove_mcp(&key) {
-            warn!(
+    // Client-visible content first (the `~/.claude.json` entry, then the live
+    // aggregator backend): these are what the AI client actually loads, so
+    // they must go even if the bookkeeping below fails. The row is deleted
+    // only after both succeed — it is the only place the key can be
+    // re-resolved from, so a failure here keeps it for the next pass.
+    let mut client_side_clean = true;
+    if let Some(key) = aggregator_key.as_deref() {
+        // F2: remove the per-server entry from ~/.claude.json.
+        if let Some(p) = pusher {
+            match p.remove_mcp(key) {
+                Ok(r) => removed |= r,
+                Err(e) => {
+                    client_side_clean = false;
+                    errors.push(format!("remove_mcp '{key}' failed: {e:#}"));
+                }
+            }
+        }
+        // `remove_backend` shuts down any spawned stdio child process, so the
+        // AI client stops seeing the tools without a daemon restart.
+        if backend_registry.remove_backend(key) {
+            removed = true;
+            info!(
                 mcp_server_id,
-                slug = %key,
-                error = %e,
-                "reconciler: F2 remove_mcp failed (non-fatal)"
+                aggregator_key = %key,
+                "reconciler: removed MCP backend from aggregator"
             );
+        }
+    } else if errors.is_empty() {
+        debug!(
+            mcp_server_id,
+            "reconciler: no local mcp_installations row for teardown — nothing to resolve"
+        );
+    }
+
+    if client_side_clean && errors.is_empty() {
+        match state.delete_mcp_install(mcp_server_id) {
+            Ok(()) => removed |= aggregator_key.is_some(),
+            Err(e) => errors.push(format!("failed to delete mcp_installations row: {e:#}")),
+        }
+        // Always regenerate: a previous pass may have deleted the row and
+        // then failed this write, and a stale managed-mcp.json would reload
+        // the revoked server on the next daemon start. The writer skips the
+        // file write when nothing changed, so a clean redelivery is free.
+        if let Err(e) = write_managed_mcp_json(state) {
+            errors.push(format!("failed to write managed-mcp.json: {e:#}"));
         }
     }
 
-    // Remove the backend from the live aggregator so the AI client stops
-    // seeing its tools immediately without a daemon restart. `remove_backend`
-    // shuts down any spawned stdio child process.
-    let removed = backend_registry.remove_backend(&key);
-    if removed {
-        info!(
-            mcp_server_id,
-            aggregator_key = %key,
-            "reconciler: removed MCP backend from aggregator"
+    if !errors.is_empty() {
+        anyhow::bail!(
+            "mcp server '{mcp_server_id}' teardown incomplete: {}",
+            errors.join("; ")
         );
     }
     Ok(removed)
@@ -2294,6 +2358,11 @@ fn write_managed_mcp_json(state: &AppState) -> Result<()> {
 
     let dest = state.root_dir.as_std_path().join("managed-mcp.json");
     let tmp = state.root_dir.as_std_path().join("managed-mcp.json.tmp");
+
+    // Unchanged content: skip the write (a redelivered revoke re-runs this).
+    if std::fs::read(&dest).is_ok_and(|existing| existing == json_bytes) {
+        return Ok(());
+    }
 
     std::fs::write(&tmp, &json_bytes)
         .with_context(|| format!("failed to write managed-mcp.json.tmp to {}", tmp.display()))?;
@@ -2785,9 +2854,20 @@ fn push_skill_to_claude(
     installation_id: Option<&str>,
     state: &Arc<AppState>,
 ) {
+    use crate::managed_paths::projection_outcome::{record, ProjectionOutcome};
+    let record_outcome = |outcome: ProjectionOutcome| {
+        if let Err(e) = record(state, skill_id, &outcome) {
+            warn!(skill_id, error = %e, "reconciler: could not record native projection outcome");
+        }
+    };
     let p = match pusher {
         Some(p) => p,
-        None => return,
+        None => {
+            // No pusher (filesystem reconciler disabled in the DAEMON's
+            // environment): nothing is projected, so nothing to wait for.
+            record_outcome(ProjectionOutcome::Ok);
+            return;
+        }
     };
 
     let active_dir = state.root_dir.join("skills").join(skill_id).join("active");
@@ -2801,6 +2881,9 @@ fn push_skill_to_claude(
                 error = %e,
                 "reconciler: F2 cannot read SKILL.md for push — skipping"
             );
+            record_outcome(ProjectionOutcome::PushFailed {
+                detail: format!("cannot read {skill_md_path}: {e}"),
+            });
             return;
         }
     };
@@ -2808,13 +2891,29 @@ fn push_skill_to_claude(
     // Collect referenced files (prompts/ etc.) for the push.
     let referenced = collect_referenced_files(active_dir.as_std_path());
 
-    if let Err(e) = p.push_skill(skill_id, installation_id, &skill_md_bytes, &referenced) {
-        warn!(
-            skill_id,
-            error = %e,
-            "reconciler: F2 push_skill failed (non-fatal)"
-        );
-        return;
+    match p.push_skill(skill_id, installation_id, &skill_md_bytes, &referenced) {
+        Ok(push) => record_outcome(match push.link_refused {
+            Some(path) => ProjectionOutcome::LinkRefused { path },
+            None => ProjectionOutcome::Ok,
+        }),
+        Err(e) => {
+            warn!(
+                skill_id,
+                error = %e,
+                "reconciler: F2 push_skill failed (non-fatal)"
+            );
+            record_outcome(
+                match e.downcast_ref::<crate::managed_paths::pusher::CollisionRefused>() {
+                    Some(c) => ProjectionOutcome::PushRefused {
+                        path: c.path.clone(),
+                    },
+                    None => ProjectionOutcome::PushFailed {
+                        detail: format!("{e:#}"),
+                    },
+                },
+            );
+            return;
+        }
     }
 
     // Adopt-takeover convergence (immediate-publish + any other normal
@@ -3307,7 +3406,8 @@ async fn handle_deactivate(
 
             // F2: Remove the skill from ~/.claude/skills/.
             if let Some(p) = pusher {
-                if let Err(e) = p.remove_skill(&skill_id_for_pusher) {
+                let slug = state.skill_local_name(&skill_id_for_pusher);
+                if let Err(e) = p.remove_skill(&slug) {
                     warn!(
                         skill_id = %skill_id_for_pusher,
                         error = %e,
@@ -3376,7 +3476,7 @@ async fn handle_purge(
         tokio::task::spawn_blocking(move || purge_skill_blocking(&state_clone, &skill_id)).await;
 
     match result {
-        Ok(Ok(())) => {
+        Ok(Ok(_)) => {
             report_installation_status(installation_id, "removed", None, &reg_url, state).await;
             true
         }
@@ -3391,41 +3491,89 @@ async fn handle_purge(
     }
 }
 
-fn purge_skill_blocking(state: &AppState, skill_id: &str) -> Result<()> {
-    let install_root = state.root_dir.join("skills").join(skill_id);
+/// Idempotent teardown of everything a skill has locally: the internal
+/// install dir, the SQLite rows, and the client-projected content (the
+/// `~/.agents/skills/<slug>` dir, its marker row and the `~/.claude/skills`
+/// link). Returns whether anything was actually removed, and logs only then,
+/// so redelivered revocations are cheap and silent when nothing is left.
+///
+/// Every step runs even if an earlier one failed — the client projection is
+/// what the AI clients actually load, so it must be removed even when the
+/// internal dir cannot be. The SQLite rows are kept when the internal dir
+/// could not be deleted (they are the retry marker); errors are collected and
+/// returned together at the end.
+///
+/// The projection is keyed by the LOCAL slug (`skill_local_name`), which can
+/// differ from the registry `skill_id`; both are removed when they differ.
+fn purge_skill_blocking(state: &AppState, skill_id: &str) -> Result<bool> {
+    let mut removed = false;
+    let mut errors: Vec<String> = Vec::new();
+    // Read before anything is deleted.
+    let local_slug = state.skill_local_name(skill_id);
 
-    // Delete all files for this skill.
+    let install_root = state.root_dir.join("skills").join(skill_id);
+    let mut dir_ok = true;
     if install_root.exists() {
-        std::fs::remove_dir_all(&install_root)
-            .with_context(|| format!("failed to delete skill dir: {install_root}"))?;
+        match std::fs::remove_dir_all(&install_root) {
+            Ok(()) => removed = true,
+            Err(e) => {
+                dir_ok = false;
+                errors.push(format!("failed to delete skill dir {install_root}: {e}"));
+            }
+        }
     }
 
-    let conn =
-        rusqlite::Connection::open(&state.db_path).context("failed to open state DB for purge")?;
-    conn.execute(
-        "DELETE FROM installed_skills WHERE skill_id = ?1",
-        rusqlite::params![skill_id],
-    )
-    .context("failed to remove skill from SQLite")?;
-    conn.execute(
-        "DELETE FROM skill_versions WHERE skill_id = ?1",
-        rusqlite::params![skill_id],
-    )
-    .context("failed to remove skill_versions from SQLite")?;
+    if dir_ok {
+        match purge_skill_rows(state, skill_id) {
+            Ok(n) => removed |= n > 0,
+            Err(e) => errors.push(format!("{e:#}")),
+        }
+    }
 
-    // F2 pusher owns `~/.claude/skills/<id>` — drop the managed dir + marker
-    // so a purge leaves nothing behind. Non-fatal if F2 cleanup fails.
+    // F2 pusher owns `~/.agents/skills/<slug>` and the `~/.claude/skills`
+    // link. A failure here is NOT swallowed: it leaves the skill live in
+    // Claude Code / Cursor, so the caller must know the teardown is partial.
     let pusher = crate::managed_paths::ManagedPathsPusher::new(state);
-    if let Err(e) = pusher.remove_skill(skill_id) {
-        warn!(
-            skill_id,
-            error = %e,
-            "reconciler: F2 remove_skill failed during purge (non-fatal)"
+    let mut slugs = vec![local_slug];
+    if slugs[0] != skill_id {
+        slugs.push(skill_id.to_string());
+    }
+    for slug in &slugs {
+        match pusher.remove_skill(slug) {
+            Ok(r) => removed |= r,
+            Err(e) => errors.push(format!("F2 remove_skill '{slug}' failed: {e:#}")),
+        }
+    }
+
+    if !errors.is_empty() {
+        anyhow::bail!(
+            "skill '{skill_id}' teardown incomplete: {}",
+            errors.join("; ")
         );
     }
+    if removed {
+        info!(skill_id, "reconciler: skill purged");
+    }
+    Ok(removed)
+}
 
-    info!(skill_id, "reconciler: skill purged");
-    Ok(())
+/// Delete the skill's SQLite rows; returns how many rows were removed.
+fn purge_skill_rows(state: &AppState, skill_id: &str) -> Result<usize> {
+    let conn =
+        rusqlite::Connection::open(&state.db_path).context("failed to open state DB for purge")?;
+    let a = conn
+        .execute(
+            "DELETE FROM installed_skills WHERE skill_id = ?1",
+            rusqlite::params![skill_id],
+        )
+        .context("failed to remove skill from SQLite")?;
+    let b = conn
+        .execute(
+            "DELETE FROM skill_versions WHERE skill_id = ?1",
+            rusqlite::params![skill_id],
+        )
+        .context("failed to remove skill_versions from SQLite")?;
+    Ok(a + b)
 }
 
 // ── Snapshot diff ─────────────────────────────────────────────────────────────
@@ -4186,3 +4334,7 @@ mod revoke_tests;
 #[cfg(test)]
 #[path = "revocation_scope_tests.rs"]
 mod revocation_scope_tests;
+
+#[cfg(test)]
+#[path = "revoke_redelivery_tests.rs"]
+mod revoke_redelivery_tests;

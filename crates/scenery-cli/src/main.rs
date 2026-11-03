@@ -1841,6 +1841,10 @@ async fn install_via_desired_state(
         payload["version"] = serde_json::Value::String(v.to_string());
     }
 
+    // Outcomes the daemon recorded before this moment belong to an earlier
+    // install of the same skill.
+    let install_requested_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+
     eprint!("Requesting install of '{skill_id}' from backend");
 
     let client = reqwest::Client::builder()
@@ -1923,24 +1927,35 @@ async fn install_via_desired_state(
 
         match installed {
             Some((status, 0)) if status == "active" => {
-                // The daemon marks the row active BEFORE it writes the native
-                // skill dir, the ~/.claude/skills link and the marker. Wait
-                // for those so success means the files are on disk.
-                let slug = state.skill_local_name(skill_id);
-                wait_until(
-                    || scenery_daemon::managed_paths::pusher::native_projection_present(&slug),
+                // The daemon marks the row active BEFORE it pushes the native
+                // skill dir and the ~/.claude/skills link, and either can be
+                // refused. Wait for the outcome the DAEMON records (it knows
+                // its own environment and home; the CLI's may differ under
+                // systemd/launchd), and surface a refusal as soon as it is
+                // known rather than timing out.
+                let outcome = poll_until(
+                    || {
+                        scenery_daemon::managed_paths::projection_outcome::read_since(
+                            state,
+                            skill_id,
+                            install_requested_at,
+                        )
+                    },
                     std::time::Duration::from_secs(NATIVE_PROJECTION_TIMEOUT_SECS),
                     std::time::Duration::from_millis(NATIVE_PROJECTION_POLL_INTERVAL_MS),
                 )
-                .await
-                .with_context(|| {
-                    format!(
-                        "'{skill_id}' is installed in the runner but its files were not written \
-                         to ~/.agents/skills and ~/.claude/skills in time — check the daemon \
-                         log, or run 'scenery daemon install' if the daemon is not running"
-                    )
-                })?;
+                .await?;
+                let slug = state.skill_local_name(skill_id);
+                let canonical_present =
+                    scenery_daemon::managed_paths::pusher::canonical_projection_present(&slug)
+                        .unwrap_or(false);
                 eprintln!();
+                let log_dir = state.root_dir.join("logs");
+                for warning in
+                    interpret_projection(skill_id, outcome, canonical_present, log_dir.as_str())?
+                {
+                    eprintln!("warning: {warning}");
+                }
                 println!("Installed skill '{skill_id}' from registry.");
                 // Audit: daemon confirmed the desired-state install succeeded.
                 // Fail-open: never block on audit write failure.
@@ -2004,23 +2019,64 @@ async fn install_via_desired_state(
 const NATIVE_PROJECTION_TIMEOUT_SECS: u64 = 30;
 const NATIVE_PROJECTION_POLL_INTERVAL_MS: u64 = 100;
 
-/// Poll `check` until it returns `true`, an error, or `timeout` elapses
-/// (checked once more at the deadline). A timeout is an error — never a
-/// false success.
-async fn wait_until<F: FnMut() -> Result<bool>>(
+/// Poll `check` until it yields `Some`, an error, or `timeout` elapses
+/// (checked once more at the deadline). `None` means it never yielded — the
+/// caller decides what a timeout means; it is never a false success here.
+async fn poll_until<T, F: FnMut() -> Result<Option<T>>>(
     mut check: F,
     timeout: std::time::Duration,
     interval: std::time::Duration,
-) -> Result<()> {
+) -> Result<Option<T>> {
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        if check()? {
-            return Ok(());
+        if let Some(v) = check()? {
+            return Ok(Some(v));
         }
         if std::time::Instant::now() >= deadline {
-            anyhow::bail!("timed out after {}s", timeout.as_secs());
+            return Ok(None);
         }
         tokio::time::sleep(interval).await;
+    }
+}
+
+/// Turn the daemon's recorded projection outcome into the CLI's verdict:
+/// `Ok(warnings)` to print and succeed, or an error that names the colliding
+/// path. `outcome == None` means the daemon never responded in time; the
+/// canonical dir + marker already being on disk still counts as success.
+fn interpret_projection(
+    skill_id: &str,
+    outcome: Option<scenery_daemon::managed_paths::projection_outcome::ProjectionOutcome>,
+    canonical_present: bool,
+    daemon_log_dir: &str,
+) -> Result<Vec<String>> {
+    use scenery_daemon::managed_paths::projection_outcome::ProjectionOutcome;
+    match outcome {
+        Some(ProjectionOutcome::Ok) => Ok(Vec::new()),
+        Some(ProjectionOutcome::LinkRefused { path }) => Ok(vec![format!(
+            "'{skill_id}' is installed in ~/.agents/skills, but Claude Code cannot see it: \
+             {} already exists and is not managed by Scenery. Move or remove it, then \
+             reinstall.",
+            path.display()
+        )]),
+        Some(ProjectionOutcome::PushRefused { path }) => anyhow::bail!(
+            "'{skill_id}' is installed in the runner but was not written to \
+             ~/.agents/skills: {} already exists and is not managed by Scenery. Move or \
+             remove it, then reinstall.",
+            path.display()
+        ),
+        Some(ProjectionOutcome::PushFailed { detail }) => anyhow::bail!(
+            "'{skill_id}' is installed in the runner but writing its files failed: {detail}. \
+             See the daemon log in {daemon_log_dir}."
+        ),
+        None if canonical_present => Ok(vec![format!(
+            "the daemon did not report whether '{skill_id}' was linked for Claude Code \
+             (see the daemon log in {daemon_log_dir}); its files are in ~/.agents/skills."
+        )]),
+        None => anyhow::bail!(
+            "'{skill_id}' is installed in the runner but the daemon never reported writing \
+             its files within {NATIVE_PROJECTION_TIMEOUT_SECS}s. Check the daemon log in \
+             {daemon_log_dir}, or run 'scenery daemon install' if the daemon is not running."
+        ),
     }
 }
 

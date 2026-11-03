@@ -1312,21 +1312,87 @@ fn push_skill_repush_refreshes_row_hash() {
 }
 
 #[test]
-fn native_projection_present_needs_dir_marker_and_claude_link() {
+fn canonical_projection_present_needs_skill_md_and_marker() {
     let home = tempfile::tempdir().unwrap();
     let dir = home.path().join(".agents/skills/demo");
-    let link_dir = home.path().join(".claude/skills");
     fs::create_dir_all(&dir).unwrap();
-    fs::create_dir_all(&link_dir).unwrap();
-    assert!(!native_projection_present_in(home.path(), "demo"));
-
+    assert!(!canonical_projection_present_in(home.path(), "demo"));
     fs::write(dir.join("SKILL.md"), "x").unwrap();
-    assert!(!native_projection_present_in(home.path(), "demo"));
+    assert!(!canonical_projection_present_in(home.path(), "demo"));
     fs::write(dir.join(ownership::MANAGED_MARKER_FILENAME), "{}").unwrap();
-    assert!(
-        !native_projection_present_in(home.path(), "demo"),
-        "the Claude link is the last thing the pusher writes"
-    );
-    super::super::links::link_dir(&dir, &link_dir.join("demo")).unwrap();
-    assert!(native_projection_present_in(home.path(), "demo"));
+    assert!(canonical_projection_present_in(home.path(), "demo"));
+}
+
+// ── push outcome / remove_skill "did something" reporting ─────────────────────
+
+/// Run `f` with HOME pointed at a fresh temp dir, restoring it afterwards.
+fn with_fake_home<R>(f: impl FnOnce(&std::path::Path) -> R) -> R {
+    let _g = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    let prev = std::env::var_os("HOME");
+    std::env::set_var("HOME", home.path());
+    let r = f(home.path());
+    if let Some(v) = prev {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+    r
+}
+
+#[test]
+fn push_skill_reports_a_refused_claude_link_with_its_path() {
+    let (pusher, _tmp) = make_pusher();
+    with_fake_home(|home| {
+        // A real, unmarked directory where the Claude link should go.
+        let blocker = home.join(".claude/skills/demo");
+        fs::create_dir_all(&blocker).unwrap();
+        fs::write(blocker.join("SKILL.md"), "user's own").unwrap();
+
+        let out = pusher
+            .push_skill("demo", None, b"---\nname: demo\n---\n", &[])
+            .unwrap();
+        assert_eq!(out.link_refused.as_deref(), Some(blocker.as_path()));
+        assert!(
+            home.join(".agents/skills/demo/SKILL.md").exists(),
+            "the canonical copy is still live"
+        );
+        assert_eq!(
+            fs::read_to_string(blocker.join("SKILL.md")).unwrap(),
+            "user's own"
+        );
+    });
+}
+
+#[test]
+fn push_skill_collision_is_a_typed_error_carrying_the_path() {
+    let (pusher, _tmp) = make_pusher();
+    with_fake_home(|home| {
+        let canonical = home.join(".agents/skills/demo");
+        fs::create_dir_all(&canonical).unwrap();
+        fs::write(canonical.join("SKILL.md"), "user's own").unwrap();
+
+        let err = pusher
+            .push_skill("demo", None, b"---\nname: demo\n---\n", &[])
+            .unwrap_err();
+        let c = err.downcast_ref::<CollisionRefused>().expect("typed error");
+        assert_eq!(c.path, canonical);
+        assert!(err.to_string().contains(canonical.to_str().unwrap()));
+    });
+}
+
+#[test]
+fn remove_skill_reports_whether_it_removed_anything() {
+    let (pusher, _tmp) = make_pusher();
+    with_fake_home(|_| {
+        assert!(!pusher.remove_skill("demo").unwrap(), "nothing there yet");
+        pusher
+            .push_skill("demo", None, b"---\nname: demo\n---\n", &[])
+            .unwrap();
+        assert!(pusher.remove_skill("demo").unwrap());
+        assert!(
+            !pusher.remove_skill("demo").unwrap(),
+            "second pass is a silent no-op"
+        );
+    });
 }
