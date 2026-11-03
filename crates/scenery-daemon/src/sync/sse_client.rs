@@ -631,7 +631,18 @@ async fn dispatch_event(
                 let slug = w.slug.clone();
                 let kind = w.kind.clone();
                 let source_path = w.source_path.clone();
+                // Revoke overrides adopt: never copy a revoked slug's source
+                // into the managed dirs, even briefly. Fail closed.
+                let revoked = crate::managed_paths::migrator::skill_slug_revoked(state, &w.slug)
+                    .unwrap_or_else(|e| {
+                        warn!(slug = %w.slug, error = %e, "adopt: revocation check failed; refusing local copy");
+                        true
+                    });
                 tokio::spawn(async move {
+                    if revoked {
+                        warn!(slug = %slug, "adopt: skill is revoked — local copy not pushed");
+                        return;
+                    }
                     if let Err(e) = crate::managed_paths::pusher::push_adopted_discovery(
                         &state_arc,
                         &slug,

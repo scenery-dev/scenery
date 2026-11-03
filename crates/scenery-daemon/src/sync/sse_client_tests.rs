@@ -825,3 +825,63 @@ async fn bounded_retry_stops_after_repeated_401s_following_successful_refresh() 
     events_mock.assert_async().await;
     refresh_mock.assert_async().await;
 }
+
+/// A revoked slug's source dir must never be copied into the managed dirs,
+/// even briefly; a non-revoked one still is (control).
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread")]
+async fn discovery_adopted_does_not_copy_a_revoked_slug() {
+    let _guard = crate::managed_paths::ENV_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    let prev = std::env::var_os("HOME");
+    std::env::set_var("HOME", home.path());
+
+    let (state, _tmp) = bootstrap_state();
+    scenery_core::revocation::upsert_revocation(&state, "skill", "revoked-adopt", None).unwrap();
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let mut last_event_id = None;
+    for slug in ["revoked-adopt", "fine-adopt"] {
+        let src = home.path().join("src").join(slug);
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("SKILL.md"), format!("---\nname: {slug}\n---\n")).unwrap();
+        let data = serde_json::json!({
+            "slug": slug, "kind": "skill", "source_path": src.to_string_lossy(),
+        })
+        .to_string();
+        dispatch_event(
+            "discovery_adopted",
+            &data,
+            &None,
+            &mut last_event_id,
+            &state,
+            &tx,
+        )
+        .await
+        .unwrap();
+    }
+
+    let fine = home.path().join(".agents/skills/fine-adopt");
+    for _ in 0..100 {
+        if fine.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let fine_pushed = fine.exists();
+    let revoked_copied = home.path().join(".agents/skills/revoked-adopt").exists()
+        || home
+            .path()
+            .join(".claude/skills/revoked-adopt")
+            .symlink_metadata()
+            .is_ok();
+
+    if let Some(v) = prev {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+    assert!(fine_pushed, "control: a non-revoked adopt is still pushed");
+    assert!(!revoked_copied, "a revoked slug must not be copied");
+}

@@ -570,6 +570,30 @@ async fn install_verified_version_refuses_a_revoked_skill() {
     }
 }
 
+#[tokio::test]
+async fn sweep_skips_a_slug_whose_row_appears_after_the_initial_read() {
+    let home = FakeHome::new();
+    let (_t, state) = new_state();
+    let pusher = ManagedPathsPusher::new(&state);
+    pusher.push_mcp("github-mcp", None, false).unwrap();
+
+    // A reinstall lands between the sweep's live-row read and its removal.
+    let st = Arc::clone(&state);
+    let removed = pusher
+        .sweep_orphaned_mcp_entries(&move || {
+            st.upsert_mcp_install(&mcp_row(&uuid::Uuid::new_v4().to_string()))
+                .unwrap();
+        })
+        .unwrap();
+
+    assert!(removed.is_empty(), "a live install must not be swept");
+    let cfg: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(home.path().join(".claude.json")).unwrap())
+            .unwrap();
+    assert!(cfg["mcpServers"].get("github-mcp").is_some());
+    assert!(mcp_marker_rows(&state).contains(&"github-mcp".to_string()));
+}
+
 // ── Plugin revoke: redelivery must not churn the user's files ─────────────────
 
 fn bundle() -> PluginBundle {
