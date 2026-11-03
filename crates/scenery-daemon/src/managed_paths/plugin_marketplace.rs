@@ -237,6 +237,50 @@ pub fn list_governed_plugins() -> Result<HashMap<String, String>> {
 
 /// Remove a governed plugin from the marketplace, cache, and Claude Code
 /// registries. Idempotent.
+/// Is anything of governed plugin `slug` still present locally: its source or
+/// cache dir, its marketplace entry, bundled-skills record, `installed_plugins`
+/// key or `enabledPlugins` key? Read-only, so a redelivered revoke can skip
+/// [`uninstall_plugin_bundle`] (and its file rewrites) when this is false,
+/// while any partial leftover still reports true and gets cleaned.
+pub fn plugin_has_local_state(slug: &str) -> Result<bool> {
+    if reconciler_disabled() {
+        return Ok(false);
+    }
+    ensure_single_path_component("slug", slug)?;
+    let home = home()?;
+    let mp = marketplace_dir(&home);
+    let key = plugin_key(slug);
+    if mp.join("plugins").join(slug).exists()
+        || plugins_dir(&home)
+            .join("cache")
+            .join(MARKETPLACE_NAME)
+            .join(slug)
+            .exists()
+        || read_bundled_record(&mp).contains_key(slug)
+    {
+        return Ok(true);
+    }
+    let in_manifest = read_json(&mp.join(".claude-plugin").join("marketplace.json"))
+        .and_then(|r| {
+            r.get("plugins").and_then(Value::as_array).map(|a| {
+                a.iter()
+                    .any(|p| p.get("name").and_then(Value::as_str) == Some(slug))
+            })
+        })
+        .unwrap_or(false);
+    let installed = read_json(&plugins_dir(&home).join("installed_plugins.json"))
+        .and_then(|r| r.get("plugins").and_then(|p| p.get(&key)).map(|_| true))
+        .unwrap_or(false);
+    let enabled = read_json(&home.join(".claude").join("settings.json"))
+        .and_then(|r| {
+            r.get("enabledPlugins")
+                .and_then(|p| p.get(&key))
+                .map(|_| true)
+        })
+        .unwrap_or(false);
+    Ok(in_manifest || installed || enabled)
+}
+
 pub fn uninstall_plugin_bundle(slug: &str) -> Result<()> {
     if reconciler_disabled() {
         return Ok(());
@@ -731,8 +775,18 @@ fn edit_json_create<F: FnOnce(&mut Value)>(path: &Path, mutate: F) -> Result<()>
     lock.lock_exclusive()
         .with_context(|| format!("plugin_marketplace: lock {lock_path:?}"))?;
 
-    let mut root = read_json(path).unwrap_or_else(|| Value::Object(Map::new()));
+    let original = read_json(path);
+    let mut root = original
+        .clone()
+        .unwrap_or_else(|| Value::Object(Map::new()));
     mutate(&mut root);
+    // A no-op edit must not touch the file: rewriting would reformat the
+    // user's JSON and could clobber a concurrent write by Claude Code.
+    // (A missing or unparseable file is still written.)
+    if original.as_ref() == Some(&root) {
+        drop(lock);
+        return Ok(());
+    }
     let bytes = serde_json::to_vec_pretty(&root)?;
     atomic_write(path, &bytes)?;
 

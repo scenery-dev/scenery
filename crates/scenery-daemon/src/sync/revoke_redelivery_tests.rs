@@ -490,3 +490,119 @@ async fn mcp_redelivery_with_nothing_left_is_silent() {
     }
     assert_eq!(audits(&state, "mcp_server_revoked").len(), 1);
 }
+
+// ── Plugin revoke: redelivery must not churn the user's files ─────────────────
+
+fn bundle() -> PluginBundle {
+    PluginBundle {
+        slug: "kit".into(),
+        name: "kit".into(),
+        description: String::new(),
+        version: "1.0.0".into(),
+        author: "Scenery".into(),
+        skills: vec![BundledSkill {
+            skill_id: "tool".into(),
+            version: "1.0.0".into(),
+            skill_md: b"---\nname: tool\n---\n".to_vec(),
+            files: vec![],
+        }],
+        files: vec![],
+        executables: vec![],
+    }
+}
+
+fn stamp(p: &Path) -> (Vec<u8>, std::time::SystemTime) {
+    (
+        std::fs::read(p).unwrap(),
+        std::fs::metadata(p).unwrap().modified().unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn redelivered_revoke_of_a_removed_plugin_does_not_rewrite_json_files() {
+    let home = FakeHome::new();
+    let (_t, state) = new_state();
+    crate::managed_paths::install_plugin_bundle(&bundle()).unwrap();
+
+    run(snapshot(&[("plugin", "kit", None)]), &state).await;
+    assert!(!crate::managed_paths::plugin_has_local_state("kit").unwrap());
+
+    // The user's own compact settings.json, which a rewrite would reformat.
+    let settings = home.path().join(".claude/settings.json");
+    std::fs::write(
+        &settings,
+        r#"{"theme":"dark","enabledPlugins":{"other@x":true}}"#,
+    )
+    .unwrap();
+    let installed = home.path().join(".claude/plugins/installed_plugins.json");
+    let manifest = home
+        .path()
+        .join(".claude/plugins/marketplaces/scenery/.claude-plugin/marketplace.json");
+    let before = [stamp(&settings), stamp(&installed), stamp(&manifest)];
+    std::thread::sleep(std::time::Duration::from_millis(30));
+
+    run(snapshot(&[("plugin", "kit", None)]), &state).await;
+    run(snapshot(&[("plugin", "kit", None)]), &state).await;
+
+    let after = [stamp(&settings), stamp(&installed), stamp(&manifest)];
+    assert_eq!(before, after, "bytes and mtimes must be untouched");
+    assert_eq!(audits(&state, "plugin_revoked").len(), 1);
+}
+
+#[tokio::test]
+async fn partial_plugin_leftover_is_cleaned_on_redelivery() {
+    let home = FakeHome::new();
+    let (_t, state) = new_state();
+    crate::managed_paths::install_plugin_bundle(&bundle()).unwrap();
+    run(snapshot(&[("plugin", "kit", None)]), &state).await;
+
+    // A previous attempt left only the enabledPlugins key behind.
+    let settings = home.path().join(".claude/settings.json");
+    std::fs::write(
+        &settings,
+        r#"{"enabledPlugins":{"kit@scenery":true,"other@x":true}}"#,
+    )
+    .unwrap();
+    assert!(crate::managed_paths::plugin_has_local_state("kit").unwrap());
+
+    run(snapshot(&[("plugin", "kit", None)]), &state).await;
+
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+    assert!(v["enabledPlugins"].get("kit@scenery").is_none());
+    assert!(v["enabledPlugins"].get("other@x").is_some());
+    let a = audits(&state, "plugin_revoked");
+    assert_eq!(a.len(), 2);
+    assert_eq!(a[1]["repeat_pass"], true);
+}
+
+// ── Install of an already-installed skill still yields a fresh outcome ────────
+
+#[test]
+fn snapshot_noop_for_an_installed_skill_records_a_fresh_projection_outcome() {
+    use crate::managed_paths::projection_outcome::{read_since, ProjectionOutcome};
+    use crate::sync::sse_client::InstallationRecord;
+    let _home = FakeHome::new();
+    let (_t, state) = new_state();
+    seed_skill(&state, "same", "1.0.0", true);
+    project(&state, "same");
+    let since = chrono::Utc::now() - chrono::Duration::seconds(1);
+    assert_eq!(read_since(&state, "same", since).unwrap(), None);
+
+    let events = super::build_derived_events_blocking(
+        vec![InstallationRecord {
+            installation_id: uuid::Uuid::new_v4(),
+            skill_id: "same".into(),
+            version: "1.0.0".into(),
+            state: "installed".into(),
+            source: None,
+            local_slug: None,
+        }],
+        &state,
+    );
+    assert!(events.is_empty(), "nothing to install");
+    assert_eq!(
+        read_since(&state, "same", since).unwrap(),
+        Some(ProjectionOutcome::Ok)
+    );
+}
