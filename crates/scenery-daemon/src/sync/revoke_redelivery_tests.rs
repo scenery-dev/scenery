@@ -576,6 +576,30 @@ async fn partial_plugin_leftover_is_cleaned_on_redelivery() {
     assert_eq!(a[1]["repeat_pass"], true);
 }
 
+#[tokio::test]
+async fn corrupt_installed_plugins_does_not_block_settings_cleanup_or_spam_audits() {
+    let home = FakeHome::new();
+    let (_t, state) = new_state();
+    crate::managed_paths::install_plugin_bundle(&bundle()).unwrap();
+    let installed = home.path().join(".claude/plugins/installed_plugins.json");
+    std::fs::write(&installed, "{ not json").unwrap();
+
+    for _ in 0..3 {
+        run(snapshot(&[("plugin", "kit", None)]), &state).await;
+    }
+
+    let settings: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(home.path().join(".claude/settings.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(settings["enabledPlugins"].get("kit@scenery").is_none());
+    assert_eq!(std::fs::read(&installed).unwrap(), b"{ not json");
+    // The corrupt file stays a reported leftover on every pass...
+    assert!(crate::managed_paths::plugin_has_local_state("kit").unwrap());
+    // ...but only the first pass (a state change) is audited.
+    assert_eq!(audits(&state, "plugin_revoked").len(), 1);
+}
+
 // ── No-op snapshot must not write outcomes ───────────────────────────────────
 
 #[test]

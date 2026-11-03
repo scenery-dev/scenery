@@ -276,11 +276,25 @@ pub fn plugin_has_local_state(slug: &str) -> Result<bool> {
                 .map(|_| true)
         })
         .unwrap_or(false);
-    Ok(in_manifest || installed || enabled)
+    // A corrupt user-owned file is never rewritten, so it can never be
+    // cleaned: report it so the revoke keeps WARNing instead of going silent
+    // once it is the only leftover.
+    let corrupt = [
+        plugins_dir(&home).join("installed_plugins.json"),
+        home.join(".claude").join("settings.json"),
+    ]
+    .iter()
+    .any(|p| is_unparseable_json(p));
+    Ok(in_manifest || installed || enabled || corrupt)
 }
 
 /// Remove a governed plugin from the marketplace, cache, and Claude Code
 /// registries. Idempotent.
+///
+/// Every step runs even if an earlier one failed (a corrupt user-owned
+/// `installed_plugins.json` must not stop the `settings.json` cleanup); the
+/// errors are collected and returned together at the end. An existing,
+/// unparseable user-owned file is never rewritten (see [`edit_json_create`]).
 pub fn uninstall_plugin_bundle(slug: &str) -> Result<()> {
     if reconciler_disabled() {
         return Ok(());
@@ -289,6 +303,7 @@ pub fn uninstall_plugin_bundle(slug: &str) -> Result<()> {
     let home = home()?;
     let mp = marketplace_dir(&home);
     let key = plugin_key(slug);
+    let mut errors: Vec<String> = Vec::new();
 
     fs::remove_dir_all(mp.join("plugins").join(slug)).ok();
     fs::remove_dir_all(
@@ -298,28 +313,43 @@ pub fn uninstall_plugin_bundle(slug: &str) -> Result<()> {
             .join(slug),
     )
     .ok();
-    remove_from_marketplace_manifest(&mp, slug)?;
-    edit_json(&bundled_record_path(&mp), |root| {
+    if let Err(e) = remove_from_marketplace_manifest(&mp, slug) {
+        errors.push(format!("{e:#}"));
+    }
+    let bundled = edit_json(&bundled_record_path(&mp), |root| {
         if let Some(obj) = root.as_object_mut() {
             obj.remove(slug);
         }
-    })?;
+    });
+    if let Err(e) = bundled {
+        errors.push(format!("{e:#}"));
+    }
 
     // installed_plugins.json: drop the key.
-    edit_json(&plugins_dir(&home).join("installed_plugins.json"), |root| {
+    let installed = edit_json(&plugins_dir(&home).join("installed_plugins.json"), |root| {
         if let Some(plugins) = root.get_mut("plugins").and_then(Value::as_object_mut) {
             plugins.remove(&key);
         }
-    })?;
+    });
+    if let Err(e) = installed {
+        errors.push(format!("{e:#}"));
+    }
     // settings.json: drop the enabledPlugins entry (leave the marketplace registered).
-    edit_json(&home.join(".claude").join("settings.json"), |root| {
+    let settings = edit_json(&home.join(".claude").join("settings.json"), |root| {
         if let Some(enabled) = root
             .get_mut("enabledPlugins")
             .and_then(Value::as_object_mut)
         {
             enabled.remove(&key);
         }
-    })?;
+    });
+    if let Err(e) = settings {
+        errors.push(format!("{e:#}"));
+    }
+
+    if !errors.is_empty() {
+        anyhow::bail!("plugin '{slug}' teardown incomplete: {}", errors.join("; "));
+    }
 
     info!(
         slug,
@@ -746,6 +776,13 @@ fn is_user_owned_json(path: &Path) -> bool {
         path.file_name().and_then(|n| n.to_str()),
         Some("settings.json" | "installed_plugins.json" | "known_marketplaces.json")
     )
+}
+
+/// True when `path` exists, is non-blank and is not valid JSON.
+fn is_unparseable_json(path: &Path) -> bool {
+    fs::read_to_string(path)
+        .map(|t| !t.trim().is_empty() && serde_json::from_str::<Value>(&t).is_err())
+        .unwrap_or(false)
 }
 
 fn read_json(path: &Path) -> Option<Value> {
