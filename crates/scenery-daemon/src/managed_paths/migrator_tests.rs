@@ -168,6 +168,113 @@ async fn migrate_item_marks_adopted_skill_as_managed() {
     );
 }
 
+// ── Revoked artifacts are left for the reconciler ───────────────────────────
+
+#[tokio::test]
+async fn migrate_item_skips_a_revoked_skill_without_backup_marker_or_upload() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (state, _guard) = temp_state();
+    scenery_core::revocation::upsert_revocation(&state, "skill", "revoked-one", None).unwrap();
+    let item = skill_item("revoked-one", tmp.path());
+    let backup_root = tmp.path().join("backup");
+
+    let client = reqwest::Client::new();
+    let migrated = migrate_item(&item, &backup_root, &state, "http://unused", &client)
+        .await
+        .unwrap();
+
+    assert!(!migrated, "a revoked skill must not be adopted");
+    // The backup, the backend POST and the marker all come after the gate.
+    assert!(!backup_root.exists(), "nothing may be backed up");
+    assert!(!item
+        .source_path
+        .join(scenery_mcp::ownership::MANAGED_MARKER_FILENAME)
+        .exists());
+    assert_eq!(row_count(&state), 0, "no managed_path_markers row");
+    // The `managed_path_migrated` audit event is the extra event a restart
+    // used to upload next to the revoke's `repeat_pass` one.
+    let conn = rusqlite::Connection::open(&state.db_path).unwrap();
+    let audits: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM audit_events WHERE event_type = 'managed_path_migrated'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(audits, 0);
+}
+
+#[tokio::test]
+async fn migrate_item_skips_a_skill_revoked_under_its_registry_id() {
+    // The local folder differs from the registry name the revocation names.
+    let tmp = tempfile::tempdir().unwrap();
+    let (state, _guard) = temp_state();
+    state
+        .record_skill_local_name("registry-name", "local-folder")
+        .unwrap();
+    scenery_core::revocation::upsert_revocation(&state, "skill", "registry-name", None).unwrap();
+    let item = skill_item("local-folder", tmp.path());
+
+    let client = reqwest::Client::new();
+    let migrated = migrate_item(
+        &item,
+        &tmp.path().join("backup"),
+        &state,
+        "http://unused",
+        &client,
+    )
+    .await
+    .unwrap();
+    assert!(!migrated);
+    assert_eq!(row_count(&state), 0);
+}
+
+#[tokio::test]
+async fn migrate_item_skips_a_revoked_plugin() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (state, _guard) = temp_state();
+    scenery_core::revocation::upsert_revocation(&state, "plugin", "bad-plugin", None).unwrap();
+    let mut item = skill_item("bad-plugin", tmp.path());
+    item.kind = ItemKind::Plugin;
+
+    let client = reqwest::Client::new();
+    let migrated = migrate_item(
+        &item,
+        &tmp.path().join("backup"),
+        &state,
+        "http://unused",
+        &client,
+    )
+    .await
+    .unwrap();
+    assert!(!migrated);
+    assert_eq!(row_count(&state), 0);
+}
+
+#[tokio::test]
+async fn migrate_item_still_adopts_when_only_another_artifact_or_version_is_revoked() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (state, _guard) = temp_state();
+    // Other skill revoked; and a version-scoped revoke of this one (the
+    // migration publishes its own new version, so it is not blocked).
+    scenery_core::revocation::upsert_revocation(&state, "skill", "someone-else", None).unwrap();
+    scenery_core::revocation::upsert_revocation(&state, "skill", "fine-skill", Some("9.9.9"))
+        .unwrap();
+    let item = skill_item("fine-skill", tmp.path());
+
+    let client = reqwest::Client::new();
+    let migrated = migrate_item(
+        &item,
+        &tmp.path().join("backup"),
+        &state,
+        "http://unused",
+        &client,
+    )
+    .await
+    .unwrap();
+    assert!(migrated);
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     hex::encode(Sha256::digest(bytes))

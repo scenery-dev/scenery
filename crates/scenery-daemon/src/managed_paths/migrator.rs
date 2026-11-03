@@ -164,6 +164,21 @@ pub async fn migrate_item(
         return Ok(false);
     }
 
+    // ── 0.2 Never adopt an artifact the org has revoked ───────────────────────
+    // Adopting uploads the SKILL.md, compiles and publishes it as a new
+    // owner-private registry artifact (and queues an install row), so a
+    // revoked skill's leftover dir must never get here. Skip it untouched —
+    // no backup, no POST, no marker: the reconciler's revoke pass removes it.
+    // A failed cache read is an error (retried next start), never a pass.
+    if is_revoked_locally(state, item)? {
+        info!(
+            slug = %item.slug,
+            kind = %item.kind,
+            "managed_paths: skipping revoked artifact (left for the revoke pass)"
+        );
+        return Ok(false);
+    }
+
     // ── 0.5 / 1. Never re-adopt content Scenery already tracks ─────────────
     // Ownership comes from `managed_path_markers` alone (F13). The
     // `.scenery-managed.json` sidecar is attacker-controllable — any skill
@@ -502,6 +517,36 @@ async fn post_migrate(
     let installation_id = first.map(|m| m.installation_id);
 
     Ok(installation_id)
+}
+
+/// Is `item` covered by a whole-artifact revocation in the local cache?
+///
+/// Skills match by registry name or by the local folder the registry name is
+/// recorded under; plugins by slug. A version-scoped revocation does not
+/// apply: adoption publishes a fresh version of its own. MCP entries never
+/// match — a revocation names an MCP server by UUID, which a `mcpServers`
+/// key cannot be mapped to.
+fn is_revoked_locally(state: &AppState, item: &MigrationItem) -> Result<bool> {
+    let artifact_type = match item.kind {
+        ItemKind::Skill => "skill",
+        ItemKind::Plugin => "plugin",
+        ItemKind::Mcp => return Ok(false),
+    };
+    let entries = scenery_core::revocation::list_all(state)
+        .context("migrator: failed to read the revocation cache")?;
+    for e in entries {
+        let whole = e.version.as_deref().map_or(true, |v| v.trim().is_empty());
+        if e.artifact_type != artifact_type || !whole {
+            continue;
+        }
+        if e.artifact_key == item.slug
+            || (item.kind == ItemKind::Skill
+                && state.skill_local_name(&e.artifact_key) == item.slug)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Whether `item` is already tracked in `managed_path_markers` (path-keyed,
