@@ -491,6 +491,56 @@ async fn mcp_redelivery_with_nothing_left_is_silent() {
     assert_eq!(audits(&state, "mcp_server_revoked").len(), 1);
 }
 
+fn mcp_marker_rows(state: &AppState) -> Vec<String> {
+    let conn = Connection::open(&state.db_path).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT slug FROM managed_path_markers WHERE kind = 'mcp' ORDER BY slug")
+        .unwrap();
+    stmt.query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn revoke_removes_scenery_owned_entry_even_when_the_row_is_gone() {
+    let home = FakeHome::new();
+    let (_t, state) = new_state();
+    let pusher = ManagedPathsPusher::new(&state);
+    // A leftover Scenery-pushed entry whose mcp_installations row is gone.
+    pusher.push_mcp("github-mcp", None, false).unwrap();
+    // A live install elsewhere (has a row), and entries Scenery does not own.
+    let mut live = mcp_row("live-server-id");
+    live.mcp_server_name = "Live One".into();
+    state.upsert_mcp_install(&live).unwrap();
+    pusher.push_mcp("live-one", None, false).unwrap();
+    // A pushed entry the user has since replaced with their own config.
+    pusher.push_mcp("user-edited", None, false).unwrap();
+    let claude_json = home.path().join(".claude.json");
+    let mut cfg: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&claude_json).unwrap()).unwrap();
+    cfg["mcpServers"]["user-edited"] = serde_json::json!({"command": "my-own-thing"});
+    cfg["mcpServers"]["someone-elses"] = serde_json::json!({"command": "x"});
+    std::fs::write(&claude_json, cfg.to_string()).unwrap();
+
+    let gone = uuid::Uuid::new_v4().to_string();
+    run(revoke_event("mcp_server", &gone, None), &state).await;
+
+    let cfg: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&claude_json).unwrap()).unwrap();
+    let servers = &cfg["mcpServers"];
+    assert!(
+        servers.get("github-mcp").is_none(),
+        "orphaned entry must go"
+    );
+    assert!(servers.get("live-one").is_some(), "live install untouched");
+    assert_eq!(servers["user-edited"]["command"], "my-own-thing");
+    assert!(servers.get("someone-elses").is_some());
+    // The orphan's marker row is gone; the live one's stays.
+    assert!(!mcp_marker_rows(&state).contains(&"github-mcp".to_string()));
+    assert!(mcp_marker_rows(&state).contains(&"live-one".to_string()));
+}
+
 // ── Plugin revoke: redelivery must not churn the user's files ─────────────────
 
 fn bundle() -> PluginBundle {
