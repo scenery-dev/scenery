@@ -97,6 +97,27 @@ pub async fn handle_discovery_adopted(
         return Ok(());
     }
 
+    // Revoke overrides adopt: a revoked skill is never uploaded, published or
+    // installed. Fail closed — an unreadable revocation cache blocks too.
+    let revoked = super::migrator::skill_slug_revoked(&state, &slug).unwrap_or_else(|e| {
+        warn!(slug, error = %e, "adopt-publish: revocation check failed; refusing adopt");
+        true
+    });
+    if revoked {
+        warn!(
+            slug,
+            "adopt-publish: refused — skill is revoked (nothing uploaded)"
+        );
+        scenery_core::audit::write_audit_event_direct(
+            &state.db_path,
+            &scenery_core::audit::AuditEvent {
+                event_type: "adopt_publish_blocked".to_string(),
+                payload: serde_json::json!({ "slug": slug, "reason": "revoked" }),
+            },
+        );
+        return Ok(());
+    }
+
     // Record before uploading so a crash mid-flight (or a backend that never
     // resolves to `published`) still leaves enough state for the
     // deferred-approval convergence path (a later normal `Install` SSE event)
@@ -120,13 +141,18 @@ pub async fn handle_discovery_adopted(
         "adopt-publish: uploading discovered skill"
     );
 
-    let registry = RegistryClient::new(registry_url.clone()).with_auth(token);
     let slug_for_upload = slug.clone();
-    let outcome =
-        tokio::task::spawn_blocking(move || registry.adopt_publish(gz_buf, &slug_for_upload))
-            .await
-            .context("adopt-publish: upload task panicked")?
-            .with_context(|| format!("adopt-publish: upload failed for slug={slug}"))?;
+    let url_for_upload = registry_url.clone();
+    // The blocking client must be built AND dropped on the blocking thread:
+    // building it on an async worker panics ("Cannot drop a runtime ...").
+    let outcome = tokio::task::spawn_blocking(move || {
+        RegistryClient::new(url_for_upload)
+            .with_auth(token)
+            .adopt_publish(gz_buf, &slug_for_upload)
+    })
+    .await
+    .context("adopt-publish: upload task panicked")?
+    .with_context(|| format!("adopt-publish: upload failed for slug={slug}"))?;
 
     match outcome {
         AdoptPublishOutcome::Published(resp) => {
@@ -187,6 +213,17 @@ pub async fn handle_discovery_adopted(
                 version = resp.version,
                 "adopt-publish: queued for IT review — local copy retained; \
                  takeover deferred until the version is approved and installed"
+            );
+        }
+        AdoptPublishOutcome::Revoked { message } => {
+            // Terminal (no retry): drop the pending takeover so a later
+            // install can never remove the user's source dir.
+            if let Err(e) = state.clear_pending_adopt_takeover(&slug) {
+                warn!(slug, error = %e, "adopt-publish: failed to clear pending takeover");
+            }
+            warn!(
+                slug,
+                message, "adopt-publish: backend refused — skill is revoked; local copy retained"
             );
         }
         AdoptPublishOutcome::Rejected(rej) => {

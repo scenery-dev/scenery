@@ -541,6 +541,32 @@ async fn revoke_removes_scenery_owned_entry_even_when_the_row_is_gone() {
     assert!(mcp_marker_rows(&state).contains(&"live-one".to_string()));
 }
 
+#[tokio::test]
+async fn install_verified_version_refuses_a_revoked_skill() {
+    let _home = FakeHome::new();
+    let (_t, state) = new_state();
+    scenery_core::revocation::upsert_revocation(&state, "skill", "whole", None).unwrap();
+    scenery_core::revocation::upsert_revocation(&state, "skill", "scoped", Some("1.0.0")).unwrap();
+
+    for (id, ver) in [("whole", "2.0.0"), ("scoped", "1.0.0")] {
+        let err = super::install_verified_version(
+            uuid::Uuid::new_v4(),
+            id,
+            ver,
+            &state,
+            "http://127.0.0.1:1",
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("revoked"), "{id}@{ver}: {err}");
+        assert!(
+            !state.root_dir.join("skills").join(id).exists(),
+            "nothing may be installed"
+        );
+    }
+}
+
 // ── Plugin revoke: redelivery must not churn the user's files ─────────────────
 
 fn bundle() -> PluginBundle {

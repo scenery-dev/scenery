@@ -275,6 +275,38 @@ async fn migrate_item_still_adopts_when_only_another_artifact_or_version_is_revo
     assert!(migrated);
 }
 
+#[tokio::test]
+async fn migrate_item_treats_backend_403_artifact_revoked_as_terminal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (state, _guard) = temp_state();
+    let mut server = mockito::Server::new_async().await;
+    scenery_core::auth::save_tokens(&state, &server.url(), "tok", "rtok").unwrap();
+    let m = server
+        .mock("POST", "/portal/managed-paths/migrate")
+        .with_status(403)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"detail":{"code":"artifact_revoked","message":"revoked"}}"#)
+        .expect(1)
+        .create_async()
+        .await;
+    let item = skill_item("late", tmp.path());
+
+    let client = reqwest::Client::new();
+    let migrated = migrate_item(
+        &item,
+        &tmp.path().join("backup"),
+        &state,
+        &server.url(),
+        &client,
+    )
+    .await
+    .unwrap();
+
+    assert!(!migrated, "not an error and not adopted");
+    m.assert_async().await;
+    assert_eq!(row_count(&state), 0, "no marker written");
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     hex::encode(Sha256::digest(bytes))

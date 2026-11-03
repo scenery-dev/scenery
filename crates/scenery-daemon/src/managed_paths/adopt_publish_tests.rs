@@ -181,3 +181,81 @@ async fn handle_discovery_adopted_noop_under_killswitch() {
     );
     assert!(source_dir.exists());
 }
+
+/// A revoked skill is refused before anything is recorded or uploaded: the
+/// registry URL is unreachable and there is no token, so reaching the upload
+/// would be an `Err`.
+#[tokio::test]
+async fn handle_discovery_adopted_refuses_a_revoked_skill() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let root = tempfile::tempdir().unwrap();
+    let state = make_state(&root);
+    scenery_core::revocation::upsert_revocation(&state, "skill", "bad-skill", None).unwrap();
+    let source = root.path().join("bad-skill");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("SKILL.md"), "---\nname: bad-skill\n---\n").unwrap();
+
+    let result = handle_discovery_adopted(
+        Arc::clone(&state),
+        "http://127.0.0.1:1".to_string(),
+        "bad-skill".to_string(),
+        "skill".to_string(),
+        source.to_string_lossy().to_string(),
+    )
+    .await;
+
+    assert!(result.is_ok(), "refusal is clean, not an error: {result:?}");
+    assert!(source.join("SKILL.md").exists(), "source untouched");
+    assert!(state
+        .pending_adopt_takeover_source("bad-skill")
+        .unwrap()
+        .is_none());
+    let conn = rusqlite::Connection::open(&state.db_path).unwrap();
+    let n: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM audit_events WHERE event_type = 'adopt_publish_blocked'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 1);
+}
+
+/// The backend's 403 `artifact_revoked` is terminal: one request, no
+/// takeover record left behind, local copy kept.
+#[tokio::test(flavor = "multi_thread")]
+async fn handle_discovery_adopted_handles_backend_403_artifact_revoked() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let root = tempfile::tempdir().unwrap();
+    let state = make_state(&root);
+    let mut server = mockito::Server::new_async().await;
+    scenery_core::auth::save_tokens(&state, &server.url(), "tok", "rtok").unwrap();
+    let m = server
+        .mock("POST", "/runner/skills/adopt-publish")
+        .with_status(403)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"detail":{"code":"artifact_revoked","message":"revoked"}}"#)
+        .expect(1)
+        .create_async()
+        .await;
+    let source = root.path().join("late-revoked");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(source.join("SKILL.md"), "---\nname: late-revoked\n---\n").unwrap();
+
+    let result = handle_discovery_adopted(
+        Arc::clone(&state),
+        server.url(),
+        "late-revoked".to_string(),
+        "skill".to_string(),
+        source.to_string_lossy().to_string(),
+    )
+    .await;
+
+    assert!(result.is_ok(), "{result:?}");
+    m.assert_async().await;
+    assert!(source.join("SKILL.md").exists());
+    assert!(state
+        .pending_adopt_takeover_source("late-revoked")
+        .unwrap()
+        .is_none());
+}
