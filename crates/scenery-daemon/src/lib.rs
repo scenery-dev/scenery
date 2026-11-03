@@ -1069,14 +1069,10 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     let final_audit = Arc::clone(&audit_buffer);
     let final_registry = Arc::clone(&registry);
     let shutdown_state = state.clone();
-    let _ = tokio::task::spawn_blocking(move || {
-        if let Err(e) = final_audit_flush(&final_registry, &final_audit, &shutdown_state) {
-            info!(
-                error = format!("{e:#}"),
-                "final audit flush on shutdown did not complete; pending events stay in the local store and retry on next start"
-            );
-        }
-    })
+    run_final_audit_flush(
+        move || final_audit_flush(&final_registry, &final_audit, &shutdown_state),
+        FINAL_AUDIT_FLUSH_TIMEOUT,
+    )
     .await;
 
     backend.on_shutdown().await;
@@ -2127,6 +2123,61 @@ fn install_registry_credentials(state_view: &AppState, registry: &RegistryClient
         Err(e) => {
             warn!(error = %e, "sync: failed to load device_id for X-Device-ID audit header");
         }
+    }
+}
+
+/// Upper bound for the shutdown audit flush. launchd gives a daemon 20 s
+/// (`ExitTimeOut`) before SIGKILL, and the rest of shutdown still has to run.
+const FINAL_AUDIT_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Is `e` a plain network failure (cannot reach the registry, timeout, TLS
+/// connect) as opposed to something that will not fix itself on retry, like a
+/// 4xx auth rejection, a parse error or a local DB error?
+fn is_network_failure(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<reqwest::Error>()
+            .is_some_and(|r| r.is_timeout() || r.is_connect() || r.is_request())
+    })
+}
+
+/// Run `flush` with a hard `timeout`, logging how it went. Never fails.
+///
+/// The flush runs on a detached OS thread, not the tokio blocking pool: the
+/// registry HTTP client's own timeout is 30 s, and a blocking-pool task still
+/// running at exit would hold the runtime drop past launchd's 20 s limit. A
+/// detached thread dies with the process.
+///
+/// Events that are not uploaded stay in `audit_events` (`uploaded = 0`) and
+/// are retried by the next start's first tick.
+async fn run_final_audit_flush<F>(flush: F, timeout: std::time::Duration)
+where
+    F: FnOnce() -> Result<usize> + Send + 'static,
+{
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let spawned = std::thread::Builder::new()
+        .name("final-audit-flush".into())
+        .spawn(move || {
+            let _ = tx.send(flush());
+        });
+    if let Err(e) = spawned {
+        warn!(error = %e, "could not start the shutdown audit flush; pending events stay in the local store and retry on next start");
+        return;
+    }
+    match tokio::time::timeout(timeout, rx).await {
+        Ok(Ok(Ok(n))) => info!(uploaded = n, "final audit flush on shutdown complete"),
+        Ok(Ok(Err(e))) if is_network_failure(&e) => info!(
+            error = format!("{e:#}"),
+            "final audit flush on shutdown could not reach the registry; pending events stay in the local store and retry on next start"
+        ),
+        Ok(Ok(Err(e))) => warn!(
+            error = format!("{e:#}"),
+            "final audit flush on shutdown failed (not a network error); pending events stay in the local store and retry on next start"
+        ),
+        Ok(Err(_)) => warn!("final audit flush thread ended without a result; pending events stay in the local store and retry on next start"),
+        Err(_) => info!(
+            timeout_secs = timeout.as_secs(),
+            "final audit flush on shutdown timed out; pending events stay in the local store and retry on next start"
+        ),
     }
 }
 
