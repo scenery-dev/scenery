@@ -459,7 +459,7 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
             Ok(r) if r.is_noop() => {}
             Ok(r) => info!(
                 sidecars = r.sidecars_removed,
-                native_dirs = r.native_dirs_cleaned,
+                native_dirs_with_state_removed = r.native_dirs_with_state_removed,
                 marker_rows = r.marker_rows_removed,
                 journal_entries = r.journal_entries_removed,
                 "managed_paths: native-marketplace cleanup complete"
