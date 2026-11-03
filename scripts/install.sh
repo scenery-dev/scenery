@@ -317,7 +317,11 @@ version_at_least() {
 # terminal is sitting right there controlling the process. Opening
 # /dev/tty directly is the only reliable check.
 terminal_available() {
-    : < /dev/tty 2>/dev/null
+    # The redirect failure message is emitted by the shell itself, before a
+    # trailing `2>/dev/null` on the same command takes effect, and a failed
+    # redirect on the special builtin `:` can abort dash. Run it in a
+    # subshell whose stderr is silenced from the outside.
+    ( : < /dev/tty ) 2>/dev/null
 }
 
 if [ "${NO_SETUP}" = "0" ]; then
@@ -378,9 +382,7 @@ if [ "${NO_SETUP}" = "0" ]; then
             else
                 # No terminal (CI/MDM without SCN_PAIR_CODE) — best-effort
                 # only, never blocks the install.
-                log "To finish setup, pair this device: find the code on the portal's device"
-                log "setup screen (open the catalog page), then run:"
-                log "  scenery auth pair <code>"
+                log "No terminal available — pair later: 'scenery auth pair <code>' (or set SCN_PAIR_CODE)."
             fi
         fi
     fi
