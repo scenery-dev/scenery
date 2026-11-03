@@ -1933,13 +1933,16 @@ async fn install_via_desired_state(
                 // its own environment and home; the CLI's may differ under
                 // systemd/launchd), and surface a refusal as soon as it is
                 // known rather than timing out.
+                // The daemon keys the outcome by the id on the install event,
+                // which is the local slug when it differs from the registry id.
+                let local_slug = state.skill_local_name(skill_id);
                 let outcome = poll_until(
                     || {
-                        scenery_daemon::managed_paths::projection_outcome::read_since(
-                            state,
-                            skill_id,
-                            install_requested_at,
-                        )
+                        use scenery_daemon::managed_paths::projection_outcome::read_since;
+                        match read_since(state, &local_slug, install_requested_at)? {
+                            Some(o) => Ok(Some(o)),
+                            None => read_since(state, skill_id, install_requested_at),
+                        }
                     },
                     std::time::Duration::from_secs(NATIVE_PROJECTION_TIMEOUT_SECS),
                     std::time::Duration::from_millis(NATIVE_PROJECTION_POLL_INTERVAL_MS),

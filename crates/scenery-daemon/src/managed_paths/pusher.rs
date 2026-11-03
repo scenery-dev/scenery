@@ -806,6 +806,22 @@ pub fn canonical_projection_present(slug: &str) -> Result<bool> {
     Ok(canonical_projection_present_in(&resolve_home()?, slug))
 }
 
+/// Is the full projection of `slug` intact — canonical dir + marker AND the
+/// Claude link? Always `true` when the filesystem reconciler is disabled.
+pub fn projection_intact(slug: &str) -> Result<bool> {
+    if reconciler_disabled() {
+        return Ok(true);
+    }
+    let home = resolve_home()?;
+    Ok(canonical_projection_present_in(&home, slug)
+        && home
+            .join(".claude")
+            .join("skills")
+            .join(slug)
+            .symlink_metadata()
+            .is_ok())
+}
+
 fn canonical_projection_present_in(home: &Path, slug: &str) -> bool {
     let dir = home.join(".agents").join("skills").join(slug);
     dir.join("SKILL.md").exists() && dir.join(ownership::MANAGED_MARKER_FILENAME).exists()
