@@ -77,6 +77,27 @@ pub struct RevocationEntry {
     pub version: Option<String>,
 }
 
+/// Every revocation currently cached locally (versions normalized to `""`
+/// for "whole artifact").
+pub fn list_all(state: &AppState) -> Result<Vec<RevocationEntry>> {
+    let conn =
+        Connection::open(&state.db_path).context("failed to open state DB for revoke list")?;
+    let mut stmt = conn
+        .prepare("SELECT artifact_type, artifact_key, version FROM artifact_revocations")
+        .context("failed to prepare artifact_revocations list")?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(RevocationEntry {
+                artifact_type: r.get(0)?,
+                artifact_key: r.get(1)?,
+                version: Some(r.get::<_, String>(2)?),
+            })
+        })
+        .context("failed to list artifact_revocations")?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to read artifact_revocations rows")
+}
+
 /// Replace the entire local revocation cache with `entries` in one
 /// transaction (delete-all then insert-all).
 ///
