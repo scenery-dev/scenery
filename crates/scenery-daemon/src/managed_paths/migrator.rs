@@ -231,6 +231,16 @@ pub async fn migrate_item(
                     message = %msg,
                     "managed_paths: backend refused to adopt a revoked artifact — leaving it for the revoke pass"
                 );
+                // Drop the backup copy made above: nothing was adopted, so
+                // there is nothing to roll back to.
+                let backup_dir = match item.kind {
+                    ItemKind::Skill => Some(backup_root.join("skills").join(&item.slug)),
+                    ItemKind::Plugin => Some(backup_root.join("plugins").join(&item.slug)),
+                    ItemKind::Mcp => None,
+                };
+                if let Some(dir) = backup_dir {
+                    fs::remove_dir_all(dir).ok();
+                }
                 return Ok(false);
             }
             warn!(slug = %item.slug, error = %e, "managed_paths: backend migrate call failed; will retry next start");
@@ -529,11 +539,28 @@ async fn post_migrate(
         .await
         .context("managed_paths: failed to deserialise migrate response")?;
 
-    if !migrate_resp.errors.is_empty() {
-        warn!(
-            slug = %item.slug,
-            errors = ?migrate_resp.errors,
-            "managed_paths: backend reported errors for item"
+    // A per-item error is distinct from "backend skipped" (`Ok(None)`): it
+    // must stop the backup/marker/audit steps. The request is a single-item
+    // batch, so an error naming another slug is ignored and one naming none
+    // is ours. HTTP 200 + `errors` is how the backend reports a revoked item.
+    for err in &migrate_resp.errors {
+        let names_other = err
+            .get("slug")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s != item.slug);
+        if names_other {
+            continue;
+        }
+        let message = err
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown error");
+        if message.starts_with("artifact_revoked") {
+            return Err(anyhow::Error::new(ArtifactRevoked(message.to_string())));
+        }
+        anyhow::bail!(
+            "managed_paths: backend reported an error for {}: {message}",
+            item.slug
         );
     }
 

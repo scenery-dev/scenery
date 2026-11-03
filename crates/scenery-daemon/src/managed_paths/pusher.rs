@@ -538,18 +538,29 @@ impl ManagedPathsPusher {
     /// whose entry the user has since replaced or removed is dropped without
     /// touching the entry. Anything without a marker row is never touched.
     ///
-    /// Serialization (verified in `spawn_revoke`/`spawn_install_mcp`): events
-    /// lock per artifact key, so this sweep is NOT serialized against another
-    /// server's install, and taking every lock is not feasible. It is safe
-    /// without one: the `~/.claude.json` edit and the shape comparison happen
-    /// under `modify_claude_json`'s file lock, and an install that races the
-    /// sweep at worst has its entry + marker removed and then rewritten by its
-    /// own `push_mcp` (self-healing).
+    /// Not serialized against another server's install (events lock per
+    /// artifact key; taking every lock is not feasible), so the race is
+    /// closed by re-checking, per slug, for a live row at the point of each
+    /// destructive step: inside `modify_claude_json`'s file lock right before
+    /// the entry is removed, and in one `BEGIN IMMEDIATE` transaction with the
+    /// marker delete. An install upserts its row BEFORE it writes the entry
+    /// or marker, so a row that appears after the initial read is seen by
+    /// the re-check and the slug is skipped (never removed, never re-pushed
+    /// by anyone else). A row that has not been upserted yet cannot have
+    /// pushed anything, so there is nothing fresh to lose.
     ///
-    /// Markers are read BEFORE the live rows: an install upserts its row
-    /// first and writes its marker after, so a concurrent install can never
-    /// look orphaned.
+    /// Markers are read BEFORE the live rows, which covers an install that
+    /// finished entirely between the two reads.
     pub fn remove_orphaned_mcp_entries(&self) -> Result<Vec<String>> {
+        self.sweep_orphaned_mcp_entries(&|| {})
+    }
+
+    /// [`Self::remove_orphaned_mcp_entries`] with a hook that runs right
+    /// after the initial live-row read (test seam for the reinstall race).
+    pub(crate) fn sweep_orphaned_mcp_entries(
+        &self,
+        after_live_read: &dyn Fn(),
+    ) -> Result<Vec<String>> {
         if reconciler_disabled() {
             return Ok(Vec::new());
         }
@@ -579,6 +590,7 @@ impl ManagedPathsPusher {
                 .context("pusher: failed to read mcp_installations")?;
             names.iter().map(|n| crate::mcp_server_slug(n)).collect()
         };
+        after_live_read();
 
         let mut removed = Vec::new();
         for (path, slug) in markers {
@@ -588,7 +600,18 @@ impl ManagedPathsPusher {
             let expected = scenery_mcp_entry(&slug);
             let mut entry_removed = false;
             if claude_json.exists() {
+                let mut recheck_err: Option<anyhow::Error> = None;
                 modify_claude_json(&claude_json, |root| {
+                    // Under the file lock: a row now present means a
+                    // reinstall landed after our read; leave it alone.
+                    match self.slug_has_live_row(&slug) {
+                        Ok(true) => return,
+                        Ok(false) => {}
+                        Err(e) => {
+                            recheck_err = Some(e);
+                            return;
+                        }
+                    }
                     if let Some(Value::Object(ref mut map)) = root.get_mut("mcpServers") {
                         if map.get(&slug) == Some(&expected) {
                             map.remove(&slug);
@@ -599,9 +622,12 @@ impl ManagedPathsPusher {
                 .with_context(|| {
                     format!("pusher: failed to modify ~/.claude.json for orphaned mcp slug={slug}")
                 })?;
+                if let Some(e) = recheck_err {
+                    return Err(e);
+                }
             }
             let marker_removed = self
-                .delete_db_marker(&path)
+                .delete_orphan_marker_if_no_row(&path, &slug)
                 .context("pusher: failed to delete orphaned managed_path_markers for mcp")?;
             if entry_removed {
                 info!(
@@ -614,6 +640,36 @@ impl ManagedPathsPusher {
             }
         }
         Ok(removed)
+    }
+
+    /// Does any `mcp_installations` row currently map to `slug`?
+    fn slug_has_live_row(&self, slug: &str) -> Result<bool> {
+        let conn = Connection::open(&self.db_path)
+            .context("pusher: failed to open state DB for live-row recheck")?;
+        slug_has_row(&conn, slug)
+    }
+
+    /// Delete the marker unless a row for `slug` exists, atomically: the
+    /// `IMMEDIATE` transaction blocks a concurrent install's row upsert, so
+    /// the check and the delete cannot straddle it.
+    fn delete_orphan_marker_if_no_row(&self, path: &str, slug: &str) -> Result<bool> {
+        let mut conn = Connection::open(&self.db_path)
+            .context("pusher: failed to open state DB for marker deletion")?;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .context("pusher: failed to begin marker deletion transaction")?;
+        if slug_has_row(&tx, slug)? {
+            return Ok(false);
+        }
+        let n = tx
+            .execute(
+                "DELETE FROM managed_path_markers WHERE path = ?1",
+                rusqlite::params![path],
+            )
+            .context("pusher: failed to delete managed_path_markers row")?;
+        tx.commit()
+            .context("pusher: failed to commit marker deletion")?;
+        Ok(n > 0)
     }
 
     // ── SQLite helpers ────────────────────────────────────────────────────────
@@ -944,6 +1000,18 @@ fn projection_state_in(home: &Path, slug: &str) -> ProjectionState {
 fn canonical_projection_present_in(home: &Path, slug: &str) -> bool {
     let dir = home.join(".agents").join("skills").join(slug);
     dir.join("SKILL.md").exists() && dir.join(ownership::MANAGED_MARKER_FILENAME).exists()
+}
+
+fn slug_has_row(conn: &Connection, slug: &str) -> Result<bool> {
+    let mut stmt = conn
+        .prepare("SELECT mcp_server_name FROM mcp_installations")
+        .context("pusher: failed to prepare mcp_installations lookup")?;
+    let names = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .context("pusher: failed to query mcp_installations")?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("pusher: failed to read mcp_installations")?;
+    Ok(names.iter().any(|n| crate::mcp_server_slug(n) == slug))
 }
 
 /// The `mcpServers.<slug>` entry Scenery writes for a managed MCP server.

@@ -307,6 +307,84 @@ async fn migrate_item_treats_backend_403_artifact_revoked_as_terminal() {
     assert_eq!(row_count(&state), 0, "no marker written");
 }
 
+/// Contract: the backend reports a revoked item as HTTP 200 with the item in
+/// `errors` and `migrated: []` (backend b039687) — never as a 403.
+#[tokio::test]
+async fn migrate_item_treats_200_with_artifact_revoked_error_as_terminal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (state, _guard) = temp_state();
+    let mut server = mockito::Server::new_async().await;
+    scenery_core::auth::save_tokens(&state, &server.url(), "tok", "rtok").unwrap();
+    let m = server
+        .mock("POST", "/portal/managed-paths/migrate")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"migrated":[],"errors":[{"kind":"skill","slug":"late","message":"artifact_revoked: This artifact has been revoked by your organization"}]}"#,
+        )
+        .expect(1)
+        .create_async()
+        .await;
+    let item = skill_item("late", tmp.path());
+    let backup_root = tmp.path().join("backup");
+
+    let client = reqwest::Client::new();
+    let migrated = migrate_item(&item, &backup_root, &state, &server.url(), &client)
+        .await
+        .unwrap();
+
+    assert!(!migrated);
+    m.assert_async().await;
+    assert_eq!(row_count(&state), 0, "no marker");
+    assert!(
+        !backup_root.join("skills").join("late").exists(),
+        "no backup left"
+    );
+    assert!(!item
+        .source_path
+        .join(scenery_mcp::ownership::MANAGED_MARKER_FILENAME)
+        .exists());
+    let conn = rusqlite::Connection::open(&state.db_path).unwrap();
+    let n: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM audit_events WHERE event_type = 'managed_path_migrated'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 0, "no audit event");
+}
+
+/// Any other per-item error stops the marker too (and is retried next start).
+#[tokio::test]
+async fn migrate_item_stops_on_any_per_item_backend_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (state, _guard) = temp_state();
+    let mut server = mockito::Server::new_async().await;
+    scenery_core::auth::save_tokens(&state, &server.url(), "tok", "rtok").unwrap();
+    let _m = server
+        .mock("POST", "/portal/managed-paths/migrate")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"migrated":[],"errors":[{"kind":"skill","slug":"oops","message":"compile failed"}]}"#)
+        .create_async()
+        .await;
+    let item = skill_item("oops", tmp.path());
+
+    let client = reqwest::Client::new();
+    let result = migrate_item(
+        &item,
+        &tmp.path().join("backup"),
+        &state,
+        &server.url(),
+        &client,
+    )
+    .await;
+
+    assert!(result.is_err());
+    assert_eq!(row_count(&state), 0);
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     hex::encode(Sha256::digest(bytes))
