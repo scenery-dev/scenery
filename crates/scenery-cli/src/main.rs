@@ -1845,21 +1845,18 @@ async fn install_via_desired_state(
     // install of the same skill.
     let install_requested_at = chrono::Utc::now() - chrono::Duration::seconds(1);
 
-    // Is this a no-op reinstall (already active at the requested version)? The
-    // daemon will not necessarily re-push then, so no fresh outcome may ever
-    // arrive; the projection is checked directly instead (read-only).
-    let already_installed_same_version = Connection::open(&state.db_path)
+    // The version active BEFORE the request (the daemon may upgrade it the
+    // moment the backend queues the install). Compared against the version
+    // the backend resolves for this install, below.
+    let active_before = Connection::open(&state.db_path).ok().and_then(|conn| {
+        conn.query_row(
+            "SELECT active_version FROM installed_skills \
+             WHERE skill_id = ?1 AND current_status = 'active' AND COALESCE(deactivated, 0) = 0",
+            [skill_id],
+            |row| row.get::<_, String>(0),
+        )
         .ok()
-        .and_then(|conn| {
-            conn.query_row(
-                "SELECT active_version FROM installed_skills \
-                 WHERE skill_id = ?1 AND current_status = 'active' AND COALESCE(deactivated, 0) = 0",
-                [skill_id],
-                |row| row.get::<_, String>(0),
-            )
-            .ok()
-        })
-        .is_some_and(|active| version.map_or(true, |v| v == active));
+    });
 
     eprint!("Requesting install of '{skill_id}' from backend");
 
@@ -1895,12 +1892,22 @@ async fn install_via_desired_state(
     struct InstallationCreatedBody {
         #[serde(default)]
         installation_id: Option<String>,
+        /// The version the backend resolved for this install (the latest when
+        /// no `--version` was given).
+        #[serde(default)]
+        version: Option<String>,
     }
-    let installation_id = resp
-        .json::<InstallationCreatedBody>()
-        .await
-        .ok()
-        .and_then(|b| b.installation_id);
+    let created = resp.json::<InstallationCreatedBody>().await.ok();
+    let target_version = created.as_ref().and_then(|b| b.version.clone());
+    let installation_id = created.and_then(|b| b.installation_id);
+
+    // Is this a no-op reinstall (already active at the version the backend
+    // resolved)? The daemon will not necessarily re-push then, so no fresh
+    // outcome may ever arrive; the projection is checked directly instead
+    // (read-only). With no `--version` the target is the backend's latest, so
+    // an install that is really an upgrade is never mistaken for a no-op.
+    let already_installed_same_version =
+        is_noop_reinstall(active_before.as_deref(), target_version.as_deref());
 
     // Poll SQLite for the reconciler to confirm 'installed' state (max 30 s).
     let db_path = state.db_path.clone();
@@ -2051,6 +2058,13 @@ async fn install_via_desired_state(
             }
         }
     }
+}
+
+/// True only when the version already active is known to equal the version
+/// the backend is installing. An unknown target (unparsable response) or no
+/// active version is never a no-op: the caller takes the poll path.
+fn is_noop_reinstall(active: Option<&str>, target: Option<&str>) -> bool {
+    matches!((active, target), (Some(a), Some(t)) if a == t)
 }
 
 /// How long to wait, after the daemon reports a skill active, for it to finish
