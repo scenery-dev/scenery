@@ -235,8 +235,6 @@ pub fn list_governed_plugins() -> Result<HashMap<String, String>> {
     Ok(out)
 }
 
-/// Remove a governed plugin from the marketplace, cache, and Claude Code
-/// registries. Idempotent.
 /// Is anything of governed plugin `slug` still present locally: its source or
 /// cache dir, its marketplace entry, bundled-skills record, `installed_plugins`
 /// key or `enabledPlugins` key? Read-only, so a redelivered revoke can skip
@@ -281,6 +279,8 @@ pub fn plugin_has_local_state(slug: &str) -> Result<bool> {
     Ok(in_manifest || installed || enabled)
 }
 
+/// Remove a governed plugin from the marketplace, cache, and Claude Code
+/// registries. Idempotent.
 pub fn uninstall_plugin_bundle(slug: &str) -> Result<()> {
     if reconciler_disabled() {
         return Ok(());
@@ -740,6 +740,14 @@ fn ensure_object(root: &mut Value) -> &mut Map<String, Value> {
     root.as_object_mut().expect("just ensured object")
 }
 
+/// Registries that belong to Claude Code / the user, not to Scenery.
+fn is_user_owned_json(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|n| n.to_str()),
+        Some("settings.json" | "installed_plugins.json" | "known_marketplaces.json")
+    )
+}
+
 fn read_json(path: &Path) -> Option<Value> {
     let s = fs::read_to_string(path).ok()?;
     if s.trim().is_empty() {
@@ -775,6 +783,20 @@ fn edit_json_create<F: FnOnce(&mut Value)>(path: &Path, mutate: F) -> Result<()>
     lock.lock_exclusive()
         .with_context(|| format!("plugin_marketplace: lock {lock_path:?}"))?;
 
+    // Files Claude Code or the user own: if one exists but does not parse,
+    // refuse and leave it untouched — overwriting would destroy the user's
+    // data. Only an absent (or blank) file is created. Scenery's own files
+    // (marketplace.json, bundled record) are regenerated if corrupt.
+    if is_user_owned_json(path) {
+        if let Ok(text) = fs::read_to_string(path) {
+            if !text.trim().is_empty() && serde_json::from_str::<Value>(&text).is_err() {
+                anyhow::bail!(
+                    "plugin_marketplace: {} exists but is not valid JSON; leaving it untouched",
+                    path.display()
+                );
+            }
+        }
+    }
     let original = read_json(path);
     let mut root = original
         .clone()
@@ -782,7 +804,7 @@ fn edit_json_create<F: FnOnce(&mut Value)>(path: &Path, mutate: F) -> Result<()>
     mutate(&mut root);
     // A no-op edit must not touch the file: rewriting would reformat the
     // user's JSON and could clobber a concurrent write by Claude Code.
-    // (A missing or unparseable file is still written.)
+    // (An absent or blank file is still created.)
     if original.as_ref() == Some(&root) {
         drop(lock);
         return Ok(());

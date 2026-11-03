@@ -1845,6 +1845,22 @@ async fn install_via_desired_state(
     // install of the same skill.
     let install_requested_at = chrono::Utc::now() - chrono::Duration::seconds(1);
 
+    // Is this a no-op reinstall (already active at the requested version)? The
+    // daemon will not necessarily re-push then, so no fresh outcome may ever
+    // arrive; the projection is checked directly instead (read-only).
+    let already_installed_same_version = Connection::open(&state.db_path)
+        .ok()
+        .and_then(|conn| {
+            conn.query_row(
+                "SELECT active_version FROM installed_skills \
+                 WHERE skill_id = ?1 AND current_status = 'active' AND COALESCE(deactivated, 0) = 0",
+                [skill_id],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+        })
+        .is_some_and(|active| version.map_or(true, |v| v == active));
+
     eprint!("Requesting install of '{skill_id}' from backend");
 
     let client = reqwest::Client::builder()
@@ -1936,18 +1952,38 @@ async fn install_via_desired_state(
                 // The daemon keys the outcome by the id on the install event,
                 // which is the local slug when it differs from the registry id.
                 let local_slug = state.skill_local_name(skill_id);
-                let outcome = poll_until(
-                    || {
-                        use scenery_daemon::managed_paths::projection_outcome::read_since;
-                        match read_since(state, &local_slug, install_requested_at)? {
-                            Some(o) => Ok(Some(o)),
-                            None => read_since(state, skill_id, install_requested_at),
+                let slug_for_direct = local_slug.clone();
+                let direct = if already_installed_same_version {
+                    use scenery_daemon::managed_paths::projection_outcome::ProjectionOutcome;
+                    use scenery_daemon::managed_paths::pusher::{
+                        projection_state, ProjectionState,
+                    };
+                    match projection_state(&slug_for_direct) {
+                        Ok(ProjectionState::Intact) => Some(ProjectionOutcome::Ok),
+                        Ok(ProjectionState::LinkBlocked(path)) => {
+                            Some(ProjectionOutcome::LinkRefused { path })
                         }
-                    },
-                    std::time::Duration::from_secs(NATIVE_PROJECTION_TIMEOUT_SECS),
-                    std::time::Duration::from_millis(NATIVE_PROJECTION_POLL_INTERVAL_MS),
-                )
-                .await?;
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                let outcome = if direct.is_some() {
+                    direct
+                } else {
+                    poll_until(
+                        || {
+                            use scenery_daemon::managed_paths::projection_outcome::read_since;
+                            match read_since(state, &local_slug, install_requested_at)? {
+                                Some(o) => Ok(Some(o)),
+                                None => read_since(state, skill_id, install_requested_at),
+                            }
+                        },
+                        std::time::Duration::from_secs(NATIVE_PROJECTION_TIMEOUT_SECS),
+                        std::time::Duration::from_millis(NATIVE_PROJECTION_POLL_INTERVAL_MS),
+                    )
+                    .await?
+                };
                 let slug = state.skill_local_name(skill_id);
                 let canonical_present =
                     scenery_daemon::managed_paths::pusher::canonical_projection_present(&slug)
