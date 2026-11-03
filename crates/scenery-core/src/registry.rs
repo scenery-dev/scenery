@@ -162,6 +162,27 @@ pub enum AdoptPublishOutcome {
     PendingReview(AdoptPublishResponse),
     /// Strict-mode policy rejected the skill outright (HTTP 422).
     Rejected(AdoptPublishRejection),
+    /// The artifact is revoked (HTTP 403 `artifact_revoked`). Terminal: the
+    /// caller must not retry and must leave the local copy alone.
+    Revoked { message: String },
+}
+
+/// Does an HTTP 403 body carry the backend's `artifact_revoked` code
+/// (`{"detail": {"code": "artifact_revoked", "message": ...}}`)? Returns the
+/// message when it does.
+pub fn artifact_revoked_message(body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let detail = v.get("detail")?;
+    if detail.get("code").and_then(|c| c.as_str()) != Some("artifact_revoked") {
+        return None;
+    }
+    Some(
+        detail
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("artifact revoked by administrator")
+            .to_string(),
+    )
 }
 
 /// Skill detail returned by `GET /portal/skills/{skill_id}`.
@@ -898,6 +919,14 @@ impl RegistryClient {
                 .map(str::to_string)
                 .unwrap_or_else(|| detail.to_string());
             anyhow::bail!("adopt-publish rejected (HTTP 422): {msg}");
+        }
+
+        if status == reqwest::StatusCode::FORBIDDEN {
+            let body = resp.text().unwrap_or_default();
+            if let Some(message) = artifact_revoked_message(&body) {
+                return Ok(AdoptPublishOutcome::Revoked { message });
+            }
+            anyhow::bail!("adopt-publish failed (HTTP {status}): {body}");
         }
 
         if !status.is_success() {
@@ -2439,6 +2468,31 @@ mod tests {
     /// A 422 whose `detail` is a plain string (ownership / compile error, e.g.
     /// "not yours to publish") is a genuine failure, not a scan-gate policy
     /// outcome — it must surface as Err (so no local takeover) with the message.
+    #[test]
+    fn adopt_publish_403_artifact_revoked_is_a_terminal_outcome() {
+        use mockito::Server;
+
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/runner/skills/adopt-publish")
+            .with_status(403)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"detail":{"code":"artifact_revoked","message":"skill is revoked"}}"#)
+            .expect(1)
+            .create();
+
+        let client = RegistryClient::new(server.url()).with_auth("tok");
+        match client
+            .adopt_publish(minimal_gz_bytes(), "hello-world")
+            .unwrap()
+        {
+            AdoptPublishOutcome::Revoked { message } => assert_eq!(message, "skill is revoked"),
+            other => panic!("expected Revoked, got {other:?}"),
+        }
+        // A 403 without the code is still a plain error.
+        assert!(artifact_revoked_message(r#"{"detail":"nope"}"#).is_none());
+    }
+
     #[test]
     fn adopt_publish_422_string_detail_is_error() {
         use mockito::Server;

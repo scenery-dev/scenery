@@ -170,6 +170,14 @@ pub async fn migrate_item(
     // revoked skill's leftover dir must never get here. Skip it untouched —
     // no backup, no POST, no marker: the reconciler's revoke pass removes it.
     // A failed cache read is an error (retried next start), never a pass.
+    //
+    // KNOWN LIMIT: the cache is filled by the sync snapshot, and this
+    // migration runs at startup before the first snapshot. On a fresh state
+    // DB (or first run) the cache is empty, so this gate fails open. Deferring
+    // the migration until after the first snapshot is not a contained change
+    // (it runs inline in `run_daemon`, the sync loop is a separate task), so
+    // the backend's `artifact_revoked` 403 on `/portal/managed-paths/migrate`
+    // is the check for that window; the runner handles it in `post_migrate`.
     if is_revoked_locally(state, item)? {
         info!(
             slug = %item.slug,
@@ -211,12 +219,24 @@ pub async fn migrate_item(
         .with_context(|| format!("managed_paths: backup failed for {}", item.slug))?;
 
     // ── 3. POST to backend ────────────────────────────────────────────────────
-    let maybe_installation_id = post_migrate(item, registry_url, http_client, state)
-        .await
-        .map_err(|e| {
+    let maybe_installation_id = match post_migrate(item, registry_url, http_client, state).await {
+        Ok(id) => id,
+        Err(e) => {
+            // Revoked server-side: terminal. Nothing was marked, and the
+            // local revocation cache will skip it once a snapshot lands.
+            if let Some(ArtifactRevoked(msg)) = e.downcast_ref::<ArtifactRevoked>() {
+                warn!(
+                    slug = %item.slug,
+                    kind = %item.kind,
+                    message = %msg,
+                    "managed_paths: backend refused to adopt a revoked artifact — leaving it for the revoke pass"
+                );
+                return Ok(false);
+            }
             warn!(slug = %item.slug, error = %e, "managed_paths: backend migrate call failed; will retry next start");
-            e
-        })?;
+            return Err(e);
+        }
+    };
 
     // ── 4. Write marker (replace-with-managed) ────────────────────────────────
     // Writing the marker is how Scenery "replaces the local copy with a
@@ -417,6 +437,11 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The backend refused a migrate/adopt with 403 `artifact_revoked`.
+#[derive(Debug, thiserror::Error)]
+#[error("artifact revoked: {0}")]
+struct ArtifactRevoked(String);
+
 // ── Backend POST ──────────────────────────────────────────────────────────────
 
 /// Response from `/portal/managed-paths/migrate` for a single item.
@@ -485,6 +510,14 @@ async fn post_migrate(
         anyhow::bail!("managed_paths: backend returned 401 — token expired or invalid");
     }
 
+    if resp.status() == reqwest::StatusCode::FORBIDDEN {
+        let body = resp.text().await.unwrap_or_default();
+        if let Some(message) = scenery_core::registry::artifact_revoked_message(&body) {
+            return Err(anyhow::Error::new(ArtifactRevoked(message)));
+        }
+        anyhow::bail!("managed_paths: backend migrate returned HTTP 403 Forbidden: {body}");
+    }
+
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
@@ -527,21 +560,34 @@ async fn post_migrate(
 /// match — a revocation names an MCP server by UUID, which a `mcpServers`
 /// key cannot be mapped to.
 fn is_revoked_locally(state: &AppState, item: &MigrationItem) -> Result<bool> {
-    let artifact_type = match item.kind {
-        ItemKind::Skill => "skill",
-        ItemKind::Plugin => "plugin",
-        ItemKind::Mcp => return Ok(false),
-    };
-    let entries = scenery_core::revocation::list_all(state)
-        .context("migrator: failed to read the revocation cache")?;
+    match item.kind {
+        ItemKind::Skill => skill_slug_revoked(state, &item.slug),
+        ItemKind::Plugin => artifact_whole_revoked(state, "plugin", &item.slug, false),
+        ItemKind::Mcp => Ok(false),
+    }
+}
+
+/// Is skill folder `slug` covered by a whole-artifact revocation (by registry
+/// name or by the local folder a registry name is recorded under)?
+pub(crate) fn skill_slug_revoked(state: &AppState, slug: &str) -> Result<bool> {
+    artifact_whole_revoked(state, "skill", slug, true)
+}
+
+fn artifact_whole_revoked(
+    state: &AppState,
+    artifact_type: &str,
+    slug: &str,
+    resolve_local_name: bool,
+) -> Result<bool> {
+    let entries =
+        scenery_core::revocation::list_all(state).context("failed to read the revocation cache")?;
     for e in entries {
         let whole = e.version.as_deref().map_or(true, |v| v.trim().is_empty());
         if e.artifact_type != artifact_type || !whole {
             continue;
         }
-        if e.artifact_key == item.slug
-            || (item.kind == ItemKind::Skill
-                && state.skill_local_name(&e.artifact_key) == item.slug)
+        if e.artifact_key == slug
+            || (resolve_local_name && state.skill_local_name(&e.artifact_key) == slug)
         {
             return Ok(true);
         }

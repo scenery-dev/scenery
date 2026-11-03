@@ -2818,6 +2818,29 @@ pub(crate) async fn install_verified_version(
     registry_url: &str,
     pusher: Option<&ManagedPathsPusher>,
 ) -> Result<()> {
+    // Revoke gate lives here, not only in the callers, so no present or
+    // future caller can install a revoked artifact. Whole-skill revokes block;
+    // a version-scoped one blocks only that version. Fail closed.
+    {
+        let (st, id, ver) = (Arc::clone(state), skill_id.to_string(), version.to_string());
+        let revoked = tokio::task::spawn_blocking(move || {
+            revocation::is_revoked(&st, "skill", &id, Some(&ver))
+        })
+        .await
+        .unwrap_or(Ok(true))
+        .unwrap_or_else(|e| {
+            warn!(error = %e, "reconciler: revocation check failed; refusing install");
+            true
+        });
+        if revoked {
+            warn!(
+                skill_id,
+                version, "reconciler: install blocked — skill is revoked"
+            );
+            anyhow::bail!("install of {skill_id}@{version} blocked: skill is revoked");
+        }
+    }
+
     let skill_id = skill_id.to_string();
     let version = version.to_string();
     let state_clone = Arc::clone(state);
