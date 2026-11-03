@@ -368,6 +368,69 @@ fn uninstall_plugin_bundle_refuses_traversal_in_slug() {
 }
 
 #[test]
+fn uninstall_plugin_bundle_runs_every_step_when_installed_plugins_is_corrupt() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let fake_home = tempfile::tempdir().unwrap();
+    let prev = std::env::var_os("HOME");
+    std::env::set_var("HOME", fake_home.path());
+    let h = fake_home.path();
+
+    install_plugin_bundle(&bundle()).unwrap();
+    let installed = h.join(".claude/plugins/installed_plugins.json");
+    std::fs::write(&installed, "{ not json").unwrap();
+
+    let result = uninstall_plugin_bundle("superpowers");
+
+    let installed_after = std::fs::read(&installed).unwrap();
+    let settings: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(h.join(".claude/settings.json")).unwrap())
+            .unwrap();
+    let still_has_state = plugin_has_local_state("superpowers");
+
+    if let Some(v) = prev {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+
+    assert!(result.is_err(), "the corrupt file must be reported");
+    assert_eq!(
+        installed_after, b"{ not json",
+        "never rewrite unparseable user file"
+    );
+    assert!(
+        settings["enabledPlugins"]
+            .get("superpowers@scenery")
+            .is_none(),
+        "settings.json cleanup must still run: {settings}"
+    );
+    assert!(
+        still_has_state.unwrap(),
+        "a corrupt user-owned file is a leftover the revoke must keep reporting"
+    );
+}
+
+#[test]
+fn plugin_has_local_state_is_false_for_missing_or_blank_user_files() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let fake_home = tempfile::tempdir().unwrap();
+    let prev = std::env::var_os("HOME");
+    std::env::set_var("HOME", fake_home.path());
+    let h = fake_home.path();
+
+    std::fs::create_dir_all(h.join(".claude/plugins")).unwrap();
+    std::fs::write(h.join(".claude/plugins/installed_plugins.json"), "  \n").unwrap();
+    let blank = plugin_has_local_state("superpowers");
+
+    if let Some(v) = prev {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+    assert!(!blank.unwrap());
+}
+
+#[test]
 fn single_path_component_check_accepts_versions_and_rejects_traversal() {
     for ok in [
         "5.0.7",
