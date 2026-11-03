@@ -678,3 +678,39 @@ fn gap06_no_events_when_all_servers_managed() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// ── Shutdown audit flush ──────────────────────────────────────────────────────
+
+/// The daemon's shared `RegistryClient` only gets a Bearer token on a sync
+/// tick. A restart before the first tick (or after a token rotation) must
+/// still upload authenticated on the final flush, not 401 and WARN.
+#[test]
+fn final_audit_flush_reloads_stored_credentials() {
+    let root = temp_root("final-flush");
+    let state = AppState::bootstrap_in(root.clone()).unwrap();
+    let mut server = Server::new();
+    let url = server.url();
+    scenery_core::auth::save_tokens(&state, &url, "fresh-token", "refresh").unwrap();
+
+    // Shared client with NO token installed, as at daemon start.
+    let registry = Arc::new(RegistryClient::new(&url));
+    let audit = SqliteAuditBuffer::new(Arc::clone(&registry), &state);
+    scenery_core::audit::write_audit_event_direct(
+        &state.db_path,
+        &scenery_core::audit::AuditEvent {
+            event_type: "test_event".into(),
+            payload: serde_json::json!({}),
+        },
+    );
+
+    let mock = server
+        .mock("POST", "/api/runner/audit")
+        .match_header("authorization", "Bearer fresh-token")
+        .with_status(200)
+        .create();
+
+    let n = crate::final_audit_flush(&registry, &audit, &state).unwrap();
+    assert_eq!(n, 1);
+    mock.assert();
+    let _ = std::fs::remove_dir_all(&root);
+}

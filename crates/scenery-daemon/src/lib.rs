@@ -1058,11 +1058,22 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     }
 
     // Final audit flush on clean shutdown (best-effort — do not abort shutdown on error).
+    //
+    // Credentials are re-read from SQLite first: the shared `RegistryClient`
+    // only gets a token on a sync tick, so a service restart shortly after
+    // start (before the first tick) or after a token rotation would otherwise
+    // upload with no/stale Bearer and get a 401. A failed flush is not an
+    // error: unsent events stay in `audit_events` (uploaded = 0) and the next
+    // start's first tick uploads them.
     let final_audit = Arc::clone(&audit_buffer);
+    let final_registry = Arc::clone(&registry);
     let shutdown_state = state.clone();
     let _ = tokio::task::spawn_blocking(move || {
-        if let Err(e) = final_audit.flush(&shutdown_state) {
-            warn!(error = %e, "final audit flush on shutdown failed");
+        if let Err(e) = final_audit_flush(&final_registry, &final_audit, &shutdown_state) {
+            info!(
+                error = format!("{e:#}"),
+                "final audit flush on shutdown did not complete; pending events stay in the local store and retry on next start"
+            );
         }
     })
     .await;
@@ -2075,6 +2086,60 @@ async fn register_with_backend(
     Ok(reg.device_id)
 }
 
+/// Install the freshest stored access token and device ID on the shared
+/// `RegistryClient` so authenticated calls (audit upload, ratings, stats) send
+/// the current credentials. Used by every sync tick and by the final audit
+/// flush at shutdown, which may run before any tick or after a token rotation.
+fn install_registry_credentials(state_view: &AppState, registry: &RegistryClient) {
+    // Load the current access token from SQLite and install it on the shared
+    // RegistryClient so that all authenticated calls in this tick (audit upload,
+    // execution stats, skill ratings) send the device Bearer token.
+    // The token-refresh loop may have rotated it since the last tick; reading
+    // fresh from SQLite each tick ensures we use the current token.
+    match load_tokens(state_view, &registry.base_url) {
+        Ok(Some(tokens)) if !tokens.access_token.is_empty() => {
+            registry.set_auth(&tokens.access_token);
+        }
+        Ok(_) => {
+            // No token stored for the configured registry URL — clear any stale
+            // token that may have been set by a previous tick or a different
+            // registry URL, so we do not accidentally send the wrong credentials.
+            registry.clear_auth();
+        }
+        Err(e) => {
+            warn!(error = %e, "sync: failed to load auth token; audit upload will be unauthenticated");
+        }
+    }
+
+    // Load the backend-assigned device UUID (stored in sync_state["device_id"]
+    // at registration time) and install it on the registry client so audit
+    // uploads include X-Device-ID.  Without this header the backend cannot
+    // attribute events to an org and they are invisible in the admin Activity Log.
+    match state_view.get_sync_state("device_id") {
+        Ok(Some(id)) => {
+            registry.set_device_id(&id);
+        }
+        Ok(None) => {
+            // Device not yet registered — events will upload without X-Device-ID
+            // and be unattributed until registration completes.
+        }
+        Err(e) => {
+            warn!(error = %e, "sync: failed to load device_id for X-Device-ID audit header");
+        }
+    }
+}
+
+/// Upload pending audit events once, with fresh credentials. See the shutdown
+/// call site for why credentials are reloaded.
+fn final_audit_flush(
+    registry: &RegistryClient,
+    audit: &SqliteAuditBuffer,
+    state: &AppState,
+) -> Result<usize> {
+    install_registry_credentials(state, registry);
+    audit.flush(state)
+}
+
 /// One tick of the registry sync loop.
 ///
 /// Called from `spawn_blocking` — issues synchronous SQLite and HTTP I/O.
@@ -2130,42 +2195,7 @@ pub fn run_sync_tick(
     };
 
     // ── 0. Auth token + device ID sync ───────────────────────────────────────
-    // Load the current access token from SQLite and install it on the shared
-    // RegistryClient so that all authenticated calls in this tick (audit upload,
-    // execution stats, skill ratings) send the device Bearer token.
-    // The token-refresh loop may have rotated it since the last tick; reading
-    // fresh from SQLite each tick ensures we use the current token.
-    match load_tokens(&state_view, &registry.base_url) {
-        Ok(Some(tokens)) if !tokens.access_token.is_empty() => {
-            registry.set_auth(&tokens.access_token);
-        }
-        Ok(_) => {
-            // No token stored for the configured registry URL — clear any stale
-            // token that may have been set by a previous tick or a different
-            // registry URL, so we do not accidentally send the wrong credentials.
-            registry.clear_auth();
-        }
-        Err(e) => {
-            warn!(error = %e, "sync: failed to load auth token; audit upload will be unauthenticated");
-        }
-    }
-
-    // Load the backend-assigned device UUID (stored in sync_state["device_id"]
-    // at registration time) and install it on the registry client so audit
-    // uploads include X-Device-ID.  Without this header the backend cannot
-    // attribute events to an org and they are invisible in the admin Activity Log.
-    match state_view.get_sync_state("device_id") {
-        Ok(Some(id)) => {
-            registry.set_device_id(&id);
-        }
-        Ok(None) => {
-            // Device not yet registered — events will upload without X-Device-ID
-            // and be unattributed until registration completes.
-        }
-        Err(e) => {
-            warn!(error = %e, "sync: failed to load device_id for X-Device-ID audit header");
-        }
-    }
+    install_registry_credentials(&state_view, registry);
 
     // ── 1. Desired-state snapshot reconcile ──────────────────────────────────
     // Safety net for a live SSE delta dropped while the connection stays
