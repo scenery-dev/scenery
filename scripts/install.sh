@@ -278,6 +278,13 @@ version_at_least() {
     _val_min="$1"
     _val_have="$2"
 
+    # A prerelease/build suffix ("2.0.1-rc.1", "2.0.1+build5") compares as its
+    # base version ("2.0.1"): strip everything from the first '-' or '+'.
+    _val_have="${_val_have%%-*}"
+    _val_have="${_val_have%%+*}"
+    _val_min="${_val_min%%-*}"
+    _val_min="${_val_min%%+*}"
+
     case "${_val_have}" in
         *[!0-9.]*) return 2 ;;
     esac
