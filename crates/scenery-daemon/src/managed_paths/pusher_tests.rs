@@ -1310,3 +1310,23 @@ fn push_skill_repush_refreshes_row_hash() {
         Some(hex_sha256(b"---\nname: demo\n---\nv2").as_str())
     );
 }
+
+#[test]
+fn native_projection_present_needs_dir_marker_and_claude_link() {
+    let home = tempfile::tempdir().unwrap();
+    let dir = home.path().join(".agents/skills/demo");
+    let link_dir = home.path().join(".claude/skills");
+    fs::create_dir_all(&dir).unwrap();
+    fs::create_dir_all(&link_dir).unwrap();
+    assert!(!native_projection_present_in(home.path(), "demo"));
+
+    fs::write(dir.join("SKILL.md"), "x").unwrap();
+    assert!(!native_projection_present_in(home.path(), "demo"));
+    fs::write(dir.join(ownership::MANAGED_MARKER_FILENAME), "{}").unwrap();
+    assert!(
+        !native_projection_present_in(home.path(), "demo"),
+        "the Claude link is the last thing the pusher writes"
+    );
+    super::super::links::link_dir(&dir, &link_dir.join("demo")).unwrap();
+    assert!(native_projection_present_in(home.path(), "demo"));
+}
