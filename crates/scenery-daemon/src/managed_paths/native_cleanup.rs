@@ -28,11 +28,13 @@ use super::marker::read_file_marker;
 pub struct CleanupReport {
     pub sidecars_removed: usize,
     pub marker_rows_removed: usize,
-    /// Distinct native directories whose bookkeeping (marker row, journal
-    /// entry and/or sidecar) was cleaned. This is the "how many markers" number:
-    /// a directory can have a sidecar and a journal entry but no DB row, so
-    /// `marker_rows_removed` alone under-reports it.
-    pub native_dirs_cleaned: usize,
+    /// Distinct native directories for which at least one bookkeeping record
+    /// (marker row and/or restore-journal entry) was removed. Counted once the
+    /// removal has happened, so it is "directories we stopped tracking", not a
+    /// count of sidecars (see `sidecars_removed`, which can be lower when a
+    /// sidecar is not ours) and not a count of rows (a directory can have a
+    /// journal entry but no DB row, so `marker_rows_removed` under-reports it).
+    pub native_dirs_with_state_removed: usize,
     pub journal_entries_removed: usize,
 }
 
@@ -121,7 +123,7 @@ pub fn cleanup_native_markers_in(
             None => merged.push((dir, hashes)),
         }
     }
-    report.native_dirs_cleaned = merged.len();
+    report.native_dirs_with_state_removed = merged.len();
     for (dir, hashes) in merged {
         let sidecar = dir.join(MANAGED_MARKER_FILENAME);
         let is_plain_file = std::fs::symlink_metadata(&sidecar)
