@@ -738,6 +738,34 @@ pub fn managed_skill_present(slug: &str) -> Result<bool> {
     Ok(skills_dir.join(slug).join("SKILL.md").exists())
 }
 
+/// Has the F2 pusher finished projecting `slug` onto disk — the managed dir
+/// with `SKILL.md` and its `.scenery-managed.json` marker under
+/// `~/.agents/skills/`, plus the `~/.claude/skills/<slug>` link?
+///
+/// The daemon flips `installed_skills` to `active` BEFORE it pushes, so that
+/// row alone does not mean the files exist. `scenery skill install` waits on
+/// this so a script that checks the disk right after the command returns sees
+/// the install. Always `true` when the filesystem reconciler is disabled
+/// (nothing is ever projected, so there is nothing to wait for).
+pub fn native_projection_present(slug: &str) -> Result<bool> {
+    if reconciler_disabled() {
+        return Ok(true);
+    }
+    Ok(native_projection_present_in(&resolve_home()?, slug))
+}
+
+fn native_projection_present_in(home: &Path, slug: &str) -> bool {
+    let dir = home.join(".agents").join("skills").join(slug);
+    dir.join("SKILL.md").exists()
+        && dir.join(ownership::MANAGED_MARKER_FILENAME).exists()
+        && home
+            .join(".claude")
+            .join("skills")
+            .join(slug)
+            .symlink_metadata()
+            .is_ok()
+}
+
 fn resolve_claude_json() -> Result<PathBuf> {
     Ok(resolve_home()?.join(".claude.json"))
 }

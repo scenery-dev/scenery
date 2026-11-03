@@ -1923,6 +1923,23 @@ async fn install_via_desired_state(
 
         match installed {
             Some((status, 0)) if status == "active" => {
+                // The daemon marks the row active BEFORE it writes the native
+                // skill dir, the ~/.claude/skills link and the marker. Wait
+                // for those so success means the files are on disk.
+                let slug = state.skill_local_name(skill_id);
+                wait_until(
+                    || scenery_daemon::managed_paths::pusher::native_projection_present(&slug),
+                    std::time::Duration::from_secs(NATIVE_PROJECTION_TIMEOUT_SECS),
+                    std::time::Duration::from_millis(NATIVE_PROJECTION_POLL_INTERVAL_MS),
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "'{skill_id}' is installed in the runner but its files were not written \
+                         to ~/.agents/skills and ~/.claude/skills in time — check the daemon \
+                         log, or run 'scenery daemon install' if the daemon is not running"
+                    )
+                })?;
                 eprintln!();
                 println!("Installed skill '{skill_id}' from registry.");
                 // Audit: daemon confirmed the desired-state install succeeded.
@@ -1979,6 +1996,31 @@ async fn install_via_desired_state(
                 .await;
             }
         }
+    }
+}
+
+/// How long to wait, after the daemon reports a skill active, for it to finish
+/// writing the native skill dir, `~/.claude/skills` link and marker.
+const NATIVE_PROJECTION_TIMEOUT_SECS: u64 = 30;
+const NATIVE_PROJECTION_POLL_INTERVAL_MS: u64 = 100;
+
+/// Poll `check` until it returns `true`, an error, or `timeout` elapses
+/// (checked once more at the deadline). A timeout is an error — never a
+/// false success.
+async fn wait_until<F: FnMut() -> Result<bool>>(
+    mut check: F,
+    timeout: std::time::Duration,
+    interval: std::time::Duration,
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if check()? {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("timed out after {}s", timeout.as_secs());
+        }
+        tokio::time::sleep(interval).await;
     }
 }
 
@@ -6223,6 +6265,10 @@ mod daemon_reload_tests;
 #[cfg(test)]
 #[path = "mcp_oauth_probe_tests.rs"]
 mod mcp_oauth_probe_tests;
+
+#[cfg(test)]
+#[path = "wait_until_tests.rs"]
+mod wait_until_tests;
 
 #[cfg(test)]
 #[path = "btpi_tests.rs"]
