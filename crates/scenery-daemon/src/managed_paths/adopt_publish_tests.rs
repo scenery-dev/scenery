@@ -185,6 +185,8 @@ async fn handle_discovery_adopted_noop_under_killswitch() {
 /// A revoked skill is refused before anything is recorded or uploaded: the
 /// registry URL is unreachable and there is no token, so reaching the upload
 /// would be an `Err`.
+// Holds ENV_MUTEX so the killswitch tests cannot flip the env var mid-run.
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn handle_discovery_adopted_refuses_a_revoked_skill() {
     let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
@@ -223,6 +225,7 @@ async fn handle_discovery_adopted_refuses_a_revoked_skill() {
 
 /// The backend's 403 `artifact_revoked` is terminal: one request, no
 /// takeover record left behind, local copy kept.
+#[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread")]
 async fn handle_discovery_adopted_handles_backend_403_artifact_revoked() {
     let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());

@@ -241,8 +241,14 @@ pub fn list_governed_plugins() -> Result<HashMap<String, String>> {
 /// [`uninstall_plugin_bundle`] (and its file rewrites) when this is false,
 /// while any partial leftover still reports true and gets cleaned.
 pub fn plugin_has_local_state(slug: &str) -> Result<bool> {
+    let (content, corrupt) = local_state(slug)?;
+    Ok(content || corrupt)
+}
+
+/// `(parseable governed content present, a corrupt user-owned file present)`.
+fn local_state(slug: &str) -> Result<(bool, bool)> {
     if reconciler_disabled() {
-        return Ok(false);
+        return Ok((false, false));
     }
     ensure_single_path_component("slug", slug)?;
     let home = home()?;
@@ -256,7 +262,7 @@ pub fn plugin_has_local_state(slug: &str) -> Result<bool> {
             .exists()
         || read_bundled_record(&mp).contains_key(slug)
     {
-        return Ok(true);
+        return Ok((true, false));
     }
     let in_manifest = read_json(&mp.join(".claude-plugin").join("marketplace.json"))
         .and_then(|r| {
@@ -285,7 +291,17 @@ pub fn plugin_has_local_state(slug: &str) -> Result<bool> {
     ]
     .iter()
     .any(|p| is_unparseable_json(p));
-    Ok(in_manifest || installed || enabled || corrupt)
+    Ok((in_manifest || installed || enabled, corrupt))
+}
+
+/// A plugin teardown that finished every step but reported errors.
+/// `removed_any` is true when governed content existed and the steps that
+/// could run removed it, so the caller still records a state change.
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub struct PartialTeardown {
+    pub removed_any: bool,
+    message: String,
 }
 
 /// Remove a governed plugin from the marketplace, cache, and Claude Code
@@ -304,6 +320,8 @@ pub fn uninstall_plugin_bundle(slug: &str) -> Result<()> {
     let mp = marketplace_dir(&home);
     let key = plugin_key(slug);
     let mut errors: Vec<String> = Vec::new();
+    // Read before anything is removed (see `PartialTeardown`).
+    let had_content = local_state(slug).map(|(c, _)| c).unwrap_or(false);
 
     fs::remove_dir_all(mp.join("plugins").join(slug)).ok();
     fs::remove_dir_all(
@@ -348,7 +366,10 @@ pub fn uninstall_plugin_bundle(slug: &str) -> Result<()> {
     }
 
     if !errors.is_empty() {
-        anyhow::bail!("plugin '{slug}' teardown incomplete: {}", errors.join("; "));
+        return Err(anyhow::Error::new(PartialTeardown {
+            removed_any: had_content,
+            message: format!("plugin '{slug}' teardown incomplete: {}", errors.join("; ")),
+        }));
     }
 
     info!(

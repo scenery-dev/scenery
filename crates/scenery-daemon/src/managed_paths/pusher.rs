@@ -538,6 +538,14 @@ impl ManagedPathsPusher {
     /// whose entry the user has since replaced or removed is dropped without
     /// touching the entry. Anything without a marker row is never touched.
     ///
+    /// Serialization (verified in `spawn_revoke`/`spawn_install_mcp`): events
+    /// lock per artifact key, so this sweep is NOT serialized against another
+    /// server's install, and taking every lock is not feasible. It is safe
+    /// without one: the `~/.claude.json` edit and the shape comparison happen
+    /// under `modify_claude_json`'s file lock, and an install that races the
+    /// sweep at worst has its entry + marker removed and then rewritten by its
+    /// own `push_mcp` (self-healing).
+    ///
     /// Markers are read BEFORE the live rows: an install upserts its row
     /// first and writes its marker after, so a concurrent install can never
     /// look orphaned.
