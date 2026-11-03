@@ -93,6 +93,7 @@ fn cleanup_removes_our_sidecar_row_and_journal_entry_and_leaves_files_untouched(
         CleanupReport {
             sidecars_removed: 1,
             marker_rows_removed: 1,
+            native_dirs_cleaned: 1,
             journal_entries_removed: 1
         }
     );
@@ -139,4 +140,31 @@ fn cleanup_does_nothing_when_marketplaces_unreadable() {
     let report = cleanup_native_markers_in(&state, &plugins, None).unwrap();
     assert!(report.is_noop());
     assert_eq!(row_count(&state), 1);
+}
+
+#[test]
+fn cleanup_counts_every_native_dir_not_just_rows() {
+    let (state, tmp) = temp_state();
+    let plugins = tmp.path().join("plugins");
+    let base = plugins.join("marketplaces/claude-plugins-official/external_plugins");
+    // Three adopted dirs; two of them lose their DB row beforehand so only the
+    // journal entry + sidecar remain (as on a device that was partly cleaned).
+    for slug in ["a", "b", "c"] {
+        adopt(&state, &base.join(slug), slug);
+    }
+    let conn = Connection::open(state.db_path.as_std_path()).unwrap();
+    for slug in ["b", "c"] {
+        conn.execute(
+            "DELETE FROM managed_path_markers WHERE slug = ?1",
+            rusqlite::params![slug],
+        )
+        .unwrap();
+    }
+    drop(conn);
+
+    let mkts = marketplaces(&plugins);
+    let report = cleanup_native_markers_in(&state, &plugins, Some(&mkts)).unwrap();
+    assert_eq!(report.marker_rows_removed, 1);
+    assert_eq!(report.sidecars_removed, 3);
+    assert_eq!(report.native_dirs_cleaned, 3);
 }
