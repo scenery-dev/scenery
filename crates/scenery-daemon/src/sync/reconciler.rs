@@ -1685,24 +1685,40 @@ fn spawn_revoke(
             "plugin" => {
                 let slug = artifact_key.clone();
                 let ver = scoped_version.clone();
-                match tokio::task::spawn_blocking(move || {
+                match tokio::task::spawn_blocking(move || -> Result<(bool, Option<anyhow::Error>)> {
                     if let Some(v) = ver.as_deref() {
                         let installed = crate::managed_paths::list_governed_plugins()?;
                         if installed.get(&slug).is_some_and(|iv| iv != v) {
-                            return Ok(false);
+                            return Ok((false, None));
                         }
                     }
                     // Only touch the marketplace/settings files when something
                     // governed is actually left; a redelivered revoke of an
                     // already-removed plugin must not rewrite them.
                     if !crate::managed_paths::plugin_has_local_state(&slug)? {
-                        return Ok(false);
+                        return Ok((false, None));
                     }
-                    crate::managed_paths::uninstall_plugin_bundle(&slug).map(|()| true)
+                    // A partial teardown (e.g. a corrupt user-owned file) can
+                    // still have removed content: that is a state change, so
+                    // carry the flag out of the error path.
+                    match crate::managed_paths::uninstall_plugin_bundle(&slug) {
+                        Ok(()) => Ok((true, None)),
+                        Err(e) => {
+                            let removed = e
+                                .downcast_ref::<crate::managed_paths::PartialTeardown>()
+                                .is_some_and(|p| p.removed_any);
+                            Ok((removed, Some(e)))
+                        }
+                    }
                 })
                 .await
                 {
-                    Ok(Ok(removed)) => removed,
+                    Ok(Ok((removed, err))) => {
+                        if let Some(e) = err {
+                            warn!(error = %e, plugin_slug = %artifact_key, "reconciler: revoke plugin purge incomplete");
+                        }
+                        removed
+                    }
                     Ok(Err(e)) => {
                         warn!(error = %e, plugin_slug = %artifact_key, "reconciler: revoke plugin purge failed");
                         false

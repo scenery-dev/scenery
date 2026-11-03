@@ -536,6 +536,9 @@ async fn revoke_removes_scenery_owned_entry_even_when_the_row_is_gone() {
     assert!(servers.get("live-one").is_some(), "live install untouched");
     assert_eq!(servers["user-edited"]["command"], "my-own-thing");
     assert!(servers.get("someone-elses").is_some());
+    // A user-edited entry keeps its content, but Scenery relinquishes the
+    // stale marker row.
+    assert!(!mcp_marker_rows(&state).contains(&"user-edited".to_string()));
     // The orphan's marker row is gone; the live one's stays.
     assert!(!mcp_marker_rows(&state).contains(&"github-mcp".to_string()));
     assert!(mcp_marker_rows(&state).contains(&"live-one".to_string()));
@@ -672,8 +675,40 @@ async fn corrupt_installed_plugins_does_not_block_settings_cleanup_or_spam_audit
     assert_eq!(std::fs::read(&installed).unwrap(), b"{ not json");
     // The corrupt file stays a reported leftover on every pass...
     assert!(crate::managed_paths::plugin_has_local_state("kit").unwrap());
-    // ...but only the first pass (a state change) is audited.
-    assert_eq!(audits(&state, "plugin_revoked").len(), 1);
+    // ...but only the first pass (a state change) is audited, and it records
+    // that content WAS removed even though the teardown reported an error.
+    let a = audits(&state, "plugin_revoked");
+    assert_eq!(a.len(), 1);
+    assert_eq!(a[0]["removed_locally"], true);
+}
+
+#[tokio::test]
+async fn corrupt_settings_json_is_left_alone_but_the_rest_is_removed_and_audited() {
+    let home = FakeHome::new();
+    let (_t, state) = new_state();
+    crate::managed_paths::install_plugin_bundle(&bundle()).unwrap();
+    let settings = home.path().join(".claude/settings.json");
+    std::fs::write(&settings, "{ not json").unwrap();
+
+    for _ in 0..3 {
+        run(snapshot(&[("plugin", "kit", None)]), &state).await;
+    }
+
+    assert_eq!(std::fs::read(&settings).unwrap(), b"{ not json");
+    let installed: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(home.path().join(".claude/plugins/installed_plugins.json"))
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(installed["plugins"].get("kit@scenery").is_none());
+    assert!(!home
+        .path()
+        .join(".claude/plugins/marketplaces/scenery/plugins/kit")
+        .exists());
+    assert!(crate::managed_paths::plugin_has_local_state("kit").unwrap());
+    let a = audits(&state, "plugin_revoked");
+    assert_eq!(a.len(), 1);
+    assert_eq!(a[0]["removed_locally"], true);
 }
 
 // ── No-op snapshot must not write outcomes ───────────────────────────────────
