@@ -714,3 +714,46 @@ fn final_audit_flush_reloads_stored_credentials() {
     mock.assert();
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// ── shutdown audit flush: timeout + error classification ──────────────────────
+
+#[tokio::test]
+async fn final_audit_flush_gives_up_after_the_timeout() {
+    let started = std::time::Instant::now();
+    crate::run_final_audit_flush(
+        || {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            Ok(0)
+        },
+        std::time::Duration::from_millis(50),
+    )
+    .await;
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "a stuck flush must not hold shutdown"
+    );
+}
+
+#[tokio::test]
+async fn final_audit_flush_swallows_errors() {
+    crate::run_final_audit_flush(
+        || anyhow::bail!("audit upload failed (HTTP 401): nope"),
+        std::time::Duration::from_secs(1),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn network_failures_are_told_apart_from_auth_failures() {
+    // Port 1 is closed: a real connect error from reqwest.
+    let net = reqwest::Client::new()
+        .get("http://127.0.0.1:1/")
+        .send()
+        .await
+        .unwrap_err();
+    let wrapped = anyhow::Error::new(net).context("failed to reach registry");
+    assert!(crate::is_network_failure(&wrapped));
+    assert!(!crate::is_network_failure(&anyhow::anyhow!(
+        "audit upload failed (HTTP 401): unauthorized"
+    )));
+}
