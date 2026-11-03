@@ -28,6 +28,11 @@ use super::marker::read_file_marker;
 pub struct CleanupReport {
     pub sidecars_removed: usize,
     pub marker_rows_removed: usize,
+    /// Distinct native directories whose bookkeeping (marker row, journal
+    /// entry and/or sidecar) was cleaned. This is the "how many markers" number:
+    /// a directory can have a sidecar and a journal entry but no DB row, so
+    /// `marker_rows_removed` alone under-reports it.
+    pub native_dirs_cleaned: usize,
     pub journal_entries_removed: usize,
 }
 
@@ -116,6 +121,7 @@ pub fn cleanup_native_markers_in(
             None => merged.push((dir, hashes)),
         }
     }
+    report.native_dirs_cleaned = merged.len();
     for (dir, hashes) in merged {
         let sidecar = dir.join(MANAGED_MARKER_FILENAME);
         let is_plain_file = std::fs::symlink_metadata(&sidecar)
