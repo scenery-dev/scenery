@@ -1,7 +1,7 @@
 //! Tests for the `skill install` completion wait and its verdict.
 #![allow(clippy::unwrap_used)]
 
-use super::{interpret_projection, poll_until};
+use super::{interpret_projection, is_noop_reinstall, poll_until};
 use scenery_daemon::managed_paths::projection_outcome::ProjectionOutcome;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -94,4 +94,25 @@ fn daemon_silence_is_an_error_pointing_at_the_daemon_log() {
 fn daemon_silence_with_canonical_files_on_disk_still_succeeds_with_a_warning() {
     let w = interpret_projection("s", None, true, "/state/logs").unwrap();
     assert_eq!(w.len(), 1);
+}
+
+// ── no-op reinstall fast path ────────────────────────────────────────────────
+
+#[test]
+fn unpinned_install_that_the_backend_upgrades_is_not_a_noop() {
+    // `skill install foo` (no --version): the backend resolves latest 2.0.0
+    // while 1.0.0 is active, so the install is an upgrade and must be awaited.
+    assert!(!is_noop_reinstall(Some("1.0.0"), Some("2.0.0")));
+}
+
+#[test]
+fn install_of_the_active_version_is_a_noop() {
+    assert!(is_noop_reinstall(Some("2.0.0"), Some("2.0.0")));
+}
+
+#[test]
+fn unknown_target_or_nothing_active_is_never_a_noop() {
+    // No --version and an unreadable backend response: take the poll path.
+    assert!(!is_noop_reinstall(Some("1.0.0"), None));
+    assert!(!is_noop_reinstall(None, Some("1.0.0")));
 }
