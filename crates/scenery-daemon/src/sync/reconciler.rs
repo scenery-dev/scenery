@@ -2227,6 +2227,28 @@ fn teardown_mcp_server_locally(
             mcp_server_id,
             "reconciler: no local mcp_installations row for teardown — nothing to resolve"
         );
+        // The row is gone (an older runner, or a failed teardown deleted it)
+        // so the UUID can no longer be mapped to a slug. Sweep the
+        // Scenery-owned `~/.claude.json` entries that no live row backs.
+        if let Some(p) = pusher {
+            match p.remove_orphaned_mcp_entries() {
+                Ok(slugs) => {
+                    for slug in &slugs {
+                        removed = true;
+                        backend_registry.remove_backend(slug);
+                        info!(
+                            mcp_server_id,
+                            aggregator_key = %slug,
+                            "reconciler: removed orphaned Scenery MCP entry (row already gone)"
+                        );
+                    }
+                }
+                Err(e) => {
+                    client_side_clean = false;
+                    errors.push(format!("remove orphaned mcp entries failed: {e:#}"));
+                }
+            }
+        }
     }
 
     if client_side_clean && errors.is_empty() {

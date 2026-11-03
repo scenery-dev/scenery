@@ -435,10 +435,7 @@ impl ManagedPathsPusher {
 
         let claude_json = resolve_claude_json()?;
 
-        let entry_value = serde_json::json!({
-            "command": "scenery",
-            "args": ["mcp", "serve", "--server", slug],
-        });
+        let entry_value = scenery_mcp_entry(slug);
 
         modify_claude_json(&claude_json, |root| {
             // Ensure root is an object.
@@ -525,6 +522,88 @@ impl ManagedPathsPusher {
         removed |= entry_present;
         if entry_present {
             info!(slug, "pusher: MCP entry removed from ~/.claude.json");
+        }
+        Ok(removed)
+    }
+
+    /// Remove Scenery-owned `~/.claude.json` MCP entries that no live
+    /// `mcp_installations` row backs any more, returning the slugs removed.
+    ///
+    /// For a revoke whose `mcp_installations` row is already gone (deleted by
+    /// an older runner, or by a failed teardown) nothing local maps the
+    /// server UUID to its slug, so the entry could never be removed by key.
+    /// An entry counts as Scenery's only when BOTH hold: a `kind = 'mcp'`
+    /// marker row exists for exactly `<claude.json>:<slug>`, and the live
+    /// entry is still byte-for-byte what [`Self::push_mcp`] writes. A marker
+    /// whose entry the user has since replaced or removed is dropped without
+    /// touching the entry. Anything without a marker row is never touched.
+    ///
+    /// Markers are read BEFORE the live rows: an install upserts its row
+    /// first and writes its marker after, so a concurrent install can never
+    /// look orphaned.
+    pub fn remove_orphaned_mcp_entries(&self) -> Result<Vec<String>> {
+        if reconciler_disabled() {
+            return Ok(Vec::new());
+        }
+        let claude_json = resolve_claude_json()?;
+        let prefix = format!("{}:", claude_json.display());
+
+        let conn = Connection::open(&self.db_path)
+            .context("pusher: failed to open state DB for orphaned mcp lookup")?;
+        let mut stmt = conn
+            .prepare("SELECT path, slug FROM managed_path_markers WHERE kind = 'mcp'")
+            .context("pusher: failed to prepare mcp marker lookup")?;
+        let markers = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .context("pusher: failed to query mcp markers")?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("pusher: failed to read mcp markers")?;
+        let live: std::collections::HashSet<String> = {
+            let mut stmt = conn
+                .prepare("SELECT mcp_server_name FROM mcp_installations")
+                .context("pusher: failed to prepare mcp_installations lookup")?;
+            let names = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .context("pusher: failed to query mcp_installations")?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .context("pusher: failed to read mcp_installations")?;
+            names.iter().map(|n| crate::mcp_server_slug(n)).collect()
+        };
+
+        let mut removed = Vec::new();
+        for (path, slug) in markers {
+            if path != format!("{prefix}{slug}") || live.contains(&slug) {
+                continue;
+            }
+            let expected = scenery_mcp_entry(&slug);
+            let mut entry_removed = false;
+            if claude_json.exists() {
+                modify_claude_json(&claude_json, |root| {
+                    if let Some(Value::Object(ref mut map)) = root.get_mut("mcpServers") {
+                        if map.get(&slug) == Some(&expected) {
+                            map.remove(&slug);
+                            entry_removed = true;
+                        }
+                    }
+                })
+                .with_context(|| {
+                    format!("pusher: failed to modify ~/.claude.json for orphaned mcp slug={slug}")
+                })?;
+            }
+            let marker_removed = self
+                .delete_db_marker(&path)
+                .context("pusher: failed to delete orphaned managed_path_markers for mcp")?;
+            if entry_removed {
+                info!(
+                    slug,
+                    "pusher: orphaned MCP entry removed from ~/.claude.json"
+                );
+            }
+            if entry_removed || marker_removed {
+                removed.push(slug);
+            }
         }
         Ok(removed)
     }
@@ -857,6 +936,14 @@ fn projection_state_in(home: &Path, slug: &str) -> ProjectionState {
 fn canonical_projection_present_in(home: &Path, slug: &str) -> bool {
     let dir = home.join(".agents").join("skills").join(slug);
     dir.join("SKILL.md").exists() && dir.join(ownership::MANAGED_MARKER_FILENAME).exists()
+}
+
+/// The `mcpServers.<slug>` entry Scenery writes for a managed MCP server.
+fn scenery_mcp_entry(slug: &str) -> Value {
+    serde_json::json!({
+        "command": "scenery",
+        "args": ["mcp", "serve", "--server", slug],
+    })
 }
 
 fn resolve_claude_json() -> Result<PathBuf> {
