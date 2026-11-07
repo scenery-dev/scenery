@@ -715,6 +715,13 @@ fn resolve_symlink_target(path: &std::path::Path) -> PathBuf {
     }
 }
 
+/// Atomically write a client config (through symlinks, keeping its mode).
+/// For callers outside this module that edit config text themselves, such
+/// as `scenery uninstall`.
+pub fn write_client_config(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    atomic_write(path, contents)
+}
+
 fn atomic_write(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
     // Write through any symlink to the real file, not over the link itself
     // — see `resolve_symlink_target`'s doc comment.

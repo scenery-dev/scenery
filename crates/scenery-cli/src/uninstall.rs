@@ -29,8 +29,12 @@
 //! pre-journal DB/marker-file heuristics remain as a best-effort fallback.
 
 use anyhow::{Context, Result};
-use scenery_core::restore_journal::{JournalEntry, JournalSource, RestoreJournal};
+use scenery_core::restore_journal::{JournalEntry, JournalOp, RestoreJournal};
 use serde::Serialize;
+
+#[path = "uninstall_clients.rs"]
+mod clients;
+use clients::strip_client_configs;
 use std::path::{Path, PathBuf};
 
 /// Flags for `scenery uninstall`.
@@ -84,6 +88,8 @@ pub struct KeptItem {
 /// An item VH had taken over that was restored to its original location.
 #[derive(Debug, Serialize)]
 pub struct RestoredItem {
+    /// AI client (or "Scenery" for non-client items) this belongs to.
+    pub client: String,
     pub name: String,
     pub restored_to: String,
     pub from_backup: String,
@@ -97,6 +103,8 @@ pub struct RestoreReport {
     /// Non-fatal problems (a config we couldn't parse, a backup we couldn't
     /// restore). Surfaced so the user knows what to check by hand.
     pub warnings: Vec<String>,
+    /// Restores that did not happen. Any entry makes the command exit non-zero.
+    pub failed: Vec<String>,
     pub purged_data_dir: bool,
 }
 
@@ -104,8 +112,14 @@ pub struct RestoreReport {
 pub async fn run(opts: UninstallOpts) -> Result<()> {
     let mut report = RestoreReport::default();
 
+    // The restore journal is the source of truth for what to restore and for
+    // which client-config key a brokered install touched. A corrupt or missing
+    // one degrades to an empty list (never blocks uninstall).
+    let journal_entries = load_journal_entries(&mut report);
+
     // ── 1. Plan (read-only): classify everything before mutating anything. ──
-    let plan = build_plan(&mut report).context("failed to inspect current install")?;
+    let plan =
+        build_plan(&mut report, &journal_entries).context("failed to inspect current install")?;
 
     // Show the plan and, unless --yes, confirm. A user demoing Scenery needs
     // to see *exactly* what will and won't survive before committing.
@@ -120,13 +134,6 @@ pub async fn run(opts: UninstallOpts) -> Result<()> {
         return Ok(());
     }
 
-    // Load the restore journal once, up front, and share it across the steps
-    // below — it is the source of truth for both what to restore and exactly
-    // which client-config key a brokered install touched. A corrupt or
-    // missing journal degrades to an empty entry list (never blocks
-    // uninstall) — see `load_journal_entries`.
-    let journal_entries = load_journal_entries(&mut report);
-
     // ── 2. Stop every daemon first. ──
     // A running daemon re-pushes client configs and re-saves refreshed
     // tokens, so nothing below may run while one is up — including the
@@ -137,15 +144,23 @@ pub async fn run(opts: UninstallOpts) -> Result<()> {
     // Native `~/.claude` takeovers + adopted originals from the restore journal.
     restore_from_journal(&journal_entries, &mut report);
 
-    // ── 4. Strip every client-config entry Scenery wrote. ──
+    // ── 4. Clean every client config: restore, or strip only Scenery's keys. ──
     strip_client_configs(&plan, &journal_entries, &mut report);
 
     // ── 5. Remove managed skills/plugins VH pushed into ~/.claude. ──
     remove_managed_artifacts(&plan, &mut report);
 
+    remove_lock_files(&mut report);
+
     // ── 6. Deprovision this device, revoke every session server side, and
     //       drop the local secrets. ──
     sign_out_everywhere(&opts.registry_url, &mut report).await;
+
+    // A fully successful uninstall starts the next install from a clean
+    // ledger; otherwise keep it so a re-run can finish the job.
+    if report.failed.is_empty() {
+        clear_journal(&mut report);
+    }
 
     // ── 7. Optional hard purge of local state. ──
     if opts.purge {
@@ -161,7 +176,54 @@ pub async fn run(opts: UninstallOpts) -> Result<()> {
     let paths = write_report(&report, &opts)?;
     print_summary(&report, &paths);
     println!("\nRestart your AI client(s) to apply the change.");
-    Ok(())
+    failure_result(&report)
+}
+
+/// Non-zero exit when anything could not be restored.
+fn failure_result(report: &RestoreReport) -> Result<()> {
+    if report.failed.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "{} item(s) could not be restored — see the report and warnings above",
+        report.failed.len()
+    )
+}
+
+/// Empty the restore journal (best effort, reported as a warning).
+fn clear_journal(report: &mut RestoreReport) {
+    use scenery_core::state::AppState;
+    let result = AppState::bootstrap().and_then(|state| RestoreJournal::for_state(&state).clear());
+    if let Err(e) = result {
+        report
+            .warnings
+            .push(format!("could not clear the restore journal: {e:#}"));
+    }
+}
+
+/// Delete lock files Scenery created beside Claude's files. The daemons are
+/// stopped by now, so nothing holds them.
+fn remove_lock_files(report: &mut RestoreReport) {
+    let Some(home) = dirs_home() else {
+        return;
+    };
+    let claude = home.join(".claude");
+    let plugins = claude.join("plugins");
+    let locks = [
+        home.join(".claude.json.lock"),
+        claude.join("settings.lock"),
+        plugins.join("installed_plugins.lock"),
+        plugins.join("known_marketplaces.lock"),
+    ];
+    for lock in locks {
+        match std::fs::remove_file(&lock) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => report
+                .warnings
+                .push(format!("could not remove {}: {e}", lock.display())),
+        }
+    }
 }
 
 /// Stop and deregister our own service unit and the `brew services` one.
@@ -278,9 +340,9 @@ struct Plan {
 }
 
 /// Read current state and populate the KEPT section (nothing mutated here).
-fn build_plan(report: &mut RestoreReport) -> Result<Plan> {
+fn build_plan(report: &mut RestoreReport, journal_entries: &[JournalEntry]) -> Result<Plan> {
     use scenery_core::state::AppState;
-    use scenery_mcp::setup::{detect_ai_clients, detect_unmanaged_servers};
+    use scenery_mcp::setup::{detect_ai_clients, unmanaged_servers_in};
 
     let state = AppState::bootstrap().context("failed to open Scenery state")?;
     let installs = state.list_mcp_installs().unwrap_or_default();
@@ -289,9 +351,14 @@ fn build_plan(report: &mut RestoreReport) -> Result<Plan> {
         .filter(|r| r.gateway_url.is_some())
         .collect();
 
-    // KEPT: the user's own MCP servers VH merely detected as "unmanaged". These
-    // are never touched — we only remove VH's own shim key from the same file.
-    for u in detect_unmanaged_servers() {
+    let clients = detect_ai_clients();
+    let plan = Plan { brokered, clients };
+
+    // KEPT (preview for the plan and --dry-run): the user's own servers,
+    // minus brokered ones, which are removed. The real list is rebuilt from
+    // the files after the edit.
+    let brokered_keys = clients::brokered_keys(&plan, journal_entries);
+    for u in unmanaged_servers_in(&plan.clients, &brokered_keys) {
         report.kept.push(KeptItem {
             name: u.server_name,
             location: u.client_name,
@@ -299,121 +366,7 @@ fn build_plan(report: &mut RestoreReport) -> Result<Plan> {
         });
     }
 
-    Ok(Plan {
-        brokered,
-        clients: detect_ai_clients(),
-    })
-}
-
-/// Remove VH's shim key (`scenery`) AND every brokered per-slug key from each
-/// client config, so nothing that points at the now-absent runner is left.
-///
-/// The exact (file, JSON key) a brokered install touched is derived from the
-/// restore journal (`JournalSource::Brokered` entries record `detail.
-/// server_key` + `detail.mcp_key`) — this is precise, unlike guessing from
-/// `McpInstallRow::mcp_server_id`, which is the backend's UUID and is *not*
-/// the slug the F2 pusher actually wrote into the config (see
-/// `crate::mcp_server_slug` in scenery-daemon). Rows the journal doesn't
-/// cover (pre-journal installs, a lost entry) fall back to the old best-effort
-/// sweep across every detected client.
-fn strip_client_configs(plan: &Plan, journal_entries: &[JournalEntry], report: &mut RestoreReport) {
-    use scenery_mcp::setup::remove_mcp_entry;
-    use std::collections::HashSet;
-
-    // VH's own shim entry — always stripped from every detected client.
-    for client in &plan.clients {
-        if let Err(e) = remove_mcp_entry(client) {
-            report.warnings.push(format!(
-                "{}: could not remove the scenery entry ({}): {e:#}",
-                client.name,
-                client.config_path.display()
-            ));
-        }
-    }
-
-    let mut handled: HashSet<String> = HashSet::new();
-
-    // Journal-precise removal.
-    for row in &plan.brokered {
-        let Some(entry) = latest_brokered_entry(journal_entries, &row.installation_id) else {
-            continue;
-        };
-        let server_key = entry
-            .detail
-            .get("server_key")
-            .and_then(|v| v.as_str())
-            .unwrap_or(row.mcp_server_id.as_str());
-        let mcp_key = entry
-            .detail
-            .get("mcp_key")
-            .and_then(|v| v.as_str())
-            .unwrap_or("mcpServers");
-        let target = PathBuf::from(&entry.target_path);
-
-        match remove_named_key_from_file(&target, mcp_key, server_key) {
-            Ok(true) => {
-                let client_label = plan
-                    .clients
-                    .iter()
-                    .find(|c| c.config_path == target)
-                    .map(|c| c.name.clone())
-                    .unwrap_or_else(|| entry.target_path.clone());
-                record_removed(report, row, RemovedKind::BrokeredMcp, &client_label);
-                handled.insert(row.mcp_server_id.clone());
-            }
-            Ok(false) => {}
-            Err(e) => report.warnings.push(format!(
-                "{}: could not remove brokered server '{}' via restore journal: {e:#}",
-                entry.target_path, row.mcp_server_name
-            )),
-        }
-    }
-
-    // Best-effort DB-driven fallback for anything the journal didn't cover.
-    for client in &plan.clients {
-        for row in &plan.brokered {
-            if handled.contains(&row.mcp_server_id) {
-                continue;
-            }
-            match remove_named_key_from_file(
-                &client.config_path,
-                &client.mcp_key,
-                &row.mcp_server_id,
-            ) {
-                Ok(true) => {
-                    record_removed(report, row, RemovedKind::BrokeredMcp, &client.name);
-                    handled.insert(row.mcp_server_id.clone());
-                }
-                Ok(false) => {}
-                Err(e) => report.warnings.push(format!(
-                    "{}: could not remove brokered server '{}': {e:#}",
-                    client.name, row.mcp_server_name
-                )),
-            }
-        }
-    }
-
-    // If a brokered server was in the DB but not found in any config, still report
-    // it as removed so the user knows it's gone and how to re-add it.
-    for row in &plan.brokered {
-        if !report.removed.iter().any(|r| r.name == row.mcp_server_name) {
-            record_removed(report, row, RemovedKind::BrokeredMcp, "(state only)");
-        }
-    }
-}
-
-/// Most recent journal entry recording a brokered MCP push for the install
-/// whose backend row ID is `installation_id`. Matched on `detail.
-/// installation_id` (set by `ManagedPathsPusher::push_mcp`) rather than the
-/// journal's own `slug` field, which is the config key, not a stable ID.
-fn latest_brokered_entry<'a>(
-    entries: &'a [JournalEntry],
-    installation_id: &str,
-) -> Option<&'a JournalEntry> {
-    entries.iter().rev().find(|e| {
-        e.source == JournalSource::Brokered
-            && e.detail.get("installation_id").and_then(|v| v.as_str()) == Some(installation_id)
-    })
+    Ok(plan)
 }
 
 fn record_removed(
@@ -452,37 +405,6 @@ fn reinstall_hint(row: &scenery_core::state::McpInstallRow) -> String {
          and were never stored on this machine — supply your own.",
         row.mcp_server_name, src, row.auth_type
     )
-}
-
-/// Remove `key` from the `map_key` map inside the JSON file at `path`.
-/// Mirrors `setup::remove_mcp_entry` but for a caller-supplied file/map/key
-/// triple, so brokered-slug removal isn't tied to a single `ClientConfig`.
-/// Returns `Ok(false)` (a no-op) when the file, the map, or the key is
-/// absent — never an error.
-fn remove_named_key_from_file(path: &Path, map_key: &str, key: &str) -> Result<bool> {
-    use std::fs;
-    if !path.exists() {
-        return Ok(false);
-    }
-    let text = fs::read_to_string(path)?;
-    let mut obj: serde_json::Map<String, serde_json::Value> = match serde_json::from_str(&text)
-        .unwrap_or(serde_json::Value::Object(Default::default()))
-    {
-        serde_json::Value::Object(m) => m,
-        _ => return Ok(false),
-    };
-    let removed = if let Some(serde_json::Value::Object(map)) = obj.get_mut(map_key) {
-        map.remove(key).is_some()
-    } else {
-        false
-    };
-    if removed {
-        fs::write(
-            path,
-            serde_json::to_string_pretty(&serde_json::Value::Object(obj))?,
-        )?;
-    }
-    Ok(removed)
 }
 
 /// Remove managed skills/plugins VH pushed into `~/.claude`, and its slash
@@ -701,6 +623,11 @@ fn restore_from_journal(entries: &[JournalEntry], report: &mut RestoreReport) {
         if !entry.source.should_restore() {
             continue;
         }
+        // Client-config edits are handled key by key in `strip_client_configs`:
+        // copying a backup over a live config would destroy later edits.
+        if entry.op == JournalOp::ConfigEdit {
+            continue;
+        }
         // A file can be journaled repeatedly (e.g. every `mcp setup` re-run
         // re-edits the same client config); every such entry reuses the same
         // original `backup_path`, so only the most-recent one — first seen
@@ -710,14 +637,17 @@ fn restore_from_journal(entries: &[JournalEntry], report: &mut RestoreReport) {
         }
 
         if let Err(e) = restore_one_entry(entry) {
-            report.warnings.push(format!(
+            let msg = format!(
                 "could not restore '{}' from the restore journal: {e:#}",
                 entry.target_path
-            ));
+            );
+            report.warnings.push(msg.clone());
+            report.failed.push(msg);
             continue;
         }
 
         report.restored.push(RestoredItem {
+            client: entry.client.clone().unwrap_or_else(|| "Scenery".into()),
             name: entry
                 .slug
                 .clone()
@@ -813,11 +743,6 @@ fn purge_data_dir() -> Result<()> {
             if logs_dir.exists() {
                 let _ = std::fs::remove_dir_all(&logs_dir);
             }
-        }
-
-        let lock_file = home.join(".claude.json.lock");
-        if lock_file.exists() {
-            let _ = std::fs::remove_file(&lock_file);
         }
     }
 
@@ -919,7 +844,18 @@ fn render_markdown(r: &RestoreReport) -> String {
         s.push_str("_Nothing needed restoring._\n\n");
     } else {
         for item in &r.restored {
-            s.push_str(&format!("- **{}** → {}\n", item.name, item.restored_to));
+            s.push_str(&format!(
+                "- **{}** — {} → {} ({})\n",
+                item.client, item.name, item.restored_to, item.from_backup
+            ));
+        }
+        s.push('\n');
+    }
+
+    if !r.failed.is_empty() {
+        s.push_str("## Not restored\n\n");
+        for f in &r.failed {
+            s.push_str(&format!("- {f}\n"));
         }
         s.push('\n');
     }
@@ -1002,9 +938,9 @@ mod tests {
 
     /// Serializes every test in this module that mutates the process-global
     /// `HOME` env var.
-    static HOME_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(super) static HOME_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    fn temp_dir(label: &str) -> PathBuf {
+    pub(super) fn temp_dir(label: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1016,7 +952,7 @@ mod tests {
 
     /// Run `f` with `HOME` pointed at `fake_home`, restoring the original
     /// value afterward even if `f` panics.
-    fn with_fake_home<T>(fake_home: &Path, f: impl FnOnce() -> T) -> T {
+    pub(super) fn with_fake_home<T>(fake_home: &Path, f: impl FnOnce() -> T) -> T {
         let _guard = HOME_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let original = std::env::var_os("HOME");
         std::env::set_var("HOME", fake_home);
@@ -1216,7 +1152,11 @@ mod tests {
         assert_eq!(mcp_user_id, None);
     }
 
-    fn brokered_row(mcp_server_id: &str, installation_id: &str, name: &str) -> McpInstallRow {
+    pub(super) fn brokered_row(
+        mcp_server_id: &str,
+        installation_id: &str,
+        name: &str,
+    ) -> McpInstallRow {
         McpInstallRow {
             mcp_server_id: mcp_server_id.to_string(),
             installation_id: installation_id.to_string(),
@@ -1404,14 +1344,14 @@ mod tests {
         let target_path = dir.join("target.txt");
 
         let good_entry = JournalEntry::new(
-            JournalOp::ConfigEdit,
+            JournalOp::FileReplace,
             JournalSource::Native,
             target_path.to_string_lossy().to_string(),
         )
         .with_backup_path(backup_path.to_string_lossy().to_string());
 
         let bad_entry = JournalEntry::new(
-            JournalOp::ConfigEdit,
+            JournalOp::FileReplace,
             JournalSource::Adopted,
             dir.join("other-target.txt").to_string_lossy().to_string(),
         )
@@ -1725,3 +1665,7 @@ mod tests {
         let _ = fs::remove_dir_all(&report_dir);
     }
 }
+
+#[cfg(test)]
+#[path = "uninstall_clients_tests.rs"]
+mod clients_tests;
