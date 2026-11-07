@@ -735,6 +735,52 @@ pub fn handle_tool_call(
     aggregator: Option<&BackendRegistry>,
     rating_state: Option<&RatingState>,
 ) -> ToolCallResult {
+    let result = handle_tool_call_inner(
+        name,
+        arguments,
+        state,
+        policy_client,
+        model_client,
+        registry_url,
+        update_check_cache,
+        aggregator,
+        rating_state,
+    );
+    annotate_upgrade_required(result)
+}
+
+/// If the backend recently answered HTTP 426, append the upgrade notice to
+/// the tool result so the AI client (and the user) can see why calls fail.
+fn annotate_upgrade_required(result: ToolCallResult) -> ToolCallResult {
+    annotate_with_upgrade(result, scenery_core::http::current_upgrade_required())
+}
+
+fn annotate_with_upgrade(
+    mut result: ToolCallResult,
+    upgrade: Option<scenery_core::http::UpgradeRequired>,
+) -> ToolCallResult {
+    let Some(upgrade) = upgrade else {
+        return result;
+    };
+    result.content.push(crate::protocol::ToolResultContent {
+        content_type: "text".to_string(),
+        text: format!("Scenery runner upgrade required: {upgrade}"),
+    });
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_tool_call_inner(
+    name: &str,
+    arguments: &serde_json::Value,
+    state: &AppState,
+    policy_client: &dyn PolicyClient,
+    model_client: Option<&dyn ModelClient>,
+    registry_url: &Option<String>,
+    update_check_cache: &UpdateCheckCache,
+    aggregator: Option<&BackendRegistry>,
+    rating_state: Option<&RatingState>,
+) -> ToolCallResult {
     // Check if this tool call is a rating reply to a pending prompt.
     if let Some(rs) = rating_state {
         if let Some(reply) = extract_rating_reply(arguments) {
@@ -2888,6 +2934,21 @@ mod tests {
     use scenery_core::installer::install_unpacked_skill;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn upgrade_required_is_appended_to_tool_results() {
+        let upgrade = scenery_core::http::UpgradeRequired {
+            min: Some("2.1.0".into()),
+        };
+        let out = annotate_with_upgrade(ToolCallResult::success("ok"), Some(upgrade));
+        assert_eq!(out.content.len(), 2);
+        assert!(out.content[1]
+            .text
+            .contains("Scenery 2.1.0 or newer required; run `brew upgrade scenery`"));
+
+        let untouched = annotate_with_upgrade(ToolCallResult::success("ok"), None);
+        assert_eq!(untouched.content.len(), 1);
+    }
 
     fn temp_root(label: &str) -> camino::Utf8PathBuf {
         let nanos = SystemTime::now()

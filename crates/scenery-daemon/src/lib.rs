@@ -79,6 +79,7 @@ mod protocol_frame;
 mod socket_dispatch;
 mod socket_watch;
 pub mod sync;
+use scenery_core::http::AsyncSendTrackedExt;
 use sync::SyncEvent;
 
 use anyhow::{Context, Result};
@@ -2027,7 +2028,7 @@ async fn register_with_backend(
         "agent_version": env!("CARGO_PKG_VERSION"),
     });
 
-    let client = reqwest::Client::builder()
+    let client = scenery_core::http::async_client_builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .context("failed to build HTTP client for device registration")?;
@@ -2036,7 +2037,7 @@ async fn register_with_backend(
         .post(&url)
         .bearer_auth(token)
         .json(&payload)
-        .send()
+        .send_tracked()
         .await
         .with_context(|| format!("device registration HTTP call failed to {url}"))?;
 

@@ -1,5 +1,6 @@
 //! MCP fleet governance: approved server fetching, caching, and audit buffering.
 
+use crate::http::SendTrackedExt;
 use crate::state::AppState;
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -194,7 +195,7 @@ fn unix_now() -> u64 {
 use reqwest::blocking::Client;
 
 fn make_http_client() -> Result<Client> {
-    Client::builder()
+    crate::http::blocking_client_builder()
         .connect_timeout(std::time::Duration::from_secs(5))
         .timeout(std::time::Duration::from_secs(30))
         .build()
@@ -209,7 +210,7 @@ pub fn fetch_mcp_catalog(base_url: &str) -> Result<McpServersResponse> {
     let client = make_http_client()?;
     let resp = client
         .get(&url)
-        .send()
+        .send_tracked()
         .with_context(|| format!("failed to reach registry at {url}"))?;
 
     if !resp.status().is_success() {
@@ -246,7 +247,7 @@ pub fn submit_mcp_request(
         .post(&url)
         .bearer_auth(auth_token)
         .json(&body)
-        .send()
+        .send_tracked()
         .with_context(|| format!("failed to reach registry at {url}"))?;
 
     if !resp.status().is_success() {
@@ -267,7 +268,7 @@ pub fn list_mcp_requests(base_url: &str, auth_token: &str) -> Result<serde_json:
     let resp = client
         .get(&url)
         .bearer_auth(auth_token)
-        .send()
+        .send_tracked()
         .with_context(|| format!("failed to reach registry at {url}"))?;
 
     if !resp.status().is_success() {
@@ -290,7 +291,7 @@ pub fn import_preview(base_url: &str, input: &str, auth_token: &str) -> Result<s
         .post(&url)
         .bearer_auth(auth_token)
         .json(&body)
-        .send()
+        .send_tracked()
         .with_context(|| format!("failed to reach registry at {url}"))?;
 
     if !resp.status().is_success() {
@@ -331,7 +332,7 @@ pub fn import_submit(
         .post(&url)
         .bearer_auth(auth_token)
         .json(&body)
-        .send()
+        .send_tracked()
         .with_context(|| format!("failed to reach registry at {url}"))?;
 
     if resp.status() == reqwest::StatusCode::CONFLICT {
@@ -361,7 +362,7 @@ pub fn search_skills(base_url: &str, query: &str) -> Result<Vec<serde_json::Valu
     let client = make_http_client()?;
     let resp = client
         .get(&url)
-        .send()
+        .send_tracked()
         .with_context(|| format!("failed to reach registry at {url}"))?;
 
     if !resp.status().is_success() {
@@ -515,7 +516,11 @@ fn check_remote_installation_error(
 ) -> Option<String> {
     let url = format!("{}/api/installations/mine", base_url.trim_end_matches('/'));
     let client = make_http_client().ok()?;
-    let resp = client.get(&url).bearer_auth(access_token).send().ok()?;
+    let resp = client
+        .get(&url)
+        .bearer_auth(access_token)
+        .send_tracked()
+        .ok()?;
     if !resp.status().is_success() {
         return None;
     }
@@ -555,7 +560,7 @@ fn install_via_desired_state_with_timing(
         .post(&url)
         .bearer_auth(access_token)
         .json(&body)
-        .send()
+        .send_tracked()
         .with_context(|| format!("failed to reach registry at {url}"))?;
 
     if resp.status() == reqwest::StatusCode::UNAUTHORIZED {

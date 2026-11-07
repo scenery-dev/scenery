@@ -1,3 +1,4 @@
+use crate::http::SendTrackedExt;
 use crate::secret_file;
 use crate::state::AppState;
 use anyhow::{Context, Result};
@@ -158,7 +159,7 @@ impl AuthClient {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into(),
-            http: reqwest::blocking::Client::builder()
+            http: crate::http::blocking_client_builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .expect("HTTP client should build"),
@@ -250,7 +251,7 @@ impl AuthClient {
                 ("code_verifier", code_verifier),
                 ("client_id", "runner"),
             ])
-            .send()
+            .send_tracked()
             .with_context(|| format!("failed to reach registry at {url}"))?;
 
         if !resp.status().is_success() {
@@ -299,7 +300,7 @@ impl AuthClient {
             .json(&RefreshRequest {
                 refresh_token: refresh_token.to_string(),
             })
-            .send()
+            .send_tracked()
             .map_err(|e| RefreshError::Transport {
                 source: anyhow::Error::new(e).context(format!("failed to reach registry at {url}")),
             })?;
@@ -336,7 +337,7 @@ impl AuthClient {
             .http
             .get(&url)
             .bearer_auth(access_token)
-            .send()
+            .send_tracked()
             .with_context(|| format!("failed to reach registry at {url}"))?;
 
         if !resp.status().is_success() {
@@ -359,7 +360,7 @@ impl AuthClient {
             .http
             .post(&url)
             .json(&serde_json::json!({ "refresh_token": refresh_token, "scope": scope }))
-            .send()
+            .send_tracked()
             .with_context(|| format!("failed to reach registry at {url}"))?;
         if !resp.status().is_success() {
             let status = resp.status();
@@ -383,7 +384,7 @@ impl AuthClient {
             .post(&url)
             .bearer_auth(access_token)
             .json(&serde_json::json!({ "reason": "scenery uninstall" }))
-            .send()
+            .send_tracked()
             .with_context(|| format!("failed to reach registry at {url}"))?;
         if !resp.status().is_success() {
             let status = resp.status();

@@ -15,6 +15,7 @@
 use crate::managed_paths::migrator::{BackupManifest, ManifestItem};
 use anyhow::{Context, Result};
 use rusqlite::Connection;
+use scenery_core::http::AsyncSendTrackedExt;
 use scenery_core::{auth::load_all_tokens, state::AppState};
 use std::{
     fs,
@@ -175,7 +176,7 @@ pub async fn rollback(
     // Load bearer token once — used for all HTTP calls this run.
     let bearer_token = load_bearer_token(state, registry_url);
 
-    let http_client = reqwest::Client::builder()
+    let http_client = scenery_core::http::async_client_builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .context("rollback: failed to build HTTP client")?;
@@ -259,7 +260,7 @@ pub async fn rollback(
                 match http_client
                     .delete(&catalog_url)
                     .bearer_auth(token)
-                    .send()
+                    .send_tracked()
                     .await
                 {
                     Ok(resp) => {
@@ -333,7 +334,7 @@ pub async fn rollback(
                 match http_client
                     .delete(&install_url)
                     .bearer_auth(token)
-                    .send()
+                    .send_tracked()
                     .await
                 {
                     Ok(resp) => {

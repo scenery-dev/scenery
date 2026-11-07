@@ -2384,7 +2384,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "scenery-cli"
-version = "2.0.2"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "camino",
@@ -2418,7 +2418,7 @@ dependencies = [
 
 [[package]]
 name = "scenery-core"
-version = "2.0.2"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2431,6 +2431,7 @@ dependencies = [
  "fs2",
  "getrandom 0.2.17",
  "hex",
+ "http 1.4.0",
  "jsonschema",
  "keyring",
  "mockito",
@@ -2455,7 +2456,7 @@ dependencies = [
 
 [[package]]
 name = "scenery-daemon"
-version = "2.0.2"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2494,7 +2495,7 @@ dependencies = [
 
 [[package]]
 name = "scenery-manifest"
-version = "2.0.2"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "camino",
@@ -2508,7 +2509,7 @@ dependencies = [
 
 [[package]]
 name = "scenery-mcp"
-version = "2.0.2"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2541,7 +2542,7 @@ dependencies = [
 
 [[package]]
 name = "scenery-shim"
-version = "2.0.2"
+version = "2.1.0"
 dependencies = [
  "anyhow",
  "dirs",

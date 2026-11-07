@@ -136,7 +136,7 @@ pub struct ManagedPathsReconciler {
 
 impl ManagedPathsReconciler {
     pub fn new(state: Arc<AppState>, registry_url: String) -> Result<Self> {
-        let http_client = reqwest::Client::builder()
+        let http_client = scenery_core::http::async_client_builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|e| anyhow::anyhow!("failed to build HTTP client for managed_paths: {e}"))?;

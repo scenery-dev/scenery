@@ -39,6 +39,7 @@
 //! `auth pair` would, and starts the sync subsystem — so `/mcp` → Authenticate
 //! in Claude Code is the *entire* login experience, no CLI step required.
 
+use scenery_core::http::AsyncSendTrackedExt;
 use std::{
     collections::HashMap,
     net::SocketAddr,
@@ -213,7 +214,7 @@ async fn serve_on(
         .local_mcp_key()
         .context("mcp http: failed to load/generate the per-user local key (H3)")?;
 
-    let http = reqwest::Client::builder()
+    let http = scenery_core::http::async_client_builder()
         .timeout(Duration::from_secs(10))
         .build()
         .context("mcp http: failed to build outbound HTTP client")?;
@@ -423,7 +424,7 @@ impl McpHttpState {
             .http
             .get(&url)
             .timeout(Duration::from_secs(10))
-            .send()
+            .send_tracked()
             .await
             .context("mcp http: failed to reach JWKS endpoint")?;
 
@@ -888,7 +889,7 @@ async fn device_exchange_first_run(
         .post(&url)
         .timeout(Duration::from_secs(10))
         .json(&payload)
-        .send()
+        .send_tracked()
         .await
         .map_err(|e| {
             warn!(error = %e, "mcp http: device-exchange request failed");

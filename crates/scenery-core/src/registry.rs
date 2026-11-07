@@ -1,3 +1,4 @@
+use crate::http::SendTrackedExt;
 use crate::{
     importer::ImportOutcome,
     policy::{Policy, PolicyClient, PolicyStatus},
@@ -331,7 +332,7 @@ impl RegistryClient {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into(),
-            http: reqwest::blocking::Client::builder()
+            http: crate::http::blocking_client_builder()
                 .connect_timeout(std::time::Duration::from_secs(5))
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
@@ -397,7 +398,7 @@ impl RegistryClient {
         let resp = self
             .http
             .get(&url)
-            .send()
+            .send_tracked()
             .with_context(|| format!("failed to reach registry at {url}"))?;
 
         if !resp.status().is_success() {
@@ -424,7 +425,7 @@ impl RegistryClient {
         let resp = self
             .http
             .get(&url)
-            .send()
+            .send_tracked()
             .with_context(|| format!("failed to reach registry at {url}"))?;
 
         if !resp.status().is_success() {
@@ -452,7 +453,7 @@ impl RegistryClient {
         let resp = self
             .http
             .get(&url)
-            .send()
+            .send_tracked()
             .with_context(|| format!("failed to reach registry at {url}"))?;
 
         if !resp.status().is_success() {
@@ -500,7 +501,7 @@ impl RegistryClient {
         }
 
         let resp = req
-            .send()
+            .send_tracked()
             .with_context(|| format!("failed to reach registry at {url}"))?;
 
         if !resp.status().is_success() {
@@ -544,7 +545,7 @@ impl RegistryClient {
             .get(&url)
             .bearer_auth(token)
             .header("X-Device-ID", device_id)
-            .send()
+            .send_tracked()
             .with_context(|| format!("failed to reach registry at {url}"))?;
 
         if !resp.status().is_success() {
@@ -563,7 +564,7 @@ impl RegistryClient {
         let resp = self
             .http
             .get(&url)
-            .send()
+            .send_tracked()
             .with_context(|| format!("failed to reach registry at {url}"))?;
         Ok(resp.status().is_success())
     }
@@ -589,7 +590,7 @@ impl RegistryClient {
             req = req.bearer_auth(token);
         }
         let resp = req
-            .send()
+            .send_tracked()
             .with_context(|| format!("failed to reach registry at {url}"))?;
 
         if !resp.status().is_success() {
@@ -625,7 +626,7 @@ impl RegistryClient {
             }
         }
         let mut resp = req
-            .send()
+            .send_tracked()
             .with_context(|| format!("failed to download artifact from {download_url}"))?;
 
         if !resp.status().is_success() {
@@ -682,7 +683,7 @@ impl RegistryClient {
             .http
             .get(&url)
             .bearer_auth(token)
-            .send()
+            .send_tracked()
             .with_context(|| format!("failed to reach registry at {url}"))?;
 
         if !resp.status().is_success() {
@@ -709,7 +710,7 @@ impl RegistryClient {
         let resp = self
             .http
             .get(&url)
-            .send()
+            .send_tracked()
             .with_context(|| format!("failed to reach registry at {url}"))?;
 
         if !resp.status().is_success() {
@@ -742,7 +743,7 @@ impl RegistryClient {
             .http
             .post(&url)
             .json(&body)
-            .send()
+            .send_tracked()
             .with_context(|| format!("failed to reach registry at {url}"))?;
 
         if !resp.status().is_success() {
@@ -805,7 +806,7 @@ impl RegistryClient {
             .post(&url)
             .bearer_auth(token)
             .multipart(form)
-            .send()
+            .send_tracked()
             .with_context(|| format!("failed to reach registry at {url}"))?;
 
         let status = resp.status();
@@ -884,7 +885,7 @@ impl RegistryClient {
             .post(&url)
             .bearer_auth(token)
             .multipart(form)
-            .send()
+            .send_tracked()
             .with_context(|| format!("failed to reach registry at {url}"))?;
 
         let status = resp.status();
@@ -980,7 +981,7 @@ impl RegistryClient {
         let resp = self
             .http
             .get(&url)
-            .send()
+            .send_tracked()
             .with_context(|| format!("failed to reach registry at {url}"))?;
 
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
@@ -1021,7 +1022,7 @@ impl RegistryClient {
             .post(&url)
             .bearer_auth(token)
             .json(&body)
-            .send()
+            .send_tracked()
             .with_context(|| format!("failed to reach registry at {url}"))?;
 
         let status = resp.status();
@@ -1073,7 +1074,7 @@ impl RegistryClient {
             .post(&url)
             .bearer_auth(token)
             .json(&body)
-            .send()
+            .send_tracked()
             .with_context(|| format!("failed to reach registry at {url}"))?;
 
         let status = resp.status();
@@ -1131,7 +1132,7 @@ impl RegistryClient {
             .post(&url)
             .bearer_auth(token)
             .json(&body)
-            .send()
+            .send_tracked()
             .with_context(|| format!("failed to reach registry at {url}"))?;
 
         let status = resp.status();
@@ -1181,7 +1182,7 @@ impl RegistryClient {
             .post(&url)
             .bearer_auth(token)
             .json(&body)
-            .send()
+            .send_tracked()
             .with_context(|| format!("failed to reach registry at {url}"))?;
 
         let status = resp.status();
@@ -1242,7 +1243,7 @@ impl RegistryClient {
         }
 
         let resp = req
-            .send()
+            .send_tracked()
             .with_context(|| format!("failed to reach registry at {url}"))?;
 
         if !resp.status().is_success() {
@@ -1277,7 +1278,7 @@ impl RegistryClient {
         }
 
         let resp = req
-            .send()
+            .send_tracked()
             .with_context(|| format!("failed to reach registry at {url}"))?;
 
         if !resp.status().is_success() {

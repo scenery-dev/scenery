@@ -23,6 +23,7 @@
 //! then give up and leave the installation in `error` state for the portal.
 
 use anyhow::{Context, Result};
+use scenery_core::http::AsyncSendTrackedExt;
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -1385,7 +1386,7 @@ async fn fetch_plugin_version_files(
         slug,
         version
     );
-    let client = match reqwest::Client::builder()
+    let client = match scenery_core::http::async_client_builder()
         .timeout(Duration::from_secs(15))
         .build()
     {
@@ -1397,7 +1398,7 @@ async fn fetch_plugin_version_files(
     } else {
         client.get(&url).bearer_auth(access_token)
     };
-    let body: serde_json::Value = match req.send().await {
+    let body: serde_json::Value = match req.send_tracked().await {
         Ok(r) if r.status().is_success() => match r.json().await {
             Ok(v) => v,
             Err(e) => {
@@ -2463,7 +2464,7 @@ async fn report_mcp_installation_status(
     .await
     .unwrap_or_default();
 
-    let client = match reqwest::Client::builder()
+    let client = match scenery_core::http::async_client_builder()
         .timeout(Duration::from_secs(10))
         .build()
     {
@@ -2480,7 +2481,7 @@ async fn report_mcp_installation_status(
         client.patch(&url).bearer_auth(access_token).json(&body)
     };
 
-    match req.send().await {
+    match req.send_tracked().await {
         Ok(resp) if resp.status().is_success() => {
             tracing::debug!(
                 installation_id = %installation_id,
@@ -4241,7 +4242,7 @@ async fn patch_state(
     .unwrap_or_default();
 
     // Use an async client here (we are already in an async context).
-    let client = match reqwest::Client::builder()
+    let client = match scenery_core::http::async_client_builder()
         .timeout(Duration::from_secs(10))
         .build()
     {
@@ -4258,7 +4259,7 @@ async fn patch_state(
         client.patch(&url).bearer_auth(access_token).json(&body)
     };
 
-    match req.send().await {
+    match req.send_tracked().await {
         Ok(resp) if resp.status().is_success() => {
             tracing::debug!(installation_id = %installation_id, status, "reconciler: status reported");
         }

@@ -37,6 +37,7 @@
 //!   to bridge the sync blocking I/O of `StdioProcess` into the async runtime.
 
 use anyhow::{Context, Result};
+use scenery_core::http::AsyncSendTrackedExt;
 use serde_json::Value;
 use std::{
     cmp::Reverse,
@@ -322,13 +323,17 @@ pub struct BackendRegistry {
 impl BackendRegistry {
     /// Create a new, empty registry. Call `register_backend` to populate.
     pub fn new() -> Self {
-        let http = reqwest::Client::builder()
+        let http = scenery_core::http::async_client_builder()
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(30))
             // HTTP/2 is used automatically when the server supports it via ALPN.
             // The reqwest 0.12 + rustls TLS backend handles protocol negotiation.
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .unwrap_or_else(|_| {
+                scenery_core::http::async_client_builder()
+                    .build()
+                    .unwrap_or_default()
+            });
 
         Self {
             inner: Arc::new(Mutex::new(RegistryInner {
@@ -771,7 +776,7 @@ impl BackendRegistry {
         }
 
         let resp = req
-            .send()
+            .send_tracked()
             .await
             .with_context(|| format!("failed to reach HTTP backend at {url}"))?;
 
@@ -814,7 +819,7 @@ impl BackendRegistry {
         }
 
         let resp = req
-            .send()
+            .send_tracked()
             .await
             .with_context(|| format!("failed to reach HTTP backend at {tools_url}"))?;
 

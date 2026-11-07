@@ -8,6 +8,7 @@
 //! `ScanVerdict { verdict: Severity::Unknown, ... }` rather than `Err`. This ensures
 //! that a registry outage never blocks an import.
 
+use crate::http::SendTrackedExt;
 use anyhow::Result;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
@@ -216,7 +217,7 @@ impl ScanClient for HttpScanClient {
             "content_hash": null,
         });
 
-        let client = match reqwest::blocking::Client::builder()
+        let client = match crate::http::blocking_client_builder()
             .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(std::time::Duration::from_secs(30))
             .build()
@@ -232,7 +233,7 @@ impl ScanClient for HttpScanClient {
             .post(&url)
             .bearer_auth(&self.access_token)
             .json(&body)
-            .send()
+            .send_tracked()
         {
             Ok(r) => r,
             Err(e) => {

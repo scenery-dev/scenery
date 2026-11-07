@@ -32,6 +32,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 use scenery_core::atomic_file;
 use scenery_core::auth::load_all_tokens;
+use scenery_core::http::AsyncSendTrackedExt;
 use scenery_core::state::AppState;
 use scenery_mcp::ownership;
 use serde::Serialize;
@@ -116,7 +117,7 @@ pub struct DriftScanner {
 
 impl DriftScanner {
     pub fn new(state: Arc<AppState>, registry_url: String) -> Result<Self> {
-        let http_client = reqwest::Client::builder()
+        let http_client = scenery_core::http::async_client_builder()
             .timeout(Duration::from_secs(15))
             .build()
             .context("drift: failed to build HTTP client")?;
@@ -319,7 +320,7 @@ impl DriftScanner {
             .post(&url)
             .bearer_auth(token)
             .json(&body)
-            .send()
+            .send_tracked()
             .await
             .context("drift: failed to POST drift report")?;
         if !resp.status().is_success() {
@@ -376,7 +377,7 @@ pub async fn handle_drift_resolution(
     if reconciler_disabled() {
         return Ok(());
     }
-    let client = reqwest::Client::builder()
+    let client = scenery_core::http::async_client_builder()
         .timeout(Duration::from_secs(15))
         .build()
         .context("drift: failed to build HTTP client for resolution")?;
@@ -418,7 +419,7 @@ pub async fn handle_drift_resolution(
         registry_url, drift_id
     );
     if !token.is_empty() {
-        let resp = client.post(&url).bearer_auth(token).send().await;
+        let resp = client.post(&url).bearer_auth(token).send_tracked().await;
         if let Err(e) = resp {
             warn!(error = %e, "drift: failed to ack applied to backend");
         }

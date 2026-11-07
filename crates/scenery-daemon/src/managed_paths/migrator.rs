@@ -23,6 +23,7 @@ use super::{
 };
 use anyhow::{Context, Result};
 use rusqlite::Connection;
+use scenery_core::http::AsyncSendTrackedExt;
 use scenery_core::{
     auth::load_all_tokens,
     restore_journal::{JournalEntry, JournalOp, JournalSource, RestoreJournal},
@@ -512,7 +513,7 @@ async fn post_migrate(
         .post(&url)
         .bearer_auth(&token)
         .json(&request_body)
-        .send()
+        .send_tracked()
         .await
         .with_context(|| format!("managed_paths: HTTP POST to {url} failed"))?;
 

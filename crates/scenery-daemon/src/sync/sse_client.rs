@@ -24,6 +24,7 @@
 //! A successful connection resets the backoff counter.
 
 use anyhow::{Context, Result};
+use scenery_core::http::AsyncSendTrackedExt;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
@@ -47,6 +48,9 @@ const BACKOFF_INIT_SECS: u64 = 1;
 
 /// Maximum reconnect delay.
 const BACKOFF_MAX_SECS: u64 = 60;
+/// Fixed pause after an HTTP 426 (runner too old). No escalation: the only
+/// remedy is `brew upgrade scenery`, so poll rarely.
+const UPGRADE_REQUIRED_DELAY_SECS: u64 = 600;
 
 /// How many consecutive "refresh, then retry, still 401" cycles to tolerate
 /// before giving up and treating this as "re-authentication needed" rather
@@ -258,6 +262,17 @@ pub async fn run(
                 );
                 return;
             }
+            ConnectResult::UpgradeRequired => {
+                // `send_tracked` already logged the 426 once and recorded it
+                // for the CLI / MCP tools. Park for a long, fixed interval so
+                // an outdated runner does not hammer the backend.
+                info!(
+                    delay_secs = UPGRADE_REQUIRED_DELAY_SECS,
+                    "SSE: runner upgrade required (HTTP 426) — pausing sync stream"
+                );
+                tokio::time::sleep(Duration::from_secs(UPGRADE_REQUIRED_DELAY_SECS)).await;
+                continue;
+            }
             ConnectResult::Error(e) => {
                 warn!(error = %e, backoff_secs, "SSE: connection error — backing off");
             }
@@ -284,6 +299,9 @@ enum ConnectResult {
     /// Server returned 403 with `{"code": "user_revoked"}` — the user's
     /// account was revoked (which also revoked this device). Terminal.
     UserRevoked,
+    /// Server returned 426: this runner is older than the backend's minimum.
+    /// Retrying faster cannot help; wait out a long fixed delay.
+    UpgradeRequired,
     /// Any other connection or I/O error.
     Error(anyhow::Error),
 }
@@ -335,7 +353,7 @@ async fn connect_and_stream(
     // Build an async reqwest client (not the blocking one used elsewhere).
     // Do NOT set a request timeout — SSE streams are long-lived. Only the
     // connect_timeout is set to avoid hanging indefinitely on unreachable hosts.
-    let client = match reqwest::Client::builder()
+    let client = match scenery_core::http::async_client_builder()
         .connect_timeout(Duration::from_secs(10))
         .build()
     {
@@ -356,13 +374,17 @@ async fn connect_and_stream(
         req = req.header("Last-Event-ID", id.as_str());
     }
 
-    let resp = match req.send().await {
+    let resp = match req.send_tracked().await {
         Ok(r) => r,
         Err(e) => return ConnectResult::Error(anyhow::anyhow!("SSE: HTTP request failed: {e}")),
     };
 
     if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
         return ConnectResult::Unauthorized;
+    }
+
+    if resp.status() == reqwest::StatusCode::UPGRADE_REQUIRED {
+        return ConnectResult::UpgradeRequired;
     }
 
     if resp.status() == reqwest::StatusCode::FORBIDDEN {

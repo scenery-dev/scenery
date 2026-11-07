@@ -33,6 +33,7 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use scenery_core::http::AsyncSendTrackedExt;
 use scenery_core::DEFAULT_REGISTRY_URL;
 
 mod commands_migrate;
@@ -652,7 +653,14 @@ fn main() {
         .block_on(run(cli));
 
     if let Err(e) = result {
-        eprintln!("scenery: error: {e:#}");
+        // A 426 from the backend means this runner is too old. Lead with the
+        // actionable message; keep the underlying error for context.
+        if let Some(upgrade) = scenery_core::http::current_upgrade_required() {
+            eprintln!("scenery: error: {upgrade}");
+            eprintln!("scenery: caused by: {e:#}");
+        } else {
+            eprintln!("scenery: error: {e:#}");
+        }
         std::process::exit(1);
     }
 }
@@ -1280,7 +1288,7 @@ async fn probe_registry(base_url: &str) -> String {
     use tokio::time::{timeout, Duration};
 
     let url = format!("{}/health", base_url.trim_end_matches('/'));
-    let client = match reqwest::Client::builder()
+    let client = match scenery_core::http::async_client_builder()
         .timeout(Duration::from_secs(1))
         .build()
     {
@@ -1288,7 +1296,7 @@ async fn probe_registry(base_url: &str) -> String {
         Err(e) => return format!("unavailable (client build error: {e})"),
     };
 
-    match timeout(Duration::from_secs(2), client.get(&url).send()).await {
+    match timeout(Duration::from_secs(2), client.get(&url).send_tracked()).await {
         Ok(Ok(resp)) if resp.status().is_success() => "reachable".to_string(),
         Ok(Ok(resp)) => format!("reachable (HTTP {})", resp.status()),
         Ok(Err(e)) => format!("unreachable ({e})"),
@@ -1305,7 +1313,7 @@ async fn probe_scan_endpoint(base_url: &str) -> String {
     use tokio::time::{timeout, Duration};
 
     let url = format!("{}/runner/scan", base_url.trim_end_matches('/'));
-    let client = match reqwest::Client::builder()
+    let client = match scenery_core::http::async_client_builder()
         .timeout(Duration::from_secs(1))
         .build()
     {
@@ -1313,7 +1321,7 @@ async fn probe_scan_endpoint(base_url: &str) -> String {
         Err(e) => return format!("unreachable (client build error: {e})"),
     };
 
-    match timeout(Duration::from_secs(2), client.get(&url).send()).await {
+    match timeout(Duration::from_secs(2), client.get(&url).send_tracked()).await {
         Ok(Ok(resp)) => {
             let status = resp.status();
             if status.is_server_error() {
@@ -1860,7 +1868,7 @@ async fn install_via_desired_state(
 
     eprint!("Requesting install of '{skill_id}' from backend");
 
-    let client = reqwest::Client::builder()
+    let client = scenery_core::http::async_client_builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .context("failed to build HTTP client")?;
@@ -1869,7 +1877,7 @@ async fn install_via_desired_state(
         .post(&url)
         .bearer_auth(&token)
         .json(&payload)
-        .send()
+        .send_tracked()
         .await
         .with_context(|| format!("failed to call {url}"))?;
 
@@ -2169,7 +2177,7 @@ async fn check_remote_installation_error(
     let resp = client
         .get(&url)
         .bearer_auth(access_token)
-        .send()
+        .send_tracked()
         .await
         .ok()?;
     if !resp.status().is_success() {
@@ -4881,10 +4889,11 @@ async fn cmd_auth_pair(code: Option<&str>, registry_url: &str) -> Result<()> {
 
     // HTTP call — use the async reqwest client already in scope via the
     // existing registry client infrastructure.
-    let resp = reqwest::Client::new()
+    let resp = scenery_core::http::async_client()
+        .context("failed to build HTTP client")?
         .post(format!("{registry_url}/api/devices/confirm-pair"))
         .json(&body)
-        .send()
+        .send_tracked()
         .await
         .context("failed to reach registry")?;
 
@@ -4995,14 +5004,15 @@ async fn cmd_plugin_install(
         body["device_id"] = serde_json::Value::String(id);
     }
 
-    let resp = reqwest::Client::new()
+    let resp = scenery_core::http::async_client()
+        .context("failed to build HTTP client")?
         .post(format!(
             "{}/api/plugin-installations",
             registry_url.trim_end_matches('/')
         ))
         .bearer_auth(&tokens.access_token)
         .json(&body)
-        .send()
+        .send_tracked()
         .await
         .context("failed to reach registry")?;
 
@@ -5167,7 +5177,7 @@ async fn resolve_mcp_http() -> Option<(u16, String)> {
 async fn registry_serves_mcp_oauth(registry_url: &str) -> bool {
     let issuer = registry_url.trim_end_matches('/');
     let url = format!("{issuer}/.well-known/oauth-authorization-server");
-    let Ok(client) = reqwest::Client::builder()
+    let Ok(client) = scenery_core::http::async_client_builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
     else {
@@ -5176,7 +5186,7 @@ async fn registry_serves_mcp_oauth(registry_url: &str) -> bool {
     let Ok(resp) = client
         .get(&url)
         .header(reqwest::header::ACCEPT, "application/json")
-        .send()
+        .send_tracked()
         .await
     else {
         return false;
@@ -6122,7 +6132,7 @@ async fn deactivate_backend_installation(
         .context("token-load task panicked")?
         .context("failed to load auth tokens")?;
 
-    let client = reqwest::Client::builder()
+    let client = scenery_core::http::async_client_builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .context("failed to build HTTP client")?;
@@ -6135,7 +6145,7 @@ async fn deactivate_backend_installation(
     };
 
     let resp = req
-        .send()
+        .send_tracked()
         .await
         .with_context(|| format!("PATCH {url} failed"))?;
 
@@ -6172,7 +6182,7 @@ async fn deactivate_backend_plugin_installation(
         .context("token-load task panicked")?
         .context("failed to load auth tokens")?;
 
-    let client = reqwest::Client::builder()
+    let client = scenery_core::http::async_client_builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .context("failed to build HTTP client")?;
@@ -6185,7 +6195,7 @@ async fn deactivate_backend_plugin_installation(
     };
 
     let resp = req
-        .send()
+        .send_tracked()
         .await
         .with_context(|| format!("PATCH {url} failed"))?;
 

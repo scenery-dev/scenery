@@ -15,6 +15,7 @@
 //! `tokio::task::spawn_blocking`. The daemon's `RealBackend::call_tool`
 //! already does this for the entire tool-call hot path.
 
+use crate::http::SendTrackedExt;
 use crate::{
     auth::load_tokens,
     model::{ModelClient, ModelRequest, ModelResponse, ModelSource},
@@ -79,7 +80,7 @@ impl GatewayModelClient {
     /// `base_url` should not have a trailing slash, e.g.
     /// `"https://app.scenery.dev"`.
     pub fn new(base_url: impl Into<String>, state: Arc<AppState>) -> Self {
-        let http = reqwest::blocking::Client::builder()
+        let http = crate::http::blocking_client_builder()
             .timeout(std::time::Duration::from_secs(120))
             .connect_timeout(std::time::Duration::from_secs(10))
             .build()
@@ -128,7 +129,7 @@ impl ModelClient for GatewayModelClient {
             .post(&url)
             .bearer_auth(&token)
             .json(&body)
-            .send()
+            .send_tracked()
             .with_context(|| format!("HTTP request to gateway failed: {url}"))?;
 
         let latency_ms = start.elapsed().as_millis() as u64;

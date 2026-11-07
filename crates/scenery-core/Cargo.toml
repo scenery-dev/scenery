@@ -37,6 +37,7 @@ base64.workspace = true
 getrandom.workspace = true
 hex = "0.4"
 urlencoding = "2"
+http = "1"
 
 # Restore journal: exclusive file lock on restore-journal.json so the daemon
 # and CLI can both append concurrently without corrupting it. Same crate

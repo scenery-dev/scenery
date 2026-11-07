@@ -37,6 +37,7 @@ pub mod state;
 pub mod auth;
 pub mod executor;
 pub mod gateway_model;
+pub mod http;
 pub mod importer;
 pub mod installer;
 pub mod ollama;

@@ -51,6 +51,7 @@
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
+use scenery_core::http::AsyncSendTrackedExt;
 use scenery_core::{auth::load_all_tokens, state::AppState};
 use scenery_mcp::setup::ClientConfig;
 use serde::Serialize;
@@ -236,7 +237,7 @@ pub async fn run_once(state: Arc<AppState>, registry_url: String) -> Result<usiz
     }
 
     let count = items.len();
-    let http_client = match reqwest::Client::builder()
+    let http_client = match scenery_core::http::async_client_builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
     {
@@ -519,7 +520,7 @@ async fn post_discoveries(
         .post(&url)
         .bearer_auth(token)
         .json(&body)
-        .send()
+        .send_tracked()
         .await
     {
         Ok(r) => r,
