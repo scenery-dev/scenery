@@ -229,16 +229,13 @@ impl RestoreJournal {
         let name = source
             .file_name()
             .ok_or_else(|| anyhow::anyhow!("restore_journal: source has no file name: {source}"))?;
-        let mut dest = dest_dir.join(name);
+        let dest = dest_dir.join(name);
 
+        // Keyed by basename only: two *different* files sharing a basename
+        // would be answered with the first one's snapshot. Config files must
+        // use `backup_file_for_client`, which namespaces by client.
         if dest.exists() {
-            // Same basename from a *different* file (e.g. `~/.cursor/mcp.json`
-            // and VS Code's `mcp.json`) must never be answered with the other
-            // file's snapshot: only an identical copy counts as "already done".
-            if !source.is_file() || backups_match(source, &dest) {
-                return Ok(dest);
-            }
-            dest = unique_sibling(&dest);
+            return Ok(dest);
         }
 
         if source.is_dir() {
@@ -482,14 +479,6 @@ fn client_slug(client: &str) -> String {
         "client".to_string()
     } else {
         slug
-    }
-}
-
-/// `true` when both files exist and hold identical bytes.
-fn backups_match(source: &Utf8Path, dest: &Utf8Path) -> bool {
-    match (fs::read(source.as_std_path()), fs::read(dest.as_std_path())) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => false,
     }
 }
 
@@ -1005,17 +994,6 @@ mod tests {
         fs::create_dir_all(b_dir.as_std_path()).expect("mkdir b");
         fs::write(a_dir.join("mcp.json").as_std_path(), "AAA").expect("write a");
         fs::write(b_dir.join("mcp.json").as_std_path(), "BBB").expect("write b");
-
-        // Plain backup_path_for with one ts: second call must not return the first file.
-        let p1 = journal
-            .backup_path_for("t", &a_dir.join("mcp.json"))
-            .expect("a");
-        let p2 = journal
-            .backup_path_for("t", &b_dir.join("mcp.json"))
-            .expect("b");
-        assert_ne!(p1, p2);
-        assert_eq!(fs::read_to_string(p1.as_std_path()).expect("read"), "AAA");
-        assert_eq!(fs::read_to_string(p2.as_std_path()).expect("read"), "BBB");
 
         // Client-scoped backups land in separate directories.
         let c1 = journal
