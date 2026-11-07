@@ -26,6 +26,7 @@
 pub mod aggregator;
 pub mod backend;
 pub mod http_rpc;
+pub mod http_session;
 pub mod ownership;
 pub mod protocol;
 pub mod server;

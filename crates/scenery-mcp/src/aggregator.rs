@@ -344,7 +344,7 @@ impl BackendRegistry {
                 last_synced: None,
             })),
             http,
-            http_sessions: Arc::new(Mutex::new(HashMap::new())),
+            http_sessions: SessionStore::new(),
             tokens_saved_hook: Arc::new(Mutex::new(None)),
         }
     }

@@ -5,14 +5,16 @@
 //! answer with either a plain JSON body or an SSE stream. Every HTTP request
 //! the aggregator makes goes through [`post_rpc`], so the Accept header,
 //! response parsing (JSON / SSE / sniffed), the body size cap and
-//! `Mcp-Session-Id` handling live in exactly one place.
-
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+//! `initialize` handshake / `Mcp-Session-Id` handling (see `http_session`)
+//! live in exactly one place.
 
 use anyhow::{Context, Result};
 use scenery_core::http::AsyncSendTrackedExt;
 use serde_json::Value;
+use tracing::debug;
+
+pub use crate::http_session::SessionStore;
+use crate::http_session::{Session, PROTOCOL_HEADER};
 
 /// `Accept` value mandated by the streamable-HTTP spec for every POST.
 pub const ACCEPT_HEADER_VALUE: &str = "application/json, text/event-stream";
@@ -23,9 +25,6 @@ pub const SESSION_HEADER: &str = "mcp-session-id";
 /// Hard cap on a response body. Tool results are text; 8 MiB is generous and
 /// stops a misbehaving or hostile backend from exhausting daemon memory.
 pub const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
-
-/// Per-endpoint `Mcp-Session-Id` values, shared across registry clones.
-pub type SessionStore = Arc<Mutex<HashMap<String, String>>>;
 
 /// How a response body is framed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,12 +168,131 @@ async fn read_capped(mut resp: reqwest::Response) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Why a single request failed. `SessionExpired` is split out so `post_rpc`
+/// can re-initialize once.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum RpcError {
+    #[error("MCP session expired (HTTP 404 on a request carrying a session id)")]
+    SessionExpired,
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
+impl RpcError {
+    pub(crate) fn into_anyhow(self) -> anyhow::Error {
+        match self {
+            RpcError::SessionExpired => anyhow::Error::new(RpcError::SessionExpired),
+            RpcError::Other(e) => e,
+        }
+    }
+}
+
+/// A successfully parsed JSON-RPC reply plus the `Mcp-Session-Id` it carried.
+pub(crate) struct RpcReply {
+    pub body: Value,
+    pub session_id: Option<String>,
+}
+
+fn build_request(
+    client: &reqwest::Client,
+    url: &str,
+    auth_token: Option<&str>,
+    session: Option<&Session>,
+    payload: &Value,
+) -> reqwest::RequestBuilder {
+    let mut req = client
+        .post(url)
+        .header("accept", ACCEPT_HEADER_VALUE)
+        .json(payload);
+    if let Some(token) = auth_token {
+        req = req.header("authorization", format!("Bearer {token}"));
+    }
+    if let Some(session) = session {
+        req = req.header(PROTOCOL_HEADER, &session.protocol_version);
+        if let Some(sid) = &session.session_id {
+            req = req.header(SESSION_HEADER, sid);
+        }
+    }
+    req
+}
+
+/// Send one JSON-RPC request (id 1) and parse the matching response.
+pub(crate) async fn send_request(
+    client: &reqwest::Client,
+    url: &str,
+    auth_token: Option<&str>,
+    session: Option<&Session>,
+    method: &str,
+    params: &Value,
+) -> Result<RpcReply, RpcError> {
+    let id = Value::from(1);
+    let payload = serde_json::json!({
+        "jsonrpc": "2.0", "id": id, "method": method, "params": params,
+    });
+    let resp = build_request(client, url, auth_token, session, &payload)
+        .send_tracked()
+        .await
+        .with_context(|| format!("failed to reach HTTP backend at {url}"))?;
+
+    let status = resp.status();
+    let session_id = resp
+        .headers()
+        .get(SESSION_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+
+    let bytes = read_capped(resp).await?;
+    let text = String::from_utf8_lossy(&bytes);
+    // Spec: 404 on a request carrying a session id means the session expired.
+    if status == reqwest::StatusCode::NOT_FOUND && session.is_some_and(|s| s.session_id.is_some()) {
+        return Err(RpcError::SessionExpired);
+    }
+    if !status.is_success() {
+        let snippet: String = text.chars().take(512).collect();
+        return Err(
+            anyhow::anyhow!("HTTP backend returned HTTP {status} on {method}: {snippet}").into(),
+        );
+    }
+    let body = parse_rpc_body(content_type.as_deref(), &text, &id)
+        .with_context(|| format!("failed to parse {method} response"))?;
+    Ok(RpcReply { body, session_id })
+}
+
+/// Send a JSON-RPC notification (no id). Any 2xx is success; the spec says 202.
+pub(crate) async fn send_notification(
+    client: &reqwest::Client,
+    url: &str,
+    auth_token: Option<&str>,
+    session: &Session,
+    method: &str,
+) -> Result<()> {
+    let payload = serde_json::json!({ "jsonrpc": "2.0", "method": method });
+    let resp = build_request(client, url, auth_token, Some(session), &payload)
+        .send_tracked()
+        .await
+        .with_context(|| format!("failed to reach HTTP backend at {url}"))?;
+    let status = resp.status();
+    // Drain (bounded) so the connection can be reused.
+    let _ = read_capped(resp).await;
+    if !status.is_success() {
+        anyhow::bail!("HTTP backend returned HTTP {status} on {method}");
+    }
+    Ok(())
+}
+
 /// POST one JSON-RPC request to a streamable-HTTP MCP endpoint and return the
 /// matching response envelope (`{"jsonrpc","id","result"|"error"}`).
 ///
-/// Sends the spec `Accept` header, echoes any stored `Mcp-Session-Id` for this
-/// URL and records a new one from the response. A non-2xx status is an error
-/// that includes a truncated body for diagnosis.
+/// Performs the `initialize` handshake first if this URL has no session yet
+/// (shared across concurrent callers), then sends the request with
+/// `MCP-Protocol-Version` and `Mcp-Session-Id`. If the server answers 404 to a
+/// request carrying a session id, the session is dropped, re-initialized once,
+/// and the request retried once.
 pub async fn post_rpc(
     client: &reqwest::Client,
     sessions: &SessionStore,
@@ -183,61 +301,20 @@ pub async fn post_rpc(
     method: &str,
     params: Value,
 ) -> Result<Value> {
-    let id = Value::from(1);
-    let mut req = client
-        .post(url)
-        .header("accept", ACCEPT_HEADER_VALUE)
-        .json(&serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": params,
-        }));
-    if let Some(token) = auth_token {
-        req = req.header("authorization", format!("Bearer {token}"));
-    }
-    let session = sessions.lock().ok().and_then(|m| m.get(url).cloned());
-    if let Some(sid) = session {
-        req = req.header(SESSION_HEADER, sid);
-    }
-
-    let resp = req
-        .send_tracked()
-        .await
-        .with_context(|| format!("failed to reach HTTP backend at {url}"))?;
-
-    let status = resp.status();
-    if let Some(sid) = resp
-        .headers()
-        .get(SESSION_HEADER)
-        .and_then(|v| v.to_str().ok())
-    {
-        if let Ok(mut map) = sessions.lock() {
-            map.insert(url.to_string(), sid.to_string());
+    let session = sessions.ensure(client, url, auth_token).await?;
+    match send_request(client, url, auth_token, Some(&session), method, &params).await {
+        Ok(reply) => Ok(reply.body),
+        Err(RpcError::SessionExpired) => {
+            debug!(url, "MCP session expired; re-initializing once");
+            sessions.invalidate(url, &session).await;
+            let fresh = sessions.ensure(client, url, auth_token).await?;
+            send_request(client, url, auth_token, Some(&fresh), method, &params)
+                .await
+                .map(|r| r.body)
+                .map_err(RpcError::into_anyhow)
         }
+        Err(other) => Err(other.into_anyhow()),
     }
-    let content_type = resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
-
-    if status == reqwest::StatusCode::NOT_FOUND {
-        // Spec: 404 on a request carrying a session id means the session
-        // expired; drop it so the next call starts fresh.
-        if let Ok(mut map) = sessions.lock() {
-            map.remove(url);
-        }
-    }
-
-    let bytes = read_capped(resp).await?;
-    let text = String::from_utf8_lossy(&bytes);
-    if !status.is_success() {
-        let snippet: String = text.chars().take(512).collect();
-        anyhow::bail!("HTTP backend returned HTTP {status} on {method}: {snippet}");
-    }
-    parse_rpc_body(content_type.as_deref(), &text, &id)
-        .with_context(|| format!("failed to parse {method} response"))
 }
 
 #[cfg(test)]
