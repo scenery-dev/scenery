@@ -815,9 +815,18 @@ fn read_json(path: &Path) -> Option<Value> {
 }
 
 /// Edit an existing JSON file in place; no-op if it doesn't exist.
-fn edit_json<F: FnOnce(&mut Value)>(path: &Path, mutate: F) -> Result<()> {
+fn edit_json<F: Fn(&mut Value)>(path: &Path, mutate: F) -> Result<()> {
     if !path.exists() {
         return Ok(());
+    }
+    // Look before locking: an edit that changes nothing must not leave a
+    // `<name>.lock` file behind next to the user's file (`settings.lock`).
+    if let Some(original) = read_json(path) {
+        let mut probe = original.clone();
+        mutate(&mut probe);
+        if probe == original {
+            return Ok(());
+        }
     }
     edit_json_create(path, mutate)
 }
