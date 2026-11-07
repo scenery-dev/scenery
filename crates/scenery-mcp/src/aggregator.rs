@@ -37,7 +37,6 @@
 //!   to bridge the sync blocking I/O of `StdioProcess` into the async runtime.
 
 use anyhow::{Context, Result};
-use scenery_core::http::AsyncSendTrackedExt;
 use serde_json::Value;
 use std::{
     cmp::Reverse,
@@ -49,6 +48,7 @@ use std::{
 };
 use tracing::{debug, info, warn};
 
+use crate::http_rpc::{self, SessionStore};
 use crate::stdio_process::StdioProcess;
 
 // ── Tool budget ───────────────────────────────────────────────────────────────
@@ -315,6 +315,8 @@ pub struct BackendRegistry {
     inner: Arc<Mutex<RegistryInner>>,
     /// Shared async HTTP client used for HTTP transport dispatch.
     http: reqwest::Client,
+    /// `Mcp-Session-Id` values per HTTP backend URL (see `http_rpc`).
+    http_sessions: SessionStore,
     /// Set by the daemon after construction (see `set_tokens_saved_hook`);
     /// `None` in the shim, which never handles `scenery_login` tokens.
     tokens_saved_hook: Arc<Mutex<Option<Arc<dyn TokensSavedHook>>>>,
@@ -342,6 +344,7 @@ impl BackendRegistry {
                 last_synced: None,
             })),
             http,
+            http_sessions: Arc::new(Mutex::new(HashMap::new())),
             tokens_saved_hook: Arc::new(Mutex::new(None)),
         }
     }
@@ -761,35 +764,15 @@ impl BackendRegistry {
         let url = base_url.trim_end_matches('/').to_string();
         debug!(url = %url, tool = %tool_name, "dispatching tool call to HTTP backend");
 
-        let mut req = self.http.post(&url).json(&serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {
-                "name": tool_name,
-                "arguments": args,
-            }
-        }));
-
-        if let Some(token) = auth_token {
-            req = req.header("authorization", format!("Bearer {token}"));
-        }
-
-        let resp = req
-            .send_tracked()
-            .await
-            .with_context(|| format!("failed to reach HTTP backend at {url}"))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("HTTP backend tool call failed ({status}): {body}");
-        }
-
-        let body: Value = resp
-            .json()
-            .await
-            .context("failed to parse HTTP backend tools/call response")?;
+        let body = http_rpc::post_rpc(
+            &self.http,
+            &self.http_sessions,
+            &url,
+            auth_token,
+            "tools/call",
+            serde_json::json!({ "name": tool_name, "arguments": args }),
+        )
+        .await?;
 
         if let Some(err) = body.get("error") {
             anyhow::bail!("HTTP backend returned JSON-RPC error: {err}");
@@ -807,31 +790,15 @@ impl BackendRegistry {
         let tools_url = url.trim_end_matches('/').to_string();
         debug!(url = %tools_url, "fetching tools from HTTP backend");
 
-        let mut req = self.http.post(&tools_url).json(&serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/list",
-            "params": {}
-        }));
-
-        if let Some(token) = auth_token {
-            req = req.header("authorization", format!("Bearer {token}"));
-        }
-
-        let resp = req
-            .send_tracked()
-            .await
-            .with_context(|| format!("failed to reach HTTP backend at {tools_url}"))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            anyhow::bail!("HTTP backend returned HTTP {status} on tools/list");
-        }
-
-        let body: Value = resp
-            .json()
-            .await
-            .context("failed to parse tools/list response")?;
+        let body = http_rpc::post_rpc(
+            &self.http,
+            &self.http_sessions,
+            &tools_url,
+            auth_token,
+            "tools/list",
+            serde_json::json!({}),
+        )
+        .await?;
 
         let tools = body
             .get("result")
@@ -1398,6 +1365,10 @@ mod tests {
 }
 
 // ── Stdio integration tests ───────────────────────────────────────────────────
+
+#[cfg(test)]
+#[path = "aggregator_http_tests.rs"]
+mod http_tests;
 
 #[cfg(test)]
 #[path = "aggregator_stdio_tests.rs"]
