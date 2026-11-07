@@ -36,6 +36,8 @@ pub mod stdio_process;
 // in rusqlite, the full registry HTTP client, or the skill-execution stack.
 // The daemon enables this feature by default; the shim explicitly opts out.
 #[cfg(feature = "daemon")]
+pub mod config_edit;
+#[cfg(feature = "daemon")]
 pub mod instructions;
 #[cfg(feature = "daemon")]
 pub mod oauth;

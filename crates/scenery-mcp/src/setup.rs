@@ -739,292 +739,267 @@ fn write_mcp_entry_json(config: &ClientConfig) -> Result<()> {
 
 /// Core of [`write_mcp_entry_json`], taking the entry value explicitly so
 /// [`write_claude_code_entry`] can merge in the HTTP+OAuth shape
-/// ([`build_claude_code_http_entry`]) through the exact same read/merge/
-/// journal/atomic-write path — same backup behavior, same crash safety —
-/// rather than a parallel implementation that could drift from it.
+/// ([`build_claude_code_http_entry`]) through the exact same path.
 fn write_mcp_entry_json_with_value(
     config: &ClientConfig,
     entry_value: serde_json::Value,
 ) -> Result<()> {
-    let existing: serde_json::Value = if config.config_path.exists() {
-        let text = fs::read_to_string(&config.config_path)?;
-        serde_json::from_str(&text).unwrap_or(serde_json::Value::Object(Default::default()))
-    } else {
-        serde_json::Value::Object(Default::default())
-    };
-
-    let mut obj = match existing {
-        serde_json::Value::Object(m) => m,
-        _ => Default::default(),
-    };
-
-    let servers = obj
-        .entry(config.mcp_key.clone())
-        .or_insert_with(|| serde_json::Value::Object(Default::default()));
-    if let serde_json::Value::Object(ref mut map) = servers {
-        map.insert(MCP_SERVER_NAME.to_string(), entry_value);
-    }
-
-    if let Some(parent) = config.config_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    // Journal + backup BEFORE overwriting the file, so the backup captures
-    // the file exactly as it stood before this edit (or before any
-    // Scenery edit at all, on repeat calls — see doc comment below).
-    #[cfg(feature = "daemon")]
-    record_config_edit_journal(config);
-
-    let output = serde_json::to_string_pretty(&serde_json::Value::Object(obj))?;
-    atomic_write(&config.config_path, &output)?;
-    Ok(())
+    write_entry(config, entry_value)
 }
 
-/// Write/merge the `[mcp_servers.scenery]` table into a Codex-style TOML
-/// config via `toml_edit`'s format-preserving document model, so any other
-/// tables, keys, comments, or formatting in the user's `config.toml` survive
-/// byte-for-byte. Mirrors [`write_mcp_entry_json`]'s merge-then-write shape
-/// and journaling order.
-///
-/// Only compiled with the `daemon` feature — see the `daemon` feature note
-/// on `toml_edit` in `Cargo.toml`. The shim never calls `write_mcp_entry` on
-/// a TOML client (Codex detection itself is gated the same way), so this
-/// fallback is unreachable in practice; it exists only so the match in
-/// `write_mcp_entry` stays exhaustive without pulling `toml_edit` into
-/// shim builds.
-#[cfg(feature = "daemon")]
+/// Codex's TOML counterpart: same path, `toml_edit` instead of the JSONC
+/// syntax tree.
 fn write_mcp_entry_toml(config: &ClientConfig) -> Result<()> {
-    use anyhow::Context;
-    use toml_edit::{value, Array, DocumentMut, Item, Table};
-
-    let text = if config.config_path.exists() {
-        fs::read_to_string(&config.config_path)?
-    } else {
-        String::new()
-    };
-    let mut doc: DocumentMut = if text.trim().is_empty() {
-        DocumentMut::new()
-    } else {
-        text.parse()
-            .with_context(|| format!("failed to parse {} as TOML", config.config_path.display()))?
-    };
-
-    if doc.get(config.mcp_key.as_str()).is_none() {
-        doc[config.mcp_key.as_str()] = Item::Table(Table::new());
-    }
-    // `as_table_like_mut` (not `as_table_mut`) so this also handles a user's
-    // `mcp_servers = { ... }` written as a TOML *inline* table, not just a
-    // standard `[mcp_servers]` header — both are valid TOML and Codex reads
-    // either (see `mcp_types.rs`'s `try_into::<BTreeMap<...>>()`, which is
-    // agnostic to the source table's syntax). Only a genuinely non-table
-    // value (e.g. `mcp_servers = 5`) still hits the error below.
-    let servers = doc[config.mcp_key.as_str()]
-        .as_table_like_mut()
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "{} already has a top-level `{}` key that isn't a table",
-                config.config_path.display(),
-                config.mcp_key
-            )
-        })?;
-
-    let mut entry = Table::new();
-    entry["command"] = value(resolve_mcp_command());
-    let mut args = Array::new();
-    for arg in MCP_ARGS {
-        args.push(*arg);
-    }
-    entry["args"] = value(args);
-    // `TableLike::insert` on an inline table converts this `Item::Table` into
-    // a nested inline table via `Item::into_value` (`Table::into_inline_table`
-    // under the hood) rather than panicking, so the outer `mcp_servers = {
-    // ... }` stays inline and the new `scenery = { command = ..., args =
-    // [...] }` entry matches its sibling entries' style; on a standard table
-    // it inserts as `[mcp_servers.scenery]` exactly as before.
-    servers.insert(MCP_SERVER_NAME, Item::Table(entry));
-
-    if let Some(parent) = config.config_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    // Same journal-before-write ordering as the JSON path.
-    record_config_edit_journal(config);
-
-    atomic_write(&config.config_path, &doc.to_string())?;
-    Ok(())
+    write_entry(config, build_mcp_entry())
 }
 
 #[cfg(not(feature = "daemon"))]
-fn write_mcp_entry_toml(_config: &ClientConfig) -> Result<()> {
+fn write_entry(_config: &ClientConfig, _entry_value: serde_json::Value) -> Result<()> {
     anyhow::bail!(
-        "TOML client config writing requires the `daemon` feature (scenery-mcp built \
+        "client config writing requires the `daemon` feature (scenery-mcp built \
          without it, e.g. the shim, never calls this)"
     )
 }
 
-/// Record the restore-journal entry for a `write_mcp_entry` call.
+/// Merge `entry_value` in as `<mcp_key>.scenery`, editing only that span of
+/// the file so the user's formatting, comments and key order survive.
 ///
-/// Backs up `config.config_path` (if it exists) only the *first* time this
-/// path is journaled — determined by scanning existing entries for a prior
-/// `config_edit` against the same `target_path` and reusing its
-/// `backup_path` — so a second `mcp setup` run never clobbers the pristine
-/// pre-Scenery backup with an already-modified copy. If the file did not
-/// exist before this edit, `backup_path` is left `None`: uninstall should
-/// delete `target_path` rather than restore it in that case.
+/// A file that does not parse is refused with an error and left untouched;
+/// there is no fall-back to an empty document.
 ///
-/// Best-effort: any failure (can't resolve the data dir, lock contention,
-/// I/O error) is logged at WARN and swallowed. Losing a restore-journal
-/// entry must never block the AI client from getting configured.
+/// Order: read, compute the edit, back up the pre-edit file (only when this
+/// is the first Scenery edit since the last uninstall), write atomically,
+/// then journal the result together with a hash of what was written. That
+/// hash lets uninstall tell whether the user has edited the file since.
 #[cfg(feature = "daemon")]
-fn record_config_edit_journal(config: &ClientConfig) {
-    use scenery_core::state::AppState;
-
-    let root_dir = match AppState::resolve_root_dir() {
-        Ok(r) => r,
+fn write_entry(config: &ClientConfig, entry_value: serde_json::Value) -> Result<()> {
+    let root_dir = match scenery_core::state::AppState::resolve_root_dir() {
+        Ok(r) => Some(r),
         Err(e) => {
             tracing::warn!(error = %e, "mcp setup: could not resolve data dir — skipping restore-journal entry");
-            return;
+            None
         }
     };
-    record_config_edit_journal_in(config, root_dir);
+    write_entry_in(config, entry_value, root_dir)
 }
 
-/// Core logic for [`record_config_edit_journal`], parameterised on `root_dir`
-/// so tests can point it at a temp directory instead of the real platform
-/// data dir.
+/// [`write_entry`] with the journal root injected so tests can use a temp dir.
 #[cfg(feature = "daemon")]
-fn record_config_edit_journal_in(config: &ClientConfig, root_dir: camino::Utf8PathBuf) {
-    use scenery_core::restore_journal::{
-        new_backup_ts, JournalEntry, JournalOp, JournalSource, RestoreJournal,
+fn write_entry_in(
+    config: &ClientConfig,
+    entry_value: serde_json::Value,
+    root_dir: Option<camino::Utf8PathBuf>,
+) -> Result<()> {
+    use anyhow::Context;
+
+    let path = &config.config_path;
+    let existed = path.exists();
+    let before = if existed {
+        fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?
+    } else {
+        String::new()
     };
+    let outcome = crate::config_edit::set_entry(
+        config.format,
+        &before,
+        &config.mcp_key,
+        MCP_SERVER_NAME,
+        &entry_value,
+    )
+    .with_context(|| {
+        format!(
+            "{}: refusing to edit {} (left untouched)",
+            config.name,
+            path.display()
+        )
+    })?;
+    if existed && outcome.text == before {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let prep = root_dir
+        .as_ref()
+        .map(|r| prepare_setup_journal(config, r, existed, &before, outcome.container_created));
+    atomic_write(path, &outcome.text)?;
+    if let (Some(root), Some(prep)) = (root_dir, prep) {
+        record_setup_edit(config, root, prep, &outcome.text);
+    }
+    Ok(())
+}
 
-    let journal = RestoreJournal::new(root_dir);
-    let target_path = config.config_path.to_string_lossy().to_string();
+/// What setup learned about the file before writing it.
+#[cfg(feature = "daemon")]
+struct SetupPrep {
+    backup_path: Option<String>,
+    file_existed: bool,
+    mcp_key_created: bool,
+}
 
-    let prior_backup_path = journal.read_all().ok().and_then(|entries| {
-        entries.into_iter().rev().find_map(|e| {
-            if e.op == JournalOp::ConfigEdit && e.target_path == target_path {
-                e.backup_path
-            } else {
-                None
-            }
+/// Decide the pre-setup backup for `config`.
+///
+/// While the live file still holds our `scenery` entry and the journal has a
+/// setup entry for it, that earlier backup is the real "before Scenery" state
+/// and is inherited. Otherwise (first setup, or setup after an uninstall or a
+/// manual removal) the file as it stands now is backed up fresh, into a
+/// per-client directory so two clients sharing a basename cannot collide.
+///
+/// Best-effort: failures are logged and never block configuring the client.
+#[cfg(feature = "daemon")]
+fn prepare_setup_journal(
+    config: &ClientConfig,
+    root_dir: &camino::Utf8Path,
+    existed: bool,
+    before: &str,
+    container_created: bool,
+) -> SetupPrep {
+    use scenery_core::restore_journal::{new_backup_ts, JournalOp, RestoreJournal};
+
+    let journal = RestoreJournal::new(root_dir.to_owned());
+    let target = config.config_path.to_string_lossy().to_string();
+    let holds_ours = existed
+        && crate::config_edit::entry_names(config.format, before, &config.mcp_key)
+            .map(|names| names.iter().any(|n| n == MCP_SERVER_NAME))
+            .unwrap_or(false);
+    let prior = if holds_ours {
+        journal.read_all().ok().and_then(|entries| {
+            entries.into_iter().rev().find(|e| {
+                e.op == JournalOp::ConfigEdit
+                    && e.target_path == target
+                    && e.slug.as_deref() == Some(MCP_SERVER_NAME)
+            })
         })
-    });
+    } else {
+        None
+    };
+    if let Some(prior) = prior {
+        let file_existed = prior
+            .detail
+            .get("file_existed")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(prior.backup_path.is_some());
+        let mcp_key_created = prior
+            .detail
+            .get("mcp_key_created")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        return SetupPrep {
+            backup_path: prior.backup_path,
+            file_existed,
+            mcp_key_created,
+        };
+    }
 
-    let backup_path = match prior_backup_path {
-        Some(p) => Some(p),
-        None if config.config_path.exists() => {
-            let Some(utf8_source) = camino::Utf8Path::from_path(config.config_path.as_path())
-            else {
+    let backup_path = if existed {
+        match camino::Utf8Path::from_path(config.config_path.as_path()) {
+            Some(src) => {
+                match journal.backup_file_for_client(&new_backup_ts(), &config.name, src) {
+                    Ok(p) => Some(p.to_string()),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "mcp setup: failed to back up client config for restore journal");
+                        None
+                    }
+                }
+            }
+            None => {
                 tracing::warn!(
                     path = %config.config_path.display(),
                     "mcp setup: config path is not valid UTF-8 — skipping restore-journal backup"
                 );
-                return;
-            };
-            match journal.backup_path_for(&new_backup_ts(), utf8_source) {
-                Ok(p) => Some(p.to_string()),
-                Err(e) => {
-                    tracing::warn!(error = %e, "mcp setup: failed to back up client config for restore journal");
-                    None
-                }
+                None
             }
         }
-        None => None,
+    } else {
+        None
+    };
+    SetupPrep {
+        backup_path,
+        file_existed: existed,
+        mcp_key_created: container_created,
+    }
+}
+
+/// Append the journal entry for a finished setup write. `written` is the
+/// exact text now on disk; its SHA-256 goes in `detail.post_setup_sha256`.
+#[cfg(feature = "daemon")]
+fn record_setup_edit(
+    config: &ClientConfig,
+    root_dir: camino::Utf8PathBuf,
+    prep: SetupPrep,
+    written: &str,
+) {
+    use scenery_core::restore_journal::{
+        sha256_hex, JournalEntry, JournalOp, JournalSource, RestoreJournal,
     };
 
-    let mut entry = JournalEntry::new(JournalOp::ConfigEdit, JournalSource::Native, target_path)
-        .with_slug(MCP_SERVER_NAME)
-        .with_client(config.name.clone())
-        .with_detail(serde_json::json!({
-            "server_key": MCP_SERVER_NAME,
-            "mcp_key": config.mcp_key,
-        }));
-    if let Some(bp) = backup_path {
+    let mut entry = JournalEntry::new(
+        JournalOp::ConfigEdit,
+        JournalSource::Native,
+        config.config_path.to_string_lossy().to_string(),
+    )
+    .with_slug(MCP_SERVER_NAME)
+    .with_client(config.name.clone())
+    .with_detail(serde_json::json!({
+        "server_key": MCP_SERVER_NAME,
+        "mcp_key": config.mcp_key,
+        "setup_edit": true,
+        "file_existed": prep.file_existed,
+        "mcp_key_created": prep.mcp_key_created,
+        "post_setup_sha256": sha256_hex(written.as_bytes()),
+    }));
+    if let Some(bp) = prep.backup_path {
         entry = entry.with_backup_path(bp);
     }
-
-    if let Err(e) = journal.append(entry) {
+    if let Err(e) = RestoreJournal::new(root_dir).append(entry) {
         tracing::warn!(error = %e, "mcp setup: failed to append restore-journal entry (non-fatal)");
     }
 }
 
-/// Remove the Scenery MCP entry from a client config file.
+/// Remove the Scenery MCP entry from a client config file, editing only that
+/// span so everything else in the file stays byte-for-byte as it was.
 ///
 /// Returns `true` if the entry existed and was removed, `false` if it wasn't
-/// present. The file is left unchanged when the entry is absent.
+/// present (the file is then left unchanged). A file that does not parse is
+/// an `Err` and is not touched.
 ///
 /// Dispatches on `config.format`, same as [`write_mcp_entry`].
 pub fn remove_mcp_entry(config: &ClientConfig) -> Result<bool> {
-    match config.format {
-        ConfigFormat::Json => remove_mcp_entry_json(config),
-        ConfigFormat::Toml => remove_mcp_entry_toml(config),
-    }
+    remove_named_entry(config, MCP_SERVER_NAME)
 }
 
-fn remove_mcp_entry_json(config: &ClientConfig) -> Result<bool> {
-    if !config.config_path.exists() {
-        return Ok(false);
-    }
-    let text = fs::read_to_string(&config.config_path)?;
-    let mut obj: serde_json::Map<String, serde_json::Value> =
-        match serde_json::from_str::<serde_json::Value>(&text)
-            .unwrap_or(serde_json::Value::Object(Default::default()))
-        {
-            serde_json::Value::Object(m) => m,
-            _ => return Ok(false),
-        };
-
-    let removed = if let Some(serde_json::Value::Object(ref mut map)) = obj.get_mut(&config.mcp_key)
-    {
-        map.remove(MCP_SERVER_NAME).is_some()
-    } else {
-        false
-    };
-
-    if removed {
-        let output = serde_json::to_string_pretty(&serde_json::Value::Object(obj))?;
-        atomic_write(&config.config_path, &output)?;
-    }
-
-    Ok(removed)
-}
-
-/// TOML counterpart of [`remove_mcp_entry_json`], via `toml_edit` so removing
-/// the `scenery` sub-table leaves every other table/comment/formatting in
-/// the file untouched. Same `daemon`-only gating as [`write_mcp_entry_toml`].
+/// Remove `<config.mcp_key>.<name>` from `config`'s file, format-preserving.
+/// Same contract as [`remove_mcp_entry`], for any entry name.
 #[cfg(feature = "daemon")]
-fn remove_mcp_entry_toml(config: &ClientConfig) -> Result<bool> {
-    use toml_edit::DocumentMut;
+pub fn remove_named_entry(config: &ClientConfig, name: &str) -> Result<bool> {
+    use anyhow::Context;
 
     if !config.config_path.exists() {
         return Ok(false);
     }
-    let text = fs::read_to_string(&config.config_path)?;
-    let Ok(mut doc) = text.parse::<DocumentMut>() else {
-        return Ok(false);
-    };
-    // Same `as_table_like_mut` reasoning as `write_mcp_entry_toml`: an inline
-    // `mcp_servers = { scenery = {...} }` must be removable too, not just
-    // a standard `[mcp_servers]` table.
-    let Some(servers) = doc
-        .get_mut(config.mcp_key.as_str())
-        .and_then(|item| item.as_table_like_mut())
-    else {
-        return Ok(false);
-    };
-    let removed = servers.remove(MCP_SERVER_NAME).is_some();
-
-    if removed {
-        atomic_write(&config.config_path, &doc.to_string())?;
+    let path = &config.config_path;
+    let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let edited = crate::config_edit::remove_entry(config.format, &text, &config.mcp_key, name)
+        .with_context(|| {
+            format!(
+                "{}: refusing to edit {} (left untouched)",
+                config.name,
+                path.display()
+            )
+        })?;
+    match edited {
+        Some(new_text) => {
+            atomic_write(path, &new_text)?;
+            Ok(true)
+        }
+        None => Ok(false),
     }
-    Ok(removed)
 }
 
 #[cfg(not(feature = "daemon"))]
-fn remove_mcp_entry_toml(_config: &ClientConfig) -> Result<bool> {
+pub fn remove_named_entry(_config: &ClientConfig, _name: &str) -> Result<bool> {
     anyhow::bail!(
-        "TOML client config removal requires the `daemon` feature (scenery-mcp built \
+        "client config removal requires the `daemon` feature (scenery-mcp built \
          without it, e.g. the shim, never calls this)"
     )
 }
@@ -1390,7 +1365,7 @@ fn is_scenery_configured(path: &std::path::Path, mcp_key: &str, format: ConfigFo
 /// specially).
 fn read_scenery_entry_type(path: &std::path::Path, mcp_key: &str) -> Option<String> {
     let text = fs::read_to_string(path).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let json = parse_json_lenient(&text)?;
     json.get(mcp_key)?
         .get(MCP_SERVER_NAME)?
         .get("type")?
@@ -1401,7 +1376,7 @@ fn read_scenery_entry_type(path: &std::path::Path, mcp_key: &str) -> Option<Stri
 /// Read the `url` of the `scenery` entry out of a JSON client config.
 fn read_scenery_entry_url(path: &std::path::Path, mcp_key: &str) -> Option<String> {
     let text = fs::read_to_string(path).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let json = parse_json_lenient(&text)?;
     json.get(mcp_key)?
         .get(MCP_SERVER_NAME)?
         .get("url")?
@@ -1417,7 +1392,7 @@ fn read_scenery_entry_url(path: &std::path::Path, mcp_key: &str) -> Option<Strin
 /// whether the configured callback port is currently free.
 pub fn read_claude_code_callback_port(path: &std::path::Path, mcp_key: &str) -> Option<u16> {
     let text = fs::read_to_string(path).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let json = parse_json_lenient(&text)?;
     json.get(mcp_key)?
         .get(MCP_SERVER_NAME)?
         .get("oauth")?
@@ -1459,7 +1434,7 @@ fn read_scenery_command(
     match format {
         ConfigFormat::Json => {
             let text = fs::read_to_string(path).ok()?;
-            let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+            let json = parse_json_lenient(&text)?;
             json.get(mcp_key)?
                 .get(MCP_SERVER_NAME)?
                 .get("command")?
@@ -1511,40 +1486,69 @@ pub struct UnmanagedServer {
 /// Every other server key is reported as unmanaged so IT admins can audit shadow
 /// MCP installations via the `unmanaged_server_detected` audit event stream.
 pub fn detect_unmanaged_servers() -> Vec<UnmanagedServer> {
-    let clients = detect_ai_clients();
+    unmanaged_servers_in(&detect_ai_clients(), &[])
+}
+
+/// Unmanaged servers across `clients`, skipping the keys in `exclude`.
+///
+/// Reads JSON, JSONC (VS Code) and TOML (Codex). A file that cannot be read
+/// or parsed contributes nothing.
+pub fn unmanaged_servers_in(clients: &[ClientConfig], exclude: &[String]) -> Vec<UnmanagedServer> {
     let mut unmanaged = Vec::new();
-
-    for client in &clients {
-        if !client.config_path.exists() {
+    for client in clients {
+        let Ok(text) = std::fs::read_to_string(&client.config_path) else {
             continue;
-        }
-        let text = match std::fs::read_to_string(&client.config_path) {
-            Ok(t) => t,
-            Err(_) => continue,
         };
-        let config: serde_json::Value = match serde_json::from_str(&text) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-
-        let servers = match config.get(&client.mcp_key).and_then(|v| v.as_object()) {
-            Some(s) => s,
-            None => continue,
-        };
-
-        for key in servers.keys() {
-            if key == MCP_SERVER_NAME {
+        for key in server_names_lenient(client, &text) {
+            if key == MCP_SERVER_NAME || exclude.contains(&key) {
                 continue;
             }
             unmanaged.push(UnmanagedServer {
-                server_name: key.clone(),
+                server_name: key,
                 config_path: client.config_path.display().to_string(),
                 client_name: client.name.clone(),
             });
         }
     }
-
     unmanaged
+}
+
+/// Server names under `client.mcp_key` in `text`, `[]` when unparsable.
+#[cfg(feature = "daemon")]
+pub fn server_names_lenient(client: &ClientConfig, text: &str) -> Vec<String> {
+    crate::config_edit::entry_names(client.format, text, &client.mcp_key).unwrap_or_default()
+}
+
+#[cfg(not(feature = "daemon"))]
+pub fn server_names_lenient(client: &ClientConfig, text: &str) -> Vec<String> {
+    let Ok(config) = serde_json::from_str::<serde_json::Value>(text) else {
+        return Vec::new();
+    };
+    config
+        .get(&client.mcp_key)
+        .and_then(|v| v.as_object())
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// Parse JSON, falling back to JSONC (comments, trailing commas) when the
+/// `daemon` feature is built in.
+fn parse_json_lenient(text: &str) -> Option<serde_json::Value> {
+    if let Ok(v) = serde_json::from_str(text) {
+        return Some(v);
+    }
+    #[cfg(feature = "daemon")]
+    {
+        jsonc_parser::parse_to_serde_value::<serde_json::Value>(
+            text,
+            &jsonc_parser::ParseOptions::default(),
+        )
+        .ok()
+    }
+    #[cfg(not(feature = "daemon"))]
+    {
+        None
+    }
 }
 
 // ── Full MCP entry enumeration (read-only, Shadow-AI discovery) ────────────────
@@ -1892,22 +1896,8 @@ fn migrate_stale_vscode_settings_entry(home: &std::path::Path) -> bool {
         return false;
     };
 
-    // Journal this edit the same way `write_mcp_entry` journals a fresh
-    // write, so `scenery uninstall` still restores the user's true
-    // pre-Scenery settings.json. `record_config_edit_journal` reuses the
-    // *original* backup captured the first time Scenery ever touched
-    // this file (see its backup-reuse doc comment) rather than backing up
-    // the already-Scenery-modified content we're about to write below.
-    // Runs before the write, same ordering `write_mcp_entry` uses.
-    let legacy_config = ClientConfig {
-        name: "VS Code".to_string(),
-        config_path: settings_path.clone(),
-        mcp_key: "mcpServers".to_string(),
-        already_configured: false,
-        format: ConfigFormat::Json,
-    };
-    record_config_edit_journal(&legacy_config);
-
+    // No journal entry: this deletes a stale entry Scenery itself wrote into
+    // a file VS Code never read, so there is nothing of the user's to restore.
     // Removing the property node preserves every comment, blank line, and
     // the rest of the file's formatting exactly as written — only the
     // `"scenery": {...}` property (and its now-dangling comma, if any)
@@ -2909,142 +2899,6 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
         assert_eq!(json["mcpServers"]["scenery"]["command"], expected_command());
         assert_eq!(json["mcpServers"]["other"]["command"], "other");
-
-        let _ = fs::remove_dir_all(&tmp);
-    }
-
-    // ── write_mcp_entry restore-journal integration ───────────────────────────
-    // Uses record_config_edit_journal_in directly (root_dir injected) so these
-    // tests never touch the real platform data dir.
-
-    #[cfg(feature = "daemon")]
-    fn journal_for(root_dir: &camino::Utf8Path) -> scenery_core::restore_journal::RestoreJournal {
-        scenery_core::restore_journal::RestoreJournal::new(root_dir.to_owned())
-    }
-
-    #[cfg(feature = "daemon")]
-    #[test]
-    fn record_config_edit_journal_backs_up_pre_existing_file_and_appends_entry() {
-        let tmp = temp_root("journal-existing");
-        let config_path = tmp.join("claude.json");
-        fs::create_dir_all(&tmp).unwrap();
-        fs::write(
-            &config_path,
-            r#"{"mcpServers":{"other":{"command":"other"}}}"#,
-        )
-        .unwrap();
-
-        let root_dir = camino::Utf8PathBuf::from_path_buf(tmp.join("vh-root")).unwrap();
-
-        let config = ClientConfig {
-            name: "Claude Code".to_string(),
-            config_path: config_path.clone(),
-            mcp_key: "mcpServers".to_string(),
-            already_configured: false,
-            format: ConfigFormat::Json,
-        };
-
-        record_config_edit_journal_in(&config, root_dir.clone());
-
-        let journal = journal_for(&root_dir);
-        let entries = journal.read_all().unwrap();
-        assert_eq!(entries.len(), 1, "one config_edit entry should be appended");
-
-        let entry = &entries[0];
-        assert_eq!(
-            entry.op,
-            scenery_core::restore_journal::JournalOp::ConfigEdit
-        );
-        assert_eq!(
-            entry.source,
-            scenery_core::restore_journal::JournalSource::Native
-        );
-        assert_eq!(entry.target_path, config_path.to_string_lossy());
-        assert_eq!(entry.slug.as_deref(), Some(MCP_SERVER_NAME));
-        assert_eq!(entry.client.as_deref(), Some("Claude Code"));
-        assert_eq!(entry.detail["server_key"], MCP_SERVER_NAME);
-        assert_eq!(entry.detail["mcp_key"], "mcpServers");
-
-        let backup_path = entry
-            .backup_path
-            .as_ref()
-            .expect("pre-existing file must be backed up");
-        assert_eq!(
-            fs::read_to_string(backup_path).unwrap(),
-            r#"{"mcpServers":{"other":{"command":"other"}}}"#,
-            "backup must capture the pre-edit content"
-        );
-
-        let _ = fs::remove_dir_all(&tmp);
-    }
-
-    #[cfg(feature = "daemon")]
-    #[test]
-    fn record_config_edit_journal_omits_backup_when_file_did_not_exist() {
-        let tmp = temp_root("journal-new-file");
-        let config_path = tmp.join("cursor").join("mcp.json");
-        fs::create_dir_all(&tmp).unwrap();
-        // config_path deliberately does not exist yet.
-
-        let root_dir = camino::Utf8PathBuf::from_path_buf(tmp.join("vh-root")).unwrap();
-        let config = ClientConfig {
-            name: "Cursor".to_string(),
-            config_path: config_path.clone(),
-            mcp_key: "mcpServers".to_string(),
-            already_configured: false,
-            format: ConfigFormat::Json,
-        };
-
-        record_config_edit_journal_in(&config, root_dir.clone());
-
-        let entries = journal_for(&root_dir).read_all().unwrap();
-        assert_eq!(entries.len(), 1);
-        assert!(
-            entries[0].backup_path.is_none(),
-            "no backup_path when the file did not exist before — uninstall should delete instead"
-        );
-
-        let _ = fs::remove_dir_all(&tmp);
-    }
-
-    #[cfg(feature = "daemon")]
-    #[test]
-    fn record_config_edit_journal_second_call_reuses_original_backup() {
-        let tmp = temp_root("journal-reuse");
-        let config_path = tmp.join("claude.json");
-        fs::create_dir_all(&tmp).unwrap();
-        fs::write(&config_path, "original content").unwrap();
-
-        let root_dir = camino::Utf8PathBuf::from_path_buf(tmp.join("vh-root")).unwrap();
-        let config = ClientConfig {
-            name: "Claude Code".to_string(),
-            config_path: config_path.clone(),
-            mcp_key: "mcpServers".to_string(),
-            already_configured: false,
-            format: ConfigFormat::Json,
-        };
-
-        // First edit: backs up "original content".
-        record_config_edit_journal_in(&config, root_dir.clone());
-        // Simulate the actual write happening (file now Scenery-modified).
-        fs::write(&config_path, "scenery-modified content").unwrap();
-        // Second edit (e.g. a later `mcp setup` re-run): must NOT re-back-up
-        // the now-modified content over the pristine original.
-        record_config_edit_journal_in(&config, root_dir.clone());
-
-        let entries = journal_for(&root_dir).read_all().unwrap();
-        assert_eq!(entries.len(), 2, "each call appends its own entry");
-        let backup_1 = entries[0].backup_path.clone().unwrap();
-        let backup_2 = entries[1].backup_path.clone().unwrap();
-        assert_eq!(
-            backup_1, backup_2,
-            "second call must reuse the first backup path"
-        );
-        assert_eq!(
-            fs::read_to_string(&backup_1).unwrap(),
-            "original content",
-            "backup must still hold the pristine pre-Scenery content"
-        );
 
         let _ = fs::remove_dir_all(&tmp);
     }
@@ -4412,7 +4266,10 @@ mod tests {
 
         let err = with_fake_home(&tmp, || write_mcp_entry(&config))
             .expect_err("a non-table mcp_servers value must still be rejected");
-        assert!(err.to_string().contains("isn't a table"), "got: {err:#}");
+        assert!(
+            format!("{err:#}").contains("is not a table"),
+            "got: {err:#}"
+        );
         assert_eq!(
             fs::read_to_string(&config_path).unwrap(),
             "mcp_servers = 5\n",
@@ -4446,49 +4303,6 @@ mod tests {
         assert_eq!(
             doc["mcp_servers"]["scenery"]["command"].as_str(),
             Some(expected_command().as_str())
-        );
-
-        let _ = fs::remove_dir_all(&tmp);
-    }
-
-    #[cfg(feature = "daemon")]
-    #[test]
-    fn record_config_edit_journal_backs_up_codex_toml_and_appends_entry() {
-        // Mirrors `record_config_edit_journal_backs_up_pre_existing_file_and_appends_entry`
-        // above, but for a TOML (Codex) client, so the restore-journal path
-        // that `scenery uninstall` relies on is verified for TOML too.
-        let tmp = temp_root("journal-codex");
-        let config_path = tmp.join("config.toml");
-        fs::create_dir_all(&tmp).unwrap();
-        fs::write(&config_path, "model = \"gpt-5.1\"\n").unwrap();
-
-        let root_dir = camino::Utf8PathBuf::from_path_buf(tmp.join("vh-root")).unwrap();
-
-        let config = ClientConfig {
-            name: "Codex".to_string(),
-            config_path: config_path.clone(),
-            mcp_key: "mcp_servers".to_string(),
-            already_configured: false,
-            format: ConfigFormat::Toml,
-        };
-
-        record_config_edit_journal_in(&config, root_dir.clone());
-
-        let journal = journal_for(&root_dir);
-        let entries = journal.read_all().unwrap();
-        assert_eq!(entries.len(), 1);
-
-        let entry = &entries[0];
-        assert_eq!(entry.client.as_deref(), Some("Codex"));
-        assert_eq!(entry.detail["mcp_key"], "mcp_servers");
-        let backup_path = entry
-            .backup_path
-            .as_ref()
-            .expect("pre-existing file must be backed up");
-        assert_eq!(
-            fs::read_to_string(backup_path).unwrap(),
-            "model = \"gpt-5.1\"\n",
-            "backup must capture the pre-edit TOML content"
         );
 
         let _ = fs::remove_dir_all(&tmp);
@@ -4717,3 +4531,7 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp);
     }
 }
+
+#[cfg(all(test, feature = "daemon"))]
+#[path = "setup_journal_tests.rs"]
+mod journal_tests;

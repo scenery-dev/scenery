@@ -229,10 +229,16 @@ impl RestoreJournal {
         let name = source
             .file_name()
             .ok_or_else(|| anyhow::anyhow!("restore_journal: source has no file name: {source}"))?;
-        let dest = dest_dir.join(name);
+        let mut dest = dest_dir.join(name);
 
         if dest.exists() {
-            return Ok(dest);
+            // Same basename from a *different* file (e.g. `~/.cursor/mcp.json`
+            // and VS Code's `mcp.json`) must never be answered with the other
+            // file's snapshot: only an identical copy counts as "already done".
+            if !source.is_file() || backups_match(source, &dest) {
+                return Ok(dest);
+            }
+            dest = unique_sibling(&dest);
         }
 
         if source.is_dir() {
@@ -246,6 +252,57 @@ impl RestoreJournal {
         }
 
         Ok(dest)
+    }
+
+    /// Back up the single file `source` for AI client `client` into
+    /// `backup_dir_for(ts)/<client-slug>/<basename>` and return the path.
+    ///
+    /// Namespacing by client keeps two clients whose configs share a basename
+    /// (Cursor and VS Code both use `mcp.json`) from sharing one snapshot. A
+    /// name that is somehow already taken is never reused: a numbered sibling
+    /// is picked instead, so the returned path always holds `source`'s bytes.
+    pub fn backup_file_for_client(
+        &self,
+        ts: &str,
+        client: &str,
+        source: &Utf8Path,
+    ) -> Result<Utf8PathBuf> {
+        let name = source
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("restore_journal: source has no file name: {source}"))?;
+        let dest_dir = self.backup_dir_for(ts).join(client_slug(client));
+        fs::create_dir_all(dest_dir.as_std_path())
+            .with_context(|| format!("restore_journal: failed to create backup dir {dest_dir}"))?;
+        let mut dest = dest_dir.join(name);
+        if dest.exists() {
+            dest = unique_sibling(&dest);
+        }
+        fs::copy(source.as_std_path(), dest.as_std_path()).with_context(|| {
+            format!("restore_journal: failed to back up file {source} -> {dest}")
+        })?;
+        Ok(dest)
+    }
+
+    /// Drop every journal entry (the journal file is rewritten as `[]`).
+    ///
+    /// Called after a fully successful uninstall so the next install starts
+    /// from a clean ledger: a stale entry would otherwise make a later setup
+    /// reuse a backup that predates the user's own edits. Backups on disk are
+    /// left alone.
+    pub fn clear(&self) -> Result<()> {
+        if !self.journal_path().as_std_path().exists() {
+            return Ok(());
+        }
+        let lock_file = self.open_lock_file()?;
+        fs2::FileExt::lock_exclusive(&lock_file).with_context(|| {
+            format!(
+                "restore_journal: failed to acquire exclusive lock: {}",
+                self.lock_path()
+            )
+        })?;
+        let result = self.write_entries_unlocked(&[]);
+        drop(lock_file);
+        result
     }
 
     /// Append one entry to the journal.
@@ -407,6 +464,57 @@ impl RestoreJournal {
 
         Ok(())
     }
+}
+
+/// Lowercase alphanumeric/dash form of a client name, safe as a directory name.
+fn client_slug(client: &str) -> String {
+    let slug: String = client
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if slug.is_empty() {
+        "client".to_string()
+    } else {
+        slug
+    }
+}
+
+/// `true` when both files exist and hold identical bytes.
+fn backups_match(source: &Utf8Path, dest: &Utf8Path) -> bool {
+    match (fs::read(source.as_std_path()), fs::read(dest.as_std_path())) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// First `<name>.<n>` next to `path` that does not exist yet.
+fn unique_sibling(path: &Utf8Path) -> Utf8PathBuf {
+    let mut n = 1u32;
+    loop {
+        let candidate = Utf8PathBuf::from(format!("{path}.{n}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
+/// Lowercase hex SHA-256 of `bytes`. Used to fingerprint a client config at
+/// the moment setup finished writing it (see `mcp setup`'s journal entry).
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
 }
 
 // ── Lenient parsing ──────────────────────────────────────────────────────────
@@ -885,5 +993,57 @@ mod tests {
             v.get("backup_path").is_none(),
             "None backup_path should be omitted, not null"
         );
+    }
+
+    #[test]
+    fn same_basename_from_different_files_never_shares_a_backup() {
+        let root = temp_root("collide");
+        let journal = RestoreJournal::new(root.clone());
+        let a_dir = root.join("a");
+        let b_dir = root.join("b");
+        fs::create_dir_all(a_dir.as_std_path()).expect("mkdir a");
+        fs::create_dir_all(b_dir.as_std_path()).expect("mkdir b");
+        fs::write(a_dir.join("mcp.json").as_std_path(), "AAA").expect("write a");
+        fs::write(b_dir.join("mcp.json").as_std_path(), "BBB").expect("write b");
+
+        // Plain backup_path_for with one ts: second call must not return the first file.
+        let p1 = journal
+            .backup_path_for("t", &a_dir.join("mcp.json"))
+            .expect("a");
+        let p2 = journal
+            .backup_path_for("t", &b_dir.join("mcp.json"))
+            .expect("b");
+        assert_ne!(p1, p2);
+        assert_eq!(fs::read_to_string(p1.as_std_path()).expect("read"), "AAA");
+        assert_eq!(fs::read_to_string(p2.as_std_path()).expect("read"), "BBB");
+
+        // Client-scoped backups land in separate directories.
+        let c1 = journal
+            .backup_file_for_client("t2", "Cursor", &a_dir.join("mcp.json"))
+            .expect("cursor");
+        let c2 = journal
+            .backup_file_for_client("t2", "VS Code", &b_dir.join("mcp.json"))
+            .expect("vscode");
+        assert!(c1.as_str().contains("/cursor/"), "{c1}");
+        assert!(c2.as_str().contains("/vs-code/"), "{c2}");
+        assert_eq!(fs::read_to_string(c2.as_std_path()).expect("read"), "BBB");
+        let _ = fs::remove_dir_all(root.as_std_path());
+    }
+
+    #[test]
+    fn clear_empties_the_journal() {
+        let root = temp_root("clear");
+        let journal = RestoreJournal::new(root.clone());
+        journal
+            .append(JournalEntry::new(
+                JournalOp::ConfigEdit,
+                JournalSource::Native,
+                "/x",
+            ))
+            .expect("append");
+        assert_eq!(journal.read_all().expect("read").len(), 1);
+        journal.clear().expect("clear");
+        assert!(journal.read_all().expect("read").is_empty());
+        let _ = fs::remove_dir_all(root.as_std_path());
     }
 }
