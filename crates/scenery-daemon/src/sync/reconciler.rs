@@ -3198,7 +3198,7 @@ fn install_from_registry_blocking(
     use scenery_core::installer::{install_unpacked_skill, InstallMode};
     use scenery_manifest::SkillPackage;
 
-    let registry = RegistryClient::new(registry_url);
+    let registry = RegistryClient::new(registry_url).with_stored_auth(state);
 
     // Fetch artifact metadata (SHA-256, download URL).
     let meta = registry

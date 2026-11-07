@@ -350,6 +350,23 @@ impl RegistryClient {
         self
     }
 
+    /// Install the stored access token for this client's registry, if the
+    /// user is logged in (consuming). Not logged in, or a token-store error,
+    /// leaves the client anonymous so calls the backend still allows
+    /// anonymously keep working.
+    pub fn with_stored_auth(self, state: &AppState) -> Self {
+        match crate::auth::load_tokens(state, &self.base_url) {
+            Ok(Some(tokens)) if !tokens.access_token.is_empty() => {
+                self.with_auth(tokens.access_token)
+            }
+            Ok(_) => self,
+            Err(e) => {
+                debug!(error = %e, "could not load stored auth token; continuing anonymously");
+                self
+            }
+        }
+    }
+
     /// Set the auth token on an existing client.
     ///
     /// Safe to call from any thread even when the client is behind `Arc<…>`.
@@ -395,9 +412,11 @@ impl RegistryClient {
         );
         debug!(url, "fetching approved servers");
 
-        let resp = self
-            .http
-            .get(&url)
+        let mut req = self.http.get(&url);
+        if let Some(token) = self.get_auth_token() {
+            req = req.bearer_auth(token);
+        }
+        let resp = req
             .send_tracked()
             .with_context(|| format!("failed to reach registry at {url}"))?;
 
@@ -707,9 +726,13 @@ impl RegistryClient {
         );
         debug!(url, "fetching skill detail");
 
-        let resp = self
-            .http
-            .get(&url)
+        // The backend strips detail fields for anonymous callers, so identify
+        // ourselves when logged in. Still callable anonymously.
+        let mut req = self.http.get(&url);
+        if let Some(token) = self.get_auth_token() {
+            req = req.bearer_auth(token);
+        }
+        let resp = req
             .send_tracked()
             .with_context(|| format!("failed to reach registry at {url}"))?;
 
@@ -1879,6 +1902,98 @@ mod tests {
             .unwrap();
         own.assert();
         foreign.assert();
+    }
+
+    const SKILL_DETAIL_BODY: &str =
+        r#"{"skill_id":"my-skill","name":"My Skill","latest_version":"1.0.0"}"#;
+
+    #[test]
+    fn fetch_skill_detail_sends_bearer_when_logged_in() {
+        use mockito::Server;
+        let mut server = Server::new();
+        let mock = server
+            .mock("GET", "/portal/skills/my-skill")
+            .match_header("authorization", "Bearer tok-123")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(SKILL_DETAIL_BODY)
+            .create();
+        let client = RegistryClient::new(server.url()).with_auth("tok-123");
+        let detail = client.fetch_skill_detail("my-skill").unwrap();
+        assert_eq!(detail.latest_version.as_deref(), Some("1.0.0"));
+        mock.assert();
+    }
+
+    #[test]
+    fn fetch_skill_detail_stays_anonymous_when_logged_out() {
+        use mockito::{Matcher, Server};
+        let mut server = Server::new();
+        let mock = server
+            .mock("GET", "/portal/skills/my-skill")
+            .match_header("authorization", Matcher::Missing)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(SKILL_DETAIL_BODY)
+            .create();
+        let client = RegistryClient::new(server.url());
+        client.fetch_skill_detail("my-skill").unwrap();
+        mock.assert();
+    }
+
+    #[test]
+    fn fetch_approved_servers_sends_bearer_when_logged_in() {
+        use mockito::Server;
+        let mut server = Server::new();
+        let mock = server
+            .mock("GET", "/api/runner/approved-servers")
+            .match_header("authorization", "Bearer tok-123")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"servers":[]}"#)
+            .create();
+        let client = RegistryClient::new(server.url()).with_auth("tok-123");
+        client.fetch_approved_servers().unwrap();
+        mock.assert();
+    }
+
+    #[test]
+    fn with_stored_auth_installs_saved_token_and_skips_when_logged_out() {
+        use mockito::Server;
+        let root = camino::Utf8PathBuf::from_path_buf(
+            std::env::temp_dir().join(format!("reg-stored-auth-{}", std::process::id())),
+        )
+        .unwrap();
+        let state = AppState::bootstrap_in(root.clone()).unwrap();
+        let mut server = Server::new();
+
+        let anon = server
+            .mock("GET", "/portal/skills/my-skill")
+            .match_header("authorization", mockito::Matcher::Missing)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(SKILL_DETAIL_BODY)
+            .create();
+        RegistryClient::new(server.url())
+            .with_stored_auth(&state)
+            .fetch_skill_detail("my-skill")
+            .unwrap();
+        anon.assert();
+        anon.remove();
+
+        crate::auth::save_tokens(&state, &server.url(), "stored-acc", "stored-ref").unwrap();
+        let authed = server
+            .mock("GET", "/portal/skills/my-skill")
+            .match_header("authorization", "Bearer stored-acc")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(SKILL_DETAIL_BODY)
+            .create();
+        RegistryClient::new(server.url())
+            .with_stored_auth(&state)
+            .fetch_skill_detail("my-skill")
+            .unwrap();
+        authed.assert();
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Same call, logged out — must keep working with no auth_token set.

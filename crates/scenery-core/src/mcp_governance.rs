@@ -202,14 +202,22 @@ fn make_http_client() -> Result<Client> {
         .context("failed to build HTTP client")
 }
 
+/// Shown when catalog search is attempted without (valid) credentials.
+pub const SEARCH_SIGN_IN_MESSAGE: &str = "Sign in to search the catalog (`scenery auth login`).";
+
 /// Fetch the org's MCP server catalog from the registry.
-pub fn fetch_mcp_catalog(base_url: &str) -> Result<McpServersResponse> {
+///
+/// Sends `auth_token` as a Bearer token when present; anonymous otherwise.
+pub fn fetch_mcp_catalog(base_url: &str, auth_token: Option<&str>) -> Result<McpServersResponse> {
     let url = format!("{}/api/runner/mcp-servers", base_url.trim_end_matches('/'));
     debug!(url, "fetching MCP server catalog");
 
     let client = make_http_client()?;
-    let resp = client
-        .get(&url)
+    let mut req = client.get(&url);
+    if let Some(token) = auth_token {
+        req = req.bearer_auth(token);
+    }
+    let resp = req
         .send_tracked()
         .with_context(|| format!("failed to reach registry at {url}"))?;
 
@@ -351,8 +359,16 @@ pub fn import_submit(
         .context("failed to deserialize import submit response")
 }
 
-/// Search the skill registry.
-pub fn search_skills(base_url: &str, query: &str) -> Result<Vec<serde_json::Value>> {
+/// Search the skill registry. The backend requires a signed-in user, so a
+/// missing token is reported up front instead of as a raw 401.
+pub fn search_skills(
+    base_url: &str,
+    query: &str,
+    auth_token: Option<&str>,
+) -> Result<Vec<serde_json::Value>> {
+    let Some(token) = auth_token else {
+        anyhow::bail!("{SEARCH_SIGN_IN_MESSAGE}");
+    };
     let url = format!(
         "{}/api/skills/search?q={}",
         base_url.trim_end_matches('/'),
@@ -362,9 +378,13 @@ pub fn search_skills(base_url: &str, query: &str) -> Result<Vec<serde_json::Valu
     let client = make_http_client()?;
     let resp = client
         .get(&url)
+        .bearer_auth(token)
         .send_tracked()
         .with_context(|| format!("failed to reach registry at {url}"))?;
 
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        anyhow::bail!("{SEARCH_SIGN_IN_MESSAGE}");
+    }
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().unwrap_or_default();
@@ -665,6 +685,70 @@ mod tests {
             params![skill_id, version, "/tmp/does-not-matter", status],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn fetch_mcp_catalog_sends_bearer_when_token_given() {
+        let mut server = Server::new();
+        let mock = server
+            .mock("GET", "/api/runner/mcp-servers")
+            .match_header("authorization", "Bearer tok-123")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"approval_mode":"allowlist","servers":[]}"#)
+            .create();
+        let resp = fetch_mcp_catalog(&server.url(), Some("tok-123")).unwrap();
+        assert_eq!(resp.approval_mode, "allowlist");
+        mock.assert();
+    }
+
+    #[test]
+    fn fetch_mcp_catalog_stays_anonymous_without_token() {
+        let mut server = Server::new();
+        let mock = server
+            .mock("GET", "/api/runner/mcp-servers")
+            .match_header("authorization", mockito::Matcher::Missing)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"approval_mode":"allowlist","servers":[]}"#)
+            .create();
+        fetch_mcp_catalog(&server.url(), None).unwrap();
+        mock.assert();
+    }
+
+    #[test]
+    fn search_skills_sends_bearer_token() {
+        let mut server = Server::new();
+        let mock = server
+            .mock("GET", "/api/skills/search?q=pdf")
+            .match_header("authorization", "Bearer tok-123")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"[{"skill_id":"pdf-tools"}]"#)
+            .create();
+        let results = search_skills(&server.url(), "pdf", Some("tok-123")).unwrap();
+        assert_eq!(results.len(), 1);
+        mock.assert();
+    }
+
+    #[test]
+    fn search_skills_without_token_asks_to_sign_in_and_makes_no_request() {
+        let mut server = Server::new();
+        let mock = server.mock("GET", mockito::Matcher::Any).expect(0).create();
+        let err = search_skills(&server.url(), "pdf", None).unwrap_err();
+        assert!(err.to_string().contains("scenery auth login"));
+        mock.assert();
+    }
+
+    #[test]
+    fn search_skills_maps_401_to_sign_in_message() {
+        let mut server = Server::new();
+        let _mock = server
+            .mock("GET", "/api/skills/search?q=pdf")
+            .with_status(401)
+            .create();
+        let err = search_skills(&server.url(), "pdf", Some("stale")).unwrap_err();
+        assert!(err.to_string().contains("scenery auth login"));
     }
 
     #[test]

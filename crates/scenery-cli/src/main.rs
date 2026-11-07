@@ -2215,7 +2215,6 @@ async fn direct_registry_install(
     };
 
     let url = registry_url.to_string();
-    let registry = RegistryClient::new(&url);
     let skill_id = skill_ref.to_string();
     // Reconstruct the minimal AppState from db_path — AppState::bootstrap()
     // was already called by the outer command; we just need the struct fields.
@@ -2228,6 +2227,7 @@ async fn direct_registry_install(
         db_path: db_path.clone(),
         block_third_party_inference: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
+    let registry = RegistryClient::new(&url).with_stored_auth(&state);
 
     let requested_version = version.map(|v| v.to_string());
     let installed_version = tokio::task::spawn_blocking(move || {
@@ -4247,8 +4247,9 @@ async fn cmd_skill_update(id: Option<&str>, all: bool, registry_url: Option<&str
         // Fetch latest version from registry (blocking call in async context).
         let registry_url_inner = registry_url_owned.clone();
         let skill_id_inner = skill_id.clone();
+        let detail_state = state.clone();
         let detail_result = tokio::task::spawn_blocking(move || {
-            let reg = RegistryClient::new(&registry_url_inner);
+            let reg = RegistryClient::new(&registry_url_inner).with_stored_auth(&detail_state);
             reg.fetch_skill_detail(&skill_id_inner)
         })
         .await
@@ -4310,7 +4311,7 @@ async fn cmd_skill_update(id: Option<&str>, all: bool, registry_url: Option<&str
                 let ver_str = latest_ver.to_string();
 
                 let install_result = tokio::task::spawn_blocking(move || {
-                    let registry = RegistryClient::new(&url_clone);
+                    let registry = RegistryClient::new(&url_clone).with_stored_auth(&install_state);
                     install_from_registry(&install_state, &registry, &skill_clone, Some(&ver_str))
                 })
                 .await

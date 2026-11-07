@@ -815,7 +815,7 @@ fn handle_tool_call_inner(
 
     let result = match name {
         "scenery_list" => handle_list(state),
-        "scenery_search" => handle_search(arguments, registry_url),
+        "scenery_search" => handle_search(arguments, state, registry_url),
         "scenery_install" => handle_install(arguments, state, registry_url),
         "scenery_info" => handle_info(arguments, state),
         "scenery_validate" => handle_validate(arguments),
@@ -921,7 +921,18 @@ fn handle_list(state: &AppState) -> ToolCallResult {
     }
 }
 
-fn handle_search(arguments: &serde_json::Value, registry_url: &Option<String>) -> ToolCallResult {
+fn stored_access_token(state: &AppState, registry_url: &str) -> Option<String> {
+    match auth::load_tokens(state, registry_url) {
+        Ok(Some(t)) if !t.access_token.is_empty() => Some(t.access_token),
+        Ok(_) | Err(_) => None,
+    }
+}
+
+fn handle_search(
+    arguments: &serde_json::Value,
+    state: &AppState,
+    registry_url: &Option<String>,
+) -> ToolCallResult {
     let url = match registry_url {
         Some(u) => u,
         None => return ToolCallResult::error_result("No registry URL configured"),
@@ -938,7 +949,10 @@ fn handle_search(arguments: &serde_json::Value, registry_url: &Option<String>) -
         );
     }
 
-    match mcp_governance::search_skills(url, query) {
+    let Some(token) = stored_access_token(state, url) else {
+        return ToolCallResult::error_result(mcp_governance::SEARCH_SIGN_IN_MESSAGE);
+    };
+    match mcp_governance::search_skills(url, query, Some(&token)) {
         Ok(results) => {
             if results.is_empty() {
                 ToolCallResult::success(format!("No skills found matching '{query}'."))
@@ -1777,7 +1791,8 @@ fn handle_mcp_catalog(state: &AppState, registry_url: &Option<String>) -> ToolCa
         None => return ToolCallResult::error_result("No registry URL configured"),
     };
 
-    match mcp_governance::fetch_mcp_catalog(url) {
+    let token = stored_access_token(state, url);
+    match mcp_governance::fetch_mcp_catalog(url, token.as_deref()) {
         Ok(resp) => {
             // Cache for offline use (best-effort)
             let _ = mcp_governance::fetch_approved_servers_cached(state, resp.clone());
@@ -1998,7 +2013,8 @@ pub fn handle_mcp_install(
     let server_id = sanitize_id(server_name);
 
     // Fetch the current catalog and cache it; then check if the server is in it
-    match mcp_governance::fetch_mcp_catalog(url) {
+    let token = stored_access_token(state, url);
+    match mcp_governance::fetch_mcp_catalog(url, token.as_deref()) {
         Ok(resp) => {
             let _ = mcp_governance::fetch_approved_servers_cached(state, resp.clone());
 
@@ -2106,7 +2122,7 @@ fn handle_update(
         }
     };
 
-    let registry = RegistryClient::new(url);
+    let registry = RegistryClient::new(url).with_stored_auth(state);
     match install_from_registry(state, &registry, skill_id, None) {
         Ok(version) => ToolCallResult::success(format!("Updated {skill_id} to v{version}.")),
         Err(e) => ToolCallResult::error_result(format!("Update failed: {e}")),
@@ -3290,7 +3306,10 @@ mod tests {
 
     #[test]
     fn handle_search_requires_registry() {
-        let result = handle_search(&serde_json::json!({"query": "test"}), &None);
+        let state_root = temp_root("handle-search-no-registry");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+        let result = handle_search(&serde_json::json!({"query": "test"}), &state, &None);
+        let _ = fs::remove_dir_all(&state_root);
         assert_eq!(result.is_error, Some(true));
         assert!(result.content[0].text.contains("registry"));
     }
