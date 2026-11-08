@@ -33,10 +33,12 @@ pub mod restore_journal;
 pub mod registry_url;
 pub mod revocation;
 pub mod safe_path;
+pub mod safe_unpack;
 pub mod signed;
 pub mod secret_file;
 pub mod state;
 pub mod trust;
+pub mod verifier;
 
 // M1 modules
 pub mod auth;

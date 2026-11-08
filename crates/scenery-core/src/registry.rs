@@ -39,7 +39,14 @@ pub struct ArtifactMetadata {
     pub download_url: String,
     pub sha256: String,
     pub size_bytes: Option<u64>,
+    /// Signed `skill_artifact.v1` statement. The runner takes `sha256` and
+    /// `size_bytes` from its verified payload, never from the unsigned fields.
+    #[serde(default)]
+    pub signed: Option<crate::signed::Envelope>,
 }
+
+/// Hard cap on a downloaded skill artifact, whatever the metadata claims.
+pub const MAX_ARTIFACT_BYTES: u64 = 50 * 1024 * 1024;
 
 /// A single skill result from `GET /portal/skills?search=<query>`.
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -328,6 +335,35 @@ pub struct RegistryClient {
     device_id: Mutex<Option<String>>,
 }
 
+/// Copy `resp` to `dest`, aborting past `max_bytes`; returns the hex SHA-256.
+fn stream_to_file(
+    resp: &mut reqwest::blocking::Response,
+    dest: &Utf8Path,
+    max_bytes: u64,
+) -> Result<String> {
+    let mut hasher = Sha256::new();
+    let mut out =
+        std::fs::File::create(dest).with_context(|| format!("failed to create {dest}"))?;
+    let mut buf = [0u8; 65536];
+    let mut total: u64 = 0;
+    loop {
+        let n = resp
+            .read(&mut buf)
+            .context("error reading download stream")?;
+        if n == 0 {
+            break;
+        }
+        total += n as u64;
+        if total > max_bytes {
+            anyhow::bail!("artifact exceeded the {max_bytes}-byte limit");
+        }
+        hasher.update(&buf[..n]);
+        out.write_all(&buf[..n])
+            .context("error writing download to disk")?;
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
 impl RegistryClient {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
@@ -597,8 +633,8 @@ impl RegistryClient {
         let url = format!(
             "{}/skills/{}/versions/{}",
             self.base_url.trim_end_matches('/'),
-            skill_id,
-            version
+            crate::safe_path::encode_segment(skill_id),
+            crate::safe_path::encode_segment(version)
         );
         debug!(url, "fetching artifact metadata");
 
@@ -626,23 +662,33 @@ impl RegistryClient {
 
     /// Download an artifact to `dest`, verifying its SHA-256 hash.
     ///
-    /// The file at `dest` will be created (or overwritten). On hash mismatch
-    /// the download is discarded and an error is returned.
+    /// `download_url` must be on the registry's own origin (proxy mode; this
+    /// also keeps the bearer token from ever leaving it, L3), redirects are
+    /// not followed, and at most `max_bytes` are read. The file at `dest` is
+    /// created (or overwritten) and removed again on any failure.
     pub fn download_artifact(
         &self,
         download_url: &str,
         expected_sha256: &str,
+        max_bytes: u64,
         dest: &Utf8Path,
     ) -> Result<()> {
         debug!(url = download_url, dest = %dest, "downloading artifact");
+        anyhow::ensure!(
+            crate::registry_url::same_origin(download_url, &self.base_url),
+            "artifact download_url is not on the registry origin"
+        );
+        let max_bytes = max_bytes.min(MAX_ARTIFACT_BYTES);
 
-        // Send our token only to the registry itself. In redirect mode the URL
-        // is a presigned object-store link, which rejects a second auth method.
-        let mut req = self.http.get(download_url);
-        if download_url.starts_with(self.base_url.trim_end_matches('/')) {
-            if let Some(token) = self.get_auth_token() {
-                req = req.bearer_auth(token);
-            }
+        let http = crate::http::blocking_client_builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(120))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .context("failed to build download client")?;
+        let mut req = http.get(download_url);
+        if let Some(token) = self.get_auth_token() {
+            req = req.bearer_auth(token);
         }
         let mut resp = req
             .send_tracked()
@@ -652,27 +698,19 @@ impl RegistryClient {
             let status = resp.status();
             anyhow::bail!("artifact download returned HTTP {status}");
         }
-
-        let mut hasher = Sha256::new();
-        let mut out =
-            std::fs::File::create(dest).with_context(|| format!("failed to create {dest}"))?;
-
-        let mut buf = [0u8; 65536];
-        loop {
-            let n = resp
-                .read(&mut buf)
-                .context("error reading download stream")?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&buf[..n]);
-            out.write_all(&buf[..n])
-                .context("error writing download to disk")?;
+        if resp.content_length().is_some_and(|n| n > max_bytes) {
+            anyhow::bail!("artifact larger than the {max_bytes}-byte limit");
         }
-        drop(out);
 
-        let actual = hex::encode(hasher.finalize());
-        if actual != expected_sha256 {
+        let result = stream_to_file(&mut resp, dest, max_bytes);
+        let actual = match result {
+            Ok(h) => h,
+            Err(e) => {
+                let _ = std::fs::remove_file(dest);
+                return Err(e);
+            }
+        };
+        if !actual.eq_ignore_ascii_case(expected_sha256) {
             let _ = std::fs::remove_file(dest);
             anyhow::bail!("artifact hash mismatch: expected {expected_sha256}, got {actual}");
         }
@@ -1387,6 +1425,7 @@ impl MockRegistryClient {
         &self,
         download_url: &str,
         _expected_sha256: &str,
+        _max_bytes: u64,
         _dest: &Utf8Path,
     ) -> Result<()> {
         anyhow::bail!("MockRegistryClient.download_artifact not implemented for {download_url}")
@@ -1862,11 +1901,11 @@ mod tests {
         mock.assert();
     }
 
-    /// The token goes to the registry's own artifact route, never to another
-    /// host (a presigned object-store URL rejects a second auth method).
+    /// The token goes to the registry's own artifact route; any other origin
+    /// is refused outright (L3), and a redirect is never followed.
     #[test]
-    fn download_artifact_sends_the_token_only_to_the_registry() {
-        use mockito::{Matcher, Server};
+    fn download_artifact_is_registry_origin_only_and_capped() {
+        use mockito::Server;
         use sha2::{Digest, Sha256};
         let body = b"cskill-bytes";
         let sha = hex::encode(Sha256::digest(body));
@@ -1880,28 +1919,36 @@ mod tests {
             .with_status(200)
             .with_body(body)
             .create();
-        let mut store = Server::new();
-        let foreign = store
-            .mock("GET", "/bucket/obj")
-            .match_header("authorization", Matcher::Missing)
-            .with_status(200)
-            .with_body(body)
+        let store = Server::new();
+        let redirect = registry
+            .mock("GET", "/redir")
+            .with_status(302)
+            .with_header("location", &format!("{}/bucket/obj", store.url()))
             .create();
 
         let client = RegistryClient::new(registry.url());
         client.set_auth("tok");
-        client
-            .download_artifact(
-                &format!("{}/artifacts/skills/my-skill/0.1.0.cskill", registry.url()),
-                &sha,
-                &dest,
-            )
-            .unwrap();
-        client
-            .download_artifact(&format!("{}/bucket/obj", store.url()), &sha, &dest)
-            .unwrap();
+        let url = format!("{}/artifacts/skills/my-skill/0.1.0.cskill", registry.url());
+        client.download_artifact(&url, &sha, 1024, &dest).unwrap();
         own.assert();
-        foreign.assert();
+        // Foreign origin: refused before any request.
+        assert!(client
+            .download_artifact(&format!("{}/bucket/obj", store.url()), &sha, 1024, &dest)
+            .is_err());
+        // Look-alike prefix host (L3): refused.
+        assert!(client
+            .download_artifact("http://127.0.0.1.evil.example/x", &sha, 1024, &dest)
+            .is_err());
+        // Over the byte cap: aborted and the file removed.
+        let _ = std::fs::remove_file(&dest);
+        let err = client.download_artifact(&url, &sha, 4, &dest).unwrap_err();
+        assert!(format!("{err:#}").contains("limit"), "{err:#}");
+        assert!(!dest.exists());
+        // Redirects are not followed: a 302 is a failure.
+        assert!(client
+            .download_artifact(&format!("{}/redir", registry.url()), &sha, 1024, &dest)
+            .is_err());
+        redirect.assert();
     }
 
     const SKILL_DETAIL_BODY: &str =

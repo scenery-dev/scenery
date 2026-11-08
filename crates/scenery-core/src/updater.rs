@@ -8,12 +8,11 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
-use flate2::{read::GzDecoder, write::GzEncoder, Compression};
+use flate2::{write::GzEncoder, Compression};
 use rusqlite::{Connection, OptionalExtension};
 use scenery_manifest::SkillPackage;
 use semver::Version;
 use sha2::{Digest, Sha256};
-use tar::Archive;
 use tracing::info;
 
 /// Silently update `skill_id` to `policy.target_version` if the currently
@@ -175,8 +174,15 @@ fn download_and_install(
     let archive_path = Utf8PathBuf::from_path_buf(tmp_dir.path().join("bundle.cskill"))
         .map_err(|_| anyhow::anyhow!("temp dir path is not valid UTF-8"))?;
 
+    let (sha256, size) = crate::verifier::verify_skill_artifact(state, skill_id, version, &metadata)
+        .with_context(|| format!("{skill_id}@{version} is not validly signed"))?;
     registry
-        .download_artifact(&metadata.download_url, &metadata.sha256, &archive_path)
+        .download_artifact(
+            &metadata.download_url,
+            &sha256,
+            size.min(crate::registry::MAX_ARTIFACT_BYTES),
+            &archive_path,
+        )
         .with_context(|| format!("failed to download {skill_id}@{version}"))?;
 
     // 3. Extract the tar.gz archive to a staging directory.
@@ -201,13 +207,8 @@ fn download_and_install(
 
 /// Extract a `.cskill` (tar.gz) archive into `dest`.
 fn extract_skill(archive_path: &Utf8PathBuf, dest: &Utf8PathBuf) -> Result<()> {
-    let file = std::fs::File::open(archive_path)
-        .with_context(|| format!("failed to open archive {archive_path}"))?;
-    let gz = GzDecoder::new(file);
-    let mut tar = Archive::new(gz);
-    tar.unpack(dest.as_std_path())
-        .with_context(|| format!("failed to unpack archive to {dest}"))?;
-    Ok(())
+    crate::safe_unpack::unpack_cskill_archive(archive_path, dest)
+        .with_context(|| format!("failed to unpack archive to {dest}"))
 }
 
 fn query_installed_version(state: &AppState, skill_id: &str) -> Result<Option<String>> {
@@ -667,6 +668,39 @@ mod tests {
         let _ = fs::remove_dir_all(&state_root);
     }
 
+    /// Pin a test trust root + org for `origin` and return a signed
+    /// `skill_artifact.v1` envelope as JSON.
+    fn signed_skill_envelope_json(
+        state: &AppState,
+        origin: &str,
+        skill_id: &str,
+        version: &str,
+        sha: &str,
+        size: usize,
+    ) -> String {
+        use crate::signed::testing::*;
+        state
+            .set_sync_state(crate::verifier::REGISTRY_ORIGIN_KEY, origin)
+            .unwrap();
+        state.set_sync_state(crate::verifier::ORG_ID_KEY, "org-1").unwrap();
+        crate::trust::pin_key(state, origin, TEST_KID, &trusted(1, TEST_KID).pubkey).unwrap();
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "skill_id": skill_id, "version": version, "sha256": sha,
+            "size_bytes": size, "org": "org-1",
+        }))
+        .unwrap();
+        let st = statement_json(
+            crate::signed::TYP_SKILL_ARTIFACT,
+            origin,
+            "org-1",
+            &format!("skill:{skill_id}@{version}"),
+            1,
+            "active",
+            Some(&payload),
+        );
+        serde_json::to_string(&envelope(1, TEST_KID, &st, Some(&payload))).unwrap()
+    }
+
     #[test]
     fn auto_update_downloads_extracts_and_installs_new_version() {
         use mockito::Server;
@@ -698,10 +732,12 @@ mod tests {
                     "version": "2.0.0",
                     "download_url": "{}{download_path}",
                     "sha256": "{sha}",
-                    "size_bytes": {}
+                    "size_bytes": {},
+                    "signed": {}
                 }}"#,
                 server.url(),
-                archive_bytes.len()
+                archive_bytes.len(),
+                signed_skill_envelope_json(&state, &server.url(), "test-skill", "2.0.0", &sha, archive_bytes.len())
             ))
             .create();
 
@@ -785,9 +821,10 @@ mod tests {
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(format!(
-                r#"{{"skill_id":"test-skill","version":"0.2.0","download_url":"{}{download_path}","sha256":"{sha}","size_bytes":{}}}"#,
+                r#"{{"skill_id":"test-skill","version":"0.2.0","download_url":"{}{download_path}","sha256":"{sha}","size_bytes":{},"signed":{}}}"#,
                 server.url(),
-                archive_bytes.len()
+                archive_bytes.len(),
+                signed_skill_envelope_json(&state, &server.url(), "test-skill", "0.2.0", &sha, archive_bytes.len())
             ))
             .create();
 
