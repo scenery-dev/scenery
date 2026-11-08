@@ -36,6 +36,9 @@ sha2 = "0.10"
 base64.workspace = true
 getrandom.workspace = true
 hex = "0.4"
+# Runner signing (design 2026-11-08 §1): pure Ed25519 verify_strict over the
+# statement bytes. No `rand`/`rand_core` needed: keys are only ever loaded.
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 urlencoding = "2"
 http = "1"
 

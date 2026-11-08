@@ -186,6 +186,24 @@ impl AppState {
             "ALTER TABLE mcp_installations ADD COLUMN gateway_url TEXT",
         )?;
 
+        // Runner signing (2.2.0): trust pins, device stdio approvals, per-subject
+        // sequence high-water marks, and the approval/envelope columns on
+        // mcp_installations. All additive.
+        conn.execute_batch(SCHEMA_SIGNING_SQL)
+            .context("failed to apply signing schema additions")?;
+        add_column_if_missing(
+            &conn,
+            "ALTER TABLE mcp_installations ADD COLUMN approval_hash TEXT",
+        )?;
+        add_column_if_missing(
+            &conn,
+            "ALTER TABLE mcp_installations ADD COLUMN approval_state TEXT",
+        )?;
+        add_column_if_missing(
+            &conn,
+            "ALTER TABLE mcp_installations ADD COLUMN signed_envelope TEXT",
+        )?;
+
         // F1: managed-paths reconciler marker table.
         conn.execute_batch(SCHEMA_F1_SQL)
             .context("failed to apply F1 schema additions")?;
@@ -883,6 +901,33 @@ CREATE TABLE IF NOT EXISTS mcp_installations (
     gateway_server_id TEXT,
     gateway_url      TEXT,
     installed_at     TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+"#;
+
+/// Signing and device-approval tables (design 2026-11-08 §2, §3).
+///
+/// `trusted_keys` is written only by the CLI (`scenery trust pin`). The
+/// daemon never writes it. `stdio_approvals` is written only by
+/// `scenery approve` after a TTY confirmation.
+const SCHEMA_SIGNING_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS trusted_keys (
+    origin    TEXT NOT NULL,
+    kid       TEXT NOT NULL,
+    pubkey    BLOB NOT NULL,
+    pinned_at TEXT NOT NULL,
+    PRIMARY KEY (origin, kid)
+);
+CREATE TABLE IF NOT EXISTS stdio_approvals (
+    approval_hash     TEXT PRIMARY KEY,
+    command           TEXT NOT NULL,
+    args_json         TEXT NOT NULL,
+    env_keys_json     TEXT NOT NULL,
+    first_server_name TEXT NOT NULL,
+    approved_at       TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS signed_seq (
+    sub     TEXT PRIMARY KEY,
+    max_seq INTEGER NOT NULL
 );
 "#;
 

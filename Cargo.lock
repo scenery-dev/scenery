@@ -2427,6 +2427,7 @@ dependencies = [
  "chrono",
  "ctor",
  "dirs",
+ "ed25519-dalek",
  "flate2",
  "fs2",
  "getrandom 0.2.17",

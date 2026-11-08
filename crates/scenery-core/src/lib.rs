@@ -21,6 +21,7 @@
 pub const DEFAULT_REGISTRY_URL: &str = "https://app.scenery.dev";
 
 pub mod app;
+pub mod approvals;
 pub mod atomic_file;
 pub mod audit;
 pub mod binary_path;
@@ -29,9 +30,13 @@ pub mod model;
 pub mod policy;
 pub mod registry;
 pub mod restore_journal;
+pub mod registry_url;
 pub mod revocation;
+pub mod safe_path;
+pub mod signed;
 pub mod secret_file;
 pub mod state;
+pub mod trust;
 
 // M1 modules
 pub mod auth;
