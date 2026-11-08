@@ -1,0 +1,29 @@
+# cargo-deny config. CI runs: cargo deny check advisories bans sources
+# (licenses are intentionally not checked yet).
+
+[advisories]
+# RustSec advisory DB; vulnerabilities and unsound/yanked crates fail the check.
+yanked = "deny"
+# Residual findings that need a Cargo.toml change in crates/ (tracked on the
+# board; see the P3 report). Remove each entry when its dependency is bumped.
+ignore = [
+  # rsa (Marvin timing sidechannel), no fixed release. Pulled in only by
+  # jsonwebtoken; the runner verifies tokens, it never performs RSA decryption.
+  "RUSTSEC-2023-0071",
+  # crypto-bigint 0.5.x timing issues, same path (jsonwebtoken -> rsa).
+  "RUSTSEC-2026-0387",
+  # h2 0.3.x via jsonschema -> reqwest 0.11; needs a jsonschema upgrade.
+  "RUSTSEC-2026-0258",
+  # unsafe-libyaml unmaintained, via serde_yaml (deprecated); needs a YAML crate swap.
+  "RUSTSEC-2024-0449",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
