@@ -226,7 +226,11 @@ fn revocation_snapshot_applied_even_with_no_reconciler_present() {
             r#"{{"installations":[],"mcp_installations":[],"plugin_installations":[],"revocations":[
                 {{"artifact_type":"skill","artifact_key":"ghost-skill","signed":{}}}]}}"#,
             serde_json::to_string(&crate::test_support::sign_revocation(
-                &registry_url, "skill", "ghost-skill", None, "cleared"
+                &registry_url,
+                "skill",
+                "ghost-skill",
+                None,
+                "cleared"
             ))
             .unwrap()
         ))

@@ -1951,6 +1951,23 @@ mod tests {
         redirect.assert();
     }
 
+    /// M1: slug and version are percent-encoded into the URL path, so a hostile
+    /// value can neither add path segments nor a query string.
+    #[test]
+    fn fetch_artifact_metadata_encodes_path_segments() {
+        use mockito::Server;
+        let mut server = Server::new();
+        let mock = server
+            .mock("GET", "/skills/a%2F..%2Fb%3Fx/versions/1.0%2F2")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"skill_id":"s","version":"v","download_url":"x","sha256":"y"}"#)
+            .create();
+        let client = RegistryClient::new(server.url());
+        client.fetch_artifact_metadata("a/../b?x", "1.0/2").unwrap();
+        mock.assert();
+    }
+
     const SKILL_DETAIL_BODY: &str =
         r#"{"skill_id":"my-skill","name":"My Skill","latest_version":"1.0.0"}"#;
 

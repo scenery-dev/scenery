@@ -180,7 +180,13 @@ pub(crate) fn prepare_event(
             version,
             signed: None,
         } => {
-            let signed = sign_revocation(registry_url, &artifact_type, &artifact_key, version.as_deref(), "cleared");
+            let signed = sign_revocation(
+                registry_url,
+                &artifact_type,
+                &artifact_key,
+                version.as_deref(),
+                "cleared",
+            );
             crate::sync::SyncEvent::Unrevoke {
                 artifact_type,
                 artifact_key,

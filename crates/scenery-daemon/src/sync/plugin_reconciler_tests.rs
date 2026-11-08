@@ -901,13 +901,14 @@ async fn imported_plugin_fetch_rejects_unsigned_content() {
         .mock("GET", "/api/runner/plugins/hooky/versions/1.0.0")
         .with_status(200)
         .with_header("content-type", "application/json")
-        .with_body(r##"{"components":{"files":{"hooks/check.sh":"x"},"executables":["hooks/check.sh"]}}"##)
+        .with_body(
+            r##"{"components":{"files":{"hooks/check.sh":"x"},"executables":["hooks/check.sh"]}}"##,
+        )
         .create_async()
         .await;
     let state = paired_state(&server.url());
 
-    let got =
-        super::fetch_plugin_version_files(&state, &server.url(), "hooky", "1.0.0", "").await;
+    let got = super::fetch_plugin_version_files(&state, &server.url(), "hooky", "1.0.0", "").await;
 
     mock.assert_async().await;
     assert!(got.is_err());

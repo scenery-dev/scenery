@@ -507,7 +507,16 @@ pub fn install() -> Result<()> {
     // ── 3. Write plist ────────────────────────────────────────────────────────
     // Resolve SCENERY_REGISTRY_URL from the env or, failing that, from
     // whatever the plist already had — before we overwrite it below.
-    let registry_url = resolve_registry_url_env(&plist);
+    // M3: never bake a registry URL that is not a plain https origin into
+    // the service definition (a polluted env at install time would persist).
+    let registry_url = match resolve_registry_url_env(&plist) {
+        Some(u) => Some(
+            scenery_core::registry_url::validate_origin(&u).with_context(|| {
+                format!("refusing to install the daemon with registry URL {u:?}")
+            })?,
+        ),
+        None => None,
+    };
     let plist_content = render_plist(&bin_path, &log_dir, registry_url.as_deref())
         .context("failed to render LaunchAgent plist")?;
     fs::write(&plist, &plist_content)

@@ -40,6 +40,7 @@ semver.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+base64.workspace = true
 mockito = "1"
 tempfile.workspace = true
 sha2 = "0.10"

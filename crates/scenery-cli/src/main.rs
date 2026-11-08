@@ -33,10 +33,12 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use device_trust::ApprovalsCommand;
 use scenery_core::http::AsyncSendTrackedExt;
 use scenery_core::DEFAULT_REGISTRY_URL;
 
 mod commands_migrate;
+mod device_trust;
 mod install;
 mod logging;
 mod pair;
@@ -62,7 +64,7 @@ pub enum Command {
     /// Print health status: daemon reachability, state directory, versions.
     Doctor {
         /// Registry URL to probe for reachability check.
-        #[arg(long, env = "SCENERY_REGISTRY_URL")]
+        #[arg(long, env = "SCENERY_REGISTRY_URL", value_parser = parse_registry_url)]
         registry_url: Option<String>,
     },
 
@@ -94,6 +96,38 @@ pub enum Command {
     #[command(subcommand)]
     Migrate(commands_migrate::MigrateCommand),
 
+    /// Manage which registry signing keys this runner trusts.
+    #[command(subcommand)]
+    Trust(device_trust::TrustCommand),
+
+    /// List stdio MCP servers waiting for approval on this machine.
+    Pending,
+
+    /// Approve a pending stdio MCP server. Shows the exact command and asks on
+    /// your terminal; there is no `--yes`.
+    Approve {
+        /// Server name or a unique prefix of its hash (see `scenery pending`).
+        target: String,
+    },
+
+    /// Reject a pending stdio MCP server and remove it from this device.
+    Deny {
+        /// Server name or a unique prefix of its hash (see `scenery pending`).
+        target: String,
+        /// Registry URL to report the denial to.
+        #[arg(
+            long,
+            env = "SCENERY_REGISTRY_URL",
+            default_value = DEFAULT_REGISTRY_URL,
+            value_parser = parse_registry_url
+        )]
+        registry_url: String,
+    },
+
+    /// Review or withdraw approved stdio commands.
+    #[command(subcommand)]
+    Approvals(device_trust::ApprovalsCommand),
+
     /// Remove Scenery and restore the host to its pre-install state.
     ///
     /// Unwinds every external change in reverse — stops the daemon, strips the
@@ -115,7 +149,7 @@ pub enum Command {
         #[arg(long)]
         report_dir: Option<std::path::PathBuf>,
         /// Registry URL for the backend device-deprovision call.
-        #[arg(long, env = "SCENERY_REGISTRY_URL")]
+        #[arg(long, env = "SCENERY_REGISTRY_URL", value_parser = parse_registry_url)]
         registry_url: Option<String>,
     },
 }
@@ -144,7 +178,7 @@ pub enum SkillCommand {
         link: bool,
 
         /// Registry base URL (registry installs only).
-        #[arg(long, env = "SCENERY_REGISTRY_URL")]
+        #[arg(long, env = "SCENERY_REGISTRY_URL", value_parser = parse_registry_url)]
         registry_url: Option<String>,
 
         /// Install on every device registered to your account instead of
@@ -167,8 +201,7 @@ pub enum SkillCommand {
         #[arg(
             long,
             env = "SCENERY_REGISTRY_URL",
-            default_value = DEFAULT_REGISTRY_URL
-        )]
+            default_value = DEFAULT_REGISTRY_URL, value_parser = parse_registry_url)]
         registry_url: Option<String>,
     },
 
@@ -203,7 +236,7 @@ pub enum SkillCommand {
 
         /// Registry base URL used to call the scan endpoint.
         /// When omitted, scanning is skipped (offline / unauthenticated mode).
-        #[arg(long, env = "SCENERY_REGISTRY_URL")]
+        #[arg(long, env = "SCENERY_REGISTRY_URL", value_parser = parse_registry_url)]
         registry_url: Option<String>,
 
         /// Bypass the scan warning and proceed even when the verdict is risky
@@ -242,7 +275,7 @@ pub enum SkillCommand {
         /// Path to the skill directory (must contain SKILL.md).
         path: camino::Utf8PathBuf,
         /// Registry base URL.
-        #[arg(long, env = "SCENERY_REGISTRY_URL")]
+        #[arg(long, env = "SCENERY_REGISTRY_URL", value_parser = parse_registry_url)]
         registry_url: String,
         /// Compile and validate without creating a registry entry.
         #[arg(long, default_value_t = false)]
@@ -285,8 +318,7 @@ pub enum SkillCommand {
         #[arg(
             long,
             env = "SCENERY_REGISTRY_URL",
-            default_value = DEFAULT_REGISTRY_URL
-        )]
+            default_value = DEFAULT_REGISTRY_URL, value_parser = parse_registry_url)]
         registry_url: Option<String>,
     },
 
@@ -310,8 +342,7 @@ pub enum SkillCommand {
         #[arg(
             long,
             env = "SCENERY_REGISTRY_URL",
-            default_value = DEFAULT_REGISTRY_URL
-        )]
+            default_value = DEFAULT_REGISTRY_URL, value_parser = parse_registry_url)]
         registry_url: Option<String>,
     },
 
@@ -342,7 +373,7 @@ pub enum SkillCommand {
         output_dir: Option<camino::Utf8PathBuf>,
 
         /// Registry URL used to look up your publisher ID (defaults to production).
-        #[arg(long, env = "SCENERY_REGISTRY_URL")]
+        #[arg(long, env = "SCENERY_REGISTRY_URL", value_parser = parse_registry_url)]
         registry_url: Option<String>,
     },
 }
@@ -355,8 +386,7 @@ pub enum AuthCommand {
         #[arg(
             long,
             env = "SCENERY_REGISTRY_URL",
-            default_value = DEFAULT_REGISTRY_URL
-        )]
+            default_value = DEFAULT_REGISTRY_URL, value_parser = parse_registry_url)]
         registry_url: String,
     },
 
@@ -366,8 +396,7 @@ pub enum AuthCommand {
         #[arg(
             long,
             env = "SCENERY_REGISTRY_URL",
-            default_value = DEFAULT_REGISTRY_URL
-        )]
+            default_value = DEFAULT_REGISTRY_URL, value_parser = parse_registry_url)]
         registry_url: String,
     },
 
@@ -377,8 +406,7 @@ pub enum AuthCommand {
         #[arg(
             long,
             env = "SCENERY_REGISTRY_URL",
-            default_value = DEFAULT_REGISTRY_URL
-        )]
+            default_value = DEFAULT_REGISTRY_URL, value_parser = parse_registry_url)]
         registry_url: String,
     },
 
@@ -397,8 +425,7 @@ pub enum AuthCommand {
         #[arg(
             long,
             env = "SCENERY_REGISTRY_URL",
-            default_value = DEFAULT_REGISTRY_URL
-        )]
+            default_value = DEFAULT_REGISTRY_URL, value_parser = parse_registry_url)]
         registry_url: String,
     },
 
@@ -425,8 +452,7 @@ pub enum AuthCommand {
         #[arg(
             long,
             env = "SCENERY_REGISTRY_URL",
-            default_value = DEFAULT_REGISTRY_URL
-        )]
+            default_value = DEFAULT_REGISTRY_URL, value_parser = parse_registry_url)]
         registry_url: String,
     },
 }
@@ -493,7 +519,7 @@ pub enum DaemonCommand {
         foreground: bool,
 
         /// Override the registry URL for this daemon session.
-        #[arg(long, env = "SCENERY_REGISTRY_URL")]
+        #[arg(long, env = "SCENERY_REGISTRY_URL", value_parser = parse_registry_url)]
         registry_url: Option<String>,
 
         /// Override the Ollama base URL for local LLM inference.
@@ -568,8 +594,7 @@ pub enum PluginCommand {
         #[arg(
             long,
             env = "SCENERY_REGISTRY_URL",
-            default_value = DEFAULT_REGISTRY_URL
-        )]
+            default_value = DEFAULT_REGISTRY_URL, value_parser = parse_registry_url)]
         registry_url: String,
 
         /// Install on every device registered to your account instead of
@@ -592,8 +617,7 @@ pub enum PluginCommand {
         #[arg(
             long,
             env = "SCENERY_REGISTRY_URL",
-            default_value = DEFAULT_REGISTRY_URL
-        )]
+            default_value = DEFAULT_REGISTRY_URL, value_parser = parse_registry_url)]
         registry_url: Option<String>,
     },
 }
@@ -771,6 +795,17 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Auth(AuthCommand::Token { registry_url }) => cmd_auth_token(&registry_url).await,
 
+        Command::Trust(cmd) => device_trust::cmd_trust(cmd).await,
+        Command::Pending => device_trust::cmd_pending(),
+        Command::Approve { target } => device_trust::cmd_approve(&target).await,
+        Command::Deny {
+            target,
+            registry_url,
+        } => device_trust::cmd_deny(&target, &registry_url).await,
+        Command::Approvals(ApprovalsCommand::List) => device_trust::cmd_approvals_list(),
+        Command::Approvals(ApprovalsCommand::Revoke { hash }) => {
+            device_trust::cmd_approvals_revoke(&hash).await
+        }
         Command::Mcp(McpCommand::Serve { server }) => cmd_mcp_serve(server).await,
         Command::Mcp(McpCommand::Setup {
             client,
@@ -1280,6 +1315,126 @@ async fn finish_auth(state: &scenery_core::state::AppState) {
             );
         }
     }
+}
+
+/// Tell a running daemon to re-evaluate stdio approvals (`approvals/changed`).
+/// `None` when the daemon is not reachable. The call carries no approval: the
+/// daemon only re-reads what this CLI already wrote after a terminal confirm.
+#[cfg(unix)]
+pub(crate) async fn notify_daemon_approvals_changed(socket_path: &str) -> Option<usize> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UnixStream;
+    use tokio::time::{timeout, Duration};
+
+    let stream = timeout(
+        Duration::from_secs(2),
+        UnixStream::connect(socket_path.to_string()),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let (mut reader, mut writer) = stream.into_split();
+    let body = serde_json::to_vec(&serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "approvals/changed", "params": {}
+    }))
+    .ok()?;
+    writer
+        .write_all(&(body.len() as u32).to_be_bytes())
+        .await
+        .ok()?;
+    writer.write_all(&body).await.ok()?;
+    writer.flush().await.ok()?;
+    let read = timeout(Duration::from_secs(15), async {
+        loop {
+            let mut len_buf = [0u8; 4];
+            reader.read_exact(&mut len_buf).await?;
+            let len = u32::from_be_bytes(len_buf) as usize;
+            if len > 16 * 1024 * 1024 {
+                return Err(tokio::io::Error::new(
+                    tokio::io::ErrorKind::InvalidData,
+                    "frame too large",
+                ));
+            }
+            let mut buf = vec![0u8; len];
+            reader.read_exact(&mut buf).await?;
+            let v: serde_json::Value = serde_json::from_slice(&buf).unwrap_or_default();
+            if v.get("id").is_some() {
+                return Ok(v);
+            }
+        }
+    })
+    .await
+    .ok()?
+    .ok()?;
+    read.get("result")?
+        .get("changed")?
+        .as_u64()
+        .map(|n| n as usize)
+}
+
+#[cfg(not(unix))]
+pub(crate) async fn notify_daemon_approvals_changed(_socket_path: &str) -> Option<usize> {
+    None
+}
+
+/// `PATCH /api/mcp-installations/{id}` from the CLI (used by `scenery deny`).
+pub(crate) async fn patch_mcp_installation(
+    state: &scenery_core::state::AppState,
+    registry_url: &str,
+    installation_id: &str,
+    new_state: &str,
+    error_message: Option<&str>,
+) -> Result<()> {
+    let token = scenery_core::auth::load_tokens(state, registry_url)
+        .ok()
+        .flatten()
+        .map(|t| t.access_token)
+        .context("not logged in to the registry")?;
+    let mut body = serde_json::json!({ "state": new_state });
+    if let Some(m) = error_message {
+        body["error_message"] = serde_json::Value::String(m.to_string());
+    }
+    let resp = scenery_core::http::async_client()
+        .context("failed to build HTTP client")?
+        .patch(format!(
+            "{}/api/mcp-installations/{installation_id}",
+            registry_url.trim_end_matches('/')
+        ))
+        .bearer_auth(token)
+        .timeout(std::time::Duration::from_secs(10))
+        .json(&body)
+        .send()
+        .await
+        .context("failed to reach the registry")?;
+    anyhow::ensure!(
+        resp.status().is_success(),
+        "registry returned HTTP {}",
+        resp.status()
+    );
+    Ok(())
+}
+
+/// Pin the registry origin (and org, when known) this device just paired
+/// against, and warn when signed mode is not possible for it yet.
+fn note_pairing(state: &scenery_core::state::AppState, registry_url: &str, org_id: Option<&str>) {
+    match scenery_core::verifier::record_pairing(state, registry_url, org_id) {
+        Ok(true) => {}
+        Ok(false) => {
+            let origin = scenery_core::registry_url::validate_origin(registry_url)
+                .unwrap_or_else(|_| registry_url.to_string());
+            eprintln!(
+                "warning: no trust root for {origin}, so signed definitions from it are refused \
+                 (installs will not apply). Pin its signing key with:\n  \
+                 scenery trust pin {origin} --fingerprint <sha256 of the public key>"
+            );
+        }
+        Err(e) => eprintln!("warning: could not record the registry origin: {e:#}"),
+    }
+}
+
+/// clap `value_parser` for every `--registry-url`: https origin only (M3).
+fn parse_registry_url(s: &str) -> std::result::Result<String, String> {
+    scenery_core::registry_url::validate_origin(s).map_err(|e| e.to_string())
 }
 
 /// Probe the registry health endpoint with a 1 s timeout.
@@ -4605,6 +4760,7 @@ async fn cmd_auth_login(registry_url: &str) -> Result<()> {
         &tokens.refresh_token,
     )
     .context("failed to save auth tokens")?;
+    note_pairing(&state, registry_url, None);
 
     match client.me(&tokens.access_token) {
         Ok(user) => {
@@ -4819,6 +4975,7 @@ async fn cmd_auth_token(registry_url: &str) -> Result<()> {
 
     save_tokens(&state, registry_url, token, token)
         .context("failed to save token to local state")?;
+    note_pairing(&state, registry_url, None);
 
     println!("Authenticated as {} ({}).", user.display_name, user.email);
     println!("Token saved for {}.", registry_url);
@@ -4919,6 +5076,9 @@ async fn cmd_auth_pair(code: Option<&str>, registry_url: &str) -> Result<()> {
         device_id: String,
         access_token: String,
         refresh_token: String,
+        /// Contract item 3: the device's org.
+        #[serde(default)]
+        org_id: Option<String>,
     }
     let pair: PairResponse =
         serde_json::from_str(&body_text).context("unexpected response format from registry")?;
@@ -4930,6 +5090,7 @@ async fn cmd_auth_pair(code: Option<&str>, registry_url: &str) -> Result<()> {
         &pair.refresh_token,
     )
     .context("failed to save auth token")?;
+    note_pairing(&state, registry_url, pair.org_id.as_deref());
 
     // Persist device_uuid and device_id so the daemon uses this registration.
     state
@@ -5766,8 +5927,10 @@ async fn cmd_mcp_sync() -> Result<()> {
     // org-policy snapshot reconcile (Card 3) during this tick would have
     // been invisible to anything else in this process.
     state.seed_block_third_party_from_sync_state();
-    let registry_url =
-        std::env::var("SCENERY_REGISTRY_URL").unwrap_or_else(|_| DEFAULT_REGISTRY_URL.to_string());
+    let registry_url = scenery_core::registry_url::validate_origin(
+        &std::env::var("SCENERY_REGISTRY_URL").unwrap_or_else(|_| DEFAULT_REGISTRY_URL.to_string()),
+    )
+    .context("refusing SCENERY_REGISTRY_URL")?;
 
     let registry = Arc::new(RegistryClient::new(&registry_url));
     let audit = Arc::new(SqliteAuditBuffer::new(Arc::clone(&registry), &state));

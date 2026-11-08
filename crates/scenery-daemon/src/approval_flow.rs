@@ -239,6 +239,28 @@ async fn hold_running(
     }
 }
 
+/// A row held as pending was approved while the daemon was down: record it
+/// and report `installed`.
+pub fn mark_approved_at_startup(state: &Arc<AppState>, registry_url: &str, row: &McpInstallRow) {
+    let hash = launch_gate::stdio_definition(row).map(|d| d.approval_hash());
+    if let Err(e) =
+        state.set_mcp_approval(&row.mcp_server_id, hash.as_deref(), Some(STATE_APPROVED))
+    {
+        warn!(error = %e, "startup: failed to record approval");
+    }
+    if tokio::runtime::Handle::try_current().is_err() {
+        return;
+    }
+    let Ok(iid) = Uuid::parse_str(&row.installation_id) else {
+        return;
+    };
+    let st = Arc::clone(state);
+    let url = registry_url.to_string();
+    tokio::spawn(async move {
+        report_mcp_installation_status_with_hash(iid, "installed", None, None, &url, &st).await;
+    });
+}
+
 /// Startup pass over stored rows: anything gated as pending is marked,
 /// reported and notified; nothing is registered for it.
 pub fn mark_pending_at_startup(

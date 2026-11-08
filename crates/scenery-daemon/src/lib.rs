@@ -2724,9 +2724,19 @@ fn load_managed_mcp_into_registry(
     let mut loaded = 0usize;
     let mut pending = 0usize;
     let state_arc = Arc::new(state.clone());
+    let approval_rows = state.mcp_approval_rows().unwrap_or_default();
     for row in &rows {
         match mcp_row_to_backend_entry(state, row) {
             Launch::Ready(entry) => {
+                // Approved while the daemon was down: flip the stored state
+                // and tell the backend the server is live now.
+                let was_pending = approval_rows
+                    .get(&row.mcp_server_id)
+                    .and_then(|(_, s, _)| s.as_deref())
+                    == Some(approval_flow::STATE_PENDING);
+                if was_pending {
+                    approval_flow::mark_approved_at_startup(&state_arc, registry_url, row);
+                }
                 let server_id = entry.server_id.clone();
                 registry.register_backend(entry.clone());
                 info!(server_id = %server_id, "startup: registered managed MCP backend");

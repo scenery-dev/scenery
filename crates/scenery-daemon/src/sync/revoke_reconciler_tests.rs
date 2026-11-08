@@ -506,7 +506,11 @@ async fn snapshot_revocation_with_a_signed_clear_lifts_the_entry() {
     scenery_core::revocation::upsert_revocation(&state, "skill", "unblocked-skill", None).unwrap();
     // `dispatch` pairs the device against this URL; sign for the same origin.
     let signed = crate::test_support::sign_revocation(
-        "https://example.invalid", "skill", "unblocked-skill", None, "cleared",
+        "https://example.invalid",
+        "skill",
+        "unblocked-skill",
+        None,
+        "cleared",
     );
     crate::test_support::pair_device(&state, "https://example.invalid");
 
@@ -572,7 +576,6 @@ async fn unsigned_unrevoke_keeps_the_local_revocation() {
     assert!(scenery_core::revocation::is_revoked(&state, "skill", "kept", None).unwrap());
     cleanup(&root);
 }
-
 
 #[tokio::test]
 async fn snapshot_revocations_some_purges_a_locally_installed_skill() {

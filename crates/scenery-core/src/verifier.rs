@@ -122,6 +122,40 @@ pub fn verify_with_org(
     Ok(v)
 }
 
+/// Forget every accepted sequence mark (a re-pair against a different
+/// registry or org starts a new sequence space).
+pub fn reset_seq(state: &AppState) -> Result<()> {
+    let conn = Connection::open(&state.db_path).context("failed to open state DB")?;
+    conn.execute("DELETE FROM signed_seq", [])
+        .context("failed to reset signed_seq")?;
+    Ok(())
+}
+
+/// Record what `auth pair` / `auth login` / `auth token` just paired against
+/// (M3 and contract item 3): the registry origin, and the org when the
+/// backend reported it. A different origin or org starts a fresh sequence
+/// space. Returns whether signed mode is possible for the origin (a compiled
+/// or pinned trust root exists).
+pub fn record_pairing(state: &AppState, registry_url: &str, org_id: Option<&str>) -> Result<bool> {
+    let origin =
+        crate::registry_url::validate_origin(registry_url).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let origin_changed = registry_origin(state).as_deref() != Some(origin.as_str());
+    let org_changed = org_id
+        .filter(|o| !o.is_empty())
+        .is_some_and(|o| device_org(state).as_deref() != Some(o));
+    if origin_changed {
+        state.set_sync_state(REGISTRY_ORIGIN_KEY, &origin)?;
+        state.delete_sync_state(ORG_ID_KEY)?;
+    }
+    if let Some(org) = org_id.filter(|o| !o.is_empty()) {
+        state.set_sync_state(ORG_ID_KEY, org)?;
+    }
+    if origin_changed || org_changed {
+        reset_seq(state)?;
+    }
+    Ok(trust::has_trust_root(state, &origin))
+}
+
 /// `skill_artifact.v1` payload.
 #[derive(Debug, serde::Deserialize)]
 struct SkillArtifactPayload {

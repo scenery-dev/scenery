@@ -4465,6 +4465,7 @@ pub(crate) async fn handle_install_mcp_for_test(
         registry_url,
         stats,
         backend_registry,
+        None, // pusher: tests don't need F2 push
     )
     .await
 }
@@ -4488,6 +4489,7 @@ pub(crate) async fn handle_install_mcp_with_signed_for_test(
     registry_url: &str,
     stats: &Arc<std::sync::Mutex<ReconcilerStats>>,
     backend_registry: &Arc<BackendRegistry>,
+    pusher: Option<&ManagedPathsPusher>,
 ) -> bool {
     let (list_changed_tx, _) = broadcast::channel(16);
     handle_install_mcp(
@@ -4506,7 +4508,7 @@ pub(crate) async fn handle_install_mcp_with_signed_for_test(
         stats,
         backend_registry,
         list_changed_tx,
-        None, // pusher: tests don't need F2 push
+        pusher,
     )
     .await
 }
@@ -4557,3 +4559,7 @@ mod revocation_scope_tests;
 #[cfg(test)]
 #[path = "revoke_redelivery_tests.rs"]
 mod revoke_redelivery_tests;
+
+#[cfg(test)]
+#[path = "signed_mcp_tests.rs"]
+mod signed_mcp_tests;

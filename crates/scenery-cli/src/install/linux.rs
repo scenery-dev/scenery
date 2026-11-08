@@ -917,7 +917,16 @@ fn install_systemd(bin_path: &std::path::Path) -> Result<()> {
     // ── 2. Write unit file ────────────────────────────────────────────────────
     // Resolve SCENERY_REGISTRY_URL from the env or, failing that, from
     // whatever the unit already had — before we overwrite it below.
-    let registry_url = resolve_registry_url_env(&unit);
+    // M3: never bake a registry URL that is not a plain https origin into
+    // the service definition (a polluted env at install time would persist).
+    let registry_url = match resolve_registry_url_env(&unit) {
+        Some(u) => Some(
+            scenery_core::registry_url::validate_origin(&u).with_context(|| {
+                format!("refusing to install the daemon with registry URL {u:?}")
+            })?,
+        ),
+        None => None,
+    };
     let content =
         render_unit(bin_path, registry_url.as_deref()).context("failed to render systemd unit")?;
     fs::write(&unit, &content)

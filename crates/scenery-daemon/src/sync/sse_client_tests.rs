@@ -411,7 +411,10 @@ async fn unsigned_inference_policy_update_is_ignored() {
     .await
     .unwrap();
     assert!(!state.block_third_party_inference.load(Ordering::Relaxed));
-    assert_eq!(state.get_sync_state("block_third_party_inference").unwrap(), None);
+    assert_eq!(
+        state.get_sync_state("block_third_party_inference").unwrap(),
+        None
+    );
 }
 
 #[tokio::test]
@@ -917,4 +920,172 @@ async fn discovery_adopted_does_not_copy_a_revoked_slug() {
     }
     assert!(fine_pushed, "control: a non-revoked adopt is still pushed");
     assert!(!revoked_copied, "a revoked slug must not be copied");
+}
+
+// ── M5: byte-level line splitting ────────────────────────────────────────────
+
+use super::{snapshot_event_from_json, LineSplitter, SseLine, MAX_SSE_LINE};
+
+fn lines(chunks: &[&[u8]]) -> Vec<SseLine> {
+    let mut s = LineSplitter::default();
+    let mut out = Vec::new();
+    for c in chunks {
+        out.extend(s.push(c).unwrap());
+    }
+    out
+}
+
+#[test]
+fn a_three_byte_character_split_across_chunks_is_not_an_error() {
+    // "€" is E2 82 AC; cut it after each byte.
+    let full = "data: price €5\n".as_bytes().to_vec();
+    let at = full.iter().position(|b| *b == 0xE2).unwrap();
+    for cut in [at + 1, at + 2] {
+        let got = lines(&[&full[..cut], &full[cut..]]);
+        assert_eq!(
+            got,
+            vec![SseLine::Text("data: price €5".to_string())],
+            "cut at {cut}"
+        );
+    }
+    // One byte at a time.
+    let bytes: Vec<&[u8]> = full.chunks(1).collect();
+    assert_eq!(
+        lines(&bytes),
+        vec![SseLine::Text("data: price €5".to_string())]
+    );
+}
+
+#[test]
+fn crlf_split_across_chunks_yields_one_clean_line() {
+    let got = lines(&[b"data: a\r", b"\ndata: b\r\n", b"\r\n"]);
+    assert_eq!(
+        got,
+        vec![
+            SseLine::Text("data: a".into()),
+            SseLine::Text("data: b".into()),
+            SseLine::Text(String::new()),
+        ]
+    );
+}
+
+#[test]
+fn invalid_utf8_line_is_flagged_and_the_stream_continues() {
+    let got = lines(&[b"data: \xff\xfe\n", b"data: ok\n"]);
+    assert_eq!(
+        got,
+        vec![SseLine::Invalid, SseLine::Text("data: ok".into())]
+    );
+}
+
+#[test]
+fn an_unterminated_line_over_the_cap_is_an_error() {
+    let mut s = LineSplitter::default();
+    let chunk = vec![b'x'; 1024 * 1024];
+    let mut result = Ok(Vec::new());
+    for _ in 0..=(MAX_SSE_LINE / chunk.len()) {
+        result = s.push(&chunk);
+        if result.is_err() {
+            break;
+        }
+    }
+    assert!(result.is_err(), "line cap must trip");
+    // A long line that IS terminated, under the cap, is fine.
+    let mut s = LineSplitter::default();
+    let mut ok = vec![b'y'; 1024 * 1024];
+    ok.push(b'\n');
+    assert_eq!(s.push(&ok).unwrap().len(), 1);
+}
+
+// ── M1: unsafe names from the wire are dropped ───────────────────────────────
+
+#[test]
+fn events_with_unsafe_names_are_rejected() {
+    for (ev, data) in [
+        (
+            "install",
+            r#"{"installation_id":"00000000-0000-0000-0000-000000000001","skill_id":"../../Documents/x","version":"1.0.0"}"#,
+        ),
+        (
+            "install",
+            r#"{"installation_id":"00000000-0000-0000-0000-000000000001","skill_id":"ok","version":"../1"}"#,
+        ),
+        (
+            "purge",
+            r#"{"installation_id":"00000000-0000-0000-0000-000000000001","skill_id":"/Users/u/work"}"#,
+        ),
+        (
+            "deactivate",
+            r#"{"installation_id":"00000000-0000-0000-0000-000000000001","skill_id":".."}"#,
+        ),
+        (
+            "deactivate_plugin",
+            r#"{"installation_id":"00000000-0000-0000-0000-000000000001","plugin_slug":"a/b"}"#,
+        ),
+        (
+            "install_plugin",
+            r#"{"installation_id":"00000000-0000-0000-0000-000000000001","plugin_slug":"p","version":"1.0.0","skills":[{"skill_id":"../x","version":"1"}]}"#,
+        ),
+        (
+            "revoke",
+            r#"{"artifact_type":"skill","artifact_key":"../../x"}"#,
+        ),
+        (
+            "unrevoke",
+            r#"{"artifact_type":"plugin","artifact_key":"ok","version":"../1"}"#,
+        ),
+    ] {
+        assert!(parse_sync_event(ev, data).is_err(), "{ev}: {data}");
+    }
+    // Sane names still parse.
+    assert!(parse_sync_event(
+        "purge",
+        r#"{"installation_id":"00000000-0000-0000-0000-000000000001","skill_id":"code-review"}"#
+    )
+    .is_ok());
+}
+
+#[test]
+fn snapshot_drops_only_the_bad_records_and_keeps_none_vs_empty() {
+    let data = r#"{
+        "installations":[
+            {"installation_id":"00000000-0000-0000-0000-000000000001","skill_id":"good","version":"1.0.0","state":"installed"},
+            {"installation_id":"00000000-0000-0000-0000-000000000002","skill_id":"../evil","version":"1.0.0","state":"installed"},
+            {"installation_id":"00000000-0000-0000-0000-000000000003","skill_id":"fine","version":"1.0.0","state":"installed","local_slug":"/abs"}
+        ],
+        "plugin_installations":[
+            {"installation_id":"00000000-0000-0000-0000-000000000004","plugin_slug":"p/../q","version":"1.0.0","state":"installed"}
+        ],
+        "revocations":[
+            {"artifact_type":"skill","artifact_key":"../x"},
+            {"artifact_type":"skill","artifact_key":"ok-skill"}
+        ]
+    }"#;
+    match snapshot_event_from_json(data).unwrap() {
+        super::SyncEvent::Snapshot {
+            installations,
+            mcp_installations,
+            plugin_installations,
+            revocations,
+            ..
+        } => {
+            assert_eq!(installations.len(), 1);
+            assert_eq!(installations[0].skill_id, "good");
+            assert!(plugin_installations.is_empty());
+            // The key was absent: still None, not Some(empty).
+            assert!(mcp_installations.is_none());
+            // Present list: filtered, still Some.
+            assert_eq!(revocations.unwrap().len(), 1);
+        }
+        other => panic!("expected snapshot, got {other:?}"),
+    }
+    // A present-but-all-bad revocation list stays Some(empty), not None.
+    let all_bad =
+        r#"{"installations":[],"revocations":[{"artifact_type":"skill","artifact_key":".."}]}"#;
+    match snapshot_event_from_json(all_bad).unwrap() {
+        super::SyncEvent::Snapshot { revocations, .. } => {
+            assert_eq!(revocations.map(|r| r.len()), Some(0));
+        }
+        other => panic!("expected snapshot, got {other:?}"),
+    }
 }

@@ -689,12 +689,23 @@ impl Backend for RealBackend {
                 }
                 None => Vec::new(),
             };
-            crate::instructions::build_instructions(
+            let mut text = crate::instructions::build_instructions(
                 self.managed.as_ref(),
                 "daemon",
                 logged_in,
                 &exposed_tool_names,
-            )
+            );
+            // Servers held for local approval (design §3). There is no
+            // approve tool: only the user can approve, in a terminal.
+            if let Some(note) = self
+                .state
+                .as_ref()
+                .and_then(|state| crate::tools::pending_approval_note(state))
+            {
+                text.push(' ');
+                text.push_str(&note);
+            }
+            text
         };
         #[cfg(not(feature = "daemon"))]
         let instructions = "Scenery runner — governed AI platform.".to_string();

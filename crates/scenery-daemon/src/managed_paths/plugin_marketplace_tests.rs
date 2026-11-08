@@ -178,7 +178,10 @@ fn install_plugin_bundle_rejects_absolute_and_traversal_file_keys() {
     }
     assert!(absolute.is_err(), "absolute key must abort the install");
     assert!(climbing.is_err(), "`..` key must abort the install");
-    assert!(!victim.exists(), "nothing may be written outside the plugin");
+    assert!(
+        !victim.exists(),
+        "nothing may be written outside the plugin"
+    );
     assert!(dotted.is_ok(), "a..b is a legal name");
 }
 
