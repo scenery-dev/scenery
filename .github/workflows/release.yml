@@ -21,10 +21,10 @@ jobs:
       matrix:
         include:
           - target: aarch64-apple-darwin
-            runner: macos-14
-          # x86_64-apple-darwin: cross-compiled from macos-14 (arm64 host) via Xcode universal SDK
+            runner: macos-15
+          # x86_64-apple-darwin: cross-compiled from macos-15 (arm64 host) via Xcode universal SDK
           - target: x86_64-apple-darwin
-            runner: macos-14
+            runner: macos-15
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-22.04
 
