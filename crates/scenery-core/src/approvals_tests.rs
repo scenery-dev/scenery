@@ -20,14 +20,23 @@ fn hash_is_stable_golden() {
             br#"{"args":["-y","pkg"],"command":"npx","env_keys":["A","B"],"v":1}"#
         ))
     );
-    assert_eq!(d.approval_hash(), def(&["-y", "pkg"], &["A", "B", "A"]).approval_hash());
+    assert_eq!(
+        d.approval_hash(),
+        def(&["-y", "pkg"], &["A", "B", "A"]).approval_hash()
+    );
 }
 
 #[test]
 fn args_or_env_key_change_changes_hash_but_value_does_not() {
     let a = def(&["-y", "pkg"], &["TOKEN"]);
-    assert_ne!(a.approval_hash(), def(&["-y", "pkg2"], &["TOKEN"]).approval_hash());
-    assert_ne!(a.approval_hash(), def(&["-y", "pkg"], &["TOKEN", "X"]).approval_hash());
+    assert_ne!(
+        a.approval_hash(),
+        def(&["-y", "pkg2"], &["TOKEN"]).approval_hash()
+    );
+    assert_ne!(
+        a.approval_hash(),
+        def(&["-y", "pkg"], &["TOKEN", "X"]).approval_hash()
+    );
     // Env values never enter the hash: derive from configs differing only in value.
     let c1 = serde_json::json!({"command":"npx","args":["-y","pkg"],"env":{"TOKEN":"one"}});
     let c2 = serde_json::json!({"command":"npx","args":["-y","pkg"],"env":{"TOKEN":"two"}});
@@ -40,13 +49,33 @@ fn args_or_env_key_change_changes_hash_but_value_does_not() {
 #[test]
 fn env_denylist() {
     for bad in [
-        "LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES", "PATH", "NODE_OPTIONS",
-        "NODE_PATH", "BASH_ENV", "ENV", "PYTHONSTARTUP", "PYTHONPATH", "PERL5OPT", "RUBYOPT",
-        "RUBYLIB", "JAVA_TOOL_OPTIONS", "path", "Ld_Preload",
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "DYLD_INSERT_LIBRARIES",
+        "PATH",
+        "NODE_OPTIONS",
+        "NODE_PATH",
+        "BASH_ENV",
+        "ENV",
+        "PYTHONSTARTUP",
+        "PYTHONPATH",
+        "PERL5OPT",
+        "RUBYOPT",
+        "RUBYLIB",
+        "JAVA_TOOL_OPTIONS",
+        "path",
+        "Ld_Preload",
     ] {
         assert!(env_key_denied(bad), "{bad}");
     }
-    for ok in ["GITHUB_TOKEN", "HOME", "API_KEY", "ENVIRONMENT", "MY_PATH", "PATHEXT_X"] {
+    for ok in [
+        "GITHUB_TOKEN",
+        "HOME",
+        "API_KEY",
+        "ENVIRONMENT",
+        "MY_PATH",
+        "PATHEXT_X",
+    ] {
         assert!(!env_key_denied(ok), "{ok}");
     }
     let keys = vec!["OK".to_string(), "LD_PRELOAD".to_string()];

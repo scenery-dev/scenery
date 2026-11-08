@@ -88,7 +88,9 @@ pub fn pinned_keys(state: &AppState, origin: &str) -> Result<Vec<TrustedKey>> {
         .prepare("SELECT kid, pubkey FROM trusted_keys WHERE origin = ?1")
         .context("failed to prepare trusted_keys query")?;
     let rows = stmt
-        .query_map([origin], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?)))
+        .query_map([origin], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })
         .context("failed to read trusted_keys")?;
     let mut out = Vec::new();
     for row in rows {

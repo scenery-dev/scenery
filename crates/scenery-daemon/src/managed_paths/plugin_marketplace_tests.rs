@@ -117,8 +117,6 @@ fn install_plugin_bundle_writes_imported_file_tree_verbatim() {
                 "skills/caveman/SKILL.md".to_string(),
                 b"---\nname: caveman\n---\ncompress".to_vec(),
             ),
-            // Path-traversal attempt must be ignored.
-            ("../evil.sh".to_string(), b"rm -rf".to_vec()),
         ],
         executables: vec![],
     };
@@ -134,11 +132,6 @@ fn install_plugin_bundle_writes_imported_file_tree_verbatim() {
     let cache_ok = h
         .join(".claude/plugins/cache/scenery/caveman/0.1.0/commands/caveman.toml")
         .exists();
-    let traversal_blocked = !h
-        .join(".claude/plugins/marketplaces/scenery/evil.sh")
-        .exists()
-        && !h.join(".claude/plugins/marketplaces/evil.sh").exists();
-
     if let Some(v) = prev {
         std::env::set_var("HOME", v);
     } else {
@@ -151,7 +144,42 @@ fn install_plugin_bundle_writes_imported_file_tree_verbatim() {
     assert!(agent_ok, "agent file written");
     assert!(skill_ok, "skill file written");
     assert!(cache_ok, "tree copied into cache");
-    assert!(traversal_blocked, "path traversal entry must be skipped");
+}
+
+/// L1: a backend-supplied file key that is absolute or climbs out with `..`
+/// aborts the install (it is not silently skipped) and writes nothing outside
+/// the plugin source dir. Names like `a..b` stay legal.
+#[test]
+fn install_plugin_bundle_rejects_absolute_and_traversal_file_keys() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let fake_home = tempfile::tempdir().unwrap();
+    let victim = fake_home.path().join("victim.txt");
+    let prev = std::env::var_os("HOME");
+    std::env::set_var("HOME", fake_home.path());
+
+    let mk = |rel: String| PluginBundle {
+        slug: "evil".to_string(),
+        name: "evil".to_string(),
+        description: "x".to_string(),
+        version: "0.1.0".to_string(),
+        author: "a".to_string(),
+        skills: vec![],
+        files: vec![(rel, b"pwn".to_vec())],
+        executables: vec![],
+    };
+    let absolute = install_plugin_bundle(&mk(victim.to_string_lossy().to_string()));
+    let climbing = install_plugin_bundle(&mk("../../victim.txt".to_string()));
+    let dotted = install_plugin_bundle(&mk("docs/a..b.md".to_string()));
+
+    if let Some(v) = prev {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+    assert!(absolute.is_err(), "absolute key must abort the install");
+    assert!(climbing.is_err(), "`..` key must abort the install");
+    assert!(!victim.exists(), "nothing may be written outside the plugin");
+    assert!(dotted.is_ok(), "a..b is a legal name");
 }
 
 /// Hooks and scripts that git marks executable must stay executable on the

@@ -19,7 +19,14 @@ fn params<'a>(keys: &'a [TrustedKey], typ: &'a str) -> VerifyParams<'a> {
 }
 
 fn good(payload: Option<&[u8]>) -> Envelope {
-    signed_envelope(TYP_MCP_SERVER, ORG, "mcp_server:abc", 5, STATUS_ACTIVE, payload)
+    signed_envelope(
+        TYP_MCP_SERVER,
+        ORG,
+        "mcp_server:abc",
+        5,
+        STATUS_ACTIVE,
+        payload,
+    )
 }
 
 #[test]
@@ -67,7 +74,15 @@ fn wrong_kid_is_rejected() {
 #[test]
 fn wrong_issuer_is_rejected() {
     let k = keys();
-    let st = statement_json(TYP_MCP_SERVER, "https://evil.example", ORG, "s", 1, "active", None);
+    let st = statement_json(
+        TYP_MCP_SERVER,
+        "https://evil.example",
+        ORG,
+        "s",
+        1,
+        "active",
+        None,
+    );
     let e = envelope(1, TEST_KID, &st, None);
     assert!(matches!(
         verify(&e, &params(&k, TYP_MCP_SERVER)).unwrap_err(),
@@ -136,7 +151,14 @@ fn payload_mismatch_missing_and_unbound() {
 #[test]
 fn star_org_only_for_revocation() {
     let k = keys();
-    let e = signed_envelope(TYP_REVOCATION, "*", "revocation:mcp_server:x:", 1, STATUS_REVOKED, None);
+    let e = signed_envelope(
+        TYP_REVOCATION,
+        "*",
+        "revocation:mcp_server:x:",
+        1,
+        STATUS_REVOKED,
+        None,
+    );
     let v = verify(&e, &params(&k, TYP_REVOCATION)).unwrap();
     assert_eq!(v.org, "*");
     let e = signed_envelope(TYP_MCP_SERVER, "*", "mcp_server:x", 1, STATUS_ACTIVE, None);
@@ -145,7 +167,14 @@ fn star_org_only_for_revocation() {
         SignError::WrongOrg { .. }
     ));
     // `*` revocation verifies even before the device org is known.
-    let e = signed_envelope(TYP_REVOCATION, "*", "revocation:x:y:", 1, STATUS_CLEARED, None);
+    let e = signed_envelope(
+        TYP_REVOCATION,
+        "*",
+        "revocation:x:y:",
+        1,
+        STATUS_CLEARED,
+        None,
+    );
     let mut p = params(&k, TYP_REVOCATION);
     p.org = None;
     assert!(verify(&e, &p).is_ok());
@@ -175,7 +204,10 @@ fn bad_version_oversize_and_status() {
 
 #[test]
 fn weak_zero_key_never_verifies() {
-    let k = vec![TrustedKey { kid: TEST_KID.into(), pubkey: [0u8; 32] }];
+    let k = vec![TrustedKey {
+        kid: TEST_KID.into(),
+        pubkey: [0u8; 32],
+    }];
     assert_eq!(
         verify(&good(None), &params(&k, TYP_MCP_SERVER)).unwrap_err(),
         SignError::BadSignature

@@ -39,18 +39,14 @@ pub(crate) fn apply_org_policy(
         warn!("sync: unsigned org policy ignored");
         return false;
     };
-    let v = match verifier::verify_for_device(
-        state,
-        signed::TYP_ORG_POLICY,
-        env,
-        Some("org_policy"),
-    ) {
-        Ok(v) => v,
-        Err(e) => {
-            warn!(error = %e, "sync: org policy statement rejected");
-            return false;
-        }
-    };
+    let v =
+        match verifier::verify_for_device(state, signed::TYP_ORG_POLICY, env, Some("org_policy")) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "sync: org policy statement rejected");
+                return false;
+            }
+        };
     if v.status != signed::STATUS_ACTIVE {
         warn!(status = %v.status, "sync: org policy statement is not active");
         return false;
@@ -89,7 +85,13 @@ fn revocation_sub(artifact_type: &str, key: &str, version: Option<&str>) -> Stri
 
 /// Does the statement's subject name this artifact? Skill keys are compared
 /// after the local-folder-name mapping the reconciler applies before us.
-fn sub_matches(state: &AppState, sub: &str, artifact_type: &str, key: &str, version: Option<&str>) -> bool {
+fn sub_matches(
+    state: &AppState,
+    sub: &str,
+    artifact_type: &str,
+    key: &str,
+    version: Option<&str>,
+) -> bool {
     let mut parts = sub.splitn(4, ':');
     let (Some("revocation"), Some(t), Some(k), Some(ver)) =
         (parts.next(), parts.next(), parts.next(), parts.next())
@@ -185,7 +187,10 @@ pub(crate) fn pin_org_from_snapshot(
     for (typ, env) in statements {
         if verifier::verify_with_org(state, typ, env, None, Some(org)).is_ok() {
             match state.set_sync_state(verifier::ORG_ID_KEY, org) {
-                Ok(()) => info!(org_id = org, "sync: pinned device org on first verified snapshot (TOFU)"),
+                Ok(()) => info!(
+                    org_id = org,
+                    "sync: pinned device org on first verified snapshot (TOFU)"
+                ),
                 Err(e) => warn!(error = %e, "sync: failed to store org id"),
             }
             return;

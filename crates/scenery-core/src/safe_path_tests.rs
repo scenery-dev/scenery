@@ -11,8 +11,20 @@ fn accepts_plain_names() {
 #[test]
 fn rejects_traversal_and_absolute() {
     for bad in [
-        "", ".", "..", "../x", "/abs", "a/b", "a\\b", ".hidden", "a b", "a\0b", "é", "x:y",
-        "~", "../../Documents/x",
+        "",
+        ".",
+        "..",
+        "../x",
+        "/abs",
+        "a/b",
+        "a\\b",
+        ".hidden",
+        "a b",
+        "a\0b",
+        "é",
+        "x:y",
+        "~",
+        "../../Documents/x",
     ] {
         assert!(validate_component("t", bad).is_err(), "{bad:?} should fail");
     }
@@ -37,7 +49,15 @@ fn safe_join_rel_requires_normal_components() {
     );
     assert!(safe_join_rel(root, "a..b/c").is_ok());
     assert!(safe_join_rel(root, ".claude-plugin/plugin.json").is_ok());
-    for bad in ["/Users/u/.zshrc", "../x", "a/../../x", "./a", "", "a\\b", "a/./b"] {
+    for bad in [
+        "/Users/u/.zshrc",
+        "../x",
+        "a/../../x",
+        "./a",
+        "",
+        "a\\b",
+        "a/./b",
+    ] {
         assert!(safe_join_rel(root, bad).is_err(), "{bad:?}");
     }
 }

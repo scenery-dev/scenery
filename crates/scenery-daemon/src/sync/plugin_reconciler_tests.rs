@@ -424,11 +424,13 @@ async fn concurrent_live_and_snapshot_install_for_same_slug_are_serialized() {
     // error-tolerant — an unmocked mockito route responds quickly (501)
     // rather than hanging, so no explicit mocks are required for the
     // assertions below.
-    let server = mockito::Server::new_async().await;
+    let mut server = mockito::Server::new_async().await;
+    let _plugin_content = crate::test_support::mock_plugin_content(&mut server);
     let registry_url = server.url();
 
     let root = temp_root("concurrent-install");
     let state = Arc::new(AppState::bootstrap_in(root.clone()).unwrap());
+    crate::test_support::pair_device(&state, &registry_url);
     let skill_locks: SkillLockMap =
         Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     // A single-permit semaphore, held by the test up front: forces the first
@@ -500,6 +502,7 @@ async fn concurrent_live_and_snapshot_install_for_same_slug_are_serialized() {
         plugin_installations: vec![make_record(slug, install_id(), "desired")],
         revocations: None,
         org_policy: None,
+        org_id: None,
     };
     dispatch_event(
         snapshot_event,
@@ -655,6 +658,7 @@ async fn concurrent_live_install_and_snapshot_derived_orphan_purge_for_same_slug
         plugin_installations: vec![make_record("decoy", install_id(), "installed")],
         revocations: None,
         org_policy: None,
+        org_id: None,
     };
     dispatch_event(
         snapshot_event,
@@ -763,6 +767,7 @@ async fn dispatch_event_snapshot_converges_deactivated_and_orphan_and_removed_pl
         ],
         revocations: None,
         org_policy: None,
+        org_id: None,
     };
     dispatch_event(
         snapshot_event,
@@ -800,11 +805,36 @@ async fn dispatch_event_snapshot_converges_deactivated_and_orphan_and_removed_pl
 
 // ── Imported plugin content fetch ─────────────────────────────────────────────
 
-const IMPORTED_CONTENT: &str = r##"{"components":{
-    "files":{"hooks/check.sh":"#!/bin/sh\nexit 0\n"},
-    "binary_files":{"assets/icon.png":"iVBORw0KGgo="},
-    "executables":["hooks/check.sh"]
-}}"##;
+const ICON_PNG: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+const CHECK_SH: &[u8] = b"#!/bin/sh\nexit 0\n";
+
+/// A signed imported-plugin response body for `hooky@1.0.0` served by a mock
+/// registry at `registry_url`.
+fn imported_content_body(registry_url: &str) -> String {
+    use base64::Engine as _;
+    let signed = crate::test_support::sign_plugin(
+        registry_url,
+        "hooky",
+        "1.0.0",
+        &[
+            ("hooks/check.sh", CHECK_SH, true),
+            ("assets/icon.png", &ICON_PNG, false),
+        ],
+    );
+    serde_json::json!({"components": {
+        "files": {"hooks/check.sh": std::str::from_utf8(CHECK_SH).unwrap()},
+        "binary_files": {"assets/icon.png": base64::engine::general_purpose::STANDARD.encode(ICON_PNG)},
+        "executables": ["hooks/check.sh"],
+    }, "signed": signed})
+    .to_string()
+}
+
+fn paired_state(registry_url: &str) -> std::sync::Arc<AppState> {
+    let root = temp_root("plugin-fetch");
+    let state = std::sync::Arc::new(AppState::bootstrap_in(root).unwrap());
+    crate::test_support::pair_device(&state, registry_url);
+    state
+}
 
 /// A private (imported, not yet published) plugin is served only to its owner,
 /// so the content fetch identifies the runner. Binary files arrive base64 and
@@ -812,16 +842,20 @@ const IMPORTED_CONTENT: &str = r##"{"components":{
 #[tokio::test]
 async fn imported_plugin_fetch_sends_the_token_and_decodes_binaries() {
     let mut server = mockito::Server::new_async().await;
+    let body = imported_content_body(&server.url());
     let mock = server
         .mock("GET", "/api/runner/plugins/hooky/versions/1.0.0")
         .match_header("authorization", "Bearer tok")
         .with_status(200)
         .with_header("content-type", "application/json")
-        .with_body(IMPORTED_CONTENT)
+        .with_body(body)
         .create_async()
         .await;
+    let state = paired_state(&server.url());
 
-    let got = super::fetch_plugin_version_files(&server.url(), "hooky", "1.0.0", "tok").await;
+    let got = super::fetch_plugin_version_files(&state, &server.url(), "hooky", "1.0.0", "tok")
+        .await
+        .unwrap();
 
     mock.assert_async().await;
     let mut files = got.files.clone();
@@ -829,14 +863,8 @@ async fn imported_plugin_fetch_sends_the_token_and_decodes_binaries() {
     assert_eq!(
         files,
         vec![
-            (
-                "assets/icon.png".to_string(),
-                vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]
-            ),
-            (
-                "hooks/check.sh".to_string(),
-                b"#!/bin/sh\nexit 0\n".to_vec()
-            ),
+            ("assets/icon.png".to_string(), ICON_PNG.to_vec()),
+            ("hooks/check.sh".to_string(), CHECK_SH.to_vec()),
         ]
     );
     assert_eq!(got.executables, vec!["hooks/check.sh".to_string()]);
@@ -846,17 +874,41 @@ async fn imported_plugin_fetch_sends_the_token_and_decodes_binaries() {
 #[tokio::test]
 async fn imported_plugin_fetch_sends_no_header_when_logged_out() {
     let mut server = mockito::Server::new_async().await;
+    let body = imported_content_body(&server.url());
     let mock = server
         .mock("GET", "/api/runner/plugins/hooky/versions/1.0.0")
         .match_header("authorization", mockito::Matcher::Missing)
         .with_status(200)
         .with_header("content-type", "application/json")
-        .with_body(IMPORTED_CONTENT)
+        .with_body(body)
         .create_async()
         .await;
+    let state = paired_state(&server.url());
 
-    let got = super::fetch_plugin_version_files(&server.url(), "hooky", "1.0.0", "").await;
+    let got = super::fetch_plugin_version_files(&state, &server.url(), "hooky", "1.0.0", "")
+        .await
+        .unwrap();
 
     mock.assert_async().await;
     assert_eq!(got.files.len(), 2);
+}
+
+/// An unsigned response is an error: nothing is returned to write.
+#[tokio::test]
+async fn imported_plugin_fetch_rejects_unsigned_content() {
+    let mut server = mockito::Server::new_async().await;
+    let mock = server
+        .mock("GET", "/api/runner/plugins/hooky/versions/1.0.0")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r##"{"components":{"files":{"hooks/check.sh":"x"},"executables":["hooks/check.sh"]}}"##)
+        .create_async()
+        .await;
+    let state = paired_state(&server.url());
+
+    let got =
+        super::fetch_plugin_version_files(&state, &server.url(), "hooky", "1.0.0", "").await;
+
+    mock.assert_async().await;
+    assert!(got.is_err());
 }

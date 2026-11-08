@@ -152,7 +152,10 @@ pub fn insert_approval(state: &AppState, def: &StdioDefinition, server_name: &st
 pub fn delete_approval(state: &AppState, hash: &str) -> Result<bool> {
     let conn = open(state)?;
     let n = conn
-        .execute("DELETE FROM stdio_approvals WHERE approval_hash = ?1", [hash])
+        .execute(
+            "DELETE FROM stdio_approvals WHERE approval_hash = ?1",
+            [hash],
+        )
         .context("failed to delete approval")?;
     Ok(n > 0)
 }

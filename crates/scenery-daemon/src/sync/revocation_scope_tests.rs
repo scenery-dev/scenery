@@ -156,7 +156,9 @@ fn revoke_event(artifact_type: &str, key: &str, version: Option<&str>) -> SyncEv
 /// on these paths (status PATCH, imported-plugin content fetch) is
 /// best-effort, so an unmocked mockito server (fast 501) is enough.
 async fn run(event: SyncEvent, state: &Arc<AppState>, backend_registry: &Arc<BackendRegistry>) {
-    let server = mockito::Server::new_async().await;
+    let mut server = mockito::Server::new_async().await;
+    let _plugin_content = crate::test_support::mock_plugin_content(&mut server);
+    let event = crate::test_support::prepare_event(event, state, &server.url());
     let sem = Arc::new(tokio::sync::Semaphore::new(4));
     let locks: super::SkillLockMap =
         Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
@@ -505,6 +507,7 @@ fn install_mcp_event(sid: Uuid, version_pin: Option<&str>) -> SyncEvent {
         auth_type: "none".to_string(),
         gateway_server_id: None,
         gateway_url: None,
+        signed: None,
     }
 }
 
@@ -639,7 +642,9 @@ async fn skill_revoke_racing_a_plugin_install_neither_deadlocks_nor_leaves_the_s
     let reg = Arc::new(BackendRegistry::new());
     seed_skill_version(&state, "evil", "1.0.0", "evil body", true);
 
-    let server = mockito::Server::new_async().await;
+    let mut server = mockito::Server::new_async().await;
+    let _plugin_content = crate::test_support::mock_plugin_content(&mut server);
+    crate::test_support::pair_device(&state, &server.url());
     let locks: super::SkillLockMap =
         Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let stats = Arc::new(std::sync::Mutex::new(super::ReconcilerStats::default()));

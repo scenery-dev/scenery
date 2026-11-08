@@ -125,10 +125,12 @@ fn snapshot(revs: &[(&str, &str, Option<&str>)]) -> SyncEvent {
                     artifact_type: (*t).to_string(),
                     artifact_key: (*k).to_string(),
                     version: v.map(str::to_string),
+                    signed: None,
                 })
                 .collect(),
         ),
         org_policy: None,
+        org_id: None,
     }
 }
 
@@ -312,6 +314,7 @@ async fn unrevoke_reinstall_rerevoke_removes_the_content_again() {
             artifact_type: "skill".into(),
             artifact_key: "flip".into(),
             version: None,
+            signed: None,
         },
         &state,
     )

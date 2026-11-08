@@ -24,6 +24,7 @@
 
 use anyhow::{Context, Result};
 use scenery_core::http::AsyncSendTrackedExt;
+use scenery_core::signed::Envelope;
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -32,7 +33,6 @@ use std::{
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
-use scenery_core::signed::Envelope;
 
 use crate::managed_paths::ManagedPathsPusher;
 use crate::sync::sse_client::{
@@ -644,7 +644,11 @@ async fn dispatch_event(
                             &active_for_merge,
                         );
                         (
-                            revocation::merge_snapshot(&state_for_replace, &active_for_merge, &cleared),
+                            revocation::merge_snapshot(
+                                &state_for_replace,
+                                &active_for_merge,
+                                &cleared,
+                            ),
                             seen,
                         )
                     })
@@ -2020,8 +2024,14 @@ async fn handle_install_mcp(
         Ok(Ok(v)) => v,
         Ok(Err(msg)) => {
             warn!(mcp_server_id = %mcp_server_id, reason = %msg, "reconciler: MCP install rejected");
-            report_mcp_installation_status(installation_id, "error", Some(&msg), registry_url, state)
-                .await;
+            report_mcp_installation_status(
+                installation_id,
+                "error",
+                Some(&msg),
+                registry_url,
+                state,
+            )
+            .await;
             increment_mcp_errors(stats);
             return false;
         }
@@ -2282,7 +2292,9 @@ async fn hold_mcp_pending(
     let mut changed = false;
     for slug in previous_slug
         .into_iter()
-        .chain(std::iter::once(crate::mcp_server_slug(&row.mcp_server_name)))
+        .chain(std::iter::once(crate::mcp_server_slug(
+            &row.mcp_server_name,
+        )))
     {
         changed |= backend_registry.remove_backend(&slug);
         if let Some(p) = pusher {
@@ -2545,10 +2557,9 @@ pub(crate) fn write_managed_mcp_json(state: &AppState) -> Result<()> {
         .list_mcp_installs()
         .context("failed to read mcp_installations for managed-mcp.json")?;
 
-    let pending: std::collections::HashSet<String> =
-        scenery_core::approvals::list_pending(state)
-            .map(|p| p.into_iter().map(|s| s.mcp_server_id).collect())
-            .unwrap_or_default();
+    let pending: std::collections::HashSet<String> = scenery_core::approvals::list_pending(state)
+        .map(|p| p.into_iter().map(|s| s.mcp_server_id).collect())
+        .unwrap_or_default();
     let mut servers = Vec::with_capacity(rows.len());
     for row in &rows {
         // Servers waiting for local approval are not mirrored here.
@@ -3415,8 +3426,9 @@ fn install_from_registry_blocking(
 
     // M2: the digest and size come from the verified `skill_artifact.v1`
     // payload, never from the unsigned fields beside it.
-    let (sha256, size) = scenery_core::verifier::verify_skill_artifact(state, skill_id, version, &meta)
-        .with_context(|| format!("artifact for {skill_id}@{version} is not validly signed"))?;
+    let (sha256, size) =
+        scenery_core::verifier::verify_skill_artifact(state, skill_id, version, &meta)
+            .with_context(|| format!("artifact for {skill_id}@{version} is not validly signed"))?;
 
     // Download to a temp path.
     let tmp_path = state
@@ -4402,6 +4414,9 @@ pub(crate) async fn report_mcp_installation_status_for_test(
         .await;
 }
 
+/// Test entry point: the unsigned fields are signed with the test key (and
+/// the device is paired against `registry_url`'s origin) so install tests keep
+/// exercising install behavior rather than signature plumbing.
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_install_mcp_for_test(
@@ -4419,6 +4434,61 @@ pub(crate) async fn handle_install_mcp_for_test(
     stats: &Arc<std::sync::Mutex<ReconcilerStats>>,
     backend_registry: &Arc<BackendRegistry>,
 ) -> bool {
+    crate::test_support::pair_device(state, registry_url);
+    if let Some(cfg) = server_config.as_ref() {
+        crate::test_support::approve_config(state, cfg, &mcp_server_name);
+    }
+    let signed = crate::test_support::sign_mcp(
+        registry_url,
+        &mcp_server_id.to_string(),
+        &mcp_server_name,
+        &package_source,
+        version_pin.as_deref(),
+        server_config.as_ref(),
+        &auth_type,
+        gateway_server_id.as_deref(),
+        gateway_url.as_deref(),
+        crate::test_support::next_seq(),
+    );
+    handle_install_mcp_with_signed_for_test(
+        installation_id,
+        mcp_server_id,
+        mcp_server_name,
+        package_source,
+        version_pin,
+        server_config,
+        auth_type,
+        gateway_server_id,
+        gateway_url,
+        Some(signed),
+        state,
+        registry_url,
+        stats,
+        backend_registry,
+    )
+    .await
+}
+
+/// As [`handle_install_mcp_for_test`] with the envelope supplied by the test
+/// (including `None` for the unsigned-rejection tests).
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn handle_install_mcp_with_signed_for_test(
+    installation_id: Uuid,
+    mcp_server_id: Uuid,
+    mcp_server_name: String,
+    package_source: String,
+    version_pin: Option<String>,
+    server_config: Option<serde_json::Value>,
+    auth_type: String,
+    gateway_server_id: Option<String>,
+    gateway_url: Option<String>,
+    signed: Option<Envelope>,
+    state: &Arc<AppState>,
+    registry_url: &str,
+    stats: &Arc<std::sync::Mutex<ReconcilerStats>>,
+    backend_registry: &Arc<BackendRegistry>,
+) -> bool {
     let (list_changed_tx, _) = broadcast::channel(16);
     handle_install_mcp(
         installation_id,
@@ -4430,6 +4500,7 @@ pub(crate) async fn handle_install_mcp_for_test(
         auth_type,
         gateway_server_id,
         gateway_url,
+        signed,
         state,
         registry_url,
         stats,

@@ -139,14 +139,48 @@ fn registry_id_install_happy_path() {
         .with_body(r#"{"skill_id":"test-skill-reginstall","name":"Test","latest_version":"2.0.0","publisher_name":null,"description":null}"#)
         .create();
 
+    // 2.2.0: artifact metadata must carry a signed `skill_artifact.v1`.
+    let origin = server.url();
+    {
+        use scenery_core::signed::testing::{trusted, TEST_KID};
+        state
+            .set_sync_state(scenery_core::verifier::REGISTRY_ORIGIN_KEY, &origin)
+            .unwrap();
+        state
+            .set_sync_state(scenery_core::verifier::ORG_ID_KEY, "org-1")
+            .unwrap();
+        scenery_core::trust::pin_key(&state, &origin, TEST_KID, &trusted(1, TEST_KID).pubkey)
+            .unwrap();
+    }
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "skill_id": "test-skill-reginstall", "version": "2.0.0", "sha256": sha256,
+        "size_bytes": archive_bytes.len(), "org": "org-1",
+    }))
+    .unwrap();
+    let statement = scenery_core::signed::testing::statement_json(
+        scenery_core::signed::TYP_SKILL_ARTIFACT,
+        &origin,
+        "org-1",
+        "skill:test-skill-reginstall@2.0.0",
+        1,
+        "active",
+        Some(&payload),
+    );
+    let envelope = scenery_core::signed::testing::envelope(
+        1,
+        scenery_core::signed::testing::TEST_KID,
+        &statement,
+        Some(&payload),
+    );
     let _meta = server
         .mock("GET", "/skills/test-skill-reginstall/versions/2.0.0")
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(format!(
-            r#"{{"skill_id":"test-skill-reginstall","version":"2.0.0","download_url":"{}{dl_path}","sha256":"{sha256}","size_bytes":{}}}"#,
+            r#"{{"skill_id":"test-skill-reginstall","version":"2.0.0","download_url":"{}{dl_path}","sha256":"{sha256}","size_bytes":{},"signed":{}}}"#,
             server.url(),
-            archive_bytes.len()
+            archive_bytes.len(),
+            serde_json::to_string(&envelope).unwrap()
         ))
         .create();
 

@@ -9,11 +9,11 @@
 //! The subsystem is optional: if `registry_url` is absent or the daemon is
 //! operating in offline mode, `run` immediately returns `Ok(())`.
 
+pub(crate) mod mcp_verify;
+pub(crate) mod plugin_verify;
 pub mod reconciler;
 mod revoke_gate;
 pub mod sse_client;
-pub(crate) mod mcp_verify;
-pub(crate) mod plugin_verify;
 pub(crate) mod trust_apply;
 
 pub use reconciler::ReconcilerHandle;

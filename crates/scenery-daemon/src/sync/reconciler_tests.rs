@@ -1039,8 +1039,10 @@ fn snapshot_records_folder_name_and_later_events_use_it() {
             artifact_type: "skill".to_string(),
             artifact_key: "x-bob".to_string(),
             version: None,
+            signed: None,
         }]),
         org_policy: None,
+        org_id: None,
     };
     match localize_skill_names(snapshot, &state) {
         SyncEvent::Snapshot {

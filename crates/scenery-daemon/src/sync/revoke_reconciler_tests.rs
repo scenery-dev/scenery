@@ -126,6 +126,7 @@ async fn dispatch(
     // modify the real one.
     let _home = FakeHome::new();
     let registry_url = "https://example.invalid".to_string();
+    let event = crate::test_support::prepare_event(event, state, &registry_url);
     let sem = Arc::new(tokio::sync::Semaphore::new(4));
     let locks = skill_locks();
     let stats = Arc::new(std::sync::Mutex::new(super::ReconcilerStats::default()));
@@ -284,6 +285,7 @@ async fn unrevoke_event_clears_the_local_gate_immediately() {
             artifact_type: "skill".to_string(),
             artifact_key: "temp-blocked".to_string(),
             version: None,
+            signed: None,
         },
         &state,
         &Arc::new(BackendRegistry::new()),
@@ -308,6 +310,7 @@ async fn unrevoke_event_for_a_never_revoked_key_is_a_harmless_no_op() {
             artifact_type: "skill".to_string(),
             artifact_key: "never-blocked".to_string(),
             version: None,
+            signed: None,
         },
         &state,
         &Arc::new(BackendRegistry::new()),
@@ -340,6 +343,7 @@ async fn install_event_succeeds_after_a_live_unrevoke() {
             artifact_type: "skill".to_string(),
             artifact_key: "revoked-then-unrevoked".to_string(),
             version: None,
+            signed: None,
         },
         &state,
         &Arc::new(BackendRegistry::new()),
@@ -391,10 +395,16 @@ async fn revoke_event_tears_down_a_running_mcp_backend_and_persists_the_block() 
         gateway_url: None,
     };
     state.upsert_mcp_install(&row).unwrap();
+    crate::test_support::approve_stored_stdio(&state);
 
     let backend_registry = Arc::new(BackendRegistry::new());
     let (list_changed_tx, _rx) = tokio::sync::broadcast::channel(16);
-    crate::load_managed_mcp_into_registry(&state, &backend_registry, list_changed_tx);
+    crate::load_managed_mcp_into_registry(
+        &state,
+        &backend_registry,
+        list_changed_tx,
+        "http://127.0.0.1:1",
+    );
     assert!(backend_registry.has_backend("github-mcp"));
 
     dispatch(
@@ -443,6 +453,7 @@ async fn snapshot_revocations_none_leaves_local_cache_untouched() {
             plugin_installations: vec![],
             revocations: None,
             org_policy: None,
+            org_id: None,
         },
         &state,
         &Arc::new(BackendRegistry::new()),
@@ -458,17 +469,13 @@ async fn snapshot_revocations_none_leaves_local_cache_untouched() {
 }
 
 #[tokio::test]
-async fn snapshot_revocations_some_empty_clears_an_unblocked_entry() {
-    // The admin "unblock" path: the backend's current list no longer
-    // includes an artifact that WAS revoked — the snapshot's `revocations`
-    // key is present but doesn't mention it (here: entirely empty), so the
-    // local gate must clear, allowing a future install again.
+async fn snapshot_revocations_some_empty_keeps_an_entry_without_a_signed_clear() {
+    // 2.2.0 fail-safe: an entry that merely drops out of the snapshot's
+    // `revocations` list is NOT lifted. Only a verified `cleared` statement
+    // lifts a revocation (see the next test and `trust_apply_tests`).
     let root = temp_root("snapshot-revocations-unblock");
     let state = Arc::new(AppState::bootstrap_in(root.clone()).unwrap());
     scenery_core::revocation::upsert_revocation(&state, "skill", "unblocked-skill", None).unwrap();
-    assert!(
-        scenery_core::revocation::is_revoked(&state, "skill", "unblocked-skill", None).unwrap()
-    );
 
     dispatch(
         SyncEvent::Snapshot {
@@ -477,6 +484,7 @@ async fn snapshot_revocations_some_empty_clears_an_unblocked_entry() {
             plugin_installations: vec![],
             revocations: Some(vec![]),
             org_policy: None,
+            org_id: None,
         },
         &state,
         &Arc::new(BackendRegistry::new()),
@@ -484,12 +492,87 @@ async fn snapshot_revocations_some_empty_clears_an_unblocked_entry() {
     .await;
 
     assert!(
-        !scenery_core::revocation::is_revoked(&state, "skill", "unblocked-skill", None).unwrap(),
-        "an empty (but present) revocations list must clear every local entry"
+        scenery_core::revocation::is_revoked(&state, "skill", "unblocked-skill", None).unwrap(),
+        "a dropped entry without a signed `cleared` statement must keep the gate"
     );
-
     cleanup(&root);
 }
+
+/// A snapshot entry carrying a verified `cleared` statement lifts the gate.
+#[tokio::test]
+async fn snapshot_revocation_with_a_signed_clear_lifts_the_entry() {
+    let root = temp_root("snapshot-revocations-signed-clear");
+    let state = Arc::new(AppState::bootstrap_in(root.clone()).unwrap());
+    scenery_core::revocation::upsert_revocation(&state, "skill", "unblocked-skill", None).unwrap();
+    // `dispatch` pairs the device against this URL; sign for the same origin.
+    let signed = crate::test_support::sign_revocation(
+        "https://example.invalid", "skill", "unblocked-skill", None, "cleared",
+    );
+    crate::test_support::pair_device(&state, "https://example.invalid");
+
+    dispatch(
+        SyncEvent::Snapshot {
+            installations: vec![],
+            mcp_installations: None,
+            plugin_installations: vec![],
+            revocations: Some(vec![crate::sync::sse_client::RevocationRecord {
+                artifact_type: "skill".into(),
+                artifact_key: "unblocked-skill".into(),
+                version: None,
+                signed: Some(signed),
+            }]),
+            org_policy: None,
+            org_id: None,
+        },
+        &state,
+        &Arc::new(BackendRegistry::new()),
+    )
+    .await;
+
+    assert!(
+        !scenery_core::revocation::is_revoked(&state, "skill", "unblocked-skill", None).unwrap()
+    );
+    cleanup(&root);
+}
+
+/// A live `unrevoke` with no valid signed clear keeps the local revocation.
+#[tokio::test]
+async fn unsigned_unrevoke_keeps_the_local_revocation() {
+    let root = temp_root("unsigned-unrevoke");
+    let state = Arc::new(AppState::bootstrap_in(root.clone()).unwrap());
+    scenery_core::revocation::upsert_revocation(&state, "skill", "kept", None).unwrap();
+    crate::test_support::pair_device(&state, "https://example.invalid");
+
+    // Straight to the reconciler, bypassing `dispatch`'s auto-signing.
+    let sem = Arc::new(tokio::sync::Semaphore::new(4));
+    let locks = skill_locks();
+    let stats = Arc::new(std::sync::Mutex::new(super::ReconcilerStats::default()));
+    let mut tasks: tokio::task::JoinSet<bool> = tokio::task::JoinSet::new();
+    let (tx, _rx) = tokio::sync::broadcast::channel(16);
+    super::dispatch_event(
+        SyncEvent::Unrevoke {
+            artifact_type: "skill".into(),
+            artifact_key: "kept".into(),
+            version: None,
+            signed: None,
+        },
+        &state,
+        "https://example.invalid",
+        &sem,
+        &locks,
+        &stats,
+        &mut tasks,
+        &Arc::new(BackendRegistry::new()),
+        tx,
+        None,
+    )
+    .await;
+    while tasks.join_next().await.is_some() {}
+
+    assert!(scenery_core::revocation::is_revoked(&state, "skill", "kept", None).unwrap());
+    cleanup(&root);
+}
+
 
 #[tokio::test]
 async fn snapshot_revocations_some_purges_a_locally_installed_skill() {
@@ -508,8 +591,10 @@ async fn snapshot_revocations_some_purges_a_locally_installed_skill() {
                 artifact_type: "skill".to_string(),
                 artifact_key: "snapshot-revoked".to_string(),
                 version: None,
+                signed: None,
             }]),
             org_policy: None,
+            org_id: None,
         },
         &state,
         &Arc::new(BackendRegistry::new()),
@@ -534,8 +619,10 @@ fn snapshot_revoking(key: &str) -> SyncEvent {
             artifact_type: "skill".to_string(),
             artifact_key: key.to_string(),
             version: None,
+            signed: None,
         }]),
         org_policy: None,
+        org_id: None,
     }
 }
 
@@ -707,6 +794,7 @@ async fn install_mcp_event_is_refused_for_an_already_revoked_server() {
             auth_type: "none".to_string(),
             gateway_server_id: None,
             gateway_url: None,
+            signed: None,
         },
         &state,
         &backend_registry,

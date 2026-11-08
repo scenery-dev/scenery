@@ -222,10 +222,16 @@ fn revocation_snapshot_applied_even_with_no_reconciler_present() {
         .mock("GET", "/api/sync/snapshot")
         .with_status(200)
         .with_header("content-type", "application/json")
-        .with_body(
-            r#"{"installations":[],"mcp_installations":[],"plugin_installations":[],"revocations":[]}"#,
-        )
+        .with_body(format!(
+            r#"{{"installations":[],"mcp_installations":[],"plugin_installations":[],"revocations":[
+                {{"artifact_type":"skill","artifact_key":"ghost-skill","signed":{}}}]}}"#,
+            serde_json::to_string(&crate::test_support::sign_revocation(
+                &registry_url, "skill", "ghost-skill", None, "cleared"
+            ))
+            .unwrap()
+        ))
         .create();
+    crate::test_support::pair_device(&state, &registry_url);
 
     // Simulate the STALE local state: this device revoked "ghost-skill"
     // earlier (e.g. via a live `revoke` SSE event while the daemon was
@@ -302,12 +308,14 @@ fn org_policy_snapshot_flips_the_caller_supplied_atomic() {
         .mock("GET", "/api/sync/snapshot")
         .with_status(200)
         .with_header("content-type", "application/json")
-        .with_body(
-            r#"{"installations":[],"mcp_installations":[],"plugin_installations":[],
+        .with_body(format!(
+            r#"{{"installations":[],"mcp_installations":[],"plugin_installations":[],
                 "revocations":[],
-                "org_policy":{"block_third_party_inference":true}}"#,
-        )
+                "org_policy":{{"block_third_party_inference":true,"signed":{}}}}}"#,
+            crate::test_support::sign_org_policy(&registry_url, "audit", true)
+        ))
         .create();
+    crate::test_support::pair_device(&state, &registry_url);
 
     let registry = RegistryClient::new(&registry_url);
     let audit_buf = SqliteAuditBuffer::new(Arc::new(RegistryClient::new(&registry_url)), &state);

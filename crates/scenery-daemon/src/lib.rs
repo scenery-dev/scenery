@@ -2355,8 +2355,7 @@ pub fn run_sync_tick(
                             // First verified snapshot pins the org (TOFU).
                             let mut stmts: Vec<(&str, &scenery_core::signed::Envelope)> =
                                 Vec::new();
-                            if let Some(env) = org_policy.as_ref().and_then(|p| p.signed.as_ref())
-                            {
+                            if let Some(env) = org_policy.as_ref().and_then(|p| p.signed.as_ref()) {
                                 stmts.push((scenery_core::signed::TYP_ORG_POLICY, env));
                             }
                             for rec in mcp_installations.iter().flatten() {
@@ -2670,7 +2669,10 @@ fn flush_ratings_and_scan(
 fn pin_registry_origin(state: &AppState, registry_url: &str) {
     if scenery_core::verifier::registry_origin(state).is_none() {
         match state.set_sync_state(scenery_core::verifier::REGISTRY_ORIGIN_KEY, registry_url) {
-            Ok(()) => info!(registry_url, "pinned registry origin (first start under 2.2)"),
+            Ok(()) => info!(
+                registry_url,
+                "pinned registry origin (first start under 2.2)"
+            ),
             Err(e) => warn!(error = %e, "failed to pin registry origin"),
         }
     }
@@ -3079,6 +3081,9 @@ pub fn build_stub_registry() -> BackendRegistry {
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+pub(crate) mod test_support;
+
+#[cfg(test)]
 #[path = "refresh_loop_tests.rs"]
 mod refresh_loop_tests;
 
@@ -3134,7 +3139,9 @@ mod backend_entry_tests {
     use scenery_core::state::{AppState, McpInstallRow};
     use scenery_mcp::aggregator::{resolve_live_token, BackendTransport};
 
-    fn mcp_row_to_backend_entry(row: &McpInstallRow) -> Option<scenery_mcp::aggregator::BackendEntry> {
+    fn mcp_row_to_backend_entry(
+        row: &McpInstallRow,
+    ) -> Option<scenery_mcp::aggregator::BackendEntry> {
         let dir = tempfile::tempdir().unwrap();
         let state = AppState::bootstrap_in(
             camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap(),

@@ -44,7 +44,11 @@ pub fn device_org(state: &AppState) -> Option<String> {
 pub fn max_seq(state: &AppState, sub: &str) -> Result<Option<u64>> {
     let conn = Connection::open(&state.db_path).context("failed to open state DB")?;
     let v: Option<i64> = conn
-        .query_row("SELECT max_seq FROM signed_seq WHERE sub = ?1", [sub], |r| r.get(0))
+        .query_row(
+            "SELECT max_seq FROM signed_seq WHERE sub = ?1",
+            [sub],
+            |r| r.get(0),
+        )
         .optional()
         .context("failed to read signed_seq")?;
     Ok(v.and_then(|n| u64::try_from(n).ok()))
@@ -140,8 +144,13 @@ pub fn verify_skill_artifact(
 ) -> Result<(String, u64)> {
     let Some(env) = meta.signed.as_ref() else {
         if crate::trust::insecure_unsigned() {
-            tracing::warn!(skill_id, "SCENERY_INSECURE_UNSIGNED: accepting unsigned artifact");
-            let size = meta.size_bytes.unwrap_or(crate::registry::MAX_ARTIFACT_BYTES);
+            tracing::warn!(
+                skill_id,
+                "SCENERY_INSECURE_UNSIGNED: accepting unsigned artifact"
+            );
+            let size = meta
+                .size_bytes
+                .unwrap_or(crate::registry::MAX_ARTIFACT_BYTES);
             return Ok((meta.sha256.clone(), size));
         }
         anyhow::bail!("artifact metadata is not signed");
@@ -161,7 +170,10 @@ pub fn verify_skill_artifact(
         p.skill_id,
         p.version
     );
-    anyhow::ensure!(p.org == v.org, "artifact payload org does not match its statement");
+    anyhow::ensure!(
+        p.org == v.org,
+        "artifact payload org does not match its statement"
+    );
     Ok((p.sha256, p.size_bytes))
 }
 

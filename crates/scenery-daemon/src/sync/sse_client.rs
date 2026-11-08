@@ -1442,7 +1442,11 @@ fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
             let wire: WireRevoke = serde_json::from_str(data)
                 .with_context(|| format!("failed to parse revoke event: {data}"))?;
             anyhow::ensure!(
-                revocation_ok(&wire.artifact_type, &wire.artifact_key, wire.version.as_deref()),
+                revocation_ok(
+                    &wire.artifact_type,
+                    &wire.artifact_key,
+                    wire.version.as_deref()
+                ),
                 "revoke event has an unsafe key or version"
             );
             Ok(SyncEvent::Revoke {
@@ -1460,7 +1464,11 @@ fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
             let wire: WireUnrevoke = serde_json::from_str(data)
                 .with_context(|| format!("failed to parse unrevoke event: {data}"))?;
             anyhow::ensure!(
-                revocation_ok(&wire.artifact_type, &wire.artifact_key, wire.version.as_deref()),
+                revocation_ok(
+                    &wire.artifact_type,
+                    &wire.artifact_key,
+                    wire.version.as_deref()
+                ),
                 "unrevoke event has an unsafe key or version"
             );
             Ok(SyncEvent::Unrevoke {

@@ -220,12 +220,16 @@ fn check_org(raw: &RawStatement, p: &VerifyParams<'_>) -> Result<(), SignError> 
         if raw.typ == TYP_REVOCATION {
             return Ok(());
         }
-        return Err(SignError::WrongOrg { got: raw.org.clone() });
+        return Err(SignError::WrongOrg {
+            got: raw.org.clone(),
+        });
     }
     match p.org {
         None => Err(SignError::OrgUnknown),
         Some(org) if org == raw.org => Ok(()),
-        Some(_) => Err(SignError::WrongOrg { got: raw.org.clone() }),
+        Some(_) => Err(SignError::WrongOrg {
+            got: raw.org.clone(),
+        }),
     }
 }
 

@@ -81,9 +81,7 @@ pub(crate) fn verify_mcp_definition(
     if v.status != signed::STATUS_ACTIVE {
         return Err(format!("rejected: statement status is '{}'", v.status));
     }
-    let p: McpPayload = v
-        .payload_json()
-        .map_err(|e| format!("rejected: {e}"))?;
+    let p: McpPayload = v.payload_json().map_err(|e| format!("rejected: {e}"))?;
     if p.mcp_server_id != mcp_server_id.to_string() {
         return Err("rejected: payload is for a different server".to_string());
     }

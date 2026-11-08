@@ -3410,12 +3410,39 @@ mod tests {
             .with_body(r#"{"skill_id":"test-skill","name":"Test Skill","latest_version":"0.1.0","publisher_name":"scenery","description":"A test skill."}"#)
             .create();
 
+        // 2.2.0: artifact metadata must carry a signed `skill_artifact.v1`.
+        use scenery_core::signed::testing::{envelope, statement_json, trusted, TEST_KID};
+        state
+            .set_sync_state(scenery_core::verifier::REGISTRY_ORIGIN_KEY, &url)
+            .unwrap();
+        state
+            .set_sync_state(scenery_core::verifier::ORG_ID_KEY, "org-1")
+            .unwrap();
+        scenery_core::trust::pin_key(&state, &url, TEST_KID, &trusted(1, TEST_KID).pubkey)
+            .unwrap();
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "skill_id": "test-skill", "version": "0.1.0", "sha256": sha256,
+            "size_bytes": archive_bytes.len(), "org": "org-1",
+        }))
+        .unwrap();
+        let statement = statement_json(
+            scenery_core::signed::TYP_SKILL_ARTIFACT,
+            &url,
+            "org-1",
+            "skill:test-skill@0.1.0",
+            1,
+            "active",
+            Some(&payload),
+        );
+        let signed = serde_json::to_string(&envelope(1, TEST_KID, &statement, Some(&payload)))
+            .unwrap();
+
         let _meta_mock = server
             .mock("GET", "/skills/test-skill/versions/0.1.0")
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(format!(
-                r#"{{"skill_id":"test-skill","version":"0.1.0","download_url":"{url}{download_path}","sha256":"{sha256}","size_bytes":{}}}"#,
+                r#"{{"skill_id":"test-skill","version":"0.1.0","download_url":"{url}{download_path}","sha256":"{sha256}","size_bytes":{},"signed":{signed}}}"#,
                 archive_bytes.len()
             ))
             .create();

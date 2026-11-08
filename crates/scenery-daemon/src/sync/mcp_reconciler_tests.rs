@@ -307,6 +307,7 @@ fn make_mcp_snapshot_record(
         auth_type: "none".to_string(),
         gateway_server_id: None,
         gateway_url: None,
+        signed: None,
         state: state.to_string(),
     }
 }
@@ -524,7 +525,8 @@ fn snapshot_mcp_some_empty_reconciles_away_existing_installs() {
 
     let registry = fresh_registry();
     let (list_changed_tx, _rx) = tokio::sync::broadcast::channel(16);
-    crate::load_managed_mcp_into_registry(&state, &registry, list_changed_tx);
+    crate::test_support::approve_stored_stdio(&state);
+    crate::load_managed_mcp_into_registry(&state, &registry, list_changed_tx, "http://127.0.0.1:1");
     assert!(
         registry.has_backend("github-mcp"),
         "backend must be registered before reconciling against Some(empty)"
@@ -581,7 +583,8 @@ async fn snapshot_mcp_deactivated_event_stops_running_backend() {
 
     let registry = fresh_registry();
     let (list_changed_tx, _rx) = tokio::sync::broadcast::channel(16);
-    crate::load_managed_mcp_into_registry(&state, &registry, list_changed_tx);
+    crate::test_support::approve_stored_stdio(&state);
+    crate::load_managed_mcp_into_registry(&state, &registry, list_changed_tx, "http://127.0.0.1:1");
     assert!(
         registry.has_backend("github-mcp"),
         "backend must be registered before deactivation"
@@ -660,7 +663,8 @@ async fn snapshot_mcp_orphan_removal_stops_running_backend() {
 
     let registry = fresh_registry();
     let (list_changed_tx, _rx) = tokio::sync::broadcast::channel(16);
-    crate::load_managed_mcp_into_registry(&state, &registry, list_changed_tx);
+    crate::test_support::approve_stored_stdio(&state);
+    crate::load_managed_mcp_into_registry(&state, &registry, list_changed_tx, "http://127.0.0.1:1");
     assert!(registry.has_backend("github-mcp"));
     assert!(registry.has_backend("slack-mcp"));
 
@@ -710,7 +714,13 @@ async fn dispatch_event_mcp_none_leaves_existing_installs_and_backend_untouched(
 
     let registry = fresh_registry();
     let (list_changed_tx, _rx) = tokio::sync::broadcast::channel(16);
-    crate::load_managed_mcp_into_registry(&state, &registry, list_changed_tx.clone());
+    crate::test_support::approve_stored_stdio(&state);
+    crate::load_managed_mcp_into_registry(
+        &state,
+        &registry,
+        list_changed_tx.clone(),
+        "http://127.0.0.1:1",
+    );
     assert!(registry.has_backend("github-mcp"));
 
     let registry_url = "https://example.invalid".to_string();
@@ -726,6 +736,7 @@ async fn dispatch_event_mcp_none_leaves_existing_installs_and_backend_untouched(
         plugin_installations: vec![],
         revocations: None,
         org_policy: None,
+        org_id: None,
     };
 
     super::dispatch_event(
@@ -872,7 +883,8 @@ fn startup_with_two_entries_registers_two_backends() {
     // Act: run the startup loader.
     let registry = fresh_registry();
     let (list_changed_tx, _) = tokio::sync::broadcast::channel(16);
-    crate::load_managed_mcp_into_registry(&state, &registry, list_changed_tx);
+    crate::test_support::approve_stored_stdio(&state);
+    crate::load_managed_mcp_into_registry(&state, &registry, list_changed_tx, "http://127.0.0.1:1");
 
     // Assert: both backends are registered by their UUID server_id.
     let backends = registry.list_backends();
@@ -912,7 +924,8 @@ fn startup_with_null_server_config_skips_entry() {
     // Act.
     let registry = fresh_registry();
     let (list_changed_tx, _) = tokio::sync::broadcast::channel(16);
-    crate::load_managed_mcp_into_registry(&state, &registry, list_changed_tx);
+    crate::test_support::approve_stored_stdio(&state);
+    crate::load_managed_mcp_into_registry(&state, &registry, list_changed_tx, "http://127.0.0.1:1");
 
     // Assert: no backends registered (null config → skip with warning).
     let backends = registry.list_backends();
@@ -992,7 +1005,8 @@ async fn handle_deactivate_mcp_removes_backend_from_aggregator() {
     let registry = fresh_registry();
     // Pre-register so we can verify it gets removed.
     let (list_changed_tx, _) = tokio::sync::broadcast::channel(16);
-    crate::load_managed_mcp_into_registry(&state, &registry, list_changed_tx);
+    crate::test_support::approve_stored_stdio(&state);
+    crate::load_managed_mcp_into_registry(&state, &registry, list_changed_tx, "http://127.0.0.1:1");
     assert!(
         registry.has_backend("github-mcp"),
         "backend must be registered before deactivate"

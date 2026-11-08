@@ -4,9 +4,7 @@
 
 use crate::launch_gate::{self, Gate};
 use crate::managed_paths::ManagedPathsPusher;
-use crate::sync::reconciler::{
-    report_mcp_installation_status_with_hash, write_managed_mcp_json,
-};
+use crate::sync::reconciler::{report_mcp_installation_status_with_hash, write_managed_mcp_json};
 use scenery_core::approvals::StdioDefinition;
 use scenery_core::state::{AppState, McpInstallRow};
 use scenery_mcp::aggregator::BackendRegistry;
@@ -32,11 +30,17 @@ fn sanitize_name(name: &str) -> String {
 /// Best effort: any failure is ignored. The command line is deliberately not
 /// included, and text goes through argv, never through a script string.
 pub fn notify_pending_once(state: &AppState, hash: &str, name: &str) {
+    // Tests and the client test bed must never pop real notifications.
+    let silenced =
+        cfg!(test) || std::env::var("SCENERY_DISABLE_NOTIFICATIONS").as_deref() == Ok("1");
     let key = format!("approval_notified:{hash}");
     if matches!(state.get_sync_state(&key), Ok(Some(_))) {
         return;
     }
     let _ = state.set_sync_state(&key, "1");
+    if silenced {
+        return;
+    }
     let body = format!(
         "{} is waiting for approval. Run `scenery approve` in a terminal.",
         sanitize_name(name)
@@ -130,7 +134,15 @@ pub async fn apply_approvals_changed(
         let was_pending = prior.as_deref() == Some(STATE_PENDING);
         match launch_gate::check(state, row) {
             Gate::Allowed if was_pending => {
-                activate(state, registry_url, backend_registry, pusher, list_changed_tx, row).await;
+                activate(
+                    state,
+                    registry_url,
+                    backend_registry,
+                    pusher,
+                    list_changed_tx,
+                    row,
+                )
+                .await;
                 changed += 1;
             }
             Gate::Pending(hash) if !was_pending => {
@@ -176,10 +188,16 @@ async fn activate(
     match crate::mcp_row_to_backend_entry(state, row) {
         crate::Launch::Ready(entry) => {
             backend_registry.register_backend(entry.clone());
-            crate::spawn_tool_discovery(Arc::clone(backend_registry), entry, list_changed_tx.clone());
+            crate::spawn_tool_discovery(
+                Arc::clone(backend_registry),
+                entry,
+                list_changed_tx.clone(),
+            );
             info!(slug = %slug, "approvals: approved server registered");
         }
-        other => warn!(slug = %slug, launch = ?other, "approvals: approved server has no runnable transport"),
+        other => {
+            warn!(slug = %slug, launch = ?other, "approvals: approved server has no runnable transport")
+        }
     }
     if let Ok(iid) = Uuid::parse_str(&row.installation_id) {
         report_mcp_installation_status_with_hash(iid, "installed", None, None, registry_url, state)
@@ -223,7 +241,12 @@ async fn hold_running(
 
 /// Startup pass over stored rows: anything gated as pending is marked,
 /// reported and notified; nothing is registered for it.
-pub fn mark_pending_at_startup(state: &Arc<AppState>, registry_url: &str, row: &McpInstallRow, hash: &str) {
+pub fn mark_pending_at_startup(
+    state: &Arc<AppState>,
+    registry_url: &str,
+    row: &McpInstallRow,
+    hash: &str,
+) {
     if let Err(e) = state.set_mcp_approval(&row.mcp_server_id, Some(hash), Some(STATE_PENDING)) {
         warn!(error = %e, "startup: failed to mark server pending");
     }

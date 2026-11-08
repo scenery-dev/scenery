@@ -110,7 +110,10 @@ fn write_file<R: Read>(
     let target = dir.join(name);
     match fs::symlink_metadata(&target) {
         Ok(m) if m.is_file() => fs::remove_file(&target).context("failed to replace file")?,
-        Ok(_) => anyhow::bail!("unpack target exists and is not a file: {}", target.display()),
+        Ok(_) => anyhow::bail!(
+            "unpack target exists and is not a file: {}",
+            target.display()
+        ),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e).context("failed to stat unpack target"),
     }
@@ -122,7 +125,9 @@ fn write_file<R: Read>(
     let mut buf = [0u8; 65536];
     let mut written: u64 = 0;
     loop {
-        let n = reader.read(&mut buf).context("error reading archive entry")?;
+        let n = reader
+            .read(&mut buf)
+            .context("error reading archive entry")?;
         if n == 0 {
             break;
         }

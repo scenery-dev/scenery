@@ -708,7 +708,12 @@ impl AppState {
         conn.execute(
             "UPDATE mcp_installations SET approval_hash = ?2, approval_state = ?3, \
              signed_envelope = ?4 WHERE mcp_server_id = ?1",
-            rusqlite::params![row.mcp_server_id, approval_hash, approval_state, signed_envelope],
+            rusqlite::params![
+                row.mcp_server_id,
+                approval_hash,
+                approval_state,
+                signed_envelope
+            ],
         )
         .context("failed to record mcp approval state")?;
         Ok(())

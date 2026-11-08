@@ -93,7 +93,10 @@ pub fn safe_join_rel(root: &Path, rel: &str) -> Result<PathBuf, SafePathError> {
     if rel.is_empty() || rel.contains('\0') || rel.contains('\\') {
         return Err(SafePathError::NotNormal { what: w() });
     }
-    if rel.split('/').any(|p| p.is_empty() || p == "." || p == "..") {
+    if rel
+        .split('/')
+        .any(|p| p.is_empty() || p == "." || p == "..")
+    {
         return Err(SafePathError::NotNormal { what: w() });
     }
     let mut out = root.to_path_buf();

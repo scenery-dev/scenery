@@ -16,6 +16,7 @@ fn parses_snapshot_event() {
             plugin_installations,
             revocations,
             org_policy,
+            org_id: _,
         } => {
             assert_eq!(installations.len(), 1);
             assert_eq!(installations[0].skill_id, "my-skill");
@@ -260,6 +261,7 @@ fn parses_unrevoke_event() {
             artifact_type,
             artifact_key,
             version,
+            signed: _,
         } => {
             assert_eq!(artifact_type, "skill");
             assert_eq!(artifact_key, "code-review");
@@ -368,6 +370,7 @@ fn snapshot_with_multiple_records() {
             plugin_installations: _,
             revocations: _,
             org_policy: _,
+            org_id: None,
         } => {
             assert_eq!(installations.len(), 2);
             assert_eq!(installations[0].skill_id, "skill-a");
@@ -389,11 +392,35 @@ fn bootstrap_state() -> (scenery_core::state::AppState, tempfile::TempDir) {
     (state, tmp)
 }
 
+/// An unsigned (or forged) org-policy push changes nothing.
+#[tokio::test]
+async fn unsigned_inference_policy_update_is_ignored() {
+    use std::sync::atomic::Ordering;
+    let (state, _tmp) = bootstrap_state();
+    crate::test_support::pair_device(&state, "http://127.0.0.1:9");
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let mut last_event_id = None;
+    dispatch_event(
+        "inference_policy_update",
+        r#"{"org_id":"default","enabled":true}"#,
+        &None,
+        &mut last_event_id,
+        &state,
+        &tx,
+    )
+    .await
+    .unwrap();
+    assert!(!state.block_third_party_inference.load(Ordering::Relaxed));
+    assert_eq!(state.get_sync_state("block_third_party_inference").unwrap(), None);
+}
+
 #[tokio::test]
 async fn inference_policy_update_flips_flag_and_persists() {
     use std::sync::atomic::Ordering;
 
     let (state, _tmp) = bootstrap_state();
+    let origin = "http://127.0.0.1:9";
+    crate::test_support::pair_device(&state, origin);
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
     let mut last_event_id = None;
 
@@ -411,7 +438,10 @@ async fn inference_policy_update_flips_flag_and_persists() {
 
     dispatch_event(
         "inference_policy_update",
-        r#"{"org_id":"default","enabled":true,"updated_at":"2026-01-01T00:00:00Z"}"#,
+        &format!(
+            r#"{{"org_id":"default","enabled":true,"signed":{}}}"#,
+            crate::test_support::sign_org_policy(origin, "audit", true)
+        ),
         &None,
         &mut last_event_id,
         &state,
@@ -437,7 +467,10 @@ async fn inference_policy_update_flips_flag_and_persists() {
     // and correctly tracks the live value both ways.
     dispatch_event(
         "inference_policy_update",
-        r#"{"org_id":"default","enabled":false,"updated_at":"2026-01-01T00:01:00Z"}"#,
+        &format!(
+            r#"{{"org_id":"default","enabled":false,"signed":{}}}"#,
+            crate::test_support::sign_org_policy(origin, "audit", false)
+        ),
         &None,
         &mut last_event_id,
         &state,

@@ -174,8 +174,9 @@ fn download_and_install(
     let archive_path = Utf8PathBuf::from_path_buf(tmp_dir.path().join("bundle.cskill"))
         .map_err(|_| anyhow::anyhow!("temp dir path is not valid UTF-8"))?;
 
-    let (sha256, size) = crate::verifier::verify_skill_artifact(state, skill_id, version, &metadata)
-        .with_context(|| format!("{skill_id}@{version} is not validly signed"))?;
+    let (sha256, size) =
+        crate::verifier::verify_skill_artifact(state, skill_id, version, &metadata)
+            .with_context(|| format!("{skill_id}@{version} is not validly signed"))?;
     registry
         .download_artifact(
             &metadata.download_url,
@@ -682,7 +683,9 @@ mod tests {
         state
             .set_sync_state(crate::verifier::REGISTRY_ORIGIN_KEY, origin)
             .unwrap();
-        state.set_sync_state(crate::verifier::ORG_ID_KEY, "org-1").unwrap();
+        state
+            .set_sync_state(crate::verifier::ORG_ID_KEY, "org-1")
+            .unwrap();
         crate::trust::pin_key(state, origin, TEST_KID, &trusted(1, TEST_KID).pubkey).unwrap();
         let payload = serde_json::to_vec(&serde_json::json!({
             "skill_id": skill_id, "version": version, "sha256": sha,
@@ -737,7 +740,14 @@ mod tests {
                 }}"#,
                 server.url(),
                 archive_bytes.len(),
-                signed_skill_envelope_json(&state, &server.url(), "test-skill", "2.0.0", &sha, archive_bytes.len())
+                signed_skill_envelope_json(
+                    &state,
+                    &server.url(),
+                    "test-skill",
+                    "2.0.0",
+                    &sha,
+                    archive_bytes.len()
+                )
             ))
             .create();
 

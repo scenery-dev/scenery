@@ -40,12 +40,25 @@ fn fingerprint_selection_matches_only_exact_key() {
     let resp = SigningKeysResponse {
         iss: "https://r.example".into(),
         keys: vec![
-            SigningKeyInfo { kid: "a".into(), alg: "ed25519".into(), public_key: URL_SAFE_NO_PAD.encode(k1.pubkey), status: "active".into() },
-            SigningKeyInfo { kid: "b".into(), alg: "ed25519".into(), public_key: URL_SAFE_NO_PAD.encode(k2.pubkey), status: "standby".into() },
+            SigningKeyInfo {
+                kid: "a".into(),
+                alg: "ed25519".into(),
+                public_key: URL_SAFE_NO_PAD.encode(k1.pubkey),
+                status: "active".into(),
+            },
+            SigningKeyInfo {
+                kid: "b".into(),
+                alg: "ed25519".into(),
+                public_key: URL_SAFE_NO_PAD.encode(k2.pubkey),
+                status: "standby".into(),
+            },
         ],
     };
-    let (kid, pk) = select_key_by_fingerprint(&resp, "https://r.example", &fingerprint(&k2.pubkey)).unwrap();
+    let (kid, pk) =
+        select_key_by_fingerprint(&resp, "https://r.example", &fingerprint(&k2.pubkey)).unwrap();
     assert_eq!((kid.as_str(), pk), ("b", k2.pubkey));
     assert!(select_key_by_fingerprint(&resp, "https://r.example", &"0".repeat(64)).is_err());
-    assert!(select_key_by_fingerprint(&resp, "https://evil.example", &fingerprint(&k1.pubkey)).is_err());
+    assert!(
+        select_key_by_fingerprint(&resp, "https://evil.example", &fingerprint(&k1.pubkey)).is_err()
+    );
 }

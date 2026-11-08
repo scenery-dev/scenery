@@ -26,7 +26,10 @@ pub(crate) struct ImportedPluginContent {
     pub executables: Vec<String>,
 }
 
-fn text_entries(components: &serde_json::Value, key: &str) -> serde_json::Map<String, serde_json::Value> {
+fn text_entries(
+    components: &serde_json::Value,
+    key: &str,
+) -> serde_json::Map<String, serde_json::Value> {
     components
         .get(key)
         .and_then(|f| f.as_object())
@@ -73,10 +76,7 @@ fn received_files(components: &serde_json::Value) -> Result<Vec<(String, Vec<u8>
 }
 
 /// Check received files against the listed entries (both directions).
-fn check_against_listing(
-    received: &[(String, Vec<u8>)],
-    listed: &[PluginFileEntry],
-) -> Result<()> {
+fn check_against_listing(received: &[(String, Vec<u8>)], listed: &[PluginFileEntry]) -> Result<()> {
     anyhow::ensure!(
         listed.len() <= MAX_PLUGIN_FILES,
         "signed plugin listing has more than {MAX_PLUGIN_FILES} files"
@@ -133,7 +133,10 @@ pub(crate) fn verify_plugin_content(
         .map(|v| serde_json::from_value(v.clone()))
         .transpose()
         .context("plugin `signed` envelope is malformed")?;
-    let components = body.get("components").cloned().unwrap_or(serde_json::Value::Null);
+    let components = body
+        .get("components")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
 
     let Some(env) = env else {
         if scenery_core::trust::insecure_unsigned() {
@@ -178,7 +181,11 @@ fn unsigned_content(components: &serde_json::Value) -> Result<ImportedPluginCont
     let executables = components
         .get("executables")
         .and_then(|e| e.as_array())
-        .map(|p| p.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+        .map(|p| {
+            p.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect()
+        })
         .unwrap_or_default();
     Ok(ImportedPluginContent { files, executables })
 }
