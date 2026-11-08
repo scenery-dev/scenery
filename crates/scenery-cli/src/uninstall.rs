@@ -731,18 +731,16 @@ fn purge_data_dir() -> Result<()> {
         std::fs::remove_dir_all(&root).with_context(|| format!("removing {}", root.display()))?;
     }
 
+    // macOS: `scenery daemon install` points the LaunchAgent's
+    // StandardOut/ErrorPath at `~/Library/Logs/Scenery/` (see
+    // `install/macos.rs::log_dir`). Linux has no equivalent file: the
+    // systemd user unit's stdout/stderr go to the journal
+    // (`journalctl --user -u scenery`), not a log directory.
+    #[cfg(target_os = "macos")]
     if let Some(home) = dirs_home() {
-        // macOS: `scenery daemon install` points the LaunchAgent's
-        // StandardOut/ErrorPath at `~/Library/Logs/Scenery/` (see
-        // `install/macos.rs::log_dir`). Linux has no equivalent file — the
-        // systemd user unit's stdout/stderr go to the journal
-        // (`journalctl --user -u scenery`), not a log directory.
-        #[cfg(target_os = "macos")]
-        {
-            let logs_dir = home.join("Library").join("Logs").join("Scenery");
-            if logs_dir.exists() {
-                let _ = std::fs::remove_dir_all(&logs_dir);
-            }
+        let logs_dir = home.join("Library").join("Logs").join("Scenery");
+        if logs_dir.exists() {
+            let _ = std::fs::remove_dir_all(&logs_dir);
         }
     }
 
