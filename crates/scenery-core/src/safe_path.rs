@@ -53,6 +53,25 @@ pub fn validate_component(what: &str, s: &str) -> Result<(), SafePathError> {
     }
 }
 
+/// Permissive sibling of [`validate_component`] for names that originate on
+/// this machine (local skill folders adopted from disk): exactly one plain
+/// path component, any characters otherwise. Still refuses `.`, `..`,
+/// separators, roots and NUL, so it can never aim a join outside its parent.
+pub fn validate_single_component(what: &str, s: &str) -> Result<(), SafePathError> {
+    if s.is_empty() || s.contains('\0') || s.contains(['/', '\\']) {
+        return Err(SafePathError::NotNormal {
+            what: what.to_string(),
+        });
+    }
+    let mut comps = Path::new(s).components();
+    match (comps.next(), comps.next()) {
+        (Some(Component::Normal(c)), None) if c == std::ffi::OsStr::new(s) => Ok(()),
+        _ => Err(SafePathError::NotNormal {
+            what: what.to_string(),
+        }),
+    }
+}
+
 /// Validate `comp` and join it under `root`, asserting the result is still
 /// lexically under `root`.
 pub fn safe_join(root: &Path, comp: &str) -> Result<PathBuf, SafePathError> {

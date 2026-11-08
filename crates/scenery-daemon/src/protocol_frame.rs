@@ -12,6 +12,10 @@
 
 use std::io::{Read, Write};
 
+/// Largest frame accepted from the socket (L2). A peer claiming more is
+/// refused before anything is allocated.
+pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+
 /// Write one length-prefixed frame.
 pub fn write_framed_blocking<W: Write>(writer: &mut W, body: &[u8]) -> std::io::Result<()> {
     let len = body.len() as u32;
@@ -29,6 +33,12 @@ pub fn read_framed_blocking<R: Read>(reader: &mut R) -> std::io::Result<Option<V
         Err(e) => return Err(e),
     }
     let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_FRAME_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("frame of {len} bytes exceeds the {MAX_FRAME_BYTES}-byte limit"),
+        ));
+    }
     let mut body = vec![0u8; len];
     reader.read_exact(&mut body)?;
     Ok(Some(body))
@@ -45,6 +55,14 @@ mod tests {
         let mut cursor = std::io::Cursor::new(buf);
         let read_back = read_framed_blocking(&mut cursor).unwrap();
         assert_eq!(read_back, Some(b"hello".to_vec()));
+    }
+
+    #[test]
+    fn oversized_frame_is_refused_without_allocating() {
+        // A 4 GiB claim with no body behind it.
+        let mut cursor = std::io::Cursor::new(u32::MAX.to_be_bytes().to_vec());
+        let err = read_framed_blocking(&mut cursor).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[test]

@@ -98,6 +98,43 @@ pub fn list_all(state: &AppState) -> Result<Vec<RevocationEntry>> {
         .context("failed to read artifact_revocations rows")
 }
 
+/// Apply a snapshot's revocation list without ever lifting anything on its
+/// own (2.2.0): upsert every `active` entry and delete only the `cleared`
+/// entries (each backed by a verified `status=cleared` statement). An entry
+/// that merely dropped out of the list stays, so a forged or truncated
+/// snapshot cannot lift a kill switch.
+pub fn merge_snapshot(
+    state: &AppState,
+    active: &[RevocationEntry],
+    cleared: &[RevocationEntry],
+) -> Result<()> {
+    let mut conn =
+        Connection::open(&state.db_path).context("failed to open state DB for revocation sync")?;
+    let tx = conn
+        .transaction()
+        .context("failed to open transaction for revocation sync")?;
+    for e in active {
+        tx.execute(
+            "INSERT INTO artifact_revocations (artifact_type, artifact_key, version, revoked_at) \
+             VALUES (?1, ?2, ?3, CURRENT_TIMESTAMP) \
+             ON CONFLICT (artifact_type, artifact_key, version) DO NOTHING",
+            params![e.artifact_type, e.artifact_key, norm(e.version.as_deref())],
+        )
+        .context("failed to upsert artifact_revocations row during sync")?;
+    }
+    for e in cleared {
+        tx.execute(
+            "DELETE FROM artifact_revocations \
+             WHERE artifact_type = ?1 AND artifact_key = ?2 AND version = ?3",
+            params![e.artifact_type, e.artifact_key, norm(e.version.as_deref())],
+        )
+        .context("failed to delete artifact_revocations row during sync")?;
+    }
+    tx.commit()
+        .context("failed to commit artifact_revocations sync")?;
+    Ok(())
+}
+
 /// Replace the entire local revocation cache with `entries` in one
 /// transaction (delete-all then insert-all).
 ///
@@ -108,6 +145,10 @@ pub fn list_all(state: &AppState) -> Result<Vec<RevocationEntry>> {
 /// dedicated `unrevoke` event. Called with an empty `entries` slice this
 /// clears the cache entirely, which is correct: the backend is telling us
 /// nothing is revoked right now.
+///
+/// NOTE (2.2.0): the sync paths no longer call this; a dropped entry is only
+/// honoured with a signed `cleared` statement (see [`merge_snapshot`]). Kept
+/// as a primitive for tests.
 ///
 /// Callers MUST NOT call this for a snapshot that omits the `revocations`
 /// key altogether (older backend) — that case must leave the local cache

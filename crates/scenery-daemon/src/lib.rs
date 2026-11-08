@@ -64,11 +64,13 @@
 //!   These are acceptable at startup time and must NOT be moved into the accept
 //!   loop or per-connection handlers without adding `spawn_blocking`.
 
+pub mod approval_flow;
 mod auth_dispatch;
 mod binary_watch;
 pub mod daemon_takeover;
 pub mod daemon_takeover_signal;
 mod instance_lock;
+pub mod launch_gate;
 pub mod managed_paths;
 mod mcp_http;
 mod oauth_listener;
@@ -240,11 +242,16 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
 
     state.seed_block_third_party_from_sync_state();
 
-    let registry_url = opts
+    let registry_url_raw = opts
         .registry_url
         .clone()
         .or_else(|| std::env::var("SCENERY_REGISTRY_URL").ok())
         .unwrap_or_else(|| scenery_core::DEFAULT_REGISTRY_URL.to_string());
+    // M3: the registry URL is a trust anchor (tokens, signed content). Only
+    // an https origin is accepted (loopback http in debug/opt-in builds).
+    let registry_url = scenery_core::registry_url::validate_origin(&registry_url_raw)
+        .with_context(|| format!("refusing registry URL {registry_url_raw:?}"))?;
+    pin_registry_origin(&state, &registry_url);
 
     info!(registry_url, "connecting to registry");
 
@@ -376,7 +383,7 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     // keep it current so gateway calls survive portal-JWT rotation.
     init_gateway_token_refresh(&state, &registry_url);
     let vh_registry = Arc::new(build_stub_registry());
-    load_managed_mcp_into_registry(&state, &vh_registry, list_changed_tx.clone());
+    load_managed_mcp_into_registry(&state, &vh_registry, list_changed_tx.clone(), &registry_url);
 
     // ── Active-skill self-heal ────────────────────────────────────────────────
     //
@@ -1755,6 +1762,20 @@ impl SyncController {
         }
     }
 
+    /// Re-evaluate every stored MCP server against the current device
+    /// approvals (`approvals/changed`): register newly approved servers and
+    /// tear down any whose approval was revoked. Returns how many changed.
+    pub(crate) async fn apply_approvals(&self) -> usize {
+        approval_flow::apply_approvals_changed(
+            &self.state,
+            &self.registry_url,
+            &self.backend_registry,
+            self.pusher.as_ref(),
+            &self.list_changed_tx,
+        )
+        .await
+    }
+
     /// Return a clone of the reconciler's event-channel sender, if the sync
     /// subsystem has started. `None` before the device is paired (no auth
     /// token yet) — callers should skip whatever they wanted to feed in.
@@ -1843,6 +1864,11 @@ async fn try_start_sync(
     backend_registry: Arc<BackendRegistry>,
     pusher: Option<Arc<managed_paths::ManagedPathsPusher>>,
 ) -> Option<RunningSync> {
+    // M3: never sync against a registry other than the one this device was
+    // paired with.
+    if !registry_origin_matches(&state, registry_url) {
+        return None;
+    }
     // Load the access token from SQLite.
     let token = match load_all_tokens(&state) {
         Ok(rows) => rows
@@ -2069,6 +2095,9 @@ async fn register_with_backend(
     #[derive(serde::Deserialize)]
     struct RegisterResponse {
         device_id: String,
+        /// Contract item 3: the device's org, stored for statement checks.
+        #[serde(default)]
+        org_id: Option<String>,
     }
 
     let reg: RegisterResponse = resp
@@ -2079,6 +2108,22 @@ async fn register_with_backend(
     state
         .set_sync_state("device_id", &reg.device_id)
         .context("failed to persist device_id")?;
+
+    // Pin the org the first time we learn it. An already-stored value is only
+    // replaced by a re-pair (CLI), never silently by the daemon.
+    if let Some(org) = reg.org_id.as_deref().filter(|o| !o.is_empty()) {
+        match scenery_core::verifier::device_org(&state) {
+            None => {
+                if let Err(e) = state.set_sync_state(scenery_core::verifier::ORG_ID_KEY, org) {
+                    warn!(error = %e, "failed to persist org_id");
+                }
+            }
+            Some(stored) if stored != org => {
+                warn!(stored = %stored, reported = %org, "backend reports a different org than this device was paired with");
+            }
+            Some(_) => {}
+        }
+    }
 
     info!(device_id = %reg.device_id, "device registered with backend");
     Ok(reg.device_id)
@@ -2247,6 +2292,13 @@ pub fn run_sync_tick(
         block_third_party_inference: Arc::clone(block_third_party),
     };
 
+    // M3: refuse to sync against a registry other than the paired one.
+    let configured_origin = scenery_core::registry_url::validate_origin(&registry.base_url)
+        .unwrap_or_else(|_| registry.base_url.trim_end_matches('/').to_string());
+    if !registry_origin_matches(&state_view, &configured_origin) {
+        return Ok(false);
+    }
+
     // ── 0. Auth token + device ID sync ───────────────────────────────────────
     install_registry_credentials(&state_view, registry);
 
@@ -2294,14 +2346,38 @@ pub fn run_sync_tick(
                         // means the backend omitted `org_policy` (older
                         // backend) — leave sync_state/the live atomic alone.
                         if let SyncEvent::Snapshot {
+                            ref org_policy,
+                            ref mcp_installations,
+                            ref org_id,
+                            ..
+                        } = event
+                        {
+                            // First verified snapshot pins the org (TOFU).
+                            let mut stmts: Vec<(&str, &scenery_core::signed::Envelope)> =
+                                Vec::new();
+                            if let Some(env) = org_policy.as_ref().and_then(|p| p.signed.as_ref())
+                            {
+                                stmts.push((scenery_core::signed::TYP_ORG_POLICY, env));
+                            }
+                            for rec in mcp_installations.iter().flatten() {
+                                if let Some(env) = rec.signed.as_ref() {
+                                    stmts.push((scenery_core::signed::TYP_MCP_SERVER, env));
+                                }
+                            }
+                            sync::trust_apply::pin_org_from_snapshot(
+                                &state_view,
+                                org_id.as_deref(),
+                                &stmts,
+                            );
+                        }
+
+                        if let SyncEvent::Snapshot {
                             org_policy: Some(ref policy),
                             ..
                         } = event
                         {
-                            state_view.apply_org_policy_snapshot(
-                                policy.managed_paths_mode.as_deref(),
-                                policy.block_third_party_inference,
-                            );
+                            // Only a verified `org_policy.v1` statement is applied.
+                            sync::trust_apply::apply_org_policy_snapshot(&state_view, policy);
                         }
 
                         if let SyncEvent::Snapshot {
@@ -2309,17 +2385,14 @@ pub fn run_sync_tick(
                             ..
                         } = event
                         {
-                            let entries: Vec<scenery_core::revocation::RevocationEntry> = revs
-                                .iter()
-                                .map(|r| scenery_core::revocation::RevocationEntry {
-                                    artifact_type: r.artifact_type.clone(),
-                                    artifact_key: r.artifact_key.clone(),
-                                    version: r.version.clone(),
-                                })
-                                .collect();
-                            if let Err(e) =
-                                scenery_core::revocation::replace_all(&state_view, &entries)
-                            {
+                            // Revoked unless a verified `cleared` statement says
+                            // otherwise; a dropped entry is not a clear.
+                            let plan = sync::trust_apply::plan_revocations(&state_view, revs);
+                            if let Err(e) = scenery_core::revocation::merge_snapshot(
+                                &state_view,
+                                &plan.active,
+                                &plan.cleared,
+                            ) {
                                 warn!(error = %e, "sync: failed to persist revocation snapshot");
                             }
                         }
@@ -2591,6 +2664,36 @@ fn flush_ratings_and_scan(
     Ok(())
 }
 
+/// Record the registry origin on first start (devices paired before 2.2.0
+/// have none). A later mismatch makes [`registry_origin_matches`] false and
+/// stops sync until the user re-pairs.
+fn pin_registry_origin(state: &AppState, registry_url: &str) {
+    if scenery_core::verifier::registry_origin(state).is_none() {
+        match state.set_sync_state(scenery_core::verifier::REGISTRY_ORIGIN_KEY, registry_url) {
+            Ok(()) => info!(registry_url, "pinned registry origin (first start under 2.2)"),
+            Err(e) => warn!(error = %e, "failed to pin registry origin"),
+        }
+    }
+}
+
+/// M3: does the registry this daemon was pointed at match the origin the
+/// device was paired against? A mismatch refuses sync and tells the user to
+/// re-pair. Fails closed on a read error.
+pub(crate) fn registry_origin_matches(state: &AppState, registry_url: &str) -> bool {
+    match scenery_core::verifier::registry_origin(state) {
+        Some(pinned) if pinned != registry_url => {
+            warn!(
+                pinned = %pinned,
+                configured = %registry_url,
+                "registry URL differs from the origin this device was paired with — \
+                 sync refused. Run `scenery auth pair` against the new registry to re-pair."
+            );
+            false
+        }
+        _ => true,
+    }
+}
+
 /// Load any rows from `mcp_installations` (via SQLite) and register each as a
 /// live backend in the aggregator at daemon startup.
 ///
@@ -2604,6 +2707,7 @@ fn load_managed_mcp_into_registry(
     state: &AppState,
     registry: &Arc<BackendRegistry>,
     list_changed_tx: tokio::sync::broadcast::Sender<()>,
+    registry_url: &str,
 ) {
     let rows = match state.list_mcp_installs() {
         Ok(r) => r,
@@ -2616,16 +2720,31 @@ fn load_managed_mcp_into_registry(
     // Gateway-brokered backends authenticate via the shared live token handle
     // (kept current by the refresh task), so no token is captured here.
     let mut loaded = 0usize;
+    let mut pending = 0usize;
+    let state_arc = Arc::new(state.clone());
     for row in &rows {
-        match mcp_row_to_backend_entry(row) {
-            Some(entry) => {
+        match mcp_row_to_backend_entry(state, row) {
+            Launch::Ready(entry) => {
                 let server_id = entry.server_id.clone();
                 registry.register_backend(entry.clone());
                 info!(server_id = %server_id, "startup: registered managed MCP backend");
                 loaded += 1;
                 spawn_tool_discovery(Arc::clone(registry), entry, list_changed_tx.clone());
             }
-            None => {
+            Launch::Pending(hash) => {
+                // Not grandfathered: an unapproved stdio server is held until
+                // the user runs `scenery approve`. Nothing is spawned.
+                pending += 1;
+                approval_flow::mark_pending_at_startup(&state_arc, registry_url, row, &hash);
+            }
+            Launch::Refused(why) => {
+                warn!(
+                    mcp_server_id = %row.mcp_server_id,
+                    reason = %why,
+                    "startup: refusing managed MCP backend"
+                );
+            }
+            Launch::Unusable => {
                 warn!(
                     mcp_server_id = %row.mcp_server_id,
                     mcp_server_name = %row.mcp_server_name,
@@ -2635,6 +2754,12 @@ fn load_managed_mcp_into_registry(
         }
     }
 
+    if pending > 0 {
+        info!(
+            count = pending,
+            "startup: stdio MCP servers waiting for local approval (run `scenery pending`)"
+        );
+    }
     if loaded > 0 {
         info!(
             count = loaded,
@@ -2820,7 +2945,38 @@ fn init_gateway_token_refresh(state: &AppState, registry_url: &str) {
     });
 }
 
-pub fn mcp_row_to_backend_entry(row: &scenery_core::state::McpInstallRow) -> Option<BackendEntry> {
+/// What a stored MCP row may become after the launch gate (design 2026-11-08
+/// §3). The gate sits here so startup load, live install and post-approval
+/// registration all share it.
+#[derive(Debug)]
+pub enum Launch {
+    /// Gated through (or never needed gating): register this backend.
+    Ready(BackendEntry),
+    /// A stdio definition the user has not approved; carries its approval
+    /// hash. Nothing may be registered, spawned or discovered.
+    Pending(String),
+    /// Refused outright (for example a denylisted env key).
+    Refused(String),
+    /// No usable transport in the config.
+    Unusable,
+}
+
+/// Gate and translate a stored row.
+pub fn mcp_row_to_backend_entry(
+    state: &AppState,
+    row: &scenery_core::state::McpInstallRow,
+) -> Launch {
+    match launch_gate::check(state, row) {
+        launch_gate::Gate::Pending(hash) => Launch::Pending(hash),
+        launch_gate::Gate::Refused(why) => Launch::Refused(why),
+        launch_gate::Gate::Allowed => match translate_mcp_row(row) {
+            Some(entry) => Launch::Ready(entry),
+            None => Launch::Unusable,
+        },
+    }
+}
+
+fn translate_mcp_row(row: &scenery_core::state::McpInstallRow) -> Option<BackendEntry> {
     // Gateway-brokered servers take precedence: the daemon connects to the
     // gateway proxy URL with the shared live portal JWT (read fresh per call
     // via the token handle). The credential broker injects the real upstream
@@ -2974,9 +3130,26 @@ mod slug_tests {
 
 #[cfg(test)]
 mod backend_entry_tests {
-    use super::{gateway_token_handle, mcp_row_to_backend_entry};
-    use scenery_core::state::McpInstallRow;
+    use super::{gateway_token_handle, Launch};
+    use scenery_core::state::{AppState, McpInstallRow};
     use scenery_mcp::aggregator::{resolve_live_token, BackendTransport};
+
+    fn mcp_row_to_backend_entry(row: &McpInstallRow) -> Option<scenery_mcp::aggregator::BackendEntry> {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::bootstrap_in(
+            camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap(),
+        )
+        .unwrap();
+        // Stdio rows need an approval to translate; approve first so these
+        // tests keep exercising the translation rules only.
+        if let Some(def) = crate::launch_gate::stdio_definition(row) {
+            scenery_core::approvals::insert_approval(&state, &def, "t").unwrap();
+        }
+        match super::mcp_row_to_backend_entry(&state, row) {
+            Launch::Ready(e) => Some(e),
+            _ => None,
+        }
+    }
 
     fn row_with(gateway_url: Option<&str>, server_config: Option<&str>) -> McpInstallRow {
         McpInstallRow {

@@ -32,6 +32,9 @@ use tokio::time::Instant;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use scenery_core::safe_path::validate_component;
+use scenery_core::signed::Envelope;
+
 use crate::sync::SyncConfig;
 use scenery_core::{
     auth::{load_tokens, record_refresh_failure, save_tokens, AuthClient},
@@ -42,6 +45,53 @@ use scenery_core::{
 
 /// How long to wait with no data before treating the connection as dead.
 const WATCHDOG_SECS: u64 = 60;
+
+/// Longest SSE line / accumulated event payload accepted (M5). The stream is
+/// dropped and re-established when exceeded; a snapshot is the largest legit
+/// event.
+pub(crate) const MAX_SSE_LINE: usize = 4 * 1024 * 1024;
+
+/// One complete line out of the SSE byte stream.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SseLine {
+    Text(String),
+    /// A complete line that is not valid UTF-8: its event is dropped, the
+    /// stream is kept.
+    Invalid,
+}
+
+/// Splits the raw SSE byte stream into lines on `\n` *before* decoding, so a
+/// multi-byte UTF-8 character split across network chunks is never mistaken
+/// for invalid data (M5).
+#[derive(Default)]
+pub(crate) struct LineSplitter {
+    buf: Vec<u8>,
+}
+
+impl LineSplitter {
+    /// Feed one chunk; returns every line completed by it. Errors when a
+    /// single unterminated line grows past [`MAX_SSE_LINE`].
+    pub(crate) fn push(&mut self, chunk: &[u8]) -> Result<Vec<SseLine>> {
+        self.buf.extend_from_slice(chunk);
+        let mut out = Vec::new();
+        while let Some(pos) = self.buf.iter().position(|b| *b == b'\n') {
+            let mut line: Vec<u8> = self.buf.drain(..=pos).collect();
+            line.pop(); // the '\n'
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            out.push(match String::from_utf8(line) {
+                Ok(t) => SseLine::Text(t),
+                Err(_) => SseLine::Invalid,
+            });
+        }
+        anyhow::ensure!(
+            self.buf.len() <= MAX_SSE_LINE,
+            "SSE: line longer than {MAX_SSE_LINE} bytes"
+        );
+        Ok(out)
+    }
+}
 
 /// Starting reconnect delay.
 const BACKOFF_INIT_SECS: u64 = 1;
@@ -452,7 +502,10 @@ async fn stream_events(
     let mut byte_stream = resp.bytes_stream();
 
     // Buffer for accumulated bytes (may span multiple chunks).
-    let mut line_buf = String::new();
+    let mut splitter = LineSplitter::default();
+    // Set after an invalid-UTF-8 line: the rest of that event is ignored up
+    // to the next blank line.
+    let mut skip_event = false;
     // Current event fields.
     let mut event_type = String::new();
     let mut event_data = String::new();
@@ -475,18 +528,23 @@ async fn stream_events(
                     None => return Ok(StreamEnd::Eof),
                 };
 
-                // Append bytes to line buffer and process complete lines.
-                let text = std::str::from_utf8(&bytes)
-                    .context("SSE: non-UTF-8 bytes in stream")?;
-                line_buf.push_str(text);
-
-                // Process all complete lines (terminated by \n).
-                while let Some(pos) = line_buf.find('\n') {
-                    let line: String = line_buf.drain(..=pos).collect();
-                    let line = line.trim_end_matches('\n').trim_end_matches('\r');
-
+                // Split on bytes, decode per complete line.
+                let lines = splitter.push(&bytes)?;
+                for line in lines {
+                    let text = match line {
+                        SseLine::Text(t) => t,
+                        SseLine::Invalid => {
+                            warn!("SSE: dropping event with a non-UTF-8 line");
+                            skip_event = true;
+                            event_type.clear();
+                            event_data.clear();
+                            event_id = None;
+                            continue;
+                        }
+                    };
                     let end = process_sse_line(
-                        line,
+                        &text,
+                        &mut skip_event,
                         &mut event_type,
                         &mut event_data,
                         &mut event_id,
@@ -508,8 +566,10 @@ async fn stream_events(
 }
 
 /// Process one SSE line.  Returns `Some(StreamEnd)` if the loop should stop.
+#[allow(clippy::too_many_arguments)]
 async fn process_sse_line(
     line: &str,
+    skip_event: &mut bool,
     event_type: &mut String,
     event_data: &mut String,
     event_id: &mut Option<String>,
@@ -519,6 +579,12 @@ async fn process_sse_line(
 ) -> Result<Option<StreamEnd>> {
     // Blank line = dispatch event.
     if line.is_empty() {
+        if std::mem::take(skip_event) {
+            event_type.clear();
+            event_data.clear();
+            *event_id = None;
+            return Ok(None);
+        }
         if !event_data.is_empty() {
             let dispatch_result =
                 dispatch_event(event_type, event_data, event_id, last_event_id, state, tx).await?;
@@ -533,6 +599,10 @@ async fn process_sse_line(
         return Ok(None);
     }
 
+    if *skip_event {
+        return Ok(None);
+    }
+
     // Comment line (keep-alive pings, etc.) — no action.
     if line.starts_with(':') {
         debug!("SSE: comment: {line}");
@@ -543,10 +613,15 @@ async fn process_sse_line(
     if let Some(value) = line.strip_prefix("event:") {
         *event_type = value.trim_start().to_string();
     } else if let Some(value) = line.strip_prefix("data:") {
+        let value = value.trim_start();
+        anyhow::ensure!(
+            event_data.len() + value.len() < MAX_SSE_LINE,
+            "SSE: event payload larger than {MAX_SSE_LINE} bytes"
+        );
         if !event_data.is_empty() {
             event_data.push('\n');
         }
-        event_data.push_str(value.trim_start());
+        event_data.push_str(value);
     } else if let Some(value) = line.strip_prefix("id:") {
         *event_id = Some(value.trim_start().to_string());
     }
@@ -568,44 +643,30 @@ async fn dispatch_event(
 ) -> Result<bool> {
     debug!(event_type, "SSE: dispatching event");
 
-    // F4: persist managed_paths mode before parse so AppState is in scope.
-    // parse_sync_event is a pure parser and does not have access to AppState.
-    if event_type == "managed_paths_policy_update" {
+    // F4 / Task 8: org-policy pushes. The backend sends a full signed
+    // `org_policy.v1` envelope; policy is applied only from its verified
+    // payload (both flags), never from the unsigned siblings. Applying also
+    // flips the live third-party-inference atomic, so it takes effect
+    // without a daemon restart.
+    if event_type == "managed_paths_policy_update" || event_type == "inference_policy_update" {
         #[derive(serde::Deserialize)]
-        struct ModeOnly {
-            mode: String,
+        struct PolicyEvent {
+            #[serde(default)]
+            mode: Option<String>,
+            #[serde(default)]
+            enabled: Option<bool>,
+            #[serde(default)]
+            signed: Option<Envelope>,
         }
-        if let Ok(w) = serde_json::from_str::<ModeOnly>(event_data) {
-            if let Err(e) = state.set_sync_state("managed_paths_mode", &w.mode) {
-                warn!(error = %e, mode = %w.mode, "managed_paths: failed to persist mode to sync_state");
+        if let Ok(w) = serde_json::from_str::<PolicyEvent>(event_data) {
+            let (mode, enabled) = if event_type == "managed_paths_policy_update" {
+                (w.mode.as_deref(), None)
             } else {
-                debug!(mode = %w.mode, "managed_paths: mode persisted to sync_state");
+                (None, w.enabled)
+            };
+            if crate::sync::trust_apply::apply_org_policy(state, w.signed.as_ref(), mode, enabled) {
+                debug!(event_type, "org policy applied from verified statement");
             }
-        }
-    }
-
-    // Task 8: backend broadcasts this when an admin toggles the org's
-    // block-third-party-inference policy. Persist to sync_state (so it
-    // survives restarts / seeds correctly) and flip the live atomic that
-    // Task 7 wired into the model client, so the change takes effect
-    // immediately without a daemon restart.
-    if event_type == "inference_policy_update" {
-        #[derive(serde::Deserialize)]
-        struct EnabledOnly {
-            enabled: bool,
-        }
-        if let Ok(w) = serde_json::from_str::<EnabledOnly>(event_data) {
-            let v = if w.enabled { "true" } else { "false" };
-            if let Err(e) = state.set_sync_state("block_third_party_inference", v) {
-                warn!(error = %e, "inference policy: failed to persist to sync_state");
-            }
-            state
-                .block_third_party_inference
-                .store(w.enabled, std::sync::atomic::Ordering::Relaxed);
-            debug!(
-                enabled = w.enabled,
-                "inference policy: block-third-party updated live"
-            );
         }
     }
 
@@ -861,6 +922,9 @@ pub enum SyncEvent {
         /// backend can report one flag without having to know the other's
         /// current value.
         org_policy: Option<OrgPolicySnapshot>,
+        /// The org this snapshot is for. Compared with (or TOFU-pinned as)
+        /// `sync_state.org_id`; statements must name the same org.
+        org_id: Option<String>,
     },
     /// Immediately remove a revoked artifact (broadcast-model kill switch).
     /// `version: None` means "the whole artifact, every version" — the
@@ -882,6 +946,9 @@ pub enum SyncEvent {
         artifact_type: String,
         artifact_key: String,
         version: Option<String>,
+        /// `scenery.revocation.v1` `status=cleared` statement. Without a
+        /// valid one the local revocation stays.
+        signed: Option<Envelope>,
     },
     /// Install (or re-activate) a specific skill version.
     Install {
@@ -918,6 +985,8 @@ pub enum SyncEvent {
         /// the daemon connects here (with its own portal JWT) instead of the
         /// raw backend — the upstream URL and its credential stay server-side.
         gateway_url: Option<String>,
+        /// Signed `mcp_server.v1` statement. Required to install.
+        signed: Option<Envelope>,
     },
     /// Deactivate (remove) a managed MCP server.
     DeactivateMcp {
@@ -1010,6 +1079,9 @@ pub struct McpInstallationRecord {
     /// so snapshots from older backends parse with `None`.
     #[serde(default)]
     pub gateway_url: Option<String>,
+    /// Signed `mcp_server.v1` statement for this record.
+    #[serde(default)]
+    pub signed: Option<Envelope>,
     /// `"desired"` | `"installing"` | `"installed"` | `"deactivated"` | `"removed"`
     pub state: String,
 }
@@ -1026,6 +1098,10 @@ pub struct RevocationRecord {
     /// `None` (or an absent field) means "the whole artifact, every version".
     #[serde(default)]
     pub version: Option<String>,
+    /// `scenery.revocation.v1` statement. Optional for `revoked` (revoking
+    /// needs no proof); required for a `cleared` entry to lift anything.
+    #[serde(default)]
+    pub signed: Option<Envelope>,
 }
 
 /// Org-policy flags carried by a [`SyncEvent::Snapshot`]'s `org_policy` key
@@ -1043,6 +1119,10 @@ pub struct OrgPolicySnapshot {
     pub managed_paths_mode: Option<String>,
     #[serde(default)]
     pub block_third_party_inference: Option<bool>,
+    /// `scenery.org_policy.v1` statement. Org policy is applied only from its
+    /// verified payload; the unsigned siblings above are ignored.
+    #[serde(default)]
+    pub signed: Option<Envelope>,
 }
 
 // ── Wire types (SSE JSON payloads) ────────────────────────────────────────────
@@ -1076,6 +1156,9 @@ struct WireSnapshot {
     /// rather than failing deserialization.
     #[serde(default)]
     org_policy: Option<OrgPolicySnapshot>,
+    /// Top-level org id (contract item 3).
+    #[serde(default)]
+    org_id: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1098,6 +1181,8 @@ struct WireUnrevoke {
     artifact_key: String,
     #[serde(default)]
     version: Option<String>,
+    #[serde(default)]
+    signed: Option<Envelope>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1134,6 +1219,8 @@ pub struct WireInstallMcp {
     pub gateway_server_id: Option<String>,
     #[serde(default)]
     pub gateway_url: Option<String>,
+    #[serde(default)]
+    pub signed: Option<Envelope>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -1182,12 +1269,73 @@ pub fn snapshot_event_from_json(data: &str) -> Result<SyncEvent> {
     let wire: WireSnapshot = serde_json::from_str(data)
         .with_context(|| format!("failed to parse snapshot payload: {data}"))?;
     Ok(SyncEvent::Snapshot {
-        installations: wire.installations,
+        installations: wire
+            .installations
+            .into_iter()
+            .filter(installation_record_ok)
+            .collect(),
         mcp_installations: wire.mcp_installations,
-        plugin_installations: wire.plugin_installations,
-        revocations: wire.revocations,
+        plugin_installations: wire
+            .plugin_installations
+            .into_iter()
+            .filter(plugin_record_ok)
+            .collect(),
+        revocations: wire
+            .revocations
+            .map(|r| r.into_iter().filter(revocation_record_ok).collect()),
         org_policy: wire.org_policy,
+        org_id: wire.org_id.filter(|s| !s.is_empty()),
     })
+}
+
+// ── M1: names from the wire must be single safe path components ──────────────
+
+/// Validate `value`; on failure log and return `false` so the caller drops
+/// the event or record.
+fn name_ok(what: &str, value: &str) -> bool {
+    match validate_component(what, value) {
+        Ok(()) => true,
+        Err(e) => {
+            warn!(error = %e, "SSE: dropping record with an unsafe name");
+            false
+        }
+    }
+}
+
+fn opt_name_ok(what: &str, value: Option<&str>) -> bool {
+    value.map_or(true, |v| name_ok(what, v))
+}
+
+fn installation_record_ok(r: &InstallationRecord) -> bool {
+    name_ok("skill_id", &r.skill_id)
+        && name_ok("version", &r.version)
+        && opt_name_ok("local_slug", r.local_slug.as_deref())
+}
+
+fn plugin_skill_refs_ok(skills: &[PluginSkillRef]) -> bool {
+    skills
+        .iter()
+        .all(|s| name_ok("skill_id", &s.skill_id) && name_ok("version", &s.version))
+}
+
+fn plugin_record_ok(r: &PluginInstallationRecord) -> bool {
+    name_ok("plugin_slug", &r.plugin_slug)
+        && name_ok("version", &r.version)
+        && plugin_skill_refs_ok(&r.skills)
+}
+
+/// A revocation key becomes a path for skills and plugins; the version is
+/// optional (`None` / empty means every version).
+fn revocation_ok(artifact_type: &str, key: &str, version: Option<&str>) -> bool {
+    let key_ok = match artifact_type {
+        "skill" | "plugin" | "mcp_server" => name_ok("artifact_key", key),
+        _ => true,
+    };
+    key_ok && opt_name_ok("version", version.filter(|v| !v.trim().is_empty()))
+}
+
+fn revocation_record_ok(r: &RevocationRecord) -> bool {
+    revocation_ok(&r.artifact_type, &r.artifact_key, r.version.as_deref())
 }
 
 fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
@@ -1196,6 +1344,10 @@ fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
         "install" => {
             let wire: WireInstall = serde_json::from_str(data)
                 .with_context(|| format!("failed to parse install event: {data}"))?;
+            anyhow::ensure!(
+                name_ok("skill_id", &wire.skill_id) && name_ok("version", &wire.version),
+                "install event has an unsafe skill_id or version"
+            );
             Ok(SyncEvent::Install {
                 installation_id: wire.installation_id,
                 skill_id: wire.skill_id,
@@ -1206,6 +1358,10 @@ fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
         "deactivate" => {
             let wire: WireDeactivate = serde_json::from_str(data)
                 .with_context(|| format!("failed to parse deactivate event: {data}"))?;
+            anyhow::ensure!(
+                name_ok("skill_id", &wire.skill_id),
+                "deactivate event has an unsafe skill_id"
+            );
             Ok(SyncEvent::Deactivate {
                 installation_id: wire.installation_id,
                 skill_id: wire.skill_id,
@@ -1214,6 +1370,10 @@ fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
         "purge" => {
             let wire: WirePurge = serde_json::from_str(data)
                 .with_context(|| format!("failed to parse purge event: {data}"))?;
+            anyhow::ensure!(
+                name_ok("skill_id", &wire.skill_id),
+                "purge event has an unsafe skill_id"
+            );
             Ok(SyncEvent::Purge {
                 installation_id: wire.installation_id,
                 skill_id: wire.skill_id,
@@ -1232,6 +1392,7 @@ fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
                 auth_type: wire.auth_type,
                 gateway_server_id: wire.gateway_server_id,
                 gateway_url: wire.gateway_url,
+                signed: wire.signed,
             })
         }
         "deactivate_mcp" => {
@@ -1245,6 +1406,12 @@ fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
         "install_plugin" => {
             let wire: WireInstallPlugin = serde_json::from_str(data)
                 .with_context(|| format!("failed to parse install_plugin event: {data}"))?;
+            anyhow::ensure!(
+                name_ok("plugin_slug", &wire.plugin_slug)
+                    && name_ok("version", &wire.version)
+                    && plugin_skill_refs_ok(&wire.skills),
+                "install_plugin event has an unsafe slug, version or skill reference"
+            );
             Ok(SyncEvent::InstallPlugin {
                 installation_id: wire.installation_id,
                 plugin_slug: wire.plugin_slug,
@@ -1258,6 +1425,10 @@ fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
         "deactivate_plugin" => {
             let wire: WireDeactivatePlugin = serde_json::from_str(data)
                 .with_context(|| format!("failed to parse deactivate_plugin event: {data}"))?;
+            anyhow::ensure!(
+                name_ok("plugin_slug", &wire.plugin_slug),
+                "deactivate_plugin event has an unsafe slug"
+            );
             Ok(SyncEvent::DeactivatePlugin {
                 installation_id: wire.installation_id,
                 plugin_slug: wire.plugin_slug,
@@ -1270,6 +1441,10 @@ fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
             // `reconciler::spawn_revoke` for the teardown this triggers.
             let wire: WireRevoke = serde_json::from_str(data)
                 .with_context(|| format!("failed to parse revoke event: {data}"))?;
+            anyhow::ensure!(
+                revocation_ok(&wire.artifact_type, &wire.artifact_key, wire.version.as_deref()),
+                "revoke event has an unsafe key or version"
+            );
             Ok(SyncEvent::Revoke {
                 artifact_type: wire.artifact_type,
                 artifact_key: wire.artifact_key,
@@ -1284,10 +1459,15 @@ fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
             // retried or crashed on.
             let wire: WireUnrevoke = serde_json::from_str(data)
                 .with_context(|| format!("failed to parse unrevoke event: {data}"))?;
+            anyhow::ensure!(
+                revocation_ok(&wire.artifact_type, &wire.artifact_key, wire.version.as_deref()),
+                "unrevoke event has an unsafe key or version"
+            );
             Ok(SyncEvent::Unrevoke {
                 artifact_type: wire.artifact_type,
                 artifact_key: wire.artifact_key,
                 version: wire.version,
+                signed: wire.signed,
             })
         }
         "state" => {
@@ -1308,6 +1488,7 @@ fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
                 plugin_installations: vec![],
                 revocations: None,
                 org_policy: None,
+                org_id: None,
             })
         }
         "managed_paths_policy_update" => {
@@ -1346,6 +1527,7 @@ fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
                 plugin_installations: vec![],
                 revocations: None,
                 org_policy: None,
+                org_id: None,
             })
         }
         "discovery_adopted" => {
@@ -1358,6 +1540,7 @@ fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
                 plugin_installations: vec![],
                 revocations: None,
                 org_policy: None,
+                org_id: None,
             })
         }
         "discovery_publish_requested" => {
@@ -1370,6 +1553,7 @@ fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
                 plugin_installations: vec![],
                 revocations: None,
                 org_policy: None,
+                org_id: None,
             })
         }
         "inference_policy_update" => {
@@ -1383,6 +1567,7 @@ fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
                 plugin_installations: vec![],
                 revocations: None,
                 org_policy: None,
+                org_id: None,
             })
         }
         other => {

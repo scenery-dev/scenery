@@ -12,6 +12,9 @@
 pub mod reconciler;
 mod revoke_gate;
 pub mod sse_client;
+pub(crate) mod mcp_verify;
+pub(crate) mod plugin_verify;
+pub(crate) mod trust_apply;
 
 pub use reconciler::ReconcilerHandle;
 pub use sse_client::SyncEvent;

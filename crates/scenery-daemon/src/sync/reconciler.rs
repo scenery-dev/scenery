@@ -32,6 +32,7 @@ use std::{
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
+use scenery_core::signed::Envelope;
 
 use crate::managed_paths::ManagedPathsPusher;
 use crate::sync::sse_client::{
@@ -345,10 +346,12 @@ fn localize_skill_names(event: SyncEvent, state: &AppState) -> SyncEvent {
             artifact_type,
             artifact_key,
             version,
+            signed,
         } if artifact_type == "skill" => SyncEvent::Unrevoke {
             artifact_key: local(&artifact_key),
             artifact_type,
             version,
+            signed,
         },
         SyncEvent::Snapshot {
             mut installations,
@@ -356,6 +359,7 @@ fn localize_skill_names(event: SyncEvent, state: &AppState) -> SyncEvent {
             plugin_installations,
             revocations,
             org_policy,
+            org_id,
         } => {
             for record in &mut installations {
                 if let Some(folder) = record
@@ -383,6 +387,7 @@ fn localize_skill_names(event: SyncEvent, state: &AppState) -> SyncEvent {
                 plugin_installations,
                 revocations,
                 org_policy,
+                org_id,
             }
         }
         other => other,
@@ -462,6 +467,7 @@ async fn dispatch_event(
             auth_type,
             gateway_server_id,
             gateway_url,
+            signed,
         } => {
             spawn_install_mcp(
                 installation_id,
@@ -473,6 +479,7 @@ async fn dispatch_event(
                 auth_type,
                 gateway_server_id,
                 gateway_url,
+                signed,
                 state,
                 registry_url,
                 skill_locks,
@@ -558,8 +565,16 @@ async fn dispatch_event(
             artifact_type,
             artifact_key,
             version,
+            signed,
         } => {
-            spawn_unrevoke(artifact_type, artifact_key, version, state, install_tasks);
+            spawn_unrevoke(
+                artifact_type,
+                artifact_key,
+                version,
+                signed,
+                state,
+                install_tasks,
+            );
         }
         SyncEvent::Snapshot {
             installations,
@@ -567,7 +582,22 @@ async fn dispatch_event(
             plugin_installations,
             revocations,
             org_policy,
+            org_id,
         } => {
+            // ── First verified snapshot pins the org (TOFU) ──────────────────
+            {
+                let mut stmts: Vec<(&str, &scenery_core::signed::Envelope)> = Vec::new();
+                if let Some(env) = org_policy.as_ref().and_then(|p| p.signed.as_ref()) {
+                    stmts.push((scenery_core::signed::TYP_ORG_POLICY, env));
+                }
+                for rec in mcp_installations.iter().flatten() {
+                    if let Some(env) = rec.signed.as_ref() {
+                        stmts.push((scenery_core::signed::TYP_MCP_SERVER, env));
+                    }
+                }
+                super::trust_apply::pin_org_from_snapshot(state, org_id.as_deref(), &stmts);
+            }
+
             // ── Org-policy reconcile (Card 3) ─────────────────────────────────
             //
             // `None` means the backend omitted the `org_policy` key entirely
@@ -578,10 +608,7 @@ async fn dispatch_event(
             // converges immediately from this snapshot instead of staying
             // stale until the next live toggle or a restart.
             if let Some(policy) = org_policy {
-                state.apply_org_policy_snapshot(
-                    policy.managed_paths_mode.as_deref(),
-                    policy.block_third_party_inference,
-                );
+                super::trust_apply::apply_org_policy_snapshot(state, &policy);
             }
 
             // ── Revocation list reconcile (broadcast model) ──────────────────
@@ -599,26 +626,27 @@ async fn dispatch_event(
             // removing it.
             if let Some(ref revs) = revocations {
                 let state_for_replace = Arc::clone(state);
-                let entries: Vec<RevocationEntry> = revs
-                    .iter()
-                    .map(|r| RevocationEntry {
-                        artifact_type: r.artifact_type.clone(),
-                        artifact_key: r.artifact_key.clone(),
-                        version: r.version.clone(),
-                    })
-                    .collect();
+                // Fail-safe: entries are revoked unless they carry a verified
+                // `cleared` statement; a dropped entry is NOT a clear.
+                let plan = super::trust_apply::plan_revocations(state, revs);
+                let entries: Vec<RevocationEntry> = plan.active.clone();
+                let cleared = plan.cleared.clone();
                 // Decide what still needs teardown BEFORE the cache is
-                // replaced: an entry already cached whose artifact is gone was
+                // updated: an entry already cached whose artifact is gone was
                 // applied by an earlier snapshot/event and must be a no-op
                 // (no duplicate purge log or audit event).
                 let (replace_result, already_applied) = {
                     let n = entries.len();
+                    let active_for_merge = entries.clone();
                     match tokio::task::spawn_blocking(move || {
                         let seen = super::revoke_gate::entries_already_cached(
                             &state_for_replace,
-                            &entries,
+                            &active_for_merge,
                         );
-                        (revocation::replace_all(&state_for_replace, &entries), seen)
+                        (
+                            revocation::merge_snapshot(&state_for_replace, &active_for_merge, &cleared),
+                            seen,
+                        )
                     })
                     .await
                     {
@@ -639,7 +667,7 @@ async fn dispatch_event(
                 // client-projected content is removed non-fatally). The gate
                 // only silences the log line and audit event when a repeat
                 // pass finds nothing left to remove.
-                for (rec, seen) in revs.iter().zip(already_applied) {
+                for (rec, seen) in entries.iter().zip(already_applied) {
                     spawn_revoke(
                         rec.artifact_type.clone(),
                         rec.artifact_key.clone(),
@@ -746,6 +774,7 @@ async fn dispatch_event(
                             auth_type,
                             gateway_server_id,
                             gateway_url,
+                            signed,
                         } => {
                             spawn_install_mcp(
                                 installation_id,
@@ -757,6 +786,7 @@ async fn dispatch_event(
                                 auth_type,
                                 gateway_server_id,
                                 gateway_url,
+                                signed,
                                 state,
                                 registry_url,
                                 skill_locks,
@@ -947,6 +977,7 @@ fn spawn_install_mcp(
     auth_type: String,
     gateway_server_id: Option<String>,
     gateway_url: Option<String>,
+    signed: Option<Envelope>,
     state: &Arc<AppState>,
     registry_url: &str,
     skill_locks: &SkillLockMap,
@@ -976,6 +1007,7 @@ fn spawn_install_mcp(
             auth_type,
             gateway_server_id,
             gateway_url,
+            signed,
             &st,
             &reg_url,
             &stats_clone,
@@ -1302,7 +1334,9 @@ async fn do_install_plugin(
     .await
     .unwrap_or_default();
     let imported =
-        fetch_plugin_version_files(registry_url, plugin_slug, version, &access_token).await;
+        fetch_plugin_version_files(state, registry_url, plugin_slug, version, &access_token)
+            .await
+            .with_context(|| format!("plugin {plugin_slug}@{version}: content not accepted"))?;
 
     // 2. Materialize + register the plugin (direct file writes) off the async
     //    executor — the marketplace pusher does synchronous filesystem I/O.
@@ -1357,103 +1391,57 @@ async fn do_install_plugin(
     Ok(())
 }
 
-/// An imported plugin's source tree as the registry serves it.
-#[derive(Debug, Default)]
-struct ImportedPluginContent {
-    /// `(relative_path, bytes)`: `components.files` (UTF-8 text) plus
-    /// `components.binary_files` (base64, decoded here).
-    files: Vec<(String, Vec<u8>)>,
-    /// `components.executables`: paths git marks executable.
-    executables: Vec<String>,
-}
+use super::plugin_verify::ImportedPluginContent;
 
-/// Fetch an imported plugin's mirrored source tree from the registry.
-/// Empty when the plugin has no inline files (Scenery-published) or the
-/// fetch fails — the install is best-effort and still lists the plugin.
-/// `access_token` is sent when non-empty: private plugins are served only to
-/// their owner, org-published ones to anyone.
+/// Fetch an imported plugin's mirrored source tree from the registry and
+/// verify it against the signed `plugin_version.v1` statement. Any failure
+/// (network, signature, hash, caps) is an error: nothing is written and the
+/// install reports `error`. `access_token` is sent when non-empty: private
+/// plugins are served only to their owner, org-published ones to anyone.
 async fn fetch_plugin_version_files(
+    state: &Arc<AppState>,
     registry_url: &str,
     slug: &str,
     version: &str,
     access_token: &str,
-) -> ImportedPluginContent {
-    use base64::Engine as _;
-
+) -> Result<ImportedPluginContent> {
+    // M1: slug and version are one URL path segment each.
     let url = format!(
         "{}/api/runner/plugins/{}/versions/{}",
         registry_url.trim_end_matches('/'),
-        slug,
-        version
+        scenery_core::safe_path::encode_segment(slug),
+        scenery_core::safe_path::encode_segment(version)
     );
-    let client = match scenery_core::http::async_client_builder()
+    let client = scenery_core::http::async_client_builder()
         .timeout(Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
-    {
-        Ok(c) => c,
-        Err(_) => return ImportedPluginContent::default(),
-    };
+        .context("failed to build plugin content client")?;
     let req = if access_token.is_empty() {
         client.get(&url)
     } else {
         client.get(&url).bearer_auth(access_token)
     };
-    let body: serde_json::Value = match req.send_tracked().await {
-        Ok(r) if r.status().is_success() => match r.json().await {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(slug, error = %e, "reconciler: plugin content parse failed");
-                return ImportedPluginContent::default();
-            }
-        },
-        Ok(r) => {
-            warn!(slug, http_status = %r.status(), "reconciler: plugin content fetch non-success");
-            return ImportedPluginContent::default();
-        }
-        Err(e) => {
-            warn!(slug, error = %e, "reconciler: plugin content fetch failed");
-            return ImportedPluginContent::default();
-        }
-    };
-    let Some(components) = body.get("components") else {
-        return ImportedPluginContent::default();
-    };
-    let entries = |key: &str| {
-        components
-            .get(key)
-            .and_then(|f| f.as_object())
-            .cloned()
-            .unwrap_or_default()
-    };
-
-    let mut files: Vec<(String, Vec<u8>)> = entries("files")
-        .into_iter()
-        .filter_map(|(path, content)| content.as_str().map(|s| (path, s.as_bytes().to_vec())))
-        .collect();
-    for (path, content) in entries("binary_files") {
-        match content
-            .as_str()
-            .map(|b64| base64::engine::general_purpose::STANDARD.decode(b64))
-        {
-            Some(Ok(bytes)) => files.push((path, bytes)),
-            _ => warn!(
-                slug,
-                path, "reconciler: plugin binary file is not valid base64; skipped"
-            ),
-        }
-    }
-    let executables = components
-        .get("executables")
-        .and_then(|e| e.as_array())
-        .map(|paths| {
-            paths
-                .iter()
-                .filter_map(|p| p.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    ImportedPluginContent { files, executables }
+    let resp = req
+        .send_tracked()
+        .await
+        .with_context(|| format!("plugin content fetch failed for {slug}"))?;
+    anyhow::ensure!(
+        resp.status().is_success(),
+        "plugin content fetch returned HTTP {}",
+        resp.status()
+    );
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .context("plugin content response is not valid JSON")?;
+    let st = Arc::clone(state);
+    let (slug, version) = (slug.to_string(), version.to_string());
+    tokio::task::spawn_blocking(move || {
+        super::plugin_verify::verify_plugin_content(&st, &slug, &version, &body)
+    })
+    .await
+    .context("plugin verify task panicked")?
 }
 
 fn spawn_deactivate_plugin(
@@ -1923,6 +1911,7 @@ fn spawn_unrevoke(
     artifact_type: String,
     artifact_key: String,
     version: Option<String>,
+    signed: Option<Envelope>,
     state: &Arc<AppState>,
     install_tasks: &mut tokio::task::JoinSet<bool>,
 ) {
@@ -1931,17 +1920,38 @@ fn spawn_unrevoke(
         let at = artifact_type.clone();
         let ak = artifact_key.clone();
         let ver = version.clone();
-        match tokio::task::spawn_blocking(move || {
-            revocation::clear_revocation(&state, &at, &ak, ver.as_deref())
+        let state_for_clear = Arc::clone(&state);
+        match tokio::task::spawn_blocking(move || -> Result<bool> {
+            // Fail-safe rule: lifting a revocation needs a valid
+            // `revocation.v1` `status=cleared` statement. Without one the
+            // local entry stays.
+            if !super::trust_apply::verified_clear(
+                &state_for_clear,
+                &at,
+                &ak,
+                ver.as_deref(),
+                signed.as_ref(),
+            ) {
+                return Ok(false);
+            }
+            revocation::clear_revocation(&state_for_clear, &at, &ak, ver.as_deref())?;
+            Ok(true)
         })
         .await
         {
-            Ok(Ok(())) => {
+            Ok(Ok(true)) => {
                 info!(
                     artifact_type = %artifact_type,
                     artifact_key = %artifact_key,
                     version = ?version,
                     "reconciler: artifact unrevoked — local gate lifted"
+                );
+            }
+            Ok(Ok(false)) => {
+                warn!(
+                    artifact_type = %artifact_type,
+                    artifact_key = %artifact_key,
+                    "reconciler: unrevoke ignored — no valid signed clear; local revocation kept"
                 );
             }
             Ok(Err(e)) => {
@@ -1970,6 +1980,7 @@ async fn handle_install_mcp(
     auth_type: String,
     gateway_server_id: Option<String>,
     gateway_url: Option<String>,
+    signed: Option<Envelope>,
     state: &Arc<AppState>,
     registry_url: &str,
     stats: &Arc<Mutex<ReconcilerStats>>,
@@ -1977,6 +1988,60 @@ async fn handle_install_mcp(
     list_changed_tx: broadcast::Sender<()>,
     pusher: Option<&ManagedPathsPusher>,
 ) -> bool {
+    // Fail-safe rule (design §1): installing needs a valid signed statement.
+    // From here on only the VERIFIED fields are used; the unsigned fields on
+    // the event are ignored (they are consulted solely by debug builds with
+    // SCENERY_INSECURE_UNSIGNED=1 when no envelope is sent).
+    let unsigned = super::mcp_verify::McpDefinition {
+        mcp_server_name,
+        package_source,
+        version_pin,
+        server_config,
+        auth_type,
+        gateway_server_id,
+        gateway_url,
+    };
+    let verified = {
+        let st = Arc::clone(state);
+        let reg = registry_url.to_string();
+        let signed_for_task = signed.clone();
+        tokio::task::spawn_blocking(move || {
+            super::mcp_verify::verify_mcp_definition(
+                &st,
+                &reg,
+                &mcp_server_id,
+                unsigned,
+                signed_for_task.as_ref(),
+            )
+        })
+        .await
+    };
+    let verified = match verified {
+        Ok(Ok(v)) => v,
+        Ok(Err(msg)) => {
+            warn!(mcp_server_id = %mcp_server_id, reason = %msg, "reconciler: MCP install rejected");
+            report_mcp_installation_status(installation_id, "error", Some(&msg), registry_url, state)
+                .await;
+            increment_mcp_errors(stats);
+            return false;
+        }
+        Err(e) => {
+            warn!(error = %e, "reconciler: MCP verify task panicked");
+            increment_mcp_errors(stats);
+            return false;
+        }
+    };
+    let envelope_json = verified.envelope_json;
+    let super::mcp_verify::McpDefinition {
+        mcp_server_name,
+        package_source,
+        version_pin,
+        server_config,
+        auth_type,
+        gateway_server_id,
+        gateway_url,
+    } = verified.def;
+
     // Revoke overrides desired state: a revoked server must never be
     // (re)installed, even by a stale `install_mcp` event or a snapshot
     // delivered after the revoke (the Snapshot arm already reconciles the
@@ -2045,10 +2110,54 @@ async fn handle_install_mcp(
         gateway_url: gateway_url.clone(),
     };
 
+    // Launch gate (design §3): a stdio definition runs only after the user
+    // approved its exact command, args and env keys on this machine.
+    let gate = crate::launch_gate::check(state, &row);
+    let stdio_hash = crate::launch_gate::stdio_definition(&row).map(|d| d.approval_hash());
+    match &gate {
+        crate::launch_gate::Gate::Refused(why) => {
+            warn!(mcp_server_id = %mcp_server_id, reason = %why, "reconciler: MCP definition refused");
+            report_mcp_installation_status(
+                installation_id,
+                "error",
+                Some(why),
+                registry_url,
+                state,
+            )
+            .await;
+            increment_mcp_errors(stats);
+            return false;
+        }
+        crate::launch_gate::Gate::Pending(hash) => {
+            return hold_mcp_pending(
+                state,
+                registry_url,
+                backend_registry,
+                pusher,
+                &row,
+                hash,
+                envelope_json.as_deref(),
+            )
+            .await;
+        }
+        crate::launch_gate::Gate::Allowed => {}
+    }
+    let approval_state = stdio_hash
+        .as_ref()
+        .map(|_| crate::approval_flow::STATE_APPROVED);
+
     let state_clone = Arc::clone(state);
+    let row_for_db = row.clone();
+    let hash_for_db = stdio_hash.clone();
+    let env_for_db = envelope_json.clone();
     let result = tokio::task::spawn_blocking(move || {
         state_clone
-            .upsert_mcp_install(&row)
+            .upsert_mcp_install_gated(
+                &row_for_db,
+                hash_for_db.as_deref(),
+                approval_state,
+                env_for_db.as_deref(),
+            )
             .context("failed to upsert mcp_installations row")?;
         write_managed_mcp_json(&state_clone)
     })
@@ -2086,24 +2195,11 @@ async fn handle_install_mcp(
             }
 
             // Register the new backend in the live aggregator so the AI client
-            // sees it immediately without a daemon restart.
-            let row = McpInstallRow {
-                mcp_server_id: mcp_server_id.to_string(),
-                installation_id: installation_id.to_string(),
-                mcp_server_name: mcp_server_name.clone(),
-                package_source: package_source.clone(),
-                version_pin: version_pin.clone(),
-                server_config: server_config
-                    .as_ref()
-                    .and_then(|v| serde_json::to_string(v).ok()),
-                auth_type: auth_type.clone(),
-                gateway_server_id: gateway_server_id.clone(),
-                gateway_url: gateway_url.clone(),
-            };
-            // Gateway-brokered backends read the shared live token handle at
-            // call time (kept current by the daemon's refresh task).
-            match crate::mcp_row_to_backend_entry(&row) {
-                Some(entry) => {
+            // sees it immediately without a daemon restart. Gateway-brokered
+            // backends read the shared live token handle at call time (kept
+            // current by the daemon's refresh task).
+            match crate::mcp_row_to_backend_entry(state, &row) {
+                crate::Launch::Ready(entry) => {
                     let sid = entry.server_id.clone();
                     backend_registry.register_backend(entry.clone());
                     info!(server_id = %sid, "reconciler: live-registered MCP backend in aggregator");
@@ -2113,7 +2209,7 @@ async fn handle_install_mcp(
                         list_changed_tx.clone(),
                     );
                 }
-                None => {
+                _ => {
                     warn!(
                         mcp_server_id = %mcp_server_id,
                         "reconciler: installed MCP server has no usable transport — \
@@ -2153,6 +2249,80 @@ async fn handle_install_mcp(
             false
         }
     }
+}
+
+/// A verified stdio definition the user has not approved: store the row as
+/// pending, stop anything already running for the server, and tell the
+/// backend and the user. Nothing is registered, spawned, discovered or pushed
+/// to a client. Returns whether the live tool list changed.
+async fn hold_mcp_pending(
+    state: &Arc<AppState>,
+    registry_url: &str,
+    backend_registry: &Arc<BackendRegistry>,
+    pusher: Option<&ManagedPathsPusher>,
+    row: &McpInstallRow,
+    hash: &str,
+    envelope_json: Option<&str>,
+) -> bool {
+    // An edit of an already-approved server arrives here with a new hash:
+    // the old process must stop and leave the client's config until the new
+    // definition is approved. Resolve the key from the previous row's name.
+    let st = Arc::clone(state);
+    let id = row.mcp_server_id.clone();
+    let previous_slug = tokio::task::spawn_blocking(move || {
+        st.list_mcp_installs().ok().and_then(|rows| {
+            rows.into_iter()
+                .find(|r| r.mcp_server_id == id)
+                .map(|r| crate::mcp_server_slug(&r.mcp_server_name))
+        })
+    })
+    .await
+    .ok()
+    .flatten();
+    let mut changed = false;
+    for slug in previous_slug
+        .into_iter()
+        .chain(std::iter::once(crate::mcp_server_slug(&row.mcp_server_name)))
+    {
+        changed |= backend_registry.remove_backend(&slug);
+        if let Some(p) = pusher {
+            if let Err(e) = p.remove_mcp(&slug) {
+                warn!(slug = %slug, error = %e, "reconciler: remove_mcp for pending server failed");
+            }
+        }
+    }
+
+    let st = Arc::clone(state);
+    let row_db = row.clone();
+    let hash_db = hash.to_string();
+    let env_db = envelope_json.map(str::to_string);
+    let stored = tokio::task::spawn_blocking(move || {
+        st.upsert_mcp_install_gated(
+            &row_db,
+            Some(&hash_db),
+            Some(crate::approval_flow::STATE_PENDING),
+            env_db.as_deref(),
+        )?;
+        write_managed_mcp_json(&st)
+    })
+    .await;
+    if !matches!(stored, Ok(Ok(()))) {
+        warn!(mcp_server_id = %row.mcp_server_id, "reconciler: failed to store pending MCP server");
+        return changed;
+    }
+    if let (Some(def), Ok(iid)) = (
+        crate::launch_gate::stdio_definition(row),
+        Uuid::parse_str(&row.installation_id),
+    ) {
+        info!(
+            mcp_server_id = %row.mcp_server_id,
+            approval_hash = %hash,
+            "reconciler: stdio MCP server waiting for local approval"
+        );
+        crate::approval_flow::report_pending(state, registry_url, iid, &def, hash).await;
+        crate::approval_flow::notify_pending_once(state, hash, &row.mcp_server_name);
+    }
+    changed
 }
 
 // ── Shared MCP teardown ───────────────────────────────────────────────────────
@@ -2370,13 +2540,21 @@ async fn handle_deactivate_mcp(
 /// readers (the MCP server) never see a partial write.
 ///
 /// Path: `{state.root_dir}/managed-mcp.json`
-fn write_managed_mcp_json(state: &AppState) -> Result<()> {
+pub(crate) fn write_managed_mcp_json(state: &AppState) -> Result<()> {
     let rows = state
         .list_mcp_installs()
         .context("failed to read mcp_installations for managed-mcp.json")?;
 
+    let pending: std::collections::HashSet<String> =
+        scenery_core::approvals::list_pending(state)
+            .map(|p| p.into_iter().map(|s| s.mcp_server_id).collect())
+            .unwrap_or_default();
     let mut servers = Vec::with_capacity(rows.len());
     for row in &rows {
+        // Servers waiting for local approval are not mirrored here.
+        if pending.contains(&row.mcp_server_id) {
+            continue;
+        }
         let server_config: Option<serde_json::Value> = row
             .server_config
             .as_deref()
@@ -2438,6 +2616,27 @@ async fn report_mcp_installation_status(
     registry_url: &str,
     state: &Arc<AppState>,
 ) {
+    report_mcp_installation_status_with_hash(
+        installation_id,
+        status,
+        error_message,
+        None,
+        registry_url,
+        state,
+    )
+    .await;
+}
+
+/// As [`report_mcp_installation_status`], plus the optional `approval_hash`
+/// sent with `pending_approval`.
+pub(crate) async fn report_mcp_installation_status_with_hash(
+    installation_id: Uuid,
+    status: &str,
+    error_message: Option<&str>,
+    approval_hash: Option<&str>,
+    registry_url: &str,
+    state: &Arc<AppState>,
+) {
     let url = format!(
         "{}/api/mcp-installations/{}",
         registry_url.trim_end_matches('/'),
@@ -2447,6 +2646,9 @@ async fn report_mcp_installation_status(
     let mut body = serde_json::json!({ "state": status });
     if let Some(msg) = error_message {
         body["error_message"] = serde_json::Value::String(msg.to_string());
+    }
+    if let Some(h) = approval_hash {
+        body["approval_hash"] = serde_json::Value::String(h.to_string());
     }
 
     let reg_url = registry_url.to_string();
@@ -3198,12 +3400,23 @@ fn install_from_registry_blocking(
     use scenery_core::installer::{install_unpacked_skill, InstallMode};
     use scenery_manifest::SkillPackage;
 
+    // M1: both names become file names below.
+    scenery_core::safe_path::validate_component("skill_id", skill_id)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    scenery_core::safe_path::validate_component("version", version)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
     let registry = RegistryClient::new(registry_url).with_stored_auth(state);
 
-    // Fetch artifact metadata (SHA-256, download URL).
+    // Fetch artifact metadata (download URL + signed statement).
     let meta = registry
         .fetch_artifact_metadata(skill_id, version)
         .with_context(|| format!("failed to fetch artifact metadata for {skill_id}@{version}"))?;
+
+    // M2: the digest and size come from the verified `skill_artifact.v1`
+    // payload, never from the unsigned fields beside it.
+    let (sha256, size) = scenery_core::verifier::verify_skill_artifact(state, skill_id, version, &meta)
+        .with_context(|| format!("artifact for {skill_id}@{version} is not validly signed"))?;
 
     // Download to a temp path.
     let tmp_path = state
@@ -3212,14 +3425,22 @@ fn install_from_registry_blocking(
         .join(format!("{skill_id}-{version}-{installation_id}.cskill.tmp"));
 
     registry
-        .download_artifact(&meta.download_url, &meta.sha256, &tmp_path)
+        .download_artifact(
+            &meta.download_url,
+            &sha256,
+            size.min(scenery_core::registry::MAX_ARTIFACT_BYTES),
+            &tmp_path,
+        )
         .with_context(|| format!("artifact download failed for {skill_id}@{version}"))?;
 
-    // Unpack the .cskill archive to a temp directory.
+    // Unpack the .cskill archive into a fresh, empty directory (H2).
     let unpack_dir = state
         .root_dir
         .join("tmp")
         .join(format!("{skill_id}-{version}-{installation_id}-unpacked"));
+    let _ = std::fs::remove_dir_all(&unpack_dir);
+    std::fs::create_dir(&unpack_dir)
+        .with_context(|| format!("failed to create unpack dir {unpack_dir}"))?;
 
     unpack_cskill_archive(&tmp_path, &unpack_dir)
         .with_context(|| format!("failed to unpack .cskill for {skill_id}@{version}"))?;
@@ -3256,196 +3477,7 @@ fn install_from_registry_blocking(
     Ok(())
 }
 
-/// Unpack a `.cskill` archive into `dest`.
-///
-/// Supports two on-disk formats:
-/// - **tar.gz** (`\x1f\x8b` magic): produced by the backend compile pipeline.
-/// - **ZIP** (`PK\x03\x04` magic): legacy format; kept for forward-compat.
-///
-/// The format is auto-detected by reading the first two magic bytes.
-fn unpack_cskill_archive(archive_path: &camino::Utf8Path, dest: &camino::Utf8Path) -> Result<()> {
-    use std::io::Read;
-
-    // Peek at the first two bytes to detect the format.
-    let mut magic = [0u8; 2];
-    {
-        let mut f = std::fs::File::open(archive_path).with_context(|| {
-            format!("failed to open archive for magic detection: {archive_path}")
-        })?;
-        f.read_exact(&mut magic)
-            .with_context(|| format!("archive too small to detect format: {archive_path}"))?;
-    }
-
-    std::fs::create_dir_all(dest)
-        .with_context(|| format!("failed to create unpack dir: {dest}"))?;
-
-    if magic == [0x1f, 0x8b] {
-        // tar.gz format — used by backend compile pipeline.
-        unpack_tar_gz(archive_path, dest)
-    } else if magic == [0x50, 0x4b] {
-        // ZIP format (PK magic).
-        unpack_zip(archive_path, dest)
-    } else {
-        anyhow::bail!(
-            "unrecognised archive format (magic bytes {:02x}{:02x}): {archive_path}",
-            magic[0],
-            magic[1]
-        )
-    }
-}
-
-/// Unpack a tar.gz archive into `dest`, stripping a single top-level directory
-/// if all entries share one (i.e. the archive has a wrapper dir).
-fn unpack_tar_gz(archive_path: &camino::Utf8Path, dest: &camino::Utf8Path) -> Result<()> {
-    let file = std::fs::File::open(archive_path)
-        .with_context(|| format!("failed to open tar.gz: {archive_path}"))?;
-
-    let gz = flate2::read::GzDecoder::new(file);
-    let mut archive = tar::Archive::new(gz);
-    archive.set_preserve_permissions(false);
-    archive.set_overwrite(true);
-
-    // Collect entries to determine if there is a single top-level wrapper directory.
-    // We re-open rather than buffer, since tar::Archive doesn't implement Seek.
-    let file2 = std::fs::File::open(archive_path)
-        .with_context(|| format!("failed to open tar.gz (2nd pass): {archive_path}"))?;
-    let gz2 = flate2::read::GzDecoder::new(file2);
-    let mut archive2 = tar::Archive::new(gz2);
-
-    // Determine strip prefix: if every path starts with the same first component
-    // and there are no root-level files, strip it.
-    let mut top_dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut has_root_file = false;
-    for entry in archive2
-        .entries()
-        .context("failed to iterate tar entries (1st pass)")?
-    {
-        let entry = entry.context("failed to read tar entry (1st pass)")?;
-        let path = entry.path().context("invalid tar entry path")?;
-        let components: Vec<_> = path.components().collect();
-        if components.is_empty() {
-            continue;
-        }
-        if let std::path::Component::Normal(name) = &components[0] {
-            let name_str = name.to_string_lossy().to_string();
-            if components.len() == 1 {
-                has_root_file = true;
-            }
-            top_dirs.insert(name_str);
-        }
-    }
-
-    // Strip the top-level wrapper dir if: exactly one top-level name, no root files.
-    let strip_prefix: Option<String> = if !has_root_file && top_dirs.len() == 1 {
-        top_dirs.into_iter().next()
-    } else {
-        None
-    };
-
-    // Third pass: actually extract.
-    let file3 = std::fs::File::open(archive_path)
-        .with_context(|| format!("failed to open tar.gz (3rd pass): {archive_path}"))?;
-    let gz3 = flate2::read::GzDecoder::new(file3);
-    let mut archive3 = tar::Archive::new(gz3);
-
-    for entry in archive3
-        .entries()
-        .context("failed to iterate tar entries (extract)")?
-    {
-        let mut entry = entry.context("failed to read tar entry (extract)")?;
-        let path = entry.path().context("invalid tar entry path (extract)")?;
-
-        // Compute destination path, stripping wrapper prefix if applicable.
-        let rel_path: std::path::PathBuf = if let Some(ref _prefix) = strip_prefix {
-            let components: Vec<_> = path.components().collect();
-            if components.len() <= 1 {
-                // This is the wrapper dir itself — skip it.
-                continue;
-            }
-            components[1..].iter().collect()
-        } else {
-            path.to_path_buf()
-        };
-
-        // Safety: reject absolute paths and path traversal.
-        if rel_path.components().any(|c| {
-            matches!(
-                c,
-                std::path::Component::ParentDir | std::path::Component::RootDir
-            )
-        }) {
-            anyhow::bail!("unsafe path in tar archive: {}", rel_path.display());
-        }
-
-        // `Entry::unpack` hard-links to the entry's link name as given, so a
-        // hard-link entry could pull any file on disk into the bundle (and the
-        // copy into the versioned layout would then read its contents).
-        if entry.header().entry_type().is_hard_link() {
-            anyhow::bail!("hard link in tar archive: {}", rel_path.display());
-        }
-
-        let target = std::path::PathBuf::from(dest.as_str()).join(&rel_path);
-
-        if entry.header().entry_type().is_dir() {
-            std::fs::create_dir_all(&target)
-                .with_context(|| format!("failed to create dir: {}", target.display()))?;
-        } else {
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            entry
-                .unpack(&target)
-                .with_context(|| format!("failed to unpack tar entry: {}", target.display()))?;
-        }
-    }
-
-    Ok(())
-}
-
-/// Unpack a ZIP archive into `dest`.
-fn unpack_zip(archive_path: &camino::Utf8Path, dest: &camino::Utf8Path) -> Result<()> {
-    use std::io::Read;
-
-    let file = std::fs::File::open(archive_path)
-        .with_context(|| format!("failed to open ZIP archive: {archive_path}"))?;
-
-    let mut zip = zip::ZipArchive::new(file)
-        .with_context(|| format!("failed to read ZIP archive: {archive_path}"))?;
-
-    for i in 0..zip.len() {
-        let mut entry = zip
-            .by_index(i)
-            .with_context(|| format!("failed to access ZIP entry {i}"))?;
-
-        let name = entry
-            .enclosed_name()
-            .ok_or_else(|| anyhow::anyhow!("ZIP entry has unsafe path"))?
-            .to_owned();
-
-        let target = std::path::PathBuf::from(dest.as_str()).join(&name);
-
-        if entry.is_dir() {
-            std::fs::create_dir_all(&target)
-                .with_context(|| format!("failed to create dir: {}", target.display()))?;
-        } else {
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let mut out = std::fs::File::create(&target)
-                .with_context(|| format!("failed to create: {}", target.display()))?;
-            let mut buf = [0u8; 65536];
-            loop {
-                let n = entry.read(&mut buf).context("error reading ZIP entry")?;
-                if n == 0 {
-                    break;
-                }
-                std::io::Write::write_all(&mut out, &buf[..n])?;
-            }
-        }
-    }
-
-    Ok(())
-}
+use scenery_core::safe_unpack::unpack_cskill_archive;
 
 // ── Deactivate handler ────────────────────────────────────────────────────────
 
@@ -3495,8 +3527,18 @@ async fn handle_deactivate(
     }
 }
 
+/// `<root>/skills/<skill_id>`, refusing any id that is not one plain path
+/// component (M1) so a hostile id can never reach `remove_dir_all`.
+fn skill_install_root(state: &AppState, skill_id: &str) -> Result<camino::Utf8PathBuf> {
+    let skills = state.root_dir.join("skills");
+    let joined = scenery_core::safe_path::safe_join(skills.as_std_path(), skill_id)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    camino::Utf8PathBuf::from_path_buf(joined)
+        .map_err(|p| anyhow::anyhow!("non-UTF-8 skill path: {}", p.display()))
+}
+
 fn deactivate_skill_blocking(state: &AppState, skill_id: &str) -> Result<()> {
-    let install_root = state.root_dir.join("skills").join(skill_id);
+    let install_root = skill_install_root(state, skill_id)?;
     let active_dir = install_root.join("active");
 
     // Remove the active symlink; keep files on disk.
@@ -3577,7 +3619,7 @@ fn purge_skill_blocking(state: &AppState, skill_id: &str) -> Result<bool> {
     // Read before anything is deleted.
     let local_slug = state.skill_local_name(skill_id);
 
-    let install_root = state.root_dir.join("skills").join(skill_id);
+    let install_root = skill_install_root(state, skill_id)?;
     let mut dir_ok = true;
     if install_root.exists() {
         match std::fs::remove_dir_all(&install_root) {
@@ -3890,6 +3932,7 @@ pub(crate) fn build_derived_mcp_events_blocking(
     // `records`, so they can never match an arm in the loop below.
     let installed_ids: std::collections::HashSet<String> =
         local_rows.iter().map(|r| r.mcp_server_id.clone()).collect();
+    let approval_rows = state.mcp_approval_rows().unwrap_or_default();
 
     let mut events: Vec<SyncEvent> = Vec::new();
     let mut any_deactivation = false;
@@ -3898,7 +3941,9 @@ pub(crate) fn build_derived_mcp_events_blocking(
         let server_id_str = record.mcp_server_id.to_string();
         match record.state.as_str() {
             // "desired", "installing", "installed" → server should be present locally.
-            "desired" | "installing" | "installed" => {
+            // "pending_approval" is a server this device holds for local approval;
+            // the backend keeps it in the snapshot so the row is not an orphan.
+            "desired" | "installing" | "installed" | "pending_approval" => {
                 if !installed_ids.contains(&server_id_str) {
                     events.push(SyncEvent::InstallMcp {
                         installation_id: record.installation_id,
@@ -3910,9 +3955,27 @@ pub(crate) fn build_derived_mcp_events_blocking(
                         auth_type: record.auth_type.clone(),
                         gateway_server_id: record.gateway_server_id.clone(),
                         gateway_url: record.gateway_url.clone(),
+                        signed: record.signed.clone(),
+                    });
+                } else if statement_changed(&approval_rows, &server_id_str, record.signed.as_ref())
+                {
+                    // Same server, new signed statement (an edit while
+                    // approved, or a row stored before 2.2.0 that was never
+                    // verified): run it through the install handler again so
+                    // it is verified, re-gated and re-registered.
+                    events.push(SyncEvent::InstallMcp {
+                        installation_id: record.installation_id,
+                        mcp_server_id: record.mcp_server_id,
+                        mcp_server_name: record.mcp_server_name.clone(),
+                        package_source: record.package_source.clone(),
+                        version_pin: record.version_pin.clone(),
+                        server_config: record.server_config.clone(),
+                        auth_type: record.auth_type.clone(),
+                        gateway_server_id: record.gateway_server_id.clone(),
+                        gateway_url: record.gateway_url.clone(),
+                        signed: record.signed.clone(),
                     });
                 }
-                // Already installed: no event needed.
             }
             "deactivated" => {
                 // Teardown is deferred to `handle_deactivate_mcp` (shared
@@ -3965,6 +4028,25 @@ pub(crate) fn build_derived_mcp_events_blocking(
     }
 
     events
+}
+
+/// Has the backend sent a statement for an installed server that differs from
+/// the one stored with the local row? Only a present envelope counts (an
+/// unsigned record never triggers a re-install).
+#[allow(clippy::type_complexity)]
+fn statement_changed(
+    rows: &std::collections::HashMap<String, (Option<String>, Option<String>, Option<String>)>,
+    server_id: &str,
+    incoming: Option<&Envelope>,
+) -> bool {
+    let Some(incoming) = incoming else {
+        return false;
+    };
+    let stored = rows
+        .get(server_id)
+        .and_then(|(_, _, env)| env.as_deref())
+        .and_then(|e| serde_json::from_str::<Envelope>(e).ok());
+    stored.map_or(true, |s| s.statement != incoming.statement)
 }
 
 /// Result of diffing snapshot plugin records against local governed-plugin

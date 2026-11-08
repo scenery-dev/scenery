@@ -128,9 +128,13 @@ pub async fn write_framed<W: AsyncWriteExt + Unpin>(
     writer.flush().await
 }
 
+/// Largest frame accepted from the daemon socket (L2).
+pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+
 /// Read a length-prefixed JSON frame from the stream.
 ///
-/// Returns `None` on clean EOF (peer closed connection).
+/// Returns `None` on clean EOF (peer closed connection). A length over
+/// [`MAX_FRAME_BYTES`] is an `InvalidData` error, refused before allocating.
 pub async fn read_framed<R: AsyncReadExt + Unpin>(
     reader: &mut R,
 ) -> std::io::Result<Option<Vec<u8>>> {
@@ -141,6 +145,12 @@ pub async fn read_framed<R: AsyncReadExt + Unpin>(
         Err(e) => return Err(e),
     }
     let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_FRAME_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("frame of {len} bytes exceeds the {MAX_FRAME_BYTES}-byte limit"),
+        ));
+    }
     let mut body = vec![0u8; len];
     reader.read_exact(&mut body).await?;
     Ok(Some(body))
@@ -979,6 +989,13 @@ impl Backend for RealBackend {
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn read_framed_refuses_an_oversized_length() {
+        let mut cursor = std::io::Cursor::new(u32::MAX.to_be_bytes().to_vec());
+        let err = read_framed(&mut cursor).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
 
     // ── Bug: `initialize.instructions` must never name a tool `list_tools`
     //    doesn't actually expose, for every surface state ─────────────────

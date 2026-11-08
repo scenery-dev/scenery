@@ -687,6 +687,75 @@ impl AppState {
         Ok(())
     }
 
+    /// Upsert a row and its approval bookkeeping in one transaction.
+    ///
+    /// `approval_state` is `Some("pending")` while a stdio definition waits
+    /// for `scenery approve`, `Some("approved")` once it may run, and `None`
+    /// for definitions that do not spawn a local command. `signed_envelope`
+    /// is the verified envelope JSON, kept so `scenery pending` can show the
+    /// signer and so a snapshot can tell a changed statement from a
+    /// redelivery.
+    pub fn upsert_mcp_install_gated(
+        &self,
+        row: &McpInstallRow,
+        approval_hash: Option<&str>,
+        approval_state: Option<&str>,
+        signed_envelope: Option<&str>,
+    ) -> Result<()> {
+        self.upsert_mcp_install(row)?;
+        let conn = Connection::open(&self.db_path)
+            .context("failed to open state DB for mcp approval update")?;
+        conn.execute(
+            "UPDATE mcp_installations SET approval_hash = ?2, approval_state = ?3, \
+             signed_envelope = ?4 WHERE mcp_server_id = ?1",
+            rusqlite::params![row.mcp_server_id, approval_hash, approval_state, signed_envelope],
+        )
+        .context("failed to record mcp approval state")?;
+        Ok(())
+    }
+
+    /// Set only the approval columns of an existing row.
+    pub fn set_mcp_approval(
+        &self,
+        mcp_server_id: &str,
+        approval_hash: Option<&str>,
+        approval_state: Option<&str>,
+    ) -> Result<()> {
+        let conn = Connection::open(&self.db_path)
+            .context("failed to open state DB for mcp approval update")?;
+        conn.execute(
+            "UPDATE mcp_installations SET approval_hash = ?2, approval_state = ?3 \
+             WHERE mcp_server_id = ?1",
+            rusqlite::params![mcp_server_id, approval_hash, approval_state],
+        )
+        .context("failed to set mcp approval state")?;
+        Ok(())
+    }
+
+    /// `(approval_hash, approval_state, signed_envelope)` per `mcp_server_id`.
+    #[allow(clippy::type_complexity)]
+    pub fn mcp_approval_rows(
+        &self,
+    ) -> Result<std::collections::HashMap<String, (Option<String>, Option<String>, Option<String>)>>
+    {
+        let conn = Connection::open(&self.db_path)
+            .context("failed to open state DB for mcp approval rows")?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT mcp_server_id, approval_hash, approval_state, signed_envelope \
+                 FROM mcp_installations",
+            )
+            .context("failed to prepare mcp approval rows query")?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?, r.get(3)?)))
+            })
+            .context("failed to query mcp approval rows")?
+            .collect::<rusqlite::Result<std::collections::HashMap<_, _>>>()
+            .context("failed to collect mcp approval rows")?;
+        Ok(rows)
+    }
+
     /// Delete one MCP installation row by `mcp_server_id`.
     ///
     /// No-ops if the row does not exist.

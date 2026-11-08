@@ -607,11 +607,10 @@ fn write_plugin_source(plugin_src: &Path, bundle: &PluginBundle) -> Result<()> {
     if !bundle.files.is_empty() {
         let mut wrote_plugin_json = false;
         for (rel, bytes) in &bundle.files {
-            // Guard against path traversal in the relative paths.
-            if rel.contains("..") {
-                continue;
-            }
-            let dest = plugin_src.join(rel);
+            // L1: every component must be a plain name; an absolute path or
+            // `..` aborts the whole install rather than being skipped.
+            let dest = scenery_core::safe_path::safe_join_rel(plugin_src, rel)
+                .map_err(|e| anyhow::anyhow!("plugin_marketplace: unsafe file path: {e}"))?;
             if let Some(parent) = dest.parent() {
                 fs::create_dir_all(parent).ok();
             }

@@ -153,6 +153,8 @@ impl ManagedPathsPusher {
         if reconciler_disabled() {
             return Ok(PushOutcome::default());
         }
+        scenery_core::safe_path::validate_single_component("skill slug", slug)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         let skills_dir = resolve_skills_dir()?;
         let skill_dir = skills_dir.join(slug);
@@ -336,6 +338,8 @@ impl ManagedPathsPusher {
         if reconciler_disabled() {
             return Ok(false);
         }
+        scenery_core::safe_path::validate_single_component("skill slug", slug)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         let mut removed = false;
 
         let skills_dir = resolve_skills_dir()?;

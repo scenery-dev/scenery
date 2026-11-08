@@ -323,6 +323,16 @@ pub(crate) async fn dispatch(ctx: &DaemonContext, request: JsonRpcRequest) -> Js
             handle_get_portal_session(id, &ctx.state, &ctx.registry_url).await
         }
 
+        // `scenery approve` / `approvals revoke` changed the device approvals:
+        // re-run the launch gate over every stored MCP server. This method
+        // only ever re-reads `stdio_approvals`; it carries no approval itself
+        // (the CLI writes those after a TTY confirmation), so a same-user
+        // process calling it cannot approve anything.
+        "approvals/changed" => {
+            let changed = ctx.sync_controller.apply_approvals().await;
+            JsonRpcResponse::success(id, serde_json::json!({ "changed": changed }))
+        }
+
         other => {
             debug!(method = %other, "unknown method");
             JsonRpcResponse::error(id, METHOD_NOT_FOUND, format!("unknown method: {other}"))
