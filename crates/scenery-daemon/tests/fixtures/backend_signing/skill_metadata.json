@@ -1,0 +1,14 @@
+{
+ "download_url": "http://test/artifacts/skills/fx-skill-c755e735/1.2.3.cskill?org=553eeb21-f8cf-4fc4-8424-497f6126088c&exp=1794180007&sig=c75cda788ac4a3504c0878171e2c104922211882cd171bb62f1d5631c6c10f4f",
+ "sha256": "abababababababababababababababababababababababababababababababab",
+ "signed": {
+  "kid": "scn-test-a",
+  "payload": "eyJvcmciOiI1NTNlZWIyMS1mOGNmLTRmYzQtODQyNC00OTdmNjEyNjA4OGMiLCJzaGEyNTYiOiJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiIiwic2l6ZV9ieXRlcyI6NDIsInNraWxsX2lkIjoiZngtc2tpbGwtYzc1NWU3MzUiLCJ2ZXJzaW9uIjoiMS4yLjMifQ",
+  "sig": "va8dDBvh04qkeXRpwbZiFnHYFCUhf1N5EgpL5hnoSfPxsxUGw8Y0XWQw-_r32addJ2qSoxYGGZns8CW-d8slBw",
+  "statement": "eyJpYXQiOjE3OTQxNzk3MDcsImlzcyI6Imh0dHBzOi8vZml4dHVyZS5zY2VuZXJ5LmludmFsaWQiLCJvcmciOiI1NTNlZWIyMS1mOGNmLTRmYzQtODQyNC00OTdmNjEyNjA4OGMiLCJwYXlsb2FkX3NoYTI1NiI6ImQ1YzE1NmIzYjQ5YjEwYTkzNmE4YWI1YzcyODFlOThjZDI5OWYxMzRjOGVmN2I0YzI3NDA2MDQyYjBlOWMzYzYiLCJzZXEiOjcsInN0YXR1cyI6ImFjdGl2ZSIsInN1YiI6InNraWxsOmZ4LXNraWxsLWM3NTVlNzM1QDEuMi4zIiwidHlwIjoic2NlbmVyeS5za2lsbF9hcnRpZmFjdC52MSJ9",
+  "v": 1
+ },
+ "size_bytes": 42,
+ "skill_id": "fx-skill-c755e735",
+ "version": "1.2.3"
+}

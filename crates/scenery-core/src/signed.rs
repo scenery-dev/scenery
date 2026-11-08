@@ -274,6 +274,12 @@ pub mod testing {
         SigningKey::from_bytes(&[seed; 32])
     }
 
+    /// Public key for an arbitrary 32-byte Ed25519 seed (cross-repo fixtures
+    /// are signed by the backend's `file` signing backend with its test seed).
+    pub fn pubkey_from_seed(seed: &[u8; 32]) -> [u8; 32] {
+        SigningKey::from_bytes(seed).verifying_key().to_bytes()
+    }
+
     pub fn trusted(seed: u8, kid: &str) -> TrustedKey {
         TrustedKey {
             kid: kid.to_string(),

@@ -1,0 +1,26 @@
+{
+ "components": {
+  "binary_files": {
+   "bin/run": "AAE="
+  },
+  "executables": [
+   "bin/run"
+  ],
+  "files": {
+   "a/x.md": "# \u00e9",
+   "b.txt": "hello"
+  }
+ },
+ "manifest_json": {},
+ "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+ "signed": {
+  "kid": "scn-test-a",
+  "payload": "eyJmaWxlcyI6W3siZXhlY3V0YWJsZSI6ZmFsc2UsInBhdGgiOiJhL3gubWQiLCJzaGEyNTYiOiJmODRjMjlkNTQxZDI4MDc2OTA5OWM1NGIyNmVmZTlkOWU5OGRmYjMxOTcyYzBjOWJlYThlYTcyYTQ3YjY1MWEwIiwic2l6ZSI6NH0seyJleGVjdXRhYmxlIjpmYWxzZSwicGF0aCI6ImIudHh0Iiwic2hhMjU2IjoiMmNmMjRkYmE1ZmIwYTMwZTI2ZTgzYjJhYzViOWUyOWUxYjE2MWU1YzFmYTc0MjVlNzMwNDMzNjI5MzhiOTgyNCIsInNpemUiOjV9LHsiZXhlY3V0YWJsZSI6dHJ1ZSwicGF0aCI6ImJpbi9ydW4iLCJzaGEyNTYiOiJiNDEzZjQ3ZDEzZWUyZmU2Yzg0NWIyZWUxNDFhZjgxZGU4NThkZjRlYzU0OWE1OGI3OTcwYmI5NjY0NWJjOGQyIiwic2l6ZSI6Mn1dLCJzbHVnIjoiZngtcGx1Z2luLWZpbGVzLWE4NmZlZGExIiwidmVyc2lvbiI6IjAuMS4wIn0",
+  "sig": "1ttL6f5K1ItLQD0B9DYyLfejPilPvGXlwtUJi57HA8fhPFK1wE-dbSsNsnytpE2WjTKFYRwesyHo8NjnGQMICQ",
+  "statement": "eyJpYXQiOjE3OTQxNzk3MDcsImlzcyI6Imh0dHBzOi8vZml4dHVyZS5zY2VuZXJ5LmludmFsaWQiLCJvcmciOiI1NTNlZWIyMS1mOGNmLTRmYzQtODQyNC00OTdmNjEyNjA4OGMiLCJwYXlsb2FkX3NoYTI1NiI6ImNiYzM3ZmVkMGJlOGEzYTEzMTg4ODIwYWU2MzBlZjFmYWNhMTc0NTlhNTZmNDNjNzE2OGU2YzYxNjJiY2ZmYmEiLCJzZXEiOjgsInN0YXR1cyI6ImFjdGl2ZSIsInN1YiI6InBsdWdpbjpmeC1wbHVnaW4tZmlsZXMtYTg2ZmVkYTFAMC4xLjAiLCJ0eXAiOiJzY2VuZXJ5LnBsdWdpbl92ZXJzaW9uLnYxIn0",
+  "v": 1
+ },
+ "size_bytes": 1,
+ "slug": "fx-plugin-files-a86feda1",
+ "version": "0.1.0"
+}

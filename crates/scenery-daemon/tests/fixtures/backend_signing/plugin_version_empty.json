@@ -1,0 +1,15 @@
+{
+ "components": null,
+ "manifest_json": {},
+ "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+ "signed": {
+  "kid": "scn-test-a",
+  "payload": "eyJmaWxlcyI6W10sInNsdWciOiJmeC1wbHVnaW4tZW1wdHktNjRiNDU0YjYiLCJ2ZXJzaW9uIjoiMC4xLjAifQ",
+  "sig": "V91ZZkQg07IDC-dRg_IvDvy8dYH8lHtWynLB5DkfP0SdzX5J0LgdIcNkOjOSeunY5kjSWYiMkU1xX_gmq5HcDQ",
+  "statement": "eyJpYXQiOjE3OTQxNzk3MDcsImlzcyI6Imh0dHBzOi8vZml4dHVyZS5zY2VuZXJ5LmludmFsaWQiLCJvcmciOiI1NTNlZWIyMS1mOGNmLTRmYzQtODQyNC00OTdmNjEyNjA4OGMiLCJwYXlsb2FkX3NoYTI1NiI6ImIwYThhNjI3NTJlMmU0OWQ3MGFjNDgzZGRkYzE2OTBkMjhjZDdkNjhjMWRmNWNkZmVmODNhOTMzOWNiYTVhMWYiLCJzZXEiOjksInN0YXR1cyI6ImFjdGl2ZSIsInN1YiI6InBsdWdpbjpmeC1wbHVnaW4tZW1wdHktNjRiNDU0YjZAMC4xLjAiLCJ0eXAiOiJzY2VuZXJ5LnBsdWdpbl92ZXJzaW9uLnYxIn0",
+  "v": 1
+ },
+ "size_bytes": 1,
+ "slug": "fx-plugin-empty-64b454b6",
+ "version": "0.1.0"
+}

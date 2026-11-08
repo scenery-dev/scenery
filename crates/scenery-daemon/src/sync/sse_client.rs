@@ -1338,7 +1338,7 @@ fn revocation_record_ok(r: &RevocationRecord) -> bool {
     revocation_ok(&r.artifact_type, &r.artifact_key, r.version.as_deref())
 }
 
-fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
+pub(crate) fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent> {
     match event_type {
         "snapshot" => snapshot_event_from_json(data),
         "install" => {

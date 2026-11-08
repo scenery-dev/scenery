@@ -9,6 +9,8 @@
 //! The subsystem is optional: if `registry_url` is absent or the daemon is
 //! operating in offline mode, `run` immediately returns `Ok(())`.
 
+#[cfg(test)]
+mod backend_fixture_tests;
 pub(crate) mod mcp_verify;
 pub(crate) mod plugin_verify;
 pub mod reconciler;

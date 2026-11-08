@@ -1,0 +1,21 @@
+{
+ "auth_type": "oauth_pkce",
+ "gateway_server_id": "gw-453f3982",
+ "gateway_url": "https://fixture.scenery.invalid/gateway/gw-453f3982/mcp",
+ "installation_id": "6318405d-214e-416f-a544-fb590a40f401",
+ "mcp_server_id": "8b6d500a-1aeb-4beb-90fa-1cbe259ba505",
+ "mcp_server_name": "fx-gw-3841144e",
+ "package_source": "https://example.invalid/mcp",
+ "server_config": {
+  "url": "https://example.invalid/mcp"
+ },
+ "signed": {
+  "kid": "scn-test-a",
+  "payload": "eyJhdXRoX3R5cGUiOiJvYXV0aF9wa2NlIiwiZ2F0ZXdheV9zZXJ2ZXJfaWQiOiJndy00NTNmMzk4MiIsImdhdGV3YXlfdXJsIjoiaHR0cHM6Ly9maXh0dXJlLnNjZW5lcnkuaW52YWxpZC9nYXRld2F5L2d3LTQ1M2YzOTgyL21jcCIsIm1jcF9zZXJ2ZXJfaWQiOiI4YjZkNTAwYS0xYWViLTRiZWItOTBmYS0xY2JlMjU5YmE1MDUiLCJuYW1lIjoiZngtZ3ctMzg0MTE0NGUiLCJwYWNrYWdlX3NvdXJjZSI6Imh0dHBzOi8vZXhhbXBsZS5pbnZhbGlkL21jcCIsInNlcnZlcl9jb25maWciOnsidXJsIjoiaHR0cHM6Ly9leGFtcGxlLmludmFsaWQvbWNwIn0sInZlcnNpb25fcGluIjoiMS4wLjAifQ",
+  "sig": "Zn8S1rrMLYfw6nLQEbhZ-BKyIfKSEbkJiB2385vB-wcbkb3vuP5A48SAIXsI3r2mFDx1QAb2OZ1ZesIQMOQIAw",
+  "statement": "eyJpYXQiOjE3OTQxNzk3MDcsImlzcyI6Imh0dHBzOi8vZml4dHVyZS5zY2VuZXJ5LmludmFsaWQiLCJvcmciOiI1NTNlZWIyMS1mOGNmLTRmYzQtODQyNC00OTdmNjEyNjA4OGMiLCJwYXlsb2FkX3NoYTI1NiI6ImU0ZjcwOWZjYmJjOWRmMDk2YWI2ZjQ4MTg2ZmQ5MDIzYjExOTVhOTA2YmI0MmE5ODUzOGRmMDVhZGU5Yzg3NjMiLCJzZXEiOjUsInN0YXR1cyI6ImFjdGl2ZSIsInN1YiI6Im1jcF9zZXJ2ZXI6OGI2ZDUwMGEtMWFlYi00YmViLTkwZmEtMWNiZTI1OWJhNTA1IiwidHlwIjoic2NlbmVyeS5tY3Bfc2VydmVyLnYxIn0",
+  "v": 1
+ },
+ "source": "user",
+ "version_pin": "1.0.0"
+}

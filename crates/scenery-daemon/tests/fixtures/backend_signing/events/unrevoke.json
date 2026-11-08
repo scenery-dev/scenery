@@ -1,0 +1,11 @@
+{
+ "artifact_key": "fx-rev-b-8e4c98bf",
+ "artifact_type": "skill",
+ "signed": {
+  "kid": "scn-test-a",
+  "sig": "1jwltomFpMLdu16-VjQ67i5YaGlDoqlHF37fKHOeLKzW8wiJffGp8hFvrA-vrjqBa-46ThD7ID_tkyLZKD0wBw",
+  "statement": "eyJpYXQiOjE3OTQxNzk3MDcsImlzcyI6Imh0dHBzOi8vZml4dHVyZS5zY2VuZXJ5LmludmFsaWQiLCJvcmciOiI1NTNlZWIyMS1mOGNmLTRmYzQtODQyNC00OTdmNjEyNjA4OGMiLCJzZXEiOjEyLCJzdGF0dXMiOiJjbGVhcmVkIiwic3ViIjoicmV2b2NhdGlvbjpza2lsbDpmeC1yZXYtYi04ZTRjOThiZjoiLCJ0eXAiOiJzY2VuZXJ5LnJldm9jYXRpb24udjEifQ",
+  "v": 1
+ },
+ "version": null
+}

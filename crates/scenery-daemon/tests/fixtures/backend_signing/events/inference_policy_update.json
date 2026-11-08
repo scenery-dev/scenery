@@ -1,0 +1,12 @@
+{
+ "enabled": true,
+ "org_id": "553eeb21-f8cf-4fc4-8424-497f6126088c",
+ "signed": {
+  "kid": "scn-test-a",
+  "payload": "eyJibG9ja190aGlyZF9wYXJ0eV9pbmZlcmVuY2UiOnRydWUsIm1hbmFnZWRfcGF0aHNfbW9kZSI6InF1YXJhbnRpbmUifQ",
+  "sig": "CCRB6T0Zo7lor2nP5tZwep8EIPDsDu9pA-_C7W7r-_nUudwiVCs86KYv4RbMdrySfwVNGzlQ1Dtd5NeV_58MDw",
+  "statement": "eyJpYXQiOjE3OTQxNzk3MDcsImlzcyI6Imh0dHBzOi8vZml4dHVyZS5zY2VuZXJ5LmludmFsaWQiLCJvcmciOiI1NTNlZWIyMS1mOGNmLTRmYzQtODQyNC00OTdmNjEyNjA4OGMiLCJwYXlsb2FkX3NoYTI1NiI6ImE5MTg5NDBhODNhMTBjMmJlNjA2YjY0NDE1Y2UxZjE5OTI0NWUyZTliZjExNjNmODVlYzI5NDZiNjU3OGNmOTIiLCJzZXEiOjMsInN0YXR1cyI6ImFjdGl2ZSIsInN1YiI6Im9yZ19wb2xpY3kiLCJ0eXAiOiJzY2VuZXJ5Lm9yZ19wb2xpY3kudjEifQ",
+  "v": 1
+ },
+ "updated_at": "2026-11-08T23:15:07.239380+00:00"
+}

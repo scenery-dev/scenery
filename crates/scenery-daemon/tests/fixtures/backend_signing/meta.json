@@ -1,0 +1,16 @@
+{
+ "cleared_skill": "fx-rev-b-8e4c98bf",
+ "gateway_server_id": "8b6d500a-1aeb-4beb-90fa-1cbe259ba505",
+ "iss": "https://fixture.scenery.invalid",
+ "kid": "scn-test-a",
+ "org_id": "553eeb21-f8cf-4fc4-8424-497f6126088c",
+ "pending_server_id": "7c2cfd4b-7e6d-450a-a9e8-362934e0d65b",
+ "plugin_empty_slug": "fx-plugin-empty-64b454b6",
+ "plugin_files_slug": "fx-plugin-files-a86feda1",
+ "plugin_version": "0.1.0",
+ "public_key": "HSZdAJMo2Hg0gR8voyvndB_n6y_fZAGeSv9cg2fdjs8",
+ "revoked_skill": "fx-rev-a-59e7c8b8",
+ "skill_id": "fx-skill-c755e735",
+ "skill_version": "1.2.3",
+ "stdio_server_id": "d805db24-8443-4663-b290-28824e583ee0"
+}
