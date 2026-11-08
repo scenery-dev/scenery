@@ -1464,3 +1464,33 @@ fn projection_state_marked_copy_is_intact_and_stale_or_missing_links_are_not() {
         );
     }
 }
+
+// ── Antigravity alias (~/.gemini/config/skills) ───────────────────────────────
+
+#[test]
+fn push_and_remove_skill_alias_into_antigravity_when_installed() {
+    let (pusher, _tmp) = make_pusher();
+    with_fake_home(|home| {
+        fs::create_dir_all(home.join(".gemini/config")).unwrap();
+        pusher
+            .push_skill("demo", None, b"---\nname: demo\n---\n", &[])
+            .unwrap();
+        let alias = home.join(".gemini/config/skills/demo");
+        assert!(alias.is_symlink());
+        assert!(alias.join("SKILL.md").exists());
+        assert!(pusher.remove_skill("demo").unwrap());
+        assert!(!alias.exists() && !alias.is_symlink());
+        assert!(!home.join(".agents/skills/demo").exists());
+    });
+}
+
+#[test]
+fn no_antigravity_means_no_gemini_tree_is_created() {
+    let (pusher, _tmp) = make_pusher();
+    with_fake_home(|home| {
+        pusher
+            .push_skill("demo", None, b"---\nname: demo\n---\n", &[])
+            .unwrap();
+        assert!(!home.join(".gemini").exists());
+    });
+}

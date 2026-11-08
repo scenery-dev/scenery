@@ -482,8 +482,8 @@ pub fn detect_claude_code() -> Option<ClientConfig> {
 }
 
 /// Detect all supported AI clients: Claude Code, Claude Desktop, Cursor,
-/// Windsurf, VS Code, Gemini CLI (6 clients always), plus Codex CLI when
-/// built with the `daemon` feature (7 clients — see the Codex block in
+/// Windsurf, VS Code, Gemini CLI, Antigravity (always), plus Codex CLI when
+/// built with the `daemon` feature (see the Codex block in
 /// [`detect_ai_clients_in`]).
 pub fn detect_ai_clients() -> Vec<ClientConfig> {
     match home_dir() {
@@ -586,6 +586,19 @@ fn detect_ai_clients_in(
         clients.push(ClientConfig {
             name: "Gemini CLI".to_string(),
             config_path: gemini_config,
+            mcp_key: "mcpServers".to_string(),
+            already_configured: already,
+            format: ConfigFormat::Json,
+        });
+    }
+
+    // Google Antigravity (IDE, CLI and 2.0 app share one config) — see
+    // `antigravity_configs`. Same `mcpServers` JSON shape as Windsurf.
+    for (name, config_path) in antigravity_configs(home) {
+        let already = is_scenery_configured(&config_path, "mcpServers", ConfigFormat::Json);
+        clients.push(ClientConfig {
+            name,
+            config_path,
             mcp_key: "mcpServers".to_string(),
             already_configured: already,
             format: ConfigFormat::Json,
@@ -1286,6 +1299,45 @@ fn claude_desktop_config_path(home: &std::path::Path) -> Option<PathBuf> {
         let _ = home;
         None
     }
+}
+
+/// Antigravity's global MCP config locations as `(client name, path)` pairs.
+///
+/// Official docs (antigravity.google/docs/mcp): the CLI, IDE and app share
+/// `~/.gemini/config/mcp_config.json`. Older IDE builds used
+/// `~/.gemini/antigravity/mcp_config.json`; current builds still keep OAuth
+/// tokens in `~/.gemini/antigravity/`, so that directory alone does not mean
+/// the legacy file is in use. Rules:
+/// - `~/.gemini/config/` exists -> "Antigravity" at the current path.
+/// - the legacy file exists -> it is also governed (named "Antigravity" when
+///   the current path is absent, else "Antigravity (legacy)").
+/// - only the legacy directory exists (no `config/`) -> legacy path.
+///
+/// Same path on macOS, Linux and Windows (`~` is the home dir).
+fn antigravity_configs(home: &std::path::Path) -> Vec<(String, PathBuf)> {
+    let gemini = home.join(".gemini");
+    let current_dir = gemini.join("config");
+    let legacy_dir = gemini.join("antigravity");
+    let legacy_file = legacy_dir.join("mcp_config.json");
+    let mut found = Vec::new();
+    let has_current = current_dir.exists();
+    if has_current {
+        found.push((
+            "Antigravity".to_string(),
+            current_dir.join("mcp_config.json"),
+        ));
+    }
+    if legacy_file.exists() {
+        let name = if has_current {
+            "Antigravity (legacy)"
+        } else {
+            "Antigravity"
+        };
+        found.push((name.to_string(), legacy_file));
+    } else if !has_current && legacy_dir.exists() {
+        found.push(("Antigravity".to_string(), legacy_file));
+    }
+    found
 }
 
 /// Return VS Code's per-user config directory (`Code/User/`) for the current
@@ -3126,6 +3178,103 @@ mod tests {
         assert!(names.contains(&"VS Code"));
         assert!(names.contains(&"Gemini CLI"));
 
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // ── Antigravity detection ─────────────────────────────────────────────────
+
+    fn antigravity_names(tmp: &std::path::Path) -> Vec<(String, PathBuf)> {
+        detect_ai_clients_in(tmp, tmp)
+            .into_iter()
+            .filter(|c| c.name.starts_with("Antigravity"))
+            .map(|c| (c.name, c.config_path))
+            .collect()
+    }
+
+    #[test]
+    fn detect_antigravity_current_path() {
+        let tmp = temp_root("detect-ag-current");
+        fs::create_dir_all(tmp.join(".gemini").join("config")).unwrap();
+        let found = antigravity_names(&tmp);
+        assert_eq!(
+            found,
+            vec![(
+                "Antigravity".to_string(),
+                tmp.join(".gemini/config/mcp_config.json")
+            )]
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn detect_antigravity_legacy_only_when_no_current_dir() {
+        let tmp = temp_root("detect-ag-legacy");
+        fs::create_dir_all(tmp.join(".gemini").join("antigravity")).unwrap();
+        let found = antigravity_names(&tmp);
+        assert_eq!(
+            found,
+            vec![(
+                "Antigravity".to_string(),
+                tmp.join(".gemini/antigravity/mcp_config.json")
+            )]
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn antigravity_token_dir_does_not_imply_legacy_config() {
+        // 2.0 keeps mcp_oauth_tokens.json in ~/.gemini/antigravity/.
+        let tmp = temp_root("detect-ag-tokens");
+        fs::create_dir_all(tmp.join(".gemini/config")).unwrap();
+        fs::create_dir_all(tmp.join(".gemini/antigravity")).unwrap();
+        fs::write(tmp.join(".gemini/antigravity/mcp_oauth_tokens.json"), "{}").unwrap();
+        assert_eq!(antigravity_names(&tmp).len(), 1);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn detect_antigravity_both_paths_governs_both() {
+        let tmp = temp_root("detect-ag-both");
+        fs::create_dir_all(tmp.join(".gemini/config")).unwrap();
+        fs::create_dir_all(tmp.join(".gemini/antigravity")).unwrap();
+        fs::write(tmp.join(".gemini/antigravity/mcp_config.json"), "{}").unwrap();
+        let names: Vec<String> = antigravity_names(&tmp).into_iter().map(|c| c.0).collect();
+        assert_eq!(names, vec!["Antigravity", "Antigravity (legacy)"]);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn no_gemini_dir_means_no_antigravity() {
+        let tmp = temp_root("detect-ag-none");
+        fs::create_dir_all(&tmp).unwrap();
+        assert!(antigravity_names(&tmp).is_empty());
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn antigravity_write_preserves_serverurl_entries_and_adds_stdio_shim() {
+        let tmp = temp_root("antigravity-write");
+        let dir = tmp.join(".gemini").join("config");
+        fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("mcp_config.json");
+        fs::write(
+            &config_path,
+            r#"{"mcpServers":{"remote":{"serverUrl":"https://x.example/mcp","headers":{"A":"b"}}}}"#,
+        )
+        .unwrap();
+        let config = detect_ai_clients_in(&tmp, &tmp)
+            .into_iter()
+            .find(|c| c.name == "Antigravity")
+            .unwrap();
+        with_fake_home(&tmp, || write_mcp_entry(&config)).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(json["mcpServers"]["scenery"]["command"], expected_command());
+        assert_eq!(
+            json["mcpServers"]["remote"]["serverUrl"],
+            "https://x.example/mcp"
+        );
+        assert_eq!(json["mcpServers"]["remote"]["headers"]["A"], "b");
         let _ = fs::remove_dir_all(&tmp);
     }
 

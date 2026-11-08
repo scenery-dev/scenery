@@ -33,6 +33,7 @@ fn make_all_client_dirs(home: &Path) {
         home.join(".cursor"),
         home.join(".codeium/windsurf"),
         home.join(".gemini"),
+        home.join(".gemini/config"),
         home.join(".codex"),
         desktop_dir(home),
         vscode_user_dir(home),
@@ -49,6 +50,7 @@ fn client_path(home: &Path, name: &str) -> PathBuf {
         "Windsurf" => home.join(".codeium/windsurf/mcp_config.json"),
         "VS Code" => vscode_user_dir(home).join("mcp.json"),
         "Gemini CLI" => home.join(".gemini/settings.json"),
+        "Antigravity" => home.join(".gemini/config/mcp_config.json"),
         "Codex" => home.join(".codex/config.toml"),
         other => panic!("unknown client {other}"),
     }
@@ -275,6 +277,10 @@ fn untouched_configs_round_trip_byte_identical_for_every_client() {
             ("Windsurf", WINDSURF_MIN),
             ("Codex", CODEX_TOML),
             ("Gemini CLI", "{\n\t\"theme\": \"x\"\n}"),
+            (
+                "Antigravity",
+                "{\n  // mine\n  \"mcpServers\": {\"r\": {\"serverUrl\": \"https://x/mcp\"},},\n}\n",
+            ),
             ("Claude Desktop", "{\"mcpServers\":{}}\n"),
             ("Cursor", "{\r\n  \"mcpServers\": {}\r\n}\r\n"),
             ("VS Code", "{\n  // c\n  \"servers\": {},\n}\n"),
@@ -480,5 +486,55 @@ fn uninstall_creates_and_leaves_no_settings_lock() {
         remove_lock_files(&mut report);
         assert!(!claude.join("settings.lock").exists());
         assert!(!home.join(".claude.json.lock").exists());
+    });
+}
+
+#[test]
+fn antigravity_jsonc_edit_after_setup_keeps_comments_and_the_edit() {
+    let home = temp_dir("antigravity-edit");
+    with_fake_home(&home, || {
+        make_all_client_dirs(&home);
+        let path = client_path(&home, "Antigravity");
+        let seed = "// my antigravity servers\n{\n  \"mcpServers\": {\n    // remote one\n    \"r\": {\"serverUrl\": \"https://x/mcp\",},\n  },\n}\n";
+        fs::write(&path, seed).unwrap();
+        setup_all();
+        let t = fs::read_to_string(&path).unwrap();
+        assert!(t.contains("\"scenery\""), "{t}");
+        let t = t.replacen(
+            "\"mcpServers\": {",
+            "\"mcpServers\": {\n    \"later\": {\"command\": \"l\"},",
+            1,
+        );
+        fs::write(&path, t).unwrap();
+        let report = uninstall();
+        let after = fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("// my antigravity servers") && after.contains("// remote one"),
+            "{after}"
+        );
+        assert!(
+            after.contains("\"later\"")
+                && after.contains("serverUrl")
+                && !after.contains("scenery"),
+            "{after}"
+        );
+        assert!(report
+            .kept
+            .iter()
+            .any(|k| k.name == "later" && k.location == "Antigravity"));
+    });
+}
+
+#[test]
+fn antigravity_untouched_config_round_trips_and_absent_file_is_deleted() {
+    let home = temp_dir("antigravity-absent");
+    with_fake_home(&home, || {
+        make_all_client_dirs(&home);
+        let path = client_path(&home, "Antigravity");
+        assert!(!path.exists());
+        setup_all();
+        assert!(path.exists());
+        uninstall();
+        assert!(!path.exists(), "file Scenery created must be removed");
     });
 }

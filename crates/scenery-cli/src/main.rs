@@ -5399,7 +5399,7 @@ async fn cmd_mcp_setup(client: Option<&str>, dry_run: bool, rotate_local_key: bo
         if clients.is_empty() {
             anyhow::bail!(
                 "No supported AI clients detected. \
-                 Install Claude Code, Cursor, Windsurf, VS Code, Gemini CLI, Codex CLI, or \
+                 Install Claude Code, Cursor, Windsurf, VS Code, Gemini CLI, Codex CLI, Antigravity, or \
                  Claude Desktop first, or use --dry-run to preview the entry."
             );
         }

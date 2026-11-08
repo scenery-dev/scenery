@@ -276,7 +276,7 @@ fn is_governed_entry(value: &serde_json::Value, registry_url: &str) -> bool {
         }
     }
 
-    if let Some(url) = value.get("url").and_then(|v| v.as_str()) {
+    if let Some(url) = remote_url_of(value) {
         if url_host_matches(url, registry_url) {
             return true;
         }
@@ -334,7 +334,7 @@ fn build_detail(client: &ClientConfig, key: &str, value: &serde_json::Value) -> 
                 .collect()
         })
         .unwrap_or_default();
-    let raw_url = value.get("url").and_then(|v| v.as_str());
+    let raw_url = remote_url_of(value);
     let type_field = value.get("type").and_then(|v| v.as_str());
 
     let command_basename = command.map(command_basename_of);
@@ -363,6 +363,16 @@ fn object_keys(value: &serde_json::Value, field: &str) -> Vec<String> {
         .and_then(|v| v.as_object())
         .map(|obj| obj.keys().cloned().collect())
         .unwrap_or_default()
+}
+
+/// The remote endpoint of an MCP config entry, whichever field the client
+/// uses for it: `url` (Claude Code, Cursor, VS Code, Codex, Gemini SSE),
+/// `serverUrl` (Windsurf, Antigravity) or `httpUrl` (Gemini CLI streamable
+/// HTTP). Read for classification only, like the other raw fields.
+fn remote_url_of(value: &serde_json::Value) -> Option<&str> {
+    ["url", "serverUrl", "httpUrl"]
+        .iter()
+        .find_map(|k| value.get(*k).and_then(|v| v.as_str()))
 }
 
 fn infer_transport(
@@ -899,7 +909,7 @@ pub(crate) fn migrate_mcp_config(value: &serde_json::Value) -> serde_json::Value
                 .collect()
         })
         .unwrap_or_default();
-    let raw_url = value.get("url").and_then(|v| v.as_str());
+    let raw_url = remote_url_of(value);
     let type_field = value.get("type").and_then(|v| v.as_str());
 
     let command_basename = command.and_then(migrate_command_basename_of);
@@ -1429,6 +1439,31 @@ mod tests {
             Some("https://other-vendor.example.com")
         );
 
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn serverurl_and_httpurl_remote_entries_are_reported_and_gateway_recognized() {
+        let tmp = temp_root("serverurl-httpurl");
+        let client = write_json_client(
+            &tmp,
+            "Antigravity",
+            "mcpServers",
+            serde_json::json!({
+                "ag-remote": {"serverUrl": "https://other-vendor.example.com/mcp"},
+                "gem-remote": {"httpUrl": "https://gem-vendor.example.com/mcp"},
+                "brokered": {"serverUrl": "https://app.scenery.dev/gateway/mcp/x"}
+            }),
+        );
+        let (state, _guard) = temp_state();
+        let items = collect_mcp_discoveries(&[client], &state, "https://app.scenery.dev");
+        assert_eq!(items.len(), 2, "gateway serverUrl entry must be governed");
+        for item in &items {
+            assert_eq!(item.detail.transport, "http");
+        }
+        let urls: Vec<_> = items.iter().filter_map(|i| i.detail.url.clone()).collect();
+        assert!(urls.contains(&"https://other-vendor.example.com".to_string()));
+        assert!(urls.contains(&"https://gem-vendor.example.com".to_string()));
         let _ = fs::remove_dir_all(&tmp);
     }
 

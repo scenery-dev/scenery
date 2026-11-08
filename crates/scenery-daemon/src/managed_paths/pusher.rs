@@ -302,6 +302,16 @@ impl ManagedPathsPusher {
             }
         }
 
+        // Antigravity does not scan `~/.agents/skills`; its global skills dir is
+        // `~/.gemini/config/skills`. Alias there too when Antigravity is
+        // installed. Best-effort: a failure never fails the push.
+        if let Some(dir) = antigravity_skills_link_dir() {
+            match super::links::link_dir(&skill_dir, &dir.join(slug)) {
+                Ok(mode) => debug!(slug, ?mode, "pusher: linked skill for Antigravity"),
+                Err(e) => warn!(slug, error = %e, "pusher: failed to link skill for Antigravity"),
+            }
+        }
+
         info!(slug, dest = %skill_dir.display(), "pusher: skill pushed to ~/.agents/skills/");
         Ok(outcome)
     }
@@ -340,6 +350,15 @@ impl ManagedPathsPusher {
         match super::links::unlink_dir(&link_path) {
             Ok(()) => removed |= link_present,
             Err(e) => warn!(slug, error = %e, "pusher: failed to unlink skill for Claude Code"),
+        }
+
+        if let Some(dir) = antigravity_skills_link_dir() {
+            let alias = dir.join(slug);
+            let present = alias.symlink_metadata().is_ok();
+            match super::links::unlink_dir(&alias) {
+                Ok(()) => removed |= present,
+                Err(e) => warn!(slug, error = %e, "pusher: failed to unlink skill for Antigravity"),
+            }
         }
 
         // Remove the canonical directory.
@@ -924,6 +943,14 @@ fn resolve_skills_dir() -> Result<PathBuf> {
 /// symlinks here — never real content.
 fn resolve_claude_link_dir() -> Result<PathBuf> {
     Ok(resolve_home()?.join(".claude").join("skills"))
+}
+
+/// Antigravity's global skills dir, `~/.gemini/config/skills/`, returned only
+/// when Antigravity is present (`~/.gemini/config/` exists) so a machine
+/// without it never gets a stray `~/.gemini` tree. Same path on every OS.
+pub(crate) fn antigravity_skills_link_dir() -> Option<PathBuf> {
+    let config = resolve_home().ok()?.join(".gemini").join("config");
+    config.is_dir().then(|| config.join("skills"))
 }
 
 /// Return `true` if the F2-managed copy for `slug` is present on disk, i.e.

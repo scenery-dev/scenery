@@ -449,13 +449,25 @@ fn remove_managed_artifacts(_plan: &Plan, report: &mut RestoreReport) {
         &["~/.claude/skills"],
         report,
     );
+    // Antigravity alias root (`~/.gemini/config/skills`); same rule as above.
+    remove_marked_dirs(
+        &home.join(".gemini").join("config").join("skills"),
+        RemovedKind::ManagedSkill,
+        "~/.gemini/config/skills",
+        &["~/.gemini/config/skills"],
+        report,
+    );
     remove_marked_dirs(
         &home.join(".agents").join("skills"),
         RemovedKind::ManagedSkill,
         "~/.agents/skills",
         // The alias at the Claude path was removed by the sweep above, so a
         // skill that lived at both is reported once, naming both locations.
-        &["~/.agents/skills", "~/.claude/skills"],
+        &[
+            "~/.agents/skills",
+            "~/.claude/skills",
+            "~/.gemini/config/skills",
+        ],
         report,
     );
     remove_marked_dirs(
