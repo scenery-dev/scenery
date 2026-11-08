@@ -616,11 +616,12 @@ async fn dispatch_event(
             // `None` means the backend omitted the `revocations` key
             // (older backend, before this feature shipped) — leave the
             // local cache untouched. `Some(list)` — even `Some(vec![])` —
-            // is the backend's current authoritative set: replace the
-            // local cache wholesale (this is how an admin "unblock"
-            // propagates — the entry just drops out of the next
-            // snapshot), then converge anything still installed locally
-            // that is now revoked. Do this FIRST, before the install
+            // is the backend's current set of revocations. Listed entries
+            // are (re)asserted; since 2.2.0 an entry that merely drops out
+            // of the list is NOT lifted — only a verified signed `cleared`
+            // statement (carried by the entry, or by a live `unrevoke`)
+            // lifts a revocation. Then converge anything still installed
+            // locally that is revoked. Do this FIRST, before the install
             // reconciliation below, so a revoked artifact can never be
             // (re)installed by the same snapshot that is supposed to be
             // removing it.

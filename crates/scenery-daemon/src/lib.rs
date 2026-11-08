@@ -3243,3 +3243,39 @@ mod backend_entry_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod registry_origin_tests {
+    use super::{pin_registry_origin, registry_origin_matches};
+    use scenery_core::state::AppState;
+
+    fn state() -> (tempfile::TempDir, AppState) {
+        let d = tempfile::tempdir().unwrap();
+        let st = AppState::bootstrap_in(
+            camino::Utf8PathBuf::from_path_buf(d.path().to_path_buf()).unwrap(),
+        )
+        .unwrap();
+        (d, st)
+    }
+
+    /// M3: the first start pins the origin; a daemon later pointed at a
+    /// different registry refuses to sync until the user re-pairs.
+    #[test]
+    fn a_registry_other_than_the_paired_one_refuses_sync() {
+        let (_d, st) = state();
+        assert!(
+            registry_origin_matches(&st, "https://a.example"),
+            "unpinned: nothing to compare"
+        );
+        pin_registry_origin(&st, "https://app.scenery.dev");
+        assert!(registry_origin_matches(&st, "https://app.scenery.dev"));
+        assert!(!registry_origin_matches(&st, "https://evil.example"));
+        assert!(!registry_origin_matches(
+            &st,
+            "https://app.scenery.dev.evil.example"
+        ));
+        // pinning again never overwrites.
+        pin_registry_origin(&st, "https://evil.example");
+        assert!(registry_origin_matches(&st, "https://app.scenery.dev"));
+    }
+}
