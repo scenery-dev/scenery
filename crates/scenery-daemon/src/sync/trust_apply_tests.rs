@@ -222,3 +222,88 @@ fn first_verified_snapshot_pins_the_org_once() {
     pin_org_from_snapshot(&st, Some("other-org"), &[(TYP_ORG_POLICY, &env)]);
     assert_eq!(verifier::device_org(&st).as_deref(), Some(ORG));
 }
+
+#[derive(Clone, Default)]
+struct LogBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogBuf {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+    type Writer = LogBuf;
+    fn make_writer(&'a self) -> LogBuf {
+        self.clone()
+    }
+}
+
+/// Run `f` with WARN-and-up logging captured; returns what was logged.
+fn warnings_during<F: FnOnce()>(f: F) -> String {
+    let buf = LogBuf::default();
+    let sub = tracing_subscriber::fmt()
+        .with_writer(buf.clone())
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .finish();
+    tracing::subscriber::with_default(sub, f);
+    let bytes = buf.0.lock().unwrap().clone();
+    String::from_utf8(bytes).unwrap()
+}
+
+#[test]
+fn classify_clear_separates_normal_revoked_from_a_mismatched_clear() {
+    assert_eq!(classify_clear(STATUS_CLEARED, true), ClearOutcome::Clears);
+    assert_eq!(
+        classify_clear(STATUS_CLEARED, false),
+        ClearOutcome::Mismatch
+    );
+    assert_eq!(
+        classify_clear(STATUS_REVOKED, true),
+        ClearOutcome::StillRevoked
+    );
+    assert_eq!(
+        classify_clear(STATUS_REVOKED, false),
+        ClearOutcome::StillRevoked
+    );
+}
+
+#[test]
+fn verified_clear_does_not_warn_for_a_normal_revoked_item() {
+    let (_d, st) = paired();
+    let revoked = rev_env("*", "srv-1", 3, STATUS_REVOKED);
+    let logged = warnings_during(|| {
+        assert!(!verified_clear(
+            &st,
+            "mcp_server",
+            "srv-1",
+            None,
+            Some(&revoked)
+        ));
+    });
+    assert!(logged.is_empty(), "unexpected WARN: {logged}");
+}
+
+#[test]
+fn verified_clear_warns_when_a_cleared_statement_is_for_another_subject() {
+    let (_d, st) = paired();
+    let cleared = rev_env("*", "srv-1", 4, STATUS_CLEARED);
+    let logged = warnings_during(|| {
+        assert!(!verified_clear(
+            &st,
+            "mcp_server",
+            "srv-2",
+            None,
+            Some(&cleared)
+        ));
+    });
+    assert!(
+        logged.contains("does not clear this artifact"),
+        "expected WARN, got: {logged}"
+    );
+}

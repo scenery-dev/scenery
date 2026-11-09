@@ -4,7 +4,7 @@
 #![cfg(unix)]
 
 use camino::Utf8PathBuf;
-use scenery_core::state::{AppState, McpInstallRow};
+use scenery_core::state::AppState;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Output, Stdio};
 
@@ -55,101 +55,36 @@ impl Env {
     }
 }
 
-fn seed_pending(state: &AppState, name: &str) {
-    let cfg = r#"{"command":"npx","args":["-y","pkg"],"env":{"TOKEN":"x"}}"#;
-    let def = scenery_core::approvals::definition_from_config(&serde_json::from_str(cfg).unwrap())
-        .unwrap();
-    let row = McpInstallRow {
-        mcp_server_id: format!("srv-{name}"),
-        installation_id: format!("00000000-0000-0000-0000-00000000000{}", name.len()),
-        mcp_server_name: name.to_string(),
-        package_source: "npm".into(),
-        version_pin: None,
-        server_config: Some(cfg.into()),
-        auth_type: "none".into(),
-        gateway_server_id: None,
-        gateway_url: None,
-    };
-    state
-        .upsert_mcp_install_gated(&row, Some(&def.approval_hash()), Some("pending"), None)
-        .unwrap();
-}
-
 fn text(b: &[u8]) -> String {
     String::from_utf8_lossy(b).to_string()
 }
 
 #[test]
-fn approve_refuses_without_a_controlling_terminal_and_approves_nothing() {
+fn trust_reset_needs_a_terminal() {
     let env = Env::new();
-    let state = env.state();
-    seed_pending(&state, "GitHub");
-
-    let out = env.run(&["approve", "GitHub"]);
-    assert!(!out.status.success(), "must fail: {}", text(&out.stdout));
-    assert!(
-        text(&out.stderr).contains("controlling terminal"),
-        "stderr: {}",
-        text(&out.stderr)
-    );
-    assert!(scenery_core::approvals::list_approvals(&state)
-        .unwrap()
-        .is_empty());
-    assert_eq!(
-        scenery_core::approvals::list_pending(&state).unwrap().len(),
-        1
-    );
-
-    // There is no --yes bypass.
-    let out = env.run(&["approve", "GitHub", "--yes"]);
-    assert!(!out.status.success());
-    assert!(scenery_core::approvals::list_approvals(&state)
-        .unwrap()
-        .is_empty());
-}
-
-#[test]
-fn revoke_and_trust_reset_also_need_a_terminal() {
-    let env = Env::new();
-    let state = env.state();
-    let def = scenery_core::approvals::StdioDefinition::new("npx".into(), vec![], vec![]);
-    scenery_core::approvals::insert_approval(&state, &def, "x").unwrap();
-    let hash = def.approval_hash();
-    let out = env.run(&["approvals", "revoke", &hash[..8]]);
-    assert!(!out.status.success());
-    assert!(text(&out.stderr).contains("controlling terminal"));
-    assert!(scenery_core::approvals::is_approved(&state, &hash).unwrap());
-
     let out = env.run(&["trust", "reset", "https://registry.example"]);
     assert!(!out.status.success());
     assert!(text(&out.stderr).contains("controlling terminal"));
 }
 
 #[test]
-fn pending_lists_the_exact_command_and_signer_free_servers() {
+fn device_approval_commands_are_gone() {
     let env = Env::new();
-    seed_pending(&env.state(), "GitHub");
-    let out = env.run(&["pending"]);
-    assert!(out.status.success(), "{}", text(&out.stderr));
-    let s = text(&out.stdout);
-    for needle in ["GitHub", "npx -y pkg", "TOKEN", "scenery approve"] {
-        assert!(s.contains(needle), "{needle} missing from:\n{s}");
+    for args in [
+        &["pending"][..],
+        &["approve", "GitHub"],
+        &["deny", "GitHub"],
+        &["approvals", "list"],
+        &["approvals", "revoke", "abcd"],
+    ] {
+        let out = env.run(args);
+        assert!(!out.status.success(), "{args:?} must not exist");
+        assert!(
+            text(&out.stderr).contains("unrecognized subcommand"),
+            "{args:?}: {}",
+            text(&out.stderr)
+        );
     }
-    // Env VALUES are never printed.
-    assert!(!s.contains("\"x\""));
-}
-
-#[test]
-fn deny_drops_the_pending_entry() {
-    let env = Env::new();
-    let state = env.state();
-    seed_pending(&state, "GitHub");
-    let out = env.run(&["deny", "GitHub", "--registry-url", "http://127.0.0.1:9"]);
-    assert!(out.status.success(), "{}", text(&out.stderr));
-    assert!(scenery_core::approvals::list_pending(&state)
-        .unwrap()
-        .is_empty());
-    assert!(state.list_mcp_installs().unwrap().is_empty());
 }
 
 #[test]

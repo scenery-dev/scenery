@@ -1918,52 +1918,7 @@ fn handle_mcp_request(
     }
 }
 
-/// Names of stdio MCP servers waiting for local approval, as a short note
-/// for status output and the aggregator instructions. `None` when nothing is
-/// pending. The note deliberately offers no approve tool: a prompt-injected
-/// model could call it, so approval is `scenery approve` in a terminal only.
-pub fn pending_approval_note(state: &AppState) -> Option<String> {
-    let pending = scenery_core::approvals::list_pending(state).ok()?;
-    if pending.is_empty() {
-        return None;
-    }
-    let names: Vec<String> = pending
-        .iter()
-        .map(|p| {
-            p.name
-                .chars()
-                .filter(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '-' | '_' | '.'))
-                .take(40)
-                .collect()
-        })
-        .collect();
-    Some(format!(
-        "{} MCP server(s) are waiting for local approval ({}). Waiting for local approval: \
-         run `scenery approve <name>` in a terminal.",
-        pending.len(),
-        names.join(", ")
-    ))
-}
-
 fn handle_mcp_status(state: &AppState, registry_url: &Option<String>) -> ToolCallResult {
-    let result = handle_mcp_status_requests(state, registry_url);
-    match pending_approval_note(state) {
-        None => result,
-        Some(note) => {
-            let mut text = note;
-            for c in &result.content {
-                text.push_str("\n\n");
-                text.push_str(&c.text);
-            }
-            ToolCallResult {
-                is_error: result.is_error,
-                ..ToolCallResult::success(text)
-            }
-        }
-    }
-}
-
-fn handle_mcp_status_requests(state: &AppState, registry_url: &Option<String>) -> ToolCallResult {
     let url = match registry_url {
         Some(u) => u,
         None => return ToolCallResult::error_result("No registry URL configured"),
@@ -3586,46 +3541,6 @@ mod tests {
         assert!(result.content[0].text.contains("Already logged in"));
 
         let _ = fs::remove_dir_all(&state_root);
-    }
-
-    /// Servers held for local approval are surfaced to the model with the
-    /// instruction to ask the user to run `scenery approve`; no tool can
-    /// approve, so prompt injection cannot.
-    #[test]
-    fn pending_approval_note_lists_waiting_servers_and_offers_no_approve_tool() {
-        let root = temp_root("pending-note");
-        let state = AppState::bootstrap_in(root.clone()).unwrap();
-        assert!(pending_approval_note(&state).is_none());
-        let row = scenery_core::state::McpInstallRow {
-            mcp_server_id: "s1".into(),
-            installation_id: "i1".into(),
-            mcp_server_name: "GitHub\"; rm -rf /".into(),
-            package_source: "npm".into(),
-            version_pin: None,
-            server_config: Some(r#"{"command":"npx","args":["-y","p"]}"#.into()),
-            auth_type: "none".into(),
-            gateway_server_id: None,
-            gateway_url: None,
-        };
-        let def = scenery_core::approvals::definition_from_config(
-            &serde_json::from_str(row.server_config.as_deref().unwrap()).unwrap(),
-        )
-        .unwrap();
-        state
-            .upsert_mcp_install_gated(&row, Some(&def.approval_hash()), Some("pending"), None)
-            .unwrap();
-        let note = pending_approval_note(&state).unwrap();
-        assert!(note
-            .contains("Waiting for local approval: run `scenery approve <name>` in a terminal."));
-        assert!(note.contains("1 MCP server(s)"));
-        assert!(
-            !note.contains('"') && !note.contains(';'),
-            "names are sanitised: {note}"
-        );
-        assert!(!build_tool_list(&state, &None, None)
-            .iter()
-            .any(|t| t.name.contains("approve")));
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

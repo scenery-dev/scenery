@@ -1,13 +1,5 @@
 #![allow(clippy::unwrap_used)]
 use super::*;
-use camino::Utf8PathBuf;
-
-fn state() -> (tempfile::TempDir, AppState) {
-    let d = tempfile::tempdir().unwrap();
-    let st = AppState::bootstrap_in(Utf8PathBuf::from_path_buf(d.path().to_path_buf()).unwrap())
-        .unwrap();
-    (d, st)
-}
 
 fn row(cfg: &str, gateway: Option<&str>) -> McpInstallRow {
     McpInstallRow {
@@ -24,71 +16,45 @@ fn row(cfg: &str, gateway: Option<&str>) -> McpInstallRow {
 }
 
 #[test]
-fn unapproved_stdio_is_pending_then_allowed_after_approval() {
-    let (_d, st) = state();
+fn verified_stdio_is_allowed_with_no_approval() {
     let r = row(
         r#"{"command":"npx","args":["-y","pkg"],"env":{"TOKEN":"x"}}"#,
         None,
     );
-    let def = stdio_definition(&r).unwrap();
-    assert_eq!(check(&st, &r), Gate::Pending(def.approval_hash()));
-    approvals::insert_approval(&st, &def, "Srv").unwrap();
-    assert_eq!(check(&st, &r), Gate::Allowed);
+    assert!(stdio_definition(&r).is_some());
+    assert_eq!(check(&r), Gate::Allowed);
 }
 
 #[test]
-fn args_change_reprompts_env_value_change_does_not() {
-    let (_d, st) = state();
-    let r1 = row(
-        r#"{"command":"npx","args":["-y","pkg"],"env":{"TOKEN":"a"}}"#,
-        None,
-    );
-    approvals::insert_approval(&st, &stdio_definition(&r1).unwrap(), "Srv").unwrap();
-    let same_keys = row(
-        r#"{"command":"npx","args":["-y","pkg"],"env":{"TOKEN":"b"}}"#,
-        None,
-    );
-    assert_eq!(check(&st, &same_keys), Gate::Allowed);
-    let new_args = row(
-        r#"{"command":"npx","args":["-y","pkg","--evil"],"env":{"TOKEN":"a"}}"#,
-        None,
-    );
-    assert!(matches!(check(&st, &new_args), Gate::Pending(_)));
-    let new_env_key = row(
-        r#"{"command":"npx","args":["-y","pkg"],"env":{"TOKEN":"a","X":"1"}}"#,
-        None,
-    );
-    assert!(matches!(check(&st, &new_env_key), Gate::Pending(_)));
+fn denylisted_env_is_refused() {
+    for key in [
+        "LD_PRELOAD",
+        "DYLD_INSERT_LIBRARIES",
+        "NODE_OPTIONS",
+        "PATH",
+    ] {
+        let r = row(
+            &format!(r#"{{"command":"npx","args":[],"env":{{"{key}":"/x"}}}}"#),
+            None,
+        );
+        assert_eq!(
+            check(&r),
+            Gate::Refused(format!("env key {key} not allowed"))
+        );
+    }
 }
 
 #[test]
-fn denylisted_env_is_refused_even_if_approved() {
-    let (_d, st) = state();
-    let r = row(
-        r#"{"command":"npx","args":[],"env":{"LD_PRELOAD":"/x.so"}}"#,
-        None,
-    );
+fn http_and_gateway_rows_are_allowed() {
     assert_eq!(
-        check(&st, &r),
-        Gate::Refused("env key LD_PRELOAD not allowed".into())
-    );
-}
-
-#[test]
-fn http_and_gateway_rows_do_not_prompt() {
-    let (_d, st) = state();
-    assert_eq!(
-        check(&st, &row(r#"{"url":"https://x.example/mcp"}"#, None)),
+        check(&row(r#"{"url":"https://x.example/mcp"}"#, None)),
         Gate::Allowed
     );
     assert_eq!(
-        check(
-            &st,
-            &row(
-                r#"{"command":"npx","args":[]}"#,
-                Some("https://app.scenery.dev/gw/1")
-            )
-        ),
+        check(&row(
+            r#"{"command":"npx","args":[]}"#,
+            Some("https://app.scenery.dev/gw/1")
+        )),
         Gate::Allowed
     );
 }

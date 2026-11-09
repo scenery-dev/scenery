@@ -1,6 +1,5 @@
 #![allow(clippy::unwrap_used)]
 use super::*;
-use camino::Utf8PathBuf;
 
 fn def(args: &[&str], env: &[&str]) -> StdioDefinition {
     StdioDefinition::new(
@@ -80,20 +79,4 @@ fn env_denylist() {
     }
     let keys = vec!["OK".to_string(), "LD_PRELOAD".to_string()];
     assert_eq!(first_denied_env_key(&keys).as_deref(), Some("LD_PRELOAD"));
-}
-
-#[test]
-fn approvals_roundtrip() {
-    let dir = tempfile::tempdir().unwrap();
-    let st = AppState::bootstrap_in(Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap())
-        .unwrap();
-    let d = def(&["-y", "pkg"], &["T"]);
-    assert!(!is_approved(&st, &d.approval_hash()).unwrap());
-    insert_approval(&st, &d, "srv").unwrap();
-    assert!(is_approved(&st, &d.approval_hash()).unwrap());
-    let l = list_approvals(&st).unwrap();
-    assert_eq!(l.len(), 1);
-    assert_eq!(l[0].args, d.args);
-    assert!(delete_approval(&st, &d.approval_hash()).unwrap());
-    assert!(!is_approved(&st, &d.approval_hash()).unwrap());
 }

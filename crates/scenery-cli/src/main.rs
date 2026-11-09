@@ -33,7 +33,6 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use device_trust::ApprovalsCommand;
 use scenery_core::http::AsyncSendTrackedExt;
 use scenery_core::DEFAULT_REGISTRY_URL;
 
@@ -99,34 +98,6 @@ pub enum Command {
     /// Manage which registry signing keys this runner trusts.
     #[command(subcommand)]
     Trust(device_trust::TrustCommand),
-
-    /// List stdio MCP servers waiting for approval on this machine.
-    Pending,
-
-    /// Approve a pending stdio MCP server. Shows the exact command and asks on
-    /// your terminal; there is no `--yes`.
-    Approve {
-        /// Server name or a unique prefix of its hash (see `scenery pending`).
-        target: String,
-    },
-
-    /// Reject a pending stdio MCP server and remove it from this device.
-    Deny {
-        /// Server name or a unique prefix of its hash (see `scenery pending`).
-        target: String,
-        /// Registry URL to report the denial to.
-        #[arg(
-            long,
-            env = "SCENERY_REGISTRY_URL",
-            default_value = DEFAULT_REGISTRY_URL,
-            value_parser = parse_registry_url
-        )]
-        registry_url: String,
-    },
-
-    /// Review or withdraw approved stdio commands.
-    #[command(subcommand)]
-    Approvals(device_trust::ApprovalsCommand),
 
     /// Remove Scenery and restore the host to its pre-install state.
     ///
@@ -796,16 +767,6 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Auth(AuthCommand::Token { registry_url }) => cmd_auth_token(&registry_url).await,
 
         Command::Trust(cmd) => device_trust::cmd_trust(cmd).await,
-        Command::Pending => device_trust::cmd_pending(),
-        Command::Approve { target } => device_trust::cmd_approve(&target).await,
-        Command::Deny {
-            target,
-            registry_url,
-        } => device_trust::cmd_deny(&target, &registry_url).await,
-        Command::Approvals(ApprovalsCommand::List) => device_trust::cmd_approvals_list(),
-        Command::Approvals(ApprovalsCommand::Revoke { hash }) => {
-            device_trust::cmd_approvals_revoke(&hash).await
-        }
         Command::Mcp(McpCommand::Serve { server }) => cmd_mcp_serve(server).await,
         Command::Mcp(McpCommand::Setup {
             client,
@@ -1316,103 +1277,6 @@ async fn finish_auth(state: &scenery_core::state::AppState) {
             );
         }
     }
-}
-
-/// Tell a running daemon to re-evaluate stdio approvals (`approvals/changed`).
-/// `None` when the daemon is not reachable. The call carries no approval: the
-/// daemon only re-reads what this CLI already wrote after a terminal confirm.
-#[cfg(unix)]
-pub(crate) async fn notify_daemon_approvals_changed(socket_path: &str) -> Option<usize> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::UnixStream;
-    use tokio::time::{timeout, Duration};
-
-    let stream = timeout(
-        Duration::from_secs(2),
-        UnixStream::connect(socket_path.to_string()),
-    )
-    .await
-    .ok()?
-    .ok()?;
-    let (mut reader, mut writer) = stream.into_split();
-    let body = serde_json::to_vec(&serde_json::json!({
-        "jsonrpc": "2.0", "id": 1, "method": "approvals/changed", "params": {}
-    }))
-    .ok()?;
-    writer
-        .write_all(&(body.len() as u32).to_be_bytes())
-        .await
-        .ok()?;
-    writer.write_all(&body).await.ok()?;
-    writer.flush().await.ok()?;
-    let read = timeout(Duration::from_secs(15), async {
-        loop {
-            let mut len_buf = [0u8; 4];
-            reader.read_exact(&mut len_buf).await?;
-            let len = u32::from_be_bytes(len_buf) as usize;
-            if len > 16 * 1024 * 1024 {
-                return Err(tokio::io::Error::new(
-                    tokio::io::ErrorKind::InvalidData,
-                    "frame too large",
-                ));
-            }
-            let mut buf = vec![0u8; len];
-            reader.read_exact(&mut buf).await?;
-            let v: serde_json::Value = serde_json::from_slice(&buf).unwrap_or_default();
-            if v.get("id").is_some() {
-                return Ok(v);
-            }
-        }
-    })
-    .await
-    .ok()?
-    .ok()?;
-    read.get("result")?
-        .get("changed")?
-        .as_u64()
-        .map(|n| n as usize)
-}
-
-#[cfg(not(unix))]
-pub(crate) async fn notify_daemon_approvals_changed(_socket_path: &str) -> Option<usize> {
-    None
-}
-
-/// `PATCH /api/mcp-installations/{id}` from the CLI (used by `scenery deny`).
-pub(crate) async fn patch_mcp_installation(
-    state: &scenery_core::state::AppState,
-    registry_url: &str,
-    installation_id: &str,
-    new_state: &str,
-    error_message: Option<&str>,
-) -> Result<()> {
-    let token = scenery_core::auth::load_tokens(state, registry_url)
-        .ok()
-        .flatten()
-        .map(|t| t.access_token)
-        .context("not logged in to the registry")?;
-    let mut body = serde_json::json!({ "state": new_state });
-    if let Some(m) = error_message {
-        body["error_message"] = serde_json::Value::String(m.to_string());
-    }
-    let resp = scenery_core::http::async_client()
-        .context("failed to build HTTP client")?
-        .patch(format!(
-            "{}/api/mcp-installations/{installation_id}",
-            registry_url.trim_end_matches('/')
-        ))
-        .bearer_auth(token)
-        .timeout(std::time::Duration::from_secs(10))
-        .json(&body)
-        .send()
-        .await
-        .context("failed to reach the registry")?;
-    anyhow::ensure!(
-        resp.status().is_success(),
-        "registry returned HTTP {}",
-        resp.status()
-    );
-    Ok(())
 }
 
 /// Pin the registry origin (and org, when known) this device just paired

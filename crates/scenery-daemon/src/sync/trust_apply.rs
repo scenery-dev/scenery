@@ -12,7 +12,7 @@ use scenery_core::revocation::RevocationEntry;
 use scenery_core::signed::{self, Envelope};
 use scenery_core::state::AppState;
 use scenery_core::{trust, verifier};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 #[derive(Debug, serde::Deserialize)]
 struct OrgPolicyPayload {
@@ -102,6 +102,25 @@ fn sub_matches(
     t == artifact_type && key_ok && ver == version.map(str::trim).unwrap_or("")
 }
 
+/// What one verified revocation statement means for the artifact it arrived with.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ClearOutcome {
+    /// `status=cleared` for exactly this artifact.
+    Clears,
+    /// Any non-`cleared` status (normally `revoked`): not a clear, not an anomaly.
+    StillRevoked,
+    /// `status=cleared` but for a different subject: worth a warning.
+    Mismatch,
+}
+
+pub(crate) fn classify_clear(status: &str, sub_matches: bool) -> ClearOutcome {
+    match (status == signed::STATUS_CLEARED, sub_matches) {
+        (true, true) => ClearOutcome::Clears,
+        (true, false) => ClearOutcome::Mismatch,
+        (false, _) => ClearOutcome::StillRevoked,
+    }
+}
+
 /// True only when `env` is a valid `revocation.v1` `status=cleared`
 /// statement for exactly this artifact.
 pub(crate) fn verified_clear(
@@ -119,15 +138,23 @@ pub(crate) fn verified_clear(
     };
     match verifier::verify_for_device(state, signed::TYP_REVOCATION, env, None) {
         Ok(v) => {
-            let ok = v.status == signed::STATUS_CLEARED
-                && sub_matches(state, &v.sub, artifact_type, key, version);
-            if !ok {
-                warn!(
-                    artifact_type, key, sub = %v.sub, status = %v.status,
-                    "sync: revocation statement does not clear this artifact"
-                );
+            let sub_ok = sub_matches(state, &v.sub, artifact_type, key, version);
+            match classify_clear(&v.status, sub_ok) {
+                ClearOutcome::Clears => true,
+                ClearOutcome::StillRevoked => {
+                    // The normal case for every live revoked item: its
+                    // statement says `revoked`, so it is simply not a clear.
+                    debug!(artifact_type, key, "sync: revocation entry stays revoked");
+                    false
+                }
+                ClearOutcome::Mismatch => {
+                    warn!(
+                        artifact_type, key, sub = %v.sub, status = %v.status,
+                        "sync: revocation statement does not clear this artifact"
+                    );
+                    false
+                }
             }
-            ok
         }
         Err(e) => {
             warn!(error = %e, artifact_type, key, "sync: revocation clear rejected");

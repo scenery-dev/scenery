@@ -106,26 +106,8 @@ pub(crate) fn sign_plugin(
     envelope(1, TEST_KID, &st, Some(&payload))
 }
 
-/// Approve the stdio definition of every stored MCP row (tests that model an
-/// "already approved" install).
-pub(crate) fn approve_stored_stdio(state: &AppState) {
-    for row in state.list_mcp_installs().unwrap_or_default() {
-        if let Some(def) = crate::launch_gate::stdio_definition(&row) {
-            scenery_core::approvals::insert_approval(state, &def, &row.mcp_server_name)
-                .unwrap_or_default();
-        }
-    }
-}
-
-/// Approve a raw `server_config` JSON stdio definition.
-pub(crate) fn approve_config(state: &AppState, config: &serde_json::Value, name: &str) {
-    if let Some(def) = scenery_core::approvals::definition_from_config(config) {
-        scenery_core::approvals::insert_approval(state, &def, name).unwrap_or_default();
-    }
-}
-
 /// Pair the device against `registry_url`, then sign any `InstallMcp` event
-/// (and approve its stdio definition) so reconciler tests exercise install
+/// so reconciler tests exercise install
 /// behavior rather than signature plumbing. Other events pass through.
 pub(crate) fn prepare_event(
     event: crate::sync::SyncEvent,
@@ -146,9 +128,6 @@ pub(crate) fn prepare_event(
             gateway_url,
             signed: None,
         } => {
-            if let Some(cfg) = server_config.as_ref() {
-                approve_config(state, cfg, &mcp_server_name);
-            }
             let signed = sign_mcp(
                 registry_url,
                 &mcp_server_id.to_string(),

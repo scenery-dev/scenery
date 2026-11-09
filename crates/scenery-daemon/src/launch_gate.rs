@@ -1,22 +1,21 @@
-//! The launch gate: no backend-pushed stdio definition is registered,
-//! spawned, discovered or pushed to a client until the user approved its
-//! exact `(command, args, env keys)` on this machine (design 2026-11-08 §3).
+//! The launch gate. A backend-pushed stdio definition whose signed statement
+//! verified is allowed to run on install, with no local approval step (the
+//! device prompt was removed in 2.2.1; design 2026-11-08 "Decision change").
+//! The gate still refuses definitions that set a denylisted env key
+//! (`LD_*`, `DYLD_*`, `NODE_OPTIONS`, ...).
 //!
 //! Every path that turns a stored MCP row into something runnable goes
-//! through [`check`], via `mcp_row_to_backend_entry`: daemon startup, a live
-//! install, and the post-approval re-registration.
+//! through [`check`], via `mcp_row_to_backend_entry`: daemon startup and a
+//! live install.
 
 use scenery_core::approvals::{self, StdioDefinition};
-use scenery_core::state::{AppState, McpInstallRow};
-use tracing::warn;
+use scenery_core::state::McpInstallRow;
 
 /// Outcome of gating one stored MCP row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Gate {
-    /// Not a local command, or already approved by the user.
+    /// Not a local command, or a verified stdio definition: may run.
     Allowed,
-    /// A stdio definition the user has not approved yet (approval hash).
-    Pending(String),
     /// Never allowed (denylisted env key); the reason is user-facing.
     Refused(String),
 }
@@ -34,23 +33,14 @@ pub fn stdio_definition(row: &McpInstallRow) -> Option<StdioDefinition> {
 }
 
 /// Gate one row.
-pub fn check(state: &AppState, row: &McpInstallRow) -> Gate {
+pub fn check(row: &McpInstallRow) -> Gate {
     let Some(def) = stdio_definition(row) else {
         return Gate::Allowed;
     };
     if let Some(bad) = approvals::first_denied_env_key(&def.env_keys) {
         return Gate::Refused(format!("env key {bad} not allowed"));
     }
-    let hash = def.approval_hash();
-    match approvals::is_approved(state, &hash) {
-        Ok(true) => Gate::Allowed,
-        Ok(false) => Gate::Pending(hash),
-        // Fail closed: if approvals cannot be read, do not run anything.
-        Err(e) => {
-            warn!(error = %e, "launch gate: cannot read approvals; holding server as pending");
-            Gate::Pending(hash)
-        }
-    }
+    Gate::Allowed
 }
 
 #[cfg(test)]

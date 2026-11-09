@@ -1,15 +1,14 @@
-//! `scenery trust …`, `scenery pending`, `scenery approve`, `scenery deny`,
-//! `scenery approvals …` (design 2026-11-08 §2, §3).
+//! `scenery trust …` (design 2026-11-08 §2).
 //!
-//! Anything that grants trust (`trust pin`, `trust reset`, `approve`,
-//! `approvals revoke`) is human-only: it needs a controlling terminal
-//! (`/dev/tty`) and there is no `--yes`. The daemon and the MCP server have no
-//! way to call these, so prompt injection into an AI client cannot approve a
-//! command.
+//! Anything that grants trust (`trust pin`, `trust reset`) is human-only:
+//! `trust reset` needs a controlling terminal (`/dev/tty`) and there is no
+//! `--yes`. The daemon and the MCP server have no way to call these, so prompt
+//! injection into an AI client cannot change which keys are trusted.
+//! (`scenery approve` and friends were removed in 2.2.1: a verified stdio
+//! definition runs without a device prompt.)
 
 use anyhow::{Context, Result};
 use clap::Subcommand;
-use scenery_core::approvals::{self, PendingServer};
 use scenery_core::state::AppState;
 use scenery_core::trust;
 use std::io::{BufRead, Write};
@@ -34,18 +33,6 @@ pub enum TrustCommand {
     },
     /// List the keys this runner trusts, with fingerprints.
     List,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum ApprovalsCommand {
-    /// List approved stdio commands.
-    List,
-    /// Withdraw an approval (asks for confirmation on the terminal). The
-    /// server is torn down and goes back to waiting for approval.
-    Revoke {
-        /// Approval hash or a unique prefix of it.
-        hash: String,
-    },
 }
 
 // ── terminal confirmation ─────────────────────────────────────────────────────
@@ -96,212 +83,6 @@ pub(crate) fn confirm_with<R: BufRead, W: Write>(
 fn confirm_on_tty(detail: &str, prompt: &str) -> Result<bool> {
     let mut tty = open_tty()?;
     confirm_with(&mut tty.reader, &mut tty.writer, detail, prompt)
-}
-
-// ── pending selection ─────────────────────────────────────────────────────────
-
-/// Pick one pending server by exact name (case-insensitive) or hash prefix.
-pub(crate) fn select_pending<'a>(
-    pending: &'a [PendingServer],
-    needle: &str,
-) -> Result<&'a PendingServer> {
-    let n = needle.trim();
-    anyhow::ensure!(!n.is_empty(), "name or hash prefix required");
-    let by_name: Vec<&PendingServer> = pending
-        .iter()
-        .filter(|p| p.name.eq_ignore_ascii_case(n))
-        .collect();
-    let candidates = if by_name.is_empty() {
-        let lower = n.to_ascii_lowercase();
-        let by_hash: Vec<&PendingServer> = pending
-            .iter()
-            .filter(|p| lower.len() >= 4 && p.approval_hash.starts_with(&lower))
-            .collect();
-        by_hash
-    } else {
-        by_name
-    };
-    match candidates.as_slice() {
-        [one] => Ok(one),
-        [] => anyhow::bail!("no pending server matches '{n}'. Run `scenery pending`."),
-        many => anyhow::bail!(
-            "'{n}' matches {} pending servers; use a longer hash prefix",
-            many.len()
-        ),
-    }
-}
-
-fn describe(p: &PendingServer) -> String {
-    let args = if p.args.is_empty() {
-        "(none)".to_string()
-    } else {
-        p.args
-            .iter()
-            .map(|a| format!("{a:?}"))
-            .collect::<Vec<_>>()
-            .join(" ")
-    };
-    let env = if p.env_keys.is_empty() {
-        "(none)".to_string()
-    } else {
-        p.env_keys.join(", ")
-    };
-    format!(
-        "Server   : {}\nCommand  : {}\nArguments: {}\nEnv keys : {}\nSigned by: {}\nHash     : {}",
-        p.name,
-        p.command,
-        args,
-        env,
-        p.signer_kid.as_deref().unwrap_or("(unknown)"),
-        p.approval_hash,
-    )
-}
-
-// ── commands ──────────────────────────────────────────────────────────────────
-
-pub(crate) fn cmd_pending() -> Result<()> {
-    let state = AppState::bootstrap().context("failed to open state")?;
-    let pending = approvals::list_pending(&state)?;
-    if pending.is_empty() {
-        println!("No servers are waiting for approval.");
-        return Ok(());
-    }
-    println!("{} server(s) waiting for approval:\n", pending.len());
-    for p in &pending {
-        println!(
-            "  {name}\n    command : {cmd} {args}\n    env keys: {env}\n    signer  : {kid}\n    hash    : {hash}\n",
-            name = p.name,
-            cmd = p.command,
-            args = p.args.join(" "),
-            env = if p.env_keys.is_empty() { "(none)".to_string() } else { p.env_keys.join(", ") },
-            kid = p.signer_kid.as_deref().unwrap_or("(unknown)"),
-            hash = approvals::short_hash(&p.approval_hash),
-        );
-    }
-    println!("Review one and approve it with: scenery approve <name>");
-    Ok(())
-}
-
-pub(crate) async fn cmd_approve(target: &str) -> Result<()> {
-    // Terminal first: a caller without one never gets as far as reading state.
-    let mut tty = open_tty()?;
-    let state = AppState::bootstrap().context("failed to open state")?;
-    let pending = approvals::list_pending(&state)?;
-    let p = select_pending(&pending, target)?.clone();
-    let yes = confirm_with(
-        &mut tty.reader,
-        &mut tty.writer,
-        &describe(&p),
-        "Run this command on this machine?",
-    )?;
-    if !yes {
-        println!("Not approved. Nothing changed.");
-        return Ok(());
-    }
-    let def =
-        approvals::StdioDefinition::new(p.command.clone(), p.args.clone(), p.env_keys.clone());
-    anyhow::ensure!(
-        def.approval_hash() == p.approval_hash,
-        "stored definition does not match its approval hash; refusing"
-    );
-    approvals::insert_approval(&state, &def, &p.name)?;
-    println!(
-        "Approved {} ({}).",
-        p.name,
-        approvals::short_hash(&p.approval_hash)
-    );
-    match crate::notify_daemon_approvals_changed(state.socket_path().as_str()).await {
-        Some(n) => println!("Daemon updated ({n} server(s) changed)."),
-        None => println!("The daemon is not running; the server starts with it."),
-    }
-    Ok(())
-}
-
-pub(crate) async fn cmd_deny(target: &str, registry_url: &str) -> Result<()> {
-    let state = AppState::bootstrap().context("failed to open state")?;
-    let pending = approvals::list_pending(&state)?;
-    let p = select_pending(&pending, target)?.clone();
-    state
-        .delete_mcp_install(&p.mcp_server_id)
-        .context("failed to drop the pending entry")?;
-    println!("Denied {}. It was removed from this device.", p.name);
-    if let Err(e) = crate::patch_mcp_installation(
-        &state,
-        registry_url,
-        &p.installation_id,
-        "error",
-        Some("denied by user"),
-    )
-    .await
-    {
-        eprintln!("warning: could not tell the registry: {e:#}");
-    }
-    let _ = crate::notify_daemon_approvals_changed(state.socket_path().as_str()).await;
-    Ok(())
-}
-
-pub(crate) fn cmd_approvals_list() -> Result<()> {
-    let state = AppState::bootstrap().context("failed to open state")?;
-    let list = approvals::list_approvals(&state)?;
-    if list.is_empty() {
-        println!("No approved commands.");
-        return Ok(());
-    }
-    for a in &list {
-        println!(
-            "{hash}  {cmd} {args}  [env keys: {env}]  first for '{name}' on {when}",
-            hash = approvals::short_hash(&a.approval_hash),
-            cmd = a.command,
-            args = a.args.join(" "),
-            env = if a.env_keys.is_empty() {
-                "-".to_string()
-            } else {
-                a.env_keys.join(",")
-            },
-            name = a.first_server_name,
-            when = a.approved_at,
-        );
-    }
-    Ok(())
-}
-
-pub(crate) async fn cmd_approvals_revoke(prefix: &str) -> Result<()> {
-    let mut tty = open_tty()?;
-    let state = AppState::bootstrap().context("failed to open state")?;
-    let list = approvals::list_approvals(&state)?;
-    let lower = prefix.trim().to_ascii_lowercase();
-    anyhow::ensure!(lower.len() >= 4, "give at least 4 characters of the hash");
-    let hits: Vec<_> = list
-        .iter()
-        .filter(|a| a.approval_hash.starts_with(&lower))
-        .collect();
-    let a = match hits.as_slice() {
-        [one] => *one,
-        [] => anyhow::bail!("no approval matches '{prefix}'. Run `scenery approvals list`."),
-        _ => anyhow::bail!("'{prefix}' matches several approvals; use a longer prefix"),
-    };
-    let detail = format!(
-        "Command  : {} {}\nHash     : {}",
-        a.command,
-        a.args.join(" "),
-        a.approval_hash
-    );
-    if !confirm_with(
-        &mut tty.reader,
-        &mut tty.writer,
-        &detail,
-        "Withdraw this approval? Servers using it stop and wait for approval again.",
-    )? {
-        println!("Kept. Nothing changed.");
-        return Ok(());
-    }
-    approvals::delete_approval(&state, &a.approval_hash)?;
-    println!("Approval withdrawn.");
-    match crate::notify_daemon_approvals_changed(state.socket_path().as_str()).await {
-        Some(n) => println!("Daemon updated ({n} server(s) changed)."),
-        None => println!("The daemon is not running; servers hold at next start."),
-    }
-    Ok(())
 }
 
 // ── trust ─────────────────────────────────────────────────────────────────────

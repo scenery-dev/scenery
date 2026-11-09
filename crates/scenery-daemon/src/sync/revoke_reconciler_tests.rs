@@ -395,7 +395,6 @@ async fn revoke_event_tears_down_a_running_mcp_backend_and_persists_the_block() 
         gateway_url: None,
     };
     state.upsert_mcp_install(&row).unwrap();
-    crate::test_support::approve_stored_stdio(&state);
 
     let backend_registry = Arc::new(BackendRegistry::new());
     let (list_changed_tx, _rx) = tokio::sync::broadcast::channel(16);

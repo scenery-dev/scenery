@@ -5,7 +5,6 @@
 use super::*;
 use crate::managed_paths::ENV_MUTEX;
 use crate::test_support::{next_seq, pair_device, sign_mcp};
-use scenery_core::approvals;
 use scenery_core::signed::testing::envelope;
 
 const REG: &str = "http://127.0.0.1:9";
@@ -118,12 +117,6 @@ async fn unsigned_install_is_rejected_and_nothing_is_stored() {
     let reg = Arc::new(BackendRegistry::new());
     let sid = Uuid::new_v4();
     let cfg = stdio_cfg(&["-y", "pkg"]);
-    approvals::insert_approval(
-        &state,
-        &approvals::definition_from_config(&cfg).unwrap(),
-        "x",
-    )
-    .unwrap();
 
     assert!(!install(&state, &reg, None, sid, &cfg, None, None).await);
     assert!(!row_exists(&state, sid));
@@ -137,12 +130,6 @@ async fn forged_and_tampered_installs_are_rejected() {
     let reg = Arc::new(BackendRegistry::new());
     let sid = Uuid::new_v4();
     let cfg = stdio_cfg(&["-y", "pkg"]);
-    approvals::insert_approval(
-        &state,
-        &approvals::definition_from_config(&cfg).unwrap(),
-        "x",
-    )
-    .unwrap();
 
     // Signed with a key that is not trusted.
     let payload = serde_json::to_vec(&serde_json::json!({
@@ -210,7 +197,7 @@ async fn only_the_signed_definition_is_stored_never_the_unsigned_siblings() {
 }
 
 #[tokio::test]
-async fn stdio_install_waits_for_approval_and_nothing_runs_or_is_pushed() {
+async fn verified_stdio_install_registers_pushes_and_aggregates_immediately() {
     let home = Home::new();
     let state = new_state();
     let reg = Arc::new(BackendRegistry::new());
@@ -218,101 +205,64 @@ async fn stdio_install_waits_for_approval_and_nothing_runs_or_is_pushed() {
     let sid = Uuid::new_v4();
     let cfg = stdio_cfg(&["-y", "pkg"]);
 
-    install(
-        &state,
-        &reg,
-        Some(&pusher),
-        sid,
-        &cfg,
-        Some(sign(sid, &cfg, next_seq())),
-        None,
-    )
-    .await;
-
-    let pending = approvals::list_pending(&state).unwrap();
-    assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].command, "npx");
-    assert_eq!(pending[0].args, vec!["-y", "pkg"]);
-    assert_eq!(pending[0].env_keys, vec!["TOKEN"]);
-    assert_eq!(pending[0].signer_kid.as_deref(), Some("scn-test-a"));
-    assert!(!reg.has_backend("github-mcp"), "must not be registered");
-    assert!(!home.claude_json().exists(), "push_mcp must not run");
-    let mirror = std::fs::read_to_string(state.root_dir.join("managed-mcp.json")).unwrap();
     assert!(
-        !mirror.contains("npx"),
-        "pending servers are not mirrored: {mirror}"
+        install(
+            &state,
+            &reg,
+            Some(&pusher),
+            sid,
+            &cfg,
+            Some(sign(sid, &cfg, next_seq())),
+            None,
+        )
+        .await
     );
-}
 
-#[tokio::test]
-async fn approval_registers_pushes_and_arguments_edit_reprompts() {
-    let home = Home::new();
-    let state = new_state();
-    let reg = Arc::new(BackendRegistry::new());
-    let pusher = Arc::new(ManagedPathsPusher::new(&state));
-    let (tx, _rx) = broadcast::channel(16);
-    let sid = Uuid::new_v4();
-    let cfg = stdio_cfg(&["-y", "pkg"]);
-
-    install(
-        &state,
-        &reg,
-        Some(&pusher),
-        sid,
-        &cfg,
-        Some(sign(sid, &cfg, next_seq())),
-        None,
-    )
-    .await;
-    assert!(!reg.has_backend("github-mcp"));
-
-    // `scenery approve` writes the approval, then pokes the daemon.
-    approvals::insert_approval(
-        &state,
-        &approvals::definition_from_config(&cfg).unwrap(),
-        "GitHub MCP",
-    )
-    .unwrap();
-    let n =
-        crate::approval_flow::apply_approvals_changed(&state, REG, &reg, Some(&pusher), &tx).await;
-    assert_eq!(n, 1);
-    assert!(reg.has_backend("github-mcp"), "approved server registers");
+    assert!(row_exists(&state, sid));
+    assert!(reg.has_backend("github-mcp"), "must be registered at once");
     assert!(std::fs::read_to_string(home.claude_json())
         .unwrap()
         .contains("github-mcp"));
-    assert!(approvals::list_pending(&state).unwrap().is_empty());
+    let mirror = std::fs::read_to_string(state.root_dir.join("managed-mcp.json")).unwrap();
+    assert!(mirror.contains("npx"), "must be in the aggregate: {mirror}");
+    let rows = state.mcp_approval_rows().unwrap();
+    assert!(rows[&sid.to_string()].1.is_none(), "no approval state");
+}
 
-    // The admin edits the args: a new signed statement, a new hash, a new prompt.
-    let edited = stdio_cfg(&["-y", "pkg", "--extra"]);
+#[tokio::test]
+async fn edited_args_reinstall_immediately_with_no_prompt() {
+    let _h = Home::new();
+    let state = new_state();
+    let reg = Arc::new(BackendRegistry::new());
+    let pusher = ManagedPathsPusher::new(&state);
+    let sid = Uuid::new_v4();
+    let cfg = stdio_cfg(&["-y", "pkg"]);
     install(
         &state,
         &reg,
         Some(&pusher),
         sid,
-        &edited,
-        Some(sign(sid, &edited, next_seq())),
+        &cfg,
+        Some(sign(sid, &cfg, next_seq())),
         None,
     )
     .await;
-    assert!(!reg.has_backend("github-mcp"), "the old process must stop");
-    assert_eq!(approvals::list_pending(&state).unwrap().len(), 1);
-
-    // Withdrawing an approval puts a running server back to pending.
-    approvals::insert_approval(
-        &state,
-        &approvals::definition_from_config(&edited).unwrap(),
-        "GitHub MCP",
-    )
-    .unwrap();
-    crate::approval_flow::apply_approvals_changed(&state, REG, &reg, Some(&pusher), &tx).await;
+    let edited = stdio_cfg(&["-y", "pkg", "--extra"]);
+    assert!(
+        install(
+            &state,
+            &reg,
+            Some(&pusher),
+            sid,
+            &edited,
+            Some(sign(sid, &edited, next_seq())),
+            None,
+        )
+        .await
+    );
     assert!(reg.has_backend("github-mcp"));
-    let hash = approvals::definition_from_config(&edited)
-        .unwrap()
-        .approval_hash();
-    approvals::delete_approval(&state, &hash).unwrap();
-    crate::approval_flow::apply_approvals_changed(&state, REG, &reg, Some(&pusher), &tx).await;
-    assert!(!reg.has_backend("github-mcp"));
-    assert_eq!(approvals::list_pending(&state).unwrap().len(), 1);
+    let row = state.list_mcp_installs().unwrap().remove(0);
+    assert!(row.server_config.unwrap().contains("--extra"));
 }
 
 #[tokio::test]
@@ -429,42 +379,90 @@ async fn unsigned_deactivate_is_applied() {
     assert!(!row_exists(&state, sid));
 }
 
-#[test]
-fn startup_holds_unapproved_stdio_and_registers_approved_after_approval() {
-    let _h = Home::new();
-    let state = new_state();
-    let reg = Arc::new(BackendRegistry::new());
-    let cfg = stdio_cfg(&["-y", "pkg"]);
-    let row = scenery_core::state::McpInstallRow {
+fn stored_row(name: &str, cfg: &serde_json::Value) -> scenery_core::state::McpInstallRow {
+    scenery_core::state::McpInstallRow {
         mcp_server_id: Uuid::new_v4().to_string(),
         installation_id: Uuid::new_v4().to_string(),
-        mcp_server_name: "GitHub MCP".into(),
+        mcp_server_name: name.into(),
         package_source: "@org/server".into(),
         version_pin: None,
         server_config: Some(cfg.to_string()),
         auth_type: "none".into(),
         gateway_server_id: None,
         gateway_url: None,
-    };
-    // A row written by a pre-2.2.0 runner: nothing is grandfathered.
-    state.upsert_mcp_install(&row).unwrap();
-    let (tx, _rx) = broadcast::channel(16);
-    crate::load_managed_mcp_into_registry(&state, &reg, tx.clone(), REG);
-    assert!(
-        !reg.has_backend("github-mcp"),
-        "startup must not register an unapproved stdio server"
-    );
-    assert_eq!(approvals::list_pending(&state).unwrap().len(), 1);
+    }
+}
 
-    approvals::insert_approval(
-        &state,
-        &approvals::definition_from_config(&cfg).unwrap(),
-        "x",
-    )
-    .unwrap();
-    crate::load_managed_mcp_into_registry(&state, &reg, tx, REG);
-    assert!(reg.has_backend("github-mcp"));
-    assert!(approvals::list_pending(&state).unwrap().is_empty());
+#[test]
+fn startup_activates_rows_a_220_runner_left_pending() {
+    let _h = Home::new();
+    let state = new_state();
+    let reg = Arc::new(BackendRegistry::new());
+    let cfg = stdio_cfg(&["-y", "pkg"]);
+    let row = stored_row("GitHub MCP", &cfg);
+    let hash = crate::launch_gate::stdio_definition(&row)
+        .unwrap()
+        .approval_hash();
+    state
+        .upsert_mcp_install_gated(&row, Some(&hash), Some("pending"), None)
+        .unwrap();
+    let (tx, _rx) = broadcast::channel(16);
+    let activated = crate::load_managed_mcp_into_registry(&state, &reg, tx, REG);
+    assert_eq!(activated.len(), 1);
+    assert!(reg.has_backend("github-mcp"), "pending row must run");
+    let rows = state.mcp_approval_rows().unwrap();
+    assert!(
+        rows[&row.mcp_server_id].1.is_none(),
+        "nothing stays pending"
+    );
+}
+
+#[test]
+fn startup_does_not_run_a_pending_row_with_a_denylisted_env_key() {
+    let _h = Home::new();
+    let state = new_state();
+    let reg = Arc::new(BackendRegistry::new());
+    let cfg = serde_json::json!({"command": "npx", "args": [], "env": {"LD_PRELOAD": "/x.so"}});
+    let row = stored_row("Evil", &cfg);
+    state
+        .upsert_mcp_install_gated(&row, Some("h"), Some("pending"), None)
+        .unwrap();
+    let (tx, _rx) = broadcast::channel(16);
+    let activated = crate::load_managed_mcp_into_registry(&state, &reg, tx, REG);
+    assert!(activated.is_empty());
+    assert!(!reg.has_backend("evil"));
+    let rows = state.mcp_approval_rows().unwrap();
+    assert!(rows[&row.mcp_server_id].1.is_none(), "not left pending");
+}
+
+#[test]
+fn snapshot_reinstalls_a_server_the_backend_still_holds_as_pending_approval() {
+    let _h = Home::new();
+    let state = new_state();
+    let reg = BackendRegistry::new();
+    let cfg = stdio_cfg(&["-y", "pkg"]);
+    let row = stored_row("GitHub MCP", &cfg);
+    state.upsert_mcp_install(&row).unwrap();
+    let record = crate::sync::sse_client::McpInstallationRecord {
+        installation_id: Uuid::parse_str(&row.installation_id).unwrap(),
+        mcp_server_id: Uuid::parse_str(&row.mcp_server_id).unwrap(),
+        mcp_server_name: row.mcp_server_name.clone(),
+        package_source: row.package_source.clone(),
+        version_pin: None,
+        server_config: Some(cfg),
+        auth_type: "none".into(),
+        gateway_server_id: None,
+        gateway_url: None,
+        state: "pending_approval".into(),
+        signed: None,
+    };
+    let events = build_derived_mcp_events_blocking_for_test(vec![record], &state, &reg);
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, SyncEvent::InstallMcp { .. })),
+        "must re-run the install so the backend flips to installed"
+    );
 }
 
 #[tokio::test]

@@ -64,13 +64,13 @@
 //!   These are acceptable at startup time and must NOT be moved into the accept
 //!   loop or per-connection handlers without adding `spawn_blocking`.
 
-pub mod approval_flow;
 mod auth_dispatch;
 mod binary_watch;
 pub mod daemon_takeover;
 pub mod daemon_takeover_signal;
 mod instance_lock;
 pub mod launch_gate;
+pub mod legacy_pending;
 pub mod managed_paths;
 mod mcp_http;
 mod oauth_listener;
@@ -383,7 +383,18 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     // keep it current so gateway calls survive portal-JWT rotation.
     init_gateway_token_refresh(&state, &registry_url);
     let vh_registry = Arc::new(build_stub_registry());
-    load_managed_mcp_into_registry(&state, &vh_registry, list_changed_tx.clone(), &registry_url);
+    let activated_mcp = load_managed_mcp_into_registry(
+        &state,
+        &vh_registry,
+        list_changed_tx.clone(),
+        &registry_url,
+    );
+    if !activated_mcp.is_empty() {
+        // Rows a 2.2.0 runner held as pending are no longer excluded.
+        if let Err(e) = sync::reconciler::write_managed_mcp_json(&state) {
+            warn!(error = %e, "startup: failed to rewrite managed-mcp.json after activation");
+        }
+    }
 
     // ── Active-skill self-heal ────────────────────────────────────────────────
     //
@@ -393,6 +404,19 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     // `push_missing_active_skills` already covers the surviving job.
     if std::env::var("SCENERY_DISABLE_FILESYSTEM_RECONCILER").is_err() {
         let one_shot_pusher = managed_paths::ManagedPathsPusher::new(&state);
+
+        // Servers activated from a 2.2.0 pending hold were removed from the
+        // clients' configs; put them back.
+        for row in &activated_mcp {
+            let slug = mcp_server_slug(&row.mcp_server_name);
+            if let Err(e) = one_shot_pusher.push_mcp(
+                &slug,
+                Some(&row.installation_id),
+                row.gateway_url.is_some(),
+            ) {
+                warn!(slug = %slug, error = %e, "startup: push_mcp for activated server failed (non-fatal)");
+            }
+        }
 
         // Self-heal: re-push any active installed skill whose canonical
         // ~/.agents/skills dir is missing (e.g. removed by the v1.0.67 cleanup
@@ -1762,20 +1786,6 @@ impl SyncController {
         }
     }
 
-    /// Re-evaluate every stored MCP server against the current device
-    /// approvals (`approvals/changed`): register newly approved servers and
-    /// tear down any whose approval was revoked. Returns how many changed.
-    pub(crate) async fn apply_approvals(&self) -> usize {
-        approval_flow::apply_approvals_changed(
-            &self.state,
-            &self.registry_url,
-            &self.backend_registry,
-            self.pusher.as_ref(),
-            &self.list_changed_tx,
-        )
-        .await
-    }
-
     /// Return a clone of the reconciler's event-channel sender, if the sync
     /// subsystem has started. `None` before the device is paired (no auth
     /// token yet) — callers should skip whatever they wanted to feed in.
@@ -2710,32 +2720,30 @@ fn load_managed_mcp_into_registry(
     registry: &Arc<BackendRegistry>,
     list_changed_tx: tokio::sync::broadcast::Sender<()>,
     registry_url: &str,
-) {
+) -> Vec<scenery_core::state::McpInstallRow> {
     let rows = match state.list_mcp_installs() {
         Ok(r) => r,
         Err(e) => {
             warn!(error = %e, "startup: failed to read mcp_installations — no managed MCP backends loaded");
-            return;
+            return Vec::new();
         }
     };
 
     // Gateway-brokered backends authenticate via the shared live token handle
     // (kept current by the refresh task), so no token is captured here.
     let mut loaded = 0usize;
-    let mut pending = 0usize;
+    let mut activated: Vec<scenery_core::state::McpInstallRow> = Vec::new();
     let state_arc = Arc::new(state.clone());
     let approval_rows = state.mcp_approval_rows().unwrap_or_default();
     for row in &rows {
-        match mcp_row_to_backend_entry(state, row) {
+        let legacy_pending = legacy_pending::is_legacy_pending(&approval_rows, &row.mcp_server_id);
+        match mcp_row_to_backend_entry(row) {
             Launch::Ready(entry) => {
-                // Approved while the daemon was down: flip the stored state
-                // and tell the backend the server is live now.
-                let was_pending = approval_rows
-                    .get(&row.mcp_server_id)
-                    .and_then(|(_, s, _)| s.as_deref())
-                    == Some(approval_flow::STATE_PENDING);
-                if was_pending {
-                    approval_flow::mark_approved_at_startup(&state_arc, registry_url, row);
+                // Held by a 2.2.0 runner awaiting local approval: that prompt
+                // is gone, so activate it now and tell the backend.
+                if legacy_pending {
+                    legacy_pending::activate_at_startup(&state_arc, registry_url, row);
+                    activated.push(row.clone());
                 }
                 let server_id = entry.server_id.clone();
                 registry.register_backend(entry.clone());
@@ -2743,18 +2751,15 @@ fn load_managed_mcp_into_registry(
                 loaded += 1;
                 spawn_tool_discovery(Arc::clone(registry), entry, list_changed_tx.clone());
             }
-            Launch::Pending(hash) => {
-                // Not grandfathered: an unapproved stdio server is held until
-                // the user runs `scenery approve`. Nothing is spawned.
-                pending += 1;
-                approval_flow::mark_pending_at_startup(&state_arc, registry_url, row, &hash);
-            }
             Launch::Refused(why) => {
                 warn!(
                     mcp_server_id = %row.mcp_server_id,
                     reason = %why,
                     "startup: refusing managed MCP backend"
                 );
+                if legacy_pending {
+                    legacy_pending::refuse_at_startup(&state_arc, registry_url, row, &why);
+                }
             }
             Launch::Unusable => {
                 warn!(
@@ -2766,18 +2771,13 @@ fn load_managed_mcp_into_registry(
         }
     }
 
-    if pending > 0 {
-        info!(
-            count = pending,
-            "startup: stdio MCP servers waiting for local approval (run `scenery pending`)"
-        );
-    }
     if loaded > 0 {
         info!(
             count = loaded,
             "startup: managed MCP backends registered in aggregator (tool discovery running in background)"
         );
     }
+    activated
 }
 
 /// Fetch a backend's tool list off-thread and re-register the entry with the
@@ -2957,16 +2957,12 @@ fn init_gateway_token_refresh(state: &AppState, registry_url: &str) {
     });
 }
 
-/// What a stored MCP row may become after the launch gate (design 2026-11-08
-/// §3). The gate sits here so startup load, live install and post-approval
-/// registration all share it.
+/// What a stored MCP row may become after the launch gate. The gate sits here
+/// so startup load and live install share it.
 #[derive(Debug)]
 pub enum Launch {
-    /// Gated through (or never needed gating): register this backend.
+    /// Passed the gate: register this backend.
     Ready(BackendEntry),
-    /// A stdio definition the user has not approved; carries its approval
-    /// hash. Nothing may be registered, spawned or discovered.
-    Pending(String),
     /// Refused outright (for example a denylisted env key).
     Refused(String),
     /// No usable transport in the config.
@@ -2974,12 +2970,8 @@ pub enum Launch {
 }
 
 /// Gate and translate a stored row.
-pub fn mcp_row_to_backend_entry(
-    state: &AppState,
-    row: &scenery_core::state::McpInstallRow,
-) -> Launch {
-    match launch_gate::check(state, row) {
-        launch_gate::Gate::Pending(hash) => Launch::Pending(hash),
+pub fn mcp_row_to_backend_entry(row: &scenery_core::state::McpInstallRow) -> Launch {
+    match launch_gate::check(row) {
         launch_gate::Gate::Refused(why) => Launch::Refused(why),
         launch_gate::Gate::Allowed => match translate_mcp_row(row) {
             Some(entry) => Launch::Ready(entry),
@@ -3146,23 +3138,13 @@ mod slug_tests {
 #[cfg(test)]
 mod backend_entry_tests {
     use super::{gateway_token_handle, Launch};
-    use scenery_core::state::{AppState, McpInstallRow};
+    use scenery_core::state::McpInstallRow;
     use scenery_mcp::aggregator::{resolve_live_token, BackendTransport};
 
     fn mcp_row_to_backend_entry(
         row: &McpInstallRow,
     ) -> Option<scenery_mcp::aggregator::BackendEntry> {
-        let dir = tempfile::tempdir().unwrap();
-        let state = AppState::bootstrap_in(
-            camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap(),
-        )
-        .unwrap();
-        // Stdio rows need an approval to translate; approve first so these
-        // tests keep exercising the translation rules only.
-        if let Some(def) = crate::launch_gate::stdio_definition(row) {
-            scenery_core::approvals::insert_approval(&state, &def, "t").unwrap();
-        }
-        match super::mcp_row_to_backend_entry(&state, row) {
+        match super::mcp_row_to_backend_entry(row) {
             Launch::Ready(e) => Some(e),
             _ => None,
         }

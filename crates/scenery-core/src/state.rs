@@ -689,12 +689,10 @@ impl AppState {
 
     /// Upsert a row and its approval bookkeeping in one transaction.
     ///
-    /// `approval_state` is `Some("pending")` while a stdio definition waits
-    /// for `scenery approve`, `Some("approved")` once it may run, and `None`
-    /// for definitions that do not spawn a local command. `signed_envelope`
-    /// is the verified envelope JSON, kept so `scenery pending` can show the
-    /// signer and so a snapshot can tell a changed statement from a
-    /// redelivery.
+    /// `approval_state` is `None` for every row since 2.2.1 (no device
+    /// prompt); only a 2.2.0 runner wrote `Some("pending")`, which startup
+    /// clears. `signed_envelope` is the verified envelope JSON, kept so a
+    /// snapshot can tell a changed statement from a redelivery.
     pub fn upsert_mcp_install_gated(
         &self,
         row: &McpInstallRow,
@@ -981,8 +979,8 @@ CREATE TABLE IF NOT EXISTS mcp_installations (
 /// Signing and device-approval tables (design 2026-11-08 §2, §3).
 ///
 /// `trusted_keys` is written only by the CLI (`scenery trust pin`). The
-/// daemon never writes it. `stdio_approvals` is written only by
-/// `scenery approve` after a TTY confirmation.
+/// daemon never writes it. `stdio_approvals` was written by `scenery approve`
+/// in 2.2.0; it is unused since 2.2.1 and kept so the schema stays additive.
 const SCHEMA_SIGNING_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS trusted_keys (
     origin    TEXT NOT NULL,

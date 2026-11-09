@@ -2121,41 +2121,16 @@ async fn handle_install_mcp(
         gateway_url: gateway_url.clone(),
     };
 
-    // Launch gate (design §3): a stdio definition runs only after the user
-    // approved its exact command, args and env keys on this machine.
-    let gate = crate::launch_gate::check(state, &row);
+    // Launch gate: a verified stdio definition runs on install (no local
+    // approval since 2.2.1); only denylisted env keys are refused.
     let stdio_hash = crate::launch_gate::stdio_definition(&row).map(|d| d.approval_hash());
-    match &gate {
-        crate::launch_gate::Gate::Refused(why) => {
-            warn!(mcp_server_id = %mcp_server_id, reason = %why, "reconciler: MCP definition refused");
-            report_mcp_installation_status(
-                installation_id,
-                "error",
-                Some(why),
-                registry_url,
-                state,
-            )
+    if let crate::launch_gate::Gate::Refused(why) = crate::launch_gate::check(&row) {
+        warn!(mcp_server_id = %mcp_server_id, reason = %why, "reconciler: MCP definition refused");
+        report_mcp_installation_status(installation_id, "error", Some(&why), registry_url, state)
             .await;
-            increment_mcp_errors(stats);
-            return false;
-        }
-        crate::launch_gate::Gate::Pending(hash) => {
-            return hold_mcp_pending(
-                state,
-                registry_url,
-                backend_registry,
-                pusher,
-                &row,
-                hash,
-                envelope_json.as_deref(),
-            )
-            .await;
-        }
-        crate::launch_gate::Gate::Allowed => {}
+        increment_mcp_errors(stats);
+        return false;
     }
-    let approval_state = stdio_hash
-        .as_ref()
-        .map(|_| crate::approval_flow::STATE_APPROVED);
 
     let state_clone = Arc::clone(state);
     let row_for_db = row.clone();
@@ -2166,7 +2141,7 @@ async fn handle_install_mcp(
             .upsert_mcp_install_gated(
                 &row_for_db,
                 hash_for_db.as_deref(),
-                approval_state,
+                None,
                 env_for_db.as_deref(),
             )
             .context("failed to upsert mcp_installations row")?;
@@ -2209,7 +2184,7 @@ async fn handle_install_mcp(
             // sees it immediately without a daemon restart. Gateway-brokered
             // backends read the shared live token handle at call time (kept
             // current by the daemon's refresh task).
-            match crate::mcp_row_to_backend_entry(state, &row) {
+            match crate::mcp_row_to_backend_entry(&row) {
                 crate::Launch::Ready(entry) => {
                     let sid = entry.server_id.clone();
                     backend_registry.register_backend(entry.clone());
@@ -2260,82 +2235,6 @@ async fn handle_install_mcp(
             false
         }
     }
-}
-
-/// A verified stdio definition the user has not approved: store the row as
-/// pending, stop anything already running for the server, and tell the
-/// backend and the user. Nothing is registered, spawned, discovered or pushed
-/// to a client. Returns whether the live tool list changed.
-async fn hold_mcp_pending(
-    state: &Arc<AppState>,
-    registry_url: &str,
-    backend_registry: &Arc<BackendRegistry>,
-    pusher: Option<&ManagedPathsPusher>,
-    row: &McpInstallRow,
-    hash: &str,
-    envelope_json: Option<&str>,
-) -> bool {
-    // An edit of an already-approved server arrives here with a new hash:
-    // the old process must stop and leave the client's config until the new
-    // definition is approved. Resolve the key from the previous row's name.
-    let st = Arc::clone(state);
-    let id = row.mcp_server_id.clone();
-    let previous_slug = tokio::task::spawn_blocking(move || {
-        st.list_mcp_installs().ok().and_then(|rows| {
-            rows.into_iter()
-                .find(|r| r.mcp_server_id == id)
-                .map(|r| crate::mcp_server_slug(&r.mcp_server_name))
-        })
-    })
-    .await
-    .ok()
-    .flatten();
-    let mut changed = false;
-    for slug in previous_slug
-        .into_iter()
-        .chain(std::iter::once(crate::mcp_server_slug(
-            &row.mcp_server_name,
-        )))
-    {
-        changed |= backend_registry.remove_backend(&slug);
-        if let Some(p) = pusher {
-            if let Err(e) = p.remove_mcp(&slug) {
-                warn!(slug = %slug, error = %e, "reconciler: remove_mcp for pending server failed");
-            }
-        }
-    }
-
-    let st = Arc::clone(state);
-    let row_db = row.clone();
-    let hash_db = hash.to_string();
-    let env_db = envelope_json.map(str::to_string);
-    let stored = tokio::task::spawn_blocking(move || {
-        st.upsert_mcp_install_gated(
-            &row_db,
-            Some(&hash_db),
-            Some(crate::approval_flow::STATE_PENDING),
-            env_db.as_deref(),
-        )?;
-        write_managed_mcp_json(&st)
-    })
-    .await;
-    if !matches!(stored, Ok(Ok(()))) {
-        warn!(mcp_server_id = %row.mcp_server_id, "reconciler: failed to store pending MCP server");
-        return changed;
-    }
-    if let (Some(def), Ok(iid)) = (
-        crate::launch_gate::stdio_definition(row),
-        Uuid::parse_str(&row.installation_id),
-    ) {
-        info!(
-            mcp_server_id = %row.mcp_server_id,
-            approval_hash = %hash,
-            "reconciler: stdio MCP server waiting for local approval"
-        );
-        crate::approval_flow::report_pending(state, registry_url, iid, &def, hash).await;
-        crate::approval_flow::notify_pending_once(state, hash, &row.mcp_server_name);
-    }
-    changed
 }
 
 // ── Shared MCP teardown ───────────────────────────────────────────────────────
@@ -2558,15 +2457,8 @@ pub(crate) fn write_managed_mcp_json(state: &AppState) -> Result<()> {
         .list_mcp_installs()
         .context("failed to read mcp_installations for managed-mcp.json")?;
 
-    let pending: std::collections::HashSet<String> = scenery_core::approvals::list_pending(state)
-        .map(|p| p.into_iter().map(|s| s.mcp_server_id).collect())
-        .unwrap_or_default();
     let mut servers = Vec::with_capacity(rows.len());
     for row in &rows {
-        // Servers waiting for local approval are not mirrored here.
-        if pending.contains(&row.mcp_server_id) {
-            continue;
-        }
         let server_config: Option<serde_json::Value> = row
             .server_config
             .as_deref()
@@ -2621,31 +2513,10 @@ pub(crate) fn write_managed_mcp_json(state: &AppState) -> Result<()> {
 ///
 /// Mirrors `report_installation_status` for skills. Fire-and-forget: failures
 /// are logged at WARN but do not affect local state.
-async fn report_mcp_installation_status(
+pub(crate) async fn report_mcp_installation_status(
     installation_id: Uuid,
     status: &str,
     error_message: Option<&str>,
-    registry_url: &str,
-    state: &Arc<AppState>,
-) {
-    report_mcp_installation_status_with_hash(
-        installation_id,
-        status,
-        error_message,
-        None,
-        registry_url,
-        state,
-    )
-    .await;
-}
-
-/// As [`report_mcp_installation_status`], plus the optional `approval_hash`
-/// sent with `pending_approval`.
-pub(crate) async fn report_mcp_installation_status_with_hash(
-    installation_id: Uuid,
-    status: &str,
-    error_message: Option<&str>,
-    approval_hash: Option<&str>,
     registry_url: &str,
     state: &Arc<AppState>,
 ) {
@@ -2658,9 +2529,6 @@ pub(crate) async fn report_mcp_installation_status_with_hash(
     let mut body = serde_json::json!({ "state": status });
     if let Some(msg) = error_message {
         body["error_message"] = serde_json::Value::String(msg.to_string());
-    }
-    if let Some(h) = approval_hash {
-        body["approval_hash"] = serde_json::Value::String(h.to_string());
     }
 
     let reg_url = registry_url.to_string();
@@ -3954,8 +3822,8 @@ pub(crate) fn build_derived_mcp_events_blocking(
         let server_id_str = record.mcp_server_id.to_string();
         match record.state.as_str() {
             // "desired", "installing", "installed" → server should be present locally.
-            // "pending_approval" is a server this device holds for local approval;
-            // the backend keeps it in the snapshot so the row is not an orphan.
+            // "pending_approval" is a state only a 2.2.0 runner reported; it is
+            // treated like "desired" so the install runs and activates it.
             "desired" | "installing" | "installed" | "pending_approval" => {
                 if !installed_ids.contains(&server_id_str) {
                     events.push(SyncEvent::InstallMcp {
@@ -3970,12 +3838,16 @@ pub(crate) fn build_derived_mcp_events_blocking(
                         gateway_url: record.gateway_url.clone(),
                         signed: record.signed.clone(),
                     });
-                } else if statement_changed(&approval_rows, &server_id_str, record.signed.as_ref())
+                } else if record.state == "pending_approval"
+                    || statement_changed(&approval_rows, &server_id_str, record.signed.as_ref())
                 {
-                    // Same server, new signed statement (an edit while
-                    // approved, or a row stored before 2.2.0 that was never
+                    // Same server, but either the backend still holds it as
+                    // `pending_approval` from a 2.2.0 runner (the prompt is
+                    // gone: re-run the install so it activates and the backend
+                    // is told `installed`), or a new signed statement arrived
+                    // (an edit, or a row stored before 2.2.0 that was never
                     // verified): run it through the install handler again so
-                    // it is verified, re-gated and re-registered.
+                    // it is verified, gated and re-registered.
                     events.push(SyncEvent::InstallMcp {
                         installation_id: record.installation_id,
                         mcp_server_id: record.mcp_server_id,
@@ -4436,9 +4308,6 @@ pub(crate) async fn handle_install_mcp_for_test(
     backend_registry: &Arc<BackendRegistry>,
 ) -> bool {
     crate::test_support::pair_device(state, registry_url);
-    if let Some(cfg) = server_config.as_ref() {
-        crate::test_support::approve_config(state, cfg, &mcp_server_name);
-    }
     let signed = crate::test_support::sign_mcp(
         registry_url,
         &mcp_server_id.to_string(),
