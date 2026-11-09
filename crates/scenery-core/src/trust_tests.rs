@@ -11,12 +11,64 @@ fn state() -> (tempfile::TempDir, AppState) {
 }
 
 #[test]
-fn placeholders_are_not_trust_roots() {
-    assert!(is_compiled_origin("https://app.scenery.dev"));
-    assert!(compiled_keys("https://app.scenery.dev").is_empty());
+fn compiled_roots_are_real_keys() {
+    for o in [
+        "https://app.scenery.dev",
+        "https://dev.scenery.dev",
+        "https://demo.scenery.dev",
+    ] {
+        assert!(is_compiled_origin(o));
+        assert_eq!(compiled_keys(o).len(), 2, "{o}");
+    }
     let (_d, st) = state();
-    assert!(!has_trust_root(&st, "https://app.scenery.dev"));
+    assert!(has_trust_root(&st, "https://app.scenery.dev"));
     assert!(!has_trust_root(&st, "https://other.example"));
+    assert!(TRUST_ROOTS
+        .iter()
+        .flat_map(|(_, ks)| ks.iter())
+        .all(|(_, k)| *k != PLACEHOLDER_KEY));
+}
+
+/// Pins the KMS public keys: a changed byte here changes who the runner trusts.
+#[test]
+fn compiled_key_fingerprints_are_pinned() {
+    let want = [
+        ("scn-prod-a", "33a4e02f6692f54a"),
+        ("scn-prod-b", "bc8da11f4901dd15"),
+        ("scn-dev-a", "cc18702ef3a98ded"),
+        ("scn-dev-b", "91e22561bd04aeaf"),
+        ("scn-demo-a", "27592e02b1ac31c5"),
+        ("scn-demo-b", "bc85e592e02ef57a"),
+    ];
+    let all: Vec<&RootKey> = TRUST_ROOTS.iter().flat_map(|(_, ks)| ks.iter()).collect();
+    assert_eq!(all.len(), want.len());
+    for (kid, prefix) in want {
+        let (_, k) = all.iter().find(|(k, _)| *k == kid).unwrap();
+        assert!(fingerprint(k).starts_with(prefix), "{kid}");
+    }
+}
+
+/// Real AWS KMS `Sign` (ED25519_SHA_512, RAW) output, made on the dev box with
+/// `alias/scenery-sign-dev-a`, must pass dalek `verify_strict` under the
+/// compiled-in `scn-dev-a` key.
+#[test]
+fn kms_vector_verifies_under_compiled_dev_key() {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use ed25519_dalek::{Signature, VerifyingKey};
+    let v: serde_json::Value =
+        serde_json::from_str(include_str!("../tests/fixtures/kms_signing_vector.json")).unwrap();
+    let dec = |k: &str| URL_SAFE_NO_PAD.decode(v[k].as_str().unwrap()).unwrap();
+    let (stmt, sig, pk) = (dec("statement"), dec("sig"), dec("public_key"));
+    assert!(stmt.len() <= 4096);
+    let key = compiled_keys("https://dev.scenery.dev")
+        .into_iter()
+        .find(|k| k.kid == v["kid"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(key.pubkey.as_slice(), pk.as_slice());
+    let vk = VerifyingKey::from_bytes(&key.pubkey).unwrap();
+    let sig = Signature::from_slice(&sig).unwrap();
+    vk.verify_strict(&stmt, &sig).unwrap();
 }
 
 #[test]

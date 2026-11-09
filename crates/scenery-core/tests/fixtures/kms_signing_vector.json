@@ -1,0 +1,7 @@
+{
+  "kid": "scn-dev-a",
+  "alg": "ed25519",
+  "statement": "eyJpYXQiOjE3OTMwMDAwMDAsImlzcyI6Imh0dHBzOi8vZGV2LnNjZW5lcnkuZGV2Iiwib3JnIjoiKiIsInNlcSI6MSwic3RhdHVzIjoicmV2b2tlZCIsInN1YiI6InJldm9jYXRpb246bWNwOmttcy1maXh0dXJlOjEiLCJ0eXAiOiJzY2VuZXJ5LnJldm9jYXRpb24udjEifQ",
+  "sig": "O9SvY_-gRnegXl5PEuH3-J8dHpKcdSmE9fTcbZczsmUdmrbpws1tZN808pFnxoptEVqQDYT25jVceYlDaXfhDg",
+  "public_key": "xCeqsMs4Y-50UthyEmw7BZPyLlNEeweG-JspLRslbTo"
+}
