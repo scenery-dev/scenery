@@ -166,16 +166,75 @@ log "Downloading scenery ${VERSION} for ${TRIPLE}..."
 download_url "${TARBALL_URL}" "${TMPDIR}/${TARBALL}"
 
 # ---------------------------------------------------------------------------
-# Verify integrity against the published SHA-256 BEFORE extracting or running
-# anything from the tarball. A mismatch (corruption or tampering) aborts.
+# Verify authenticity + integrity BEFORE extracting or running anything.
+#
+# Order:
+#   1. minisign present  -> verify SHA256SUMS.minisig against the embedded key
+#   2. else gh present   -> `gh attestation verify` (GitHub build provenance)
+#   3. else              -> fail, unless SCENERY_INSTALL_SKIP_SIG=1
+# Then the tarball is checked against the (verified) SHA256SUMS. A signature
+# failure never falls through to a weaker method.
 # ---------------------------------------------------------------------------
 
-log_verbose "Verifying checksum..."
-download_url "${TARBALL_URL}.sha256" "${TMPDIR}/${TARBALL}.sha256"
+# Release signing key (minisign public key, the second line of the .pub file).
+# Scenery release signing key (minisign key id 73F4BD707C872144), generated 2026-11-08.
+# (see context/2026-11-08-runner-signing-design.md). While this is the
+# placeholder, minisign verification is treated as unavailable.
+MINISIGN_PUBKEY="RWREIYd8cL30cy+6WHSsE+0oVDsfoPu/1BmCGX4rb0Fgs4+ZC3jjW/gp"
+GH_REPO="scenery-dev/scenery"
 
-_EXPECTED="$(awk '{print $1}' "${TMPDIR}/${TARBALL}.sha256" | tr '[:upper:]' '[:lower:]')"
+SUMS_URL="https://github.com/scenery-dev/scenery/releases/download/${TAG}/SHA256SUMS"
+download_url "${SUMS_URL}" "${TMPDIR}/SHA256SUMS" || {
+    log_error "Could not download SHA256SUMS for ${TAG} — refusing to install."
+    exit 1
+}
+
+case "${MINISIGN_PUBKEY}" in
+    *PLACEHOLDER*) _KEY_SET=0 ;;
+    *)             _KEY_SET=1 ;;
+esac
+
+_SIG_OK=0
+if [ "${_KEY_SET}" = "1" ] && command -v minisign >/dev/null 2>&1; then
+    log_verbose "Verifying SHA256SUMS signature with minisign..."
+    download_url "${SUMS_URL}.minisig" "${TMPDIR}/SHA256SUMS.minisig" || {
+        log_error "Could not download SHA256SUMS.minisig — refusing to install."
+        exit 1
+    }
+    if ! minisign -Vm "${TMPDIR}/SHA256SUMS" -x "${TMPDIR}/SHA256SUMS.minisig" -P "${MINISIGN_PUBKEY}" >/dev/null 2>&1; then
+        log_error "minisign signature verification FAILED for SHA256SUMS — refusing to install."
+        exit 1
+    fi
+    _SIG_OK=1
+    log_verbose "minisign signature verified."
+elif command -v gh >/dev/null 2>&1; then
+    log_verbose "Verifying SHA256SUMS build provenance with gh attestation..."
+    if ! gh attestation verify "${TMPDIR}/SHA256SUMS" --repo "${GH_REPO}" >/dev/null 2>&1; then
+        log_error "gh attestation verification FAILED for SHA256SUMS — refusing to install."
+        log_error "(gh must be authenticated: run 'gh auth login'.)"
+        exit 1
+    fi
+    _SIG_OK=1
+    log_verbose "Build provenance verified."
+fi
+
+if [ "${_SIG_OK}" = "0" ]; then
+    if [ "${SCENERY_INSTALL_SKIP_SIG:-0}" = "1" ]; then
+        log "WARNING: skipping signature verification (SCENERY_INSTALL_SKIP_SIG=1)."
+        log "WARNING: only the SHA-256 from the same origin is checked; this does not prove authenticity."
+    else
+        log_error "Cannot verify the release signature: neither minisign nor gh is available."
+        log_error "Install one (brew install minisign, or https://cli.github.com), or use Homebrew:"
+        log_error "  brew tap scenery-dev/tap && brew install scenery-dev/tap/scenery"
+        log_error "To install without signature verification (not recommended): SCENERY_INSTALL_SKIP_SIG=1"
+        exit 1
+    fi
+fi
+
+log_verbose "Verifying checksum..."
+_EXPECTED="$(awk -v f="${TARBALL}" '$2==f || $2=="*" f {print $1}' "${TMPDIR}/SHA256SUMS" | head -1 | tr '[:upper:]' '[:lower:]')"
 if [ -z "${_EXPECTED}" ]; then
-    log_error "Empty or missing checksum for ${TARBALL} — refusing to install."
+    log_error "${TARBALL} is not listed in SHA256SUMS — refusing to install."
     exit 1
 fi
 
