@@ -11,7 +11,10 @@
 //! 5. On EOF, error, or watchdog timeout: exponential backoff (1s → 60s max),
 //!    then reconnect.
 //! 6. On HTTP 401: attempts token refresh via a new `AuthClient` call, then
-//!    reconnects immediately.
+//!    reconnects after the normal backoff. After more than
+//!    `MAX_CONSECUTIVE_POST_REFRESH_UNAUTHORIZED` consecutive post-refresh 401s
+//!    the client enters degraded mode (5 min, then 15 min retries) but never
+//!    stops; only an explicit 403 `device_revoked`/`user_revoked` does.
 //!
 //! # Watchdog
 //!
@@ -96,6 +99,44 @@ impl LineSplitter {
 /// Starting reconnect delay.
 const BACKOFF_INIT_SECS: u64 = 1;
 
+/// Starting delay once the post-refresh-401 streak has tripped (degraded
+/// mode): 5 minutes, then 15. The SSE client NEVER stops on 401s alone — a
+/// real revocation arrives as an explicit 403 (`device_revoked` /
+/// `user_revoked`); a 401 streak can also be a backend redeploy or other
+/// transient auth failure, and stopping there silently disabled kill-switch
+/// delivery until a daemon restart.
+const DEGRADED_BACKOFF_INIT_SECS: u64 = 300;
+
+/// Cap for the degraded-mode delay.
+const DEGRADED_BACKOFF_MAX_SECS: u64 = 900;
+
+/// `sync_state` key stamped (RFC 3339 UTC) while the SSE client is in
+/// degraded 401 mode; cleared on the next clean connect. Read by
+/// `scenery auth status` / `doctor`.
+pub const SSE_DEGRADED_KEY: &str = "sse_degraded_since";
+
+/// Reconnect delay schedule. Production uses [`BackoffPolicy::default`];
+/// tests inject millisecond-scale values (mockito/sockets do real I/O, so a
+/// paused clock is not an option there).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BackoffPolicy {
+    pub init: Duration,
+    pub max: Duration,
+    pub degraded_init: Duration,
+    pub degraded_max: Duration,
+}
+
+impl Default for BackoffPolicy {
+    fn default() -> Self {
+        Self {
+            init: Duration::from_secs(BACKOFF_INIT_SECS),
+            max: Duration::from_secs(BACKOFF_MAX_SECS),
+            degraded_init: Duration::from_secs(DEGRADED_BACKOFF_INIT_SECS),
+            degraded_max: Duration::from_secs(DEGRADED_BACKOFF_MAX_SECS),
+        }
+    }
+}
+
 /// Maximum reconnect delay.
 const BACKOFF_MAX_SECS: u64 = 60;
 /// Fixed pause after an HTTP 426 (runner too old). No escalation: the only
@@ -103,8 +144,8 @@ const BACKOFF_MAX_SECS: u64 = 60;
 const UPGRADE_REQUIRED_DELAY_SECS: u64 = 600;
 
 /// How many consecutive "refresh, then retry, still 401" cycles to tolerate
-/// before giving up and treating this as "re-authentication needed" rather
-/// than a transiently stale token. A single stale-token blip (the common
+/// before entering degraded mode (long capped backoff, never a stop) rather
+/// than treating it as a transiently stale token. A single stale-token blip (the common
 /// case: the access token merely expired) resolves on the very next retry,
 /// so this is deliberately small — it exists to bound the revoked-user
 /// case (refresh "succeeds" — the backend hands back a technically valid
@@ -142,7 +183,20 @@ pub async fn run(
     tx: mpsc::Sender<SyncEvent>,
     connected_tx: watch::Sender<bool>,
 ) {
-    let mut backoff_secs = BACKOFF_INIT_SECS;
+    run_with_policy(config, state, tx, connected_tx, BackoffPolicy::default()).await;
+}
+
+/// [`run`] with an injectable backoff schedule (tests).
+pub(crate) async fn run_with_policy(
+    config: SyncConfig,
+    state: Arc<AppState>,
+    tx: mpsc::Sender<SyncEvent>,
+    connected_tx: watch::Sender<bool>,
+    policy: BackoffPolicy,
+) {
+    let mut backoff = policy.init;
+    let mut degraded_backoff = policy.degraded_init;
+    let mut degraded = false;
     let mut last_event_id = config.last_event_id.clone();
     let mut current_token = config.token.clone();
     let mut current_device_id = config.device_id.clone();
@@ -197,7 +251,15 @@ pub async fn run(
                 // are good. Reset backoff AND the post-refresh-401 streak:
                 // a real connection in between means a LATER 401 is a fresh
                 // problem, not a continuation of an old one.
-                backoff_secs = BACKOFF_INIT_SECS;
+                backoff = policy.init;
+                degraded_backoff = policy.degraded_init;
+                if degraded {
+                    info!("SSE: connection recovered — leaving degraded mode");
+                    degraded = false;
+                    if let Err(e) = state.delete_sync_state(SSE_DEGRADED_KEY) {
+                        warn!(error = %e, "SSE: failed to clear degraded marker");
+                    }
+                }
                 post_refresh_unauthorized_streak = 0;
                 awaiting_post_refresh_check = false;
                 if let Some(id) = new_last_id {
@@ -210,28 +272,37 @@ pub async fn run(
                 // otherwise (first 401 ever, or one after an unrelated
                 // generic-error retry) it starts a fresh streak at 1.
                 if awaiting_post_refresh_check {
-                    post_refresh_unauthorized_streak += 1;
+                    post_refresh_unauthorized_streak =
+                        post_refresh_unauthorized_streak.saturating_add(1);
                 } else {
                     post_refresh_unauthorized_streak = 1;
                 }
                 awaiting_post_refresh_check = false;
 
-                if post_refresh_unauthorized_streak > MAX_CONSECUTIVE_POST_REFRESH_UNAUTHORIZED {
-                    // Refresh keeps "succeeding" (the backend hands back a
-                    // token) but the account itself is rejected on every
-                    // subsequent request — a revoked/deactivated user, not
-                    // a merely-stale token. Retrying can't fix this; only a
-                    // human re-authenticating can. Stop outright rather
-                    // than keep refreshing forever with no backoff — see
-                    // the revoke-loop bug this guards against.
+                if post_refresh_unauthorized_streak > MAX_CONSECUTIVE_POST_REFRESH_UNAUTHORIZED
+                    && !degraded
+                {
+                    // Repeated 401s right after successful refreshes. This
+                    // MAY be a deleted/deactivated account, but it can just
+                    // as well be a backend redeploy or transient auth
+                    // failure, and a 401 is not an explicit revocation
+                    // signal (those are 403 `device_revoked` /
+                    // `user_revoked`, handled below). So never stop: drop to
+                    // a long capped backoff, keep refreshing and retrying,
+                    // and recover on the first clean connect. Warn once.
+                    degraded = true;
                     warn!(
                         streak = post_refresh_unauthorized_streak,
                         "SSE: repeated 401s immediately after a successful token \
-                         refresh — treating as revoked/invalid account, not an \
-                         expired token. Run `scenery auth login` to \
-                         re-authenticate."
+                         refresh — entering degraded mode (retrying every {}s-{}s). \
+                         If this persists, run `scenery auth login` to re-authenticate.",
+                        policy.degraded_init.as_secs(),
+                        policy.degraded_max.as_secs()
                     );
-                    return;
+                    let since = chrono::Utc::now().to_rfc3339();
+                    if let Err(e) = state.set_sync_state(SSE_DEGRADED_KEY, &since) {
+                        warn!(error = %e, "SSE: failed to persist degraded marker");
+                    }
                 }
 
                 // 401: try to refresh the JWT before reconnecting.
@@ -246,11 +317,11 @@ pub async fn run(
                     Ok(new_token) => {
                         current_token = new_token;
                         info!(
-                            backoff_secs,
-                            "SSE: token refreshed — will retry after backoff"
+                            backoff_ms = backoff.as_millis() as u64,
+                            degraded, "SSE: token refreshed — will retry after backoff"
                         );
                         awaiting_post_refresh_check = true;
-                        // Deliberately NOT resetting `backoff_secs` and NOT
+                        // Deliberately NOT resetting `backoff` and NOT
                         // skipping the sleep at the bottom of the loop — a
                         // 401/refresh cycle must never retry without
                         // backing off, even on an apparently-successful
@@ -324,13 +395,19 @@ pub async fn run(
                 continue;
             }
             ConnectResult::Error(e) => {
-                warn!(error = %e, backoff_secs, "SSE: connection error — backing off");
+                warn!(error = %e, backoff_ms = backoff.as_millis() as u64, "SSE: connection error — backing off");
             }
         }
 
-        // Wait before reconnecting.
-        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
-        backoff_secs = (backoff_secs * 2).min(BACKOFF_MAX_SECS);
+        // Wait before reconnecting. Every non-terminal path funnels through
+        // this sleep, so no failure mode can retry without backing off.
+        if degraded {
+            tokio::time::sleep(degraded_backoff).await;
+            degraded_backoff = (degraded_backoff * 2).min(policy.degraded_max);
+        } else {
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(policy.max);
+        }
     }
 }
 

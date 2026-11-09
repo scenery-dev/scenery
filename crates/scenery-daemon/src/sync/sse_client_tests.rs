@@ -756,110 +756,222 @@ fn user_revoked_body_detected() {
 
 // ── bug-revoke-loop: bounded retry on a 401/refresh/401 cycle ─────────────────
 
-/// Bug 1 (revoke-loop) regression — THE headline test.
-///
-/// A revoked/deactivated user is the exact failure mode where
-/// `/api/sync/events` always 401s and `/portal/auth/refresh` keeps
-/// returning HTTP 200 with a technically-valid (but useless) fresh token
-/// pair — before this fix, every 401→refresh→retry cycle reset the
-/// in-process backoff to its minimum and skipped the sleep entirely
-/// (`continue;` with no delay), producing an unbounded ~every-poll-tick
-/// request storm (observed ~120ms / ~8 req/s in the field). This proves
-/// the fixed loop instead:
-///   1. never skips the backoff sleep on a 401, even when the refresh
-///      call itself reports success;
-///   2. stops outright — `run()` returns — once a bounded number of
-///      consecutive "refresh succeeded, very next request still 401"
-///      cycles have happened, rather than retrying forever.
-///
-/// Runs real time (not a paused clock — mockito's async server does real
-/// socket I/O, which doesn't play well with Tokio's paused-time
-/// auto-advance) through the real 1s → 2s → 4s backoff schedule before
-/// `run()` gives up on its own; the generous outer timeout below is a
-/// correctness bound ("it does eventually stop"), not a tight race.
-#[tokio::test]
-async fn bounded_retry_stops_after_repeated_401s_following_successful_refresh() {
-    use scenery_core::auth::save_tokens;
+/// Scripted fake backend over a raw TCP listener so the tests can record the
+/// time of every request (mockito cannot). Each `/api/sync/events` GET pops
+/// the next scripted status (the last one repeats); refresh always succeeds.
+struct FakeBackend {
+    url: String,
+    event_times: Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
+    refreshes: Arc<std::sync::atomic::AtomicUsize>,
+}
 
-    let (state, _tmp) = bootstrap_state();
-    let state = Arc::new(state);
+async fn fake_backend(script: Vec<(u16, &'static str)>) -> FakeBackend {
+    use std::sync::atomic::Ordering;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let event_times = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let refreshes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (times, refr) = (Arc::clone(&event_times), Arc::clone(&refreshes));
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = vec![0u8; 8192];
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            let (status, body) = if req.starts_with("POST /portal/auth/refresh") {
+                refr.fetch_add(1, Ordering::SeqCst);
+                (
+                    200,
+                    r#"{"access_token":"new-tok","refresh_token":"new-refresh"}"#,
+                )
+            } else {
+                let mut t = times.lock().unwrap();
+                let idx = t.len().min(script.len() - 1);
+                t.push(std::time::Instant::now());
+                script[idx]
+            };
+            let ctype = if body.is_empty() {
+                "text/event-stream"
+            } else {
+                "application/json"
+            };
+            let resp = format!(
+                "HTTP/1.1 {status} X\r\ncontent-type: {ctype}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        }
+    });
+    FakeBackend {
+        url,
+        event_times,
+        refreshes,
+    }
+}
 
-    let mut server = mockito::Server::new_async().await;
-    let registry_url = server.url();
+fn test_policy() -> crate::sync::sse_client::BackoffPolicy {
+    use std::time::Duration;
+    crate::sync::sse_client::BackoffPolicy {
+        init: Duration::from_millis(20),
+        max: Duration::from_millis(80),
+        degraded_init: Duration::from_millis(150),
+        degraded_max: Duration::from_millis(300),
+    }
+}
 
-    // Seed a stored refresh token for this registry so `try_refresh_token`
-    // has something to send — mirrors what `auth login`/`auth pair` would
-    // have written.
-    save_tokens(
-        &state,
-        &registry_url,
-        "stale-access-tok",
-        "some-refresh-tok",
-    )
-    .expect("seed stored tokens");
-
-    // Every GET /api/sync/events attempt is rejected — same as a revoked
-    // user, where the account (not the token) is the problem. Exact count:
-    // with MAX_CONSECUTIVE_POST_REFRESH_UNAUTHORIZED = 3, the streak goes
-    // 1, 2, 3 (each still <= max, so a refresh is attempted) then 4 (>
-    // max, loop stops) — four connect attempts total.
-    let events_mock = server
-        .mock("GET", "/api/sync/events")
-        .with_status(401)
-        .expect(4)
-        .create_async()
-        .await;
-
-    // Every refresh call "succeeds" — the backend hands back a fresh,
-    // technically-valid token pair every time, exactly like a revoked
-    // user's refresh endpoint did before the backend-side fix (and exactly
-    // what this runner-side fix must independently bound against, since a
-    // backend without that fix is one of the explicit scenarios this bug
-    // covers). Exact count: one refresh per streak count that didn't
-    // exceed the max (3), not one for the 4th (terminal) attempt.
-    let refresh_mock = server
-        .mock("POST", "/portal/auth/refresh")
-        .with_status(200)
-        .with_header("content-type", "application/json")
-        .with_body(r#"{"access_token":"new-tok","refresh_token":"new-refresh-tok"}"#)
-        .expect(3)
-        .create_async()
-        .await;
-
-    let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
-    let (connected_tx, _connected_rx) = tokio::sync::watch::channel(false);
-    let live_token = Arc::new(tokio::sync::RwLock::new("stale-access-tok".to_string()));
-    let config = crate::sync::SyncConfig {
-        registry_url: registry_url.clone(),
-        token: "stale-access-tok".to_string(),
+fn sync_config(url: &str) -> crate::sync::SyncConfig {
+    crate::sync::SyncConfig {
+        registry_url: url.to_string(),
+        token: "stale".to_string(),
         device_id: "dev-1".to_string(),
         last_event_id: None,
         pusher: None,
-        live_token,
-    };
+        live_token: Arc::new(tokio::sync::RwLock::new("stale".to_string())),
+    }
+}
 
-    // Bounded: `run()` must return on its own well within this window.
-    // The real schedule is 1s + 2s + 4s =~ 7s of sleeping before the loop
-    // gives up on the 4th connect attempt; 20s leaves ample headroom for
-    // test-runner scheduling jitter without masking an actual regression
-    // to "loops forever".
+/// Kill-switch reliability: a burst of post-refresh 401s (backend redeploy)
+/// must NOT stop the client. It enters degraded mode with capped backoff
+/// (never retrying without a sleep) and reconnects on its own once the
+/// backend returns 200; the degraded marker is stamped, then cleared.
+#[tokio::test]
+async fn post_refresh_401_burst_degrades_then_recovers_without_restart() {
+    use scenery_core::auth::save_tokens;
+    use std::time::Duration;
+
+    let (state, _tmp) = bootstrap_state();
+    let state = Arc::new(state);
+    // 8 x 401 (streak trips at the 4th), then a clean (empty) stream.
+    let mut script = vec![(401u16, r#"{"detail":"nope"}"#); 8];
+    script.push((200, ""));
+    let fake = fake_backend(script).await;
+    save_tokens(&state, &fake.url, "stale", "refresh-tok").unwrap();
+
+    let (event_tx, _rx) = tokio::sync::mpsc::channel(8);
+    let (connected_tx, mut connected_rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(crate::sync::sse_client::run_with_policy(
+        sync_config(&fake.url),
+        Arc::clone(&state),
+        event_tx,
+        connected_tx,
+        test_policy(),
+    ));
+
+    tokio::time::timeout(Duration::from_secs(10), connected_rx.wait_for(|c| *c))
+        .await
+        .expect("client must reconnect on its own after the 401 burst")
+        .unwrap();
+    assert!(!task.is_finished(), "401s must never stop the SSE task");
+
+    let times = fake.event_times.lock().unwrap().clone();
+    assert!(times.len() >= 9, "expected 9 attempts, got {}", times.len());
+    let p = test_policy();
+    // No retry without a backoff sleep: every gap honours the schedule
+    // (small slack for timer granularity).
+    for (i, w) in times.windows(2).take(9).enumerate() {
+        let gap = w[1].duration_since(w[0]);
+        let min = if i < 3 { p.init } else { p.degraded_init };
+        assert!(
+            gap + Duration::from_millis(10) >= min,
+            "gap {i} too short: {gap:?}"
+        );
+    }
+    // Bounded: refresh happened once per 401, never in a storm.
+    assert!(fake.refreshes.load(std::sync::atomic::Ordering::SeqCst) <= 8);
+    task.abort();
+}
+
+/// While degraded the marker is visible to `auth status`/`doctor`, and is
+/// cleared after recovery.
+#[tokio::test]
+async fn degraded_marker_set_then_cleared_on_recovery() {
+    use scenery_core::auth::save_tokens;
+    use std::time::Duration;
+
+    let (state, _tmp) = bootstrap_state();
+    let state = Arc::new(state);
+    let mut script = vec![(401u16, "{}"); 6];
+    script.push((200, ""));
+    let fake = fake_backend(script).await;
+    save_tokens(&state, &fake.url, "stale", "refresh-tok").unwrap();
+
+    let (event_tx, _rx) = tokio::sync::mpsc::channel(8);
+    let (connected_tx, mut connected_rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(crate::sync::sse_client::run_with_policy(
+        sync_config(&fake.url),
+        Arc::clone(&state),
+        event_tx,
+        connected_tx,
+        test_policy(),
+    ));
+    // Attempt 5+ is degraded; poll for the marker before recovery.
+    let mut seen = false;
+    for _ in 0..200 {
+        if state
+            .get_sync_state(crate::sync::sse_client::SSE_DEGRADED_KEY)
+            .unwrap()
+            .is_some()
+        {
+            seen = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(seen, "degraded marker must be stamped");
+    tokio::time::timeout(Duration::from_secs(10), connected_rx.wait_for(|c| *c))
+        .await
+        .unwrap()
+        .unwrap();
+    // Marker is cleared on the Reconnect that follows the empty stream.
+    let mut cleared = false;
+    for _ in 0..200 {
+        if state
+            .get_sync_state(crate::sync::sse_client::SSE_DEGRADED_KEY)
+            .unwrap()
+            .is_none()
+        {
+            cleared = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(cleared, "degraded marker must clear after a clean connect");
+    task.abort();
+}
+
+/// Even after the streak trips, an explicit 403 `device_revoked` still
+/// stops the task permanently (the only terminal signals are explicit 403s).
+#[tokio::test]
+async fn device_revoked_403_still_stops_after_degraded_401s() {
+    use scenery_core::auth::save_tokens;
+    use std::time::Duration;
+
+    let (state, _tmp) = bootstrap_state();
+    let state = Arc::new(state);
+    let mut script = vec![(401u16, "{}"); 5];
+    script.push((403, r#"{"detail":{"code":"device_revoked"}}"#));
+    let fake = fake_backend(script).await;
+    save_tokens(&state, &fake.url, "stale", "refresh-tok").unwrap();
+
+    let (event_tx, _rx) = tokio::sync::mpsc::channel(8);
+    let (connected_tx, _crx) = tokio::sync::watch::channel(false);
     tokio::time::timeout(
-        std::time::Duration::from_secs(20),
-        crate::sync::sse_client::run(config, Arc::clone(&state), event_tx, connected_tx),
+        Duration::from_secs(10),
+        crate::sync::sse_client::run_with_policy(
+            sync_config(&fake.url),
+            Arc::clone(&state),
+            event_tx,
+            connected_tx,
+            test_policy(),
+        ),
     )
     .await
-    .expect(
-        "run() must stop on its own after bounded 401/refresh retries, \
-         not loop forever",
-    );
-
-    // Bounded, not unbounded: a tight pre-fix loop would have hit these
-    // endpoints hundreds of times within this same logical window
-    // (observed ~8 req/s in the field with no cap at all). Asserting the
-    // EXACT counts above is what proves this loop is bounded rather than
-    // merely "eventually gave up after a while".
-    events_mock.assert_async().await;
-    refresh_mock.assert_async().await;
+    .expect("device_revoked must stop the loop");
+    assert_eq!(fake.event_times.lock().unwrap().len(), 6);
 }
 
 /// A revoked slug's source dir must never be copied into the managed dirs,

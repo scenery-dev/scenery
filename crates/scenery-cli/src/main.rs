@@ -966,6 +966,7 @@ async fn cmd_doctor(registry_url: Option<&str>) -> Result<()> {
             }
 
             print_device_revoked_notice(&app.state);
+            print_sse_degraded_notice(&app.state);
         }
         Err(e) => {
             eprintln!("warning: could not bootstrap state directory: {e:#}");
@@ -4918,6 +4919,7 @@ async fn cmd_auth_status(registry_url: &str) -> Result<()> {
                     println!("Publisher ID: {slug}");
                     println!("Registry: {registry_url}");
                     print_device_revoked_notice(&state);
+                    print_sse_degraded_notice(&state);
                     Ok(())
                 }
                 Err(e) => {
@@ -4942,6 +4944,20 @@ fn print_device_revoked_notice(state: &scenery_core::state::AppState) {
         println!();
         println!("⚠ This device was revoked by an admin (at {revoked_at}).");
         println!("  Run `scenery auth pair` to re-pair it as a new device.");
+    }
+}
+
+/// Notice for degraded SSE (`sync_state["sse_degraded_since"]`, set by the
+/// daemon after repeated 401s following token refreshes; cleared on the next
+/// clean connect). Live kill-switch delivery is impaired while it is set.
+fn print_sse_degraded_notice(state: &scenery_core::state::AppState) {
+    if let Ok(Some(since)) =
+        state.get_sync_state(scenery_daemon::sync::sse_client::SSE_DEGRADED_KEY)
+    {
+        println!();
+        println!("⚠ Live sync is degraded since {since}: the backend keeps rejecting this");
+        println!("  device's token (401). The daemon is retrying every 5-15 minutes and");
+        println!("  recovers on its own; if it persists, run `scenery auth login`.");
     }
 }
 
