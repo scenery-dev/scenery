@@ -391,6 +391,11 @@ impl SocketBackend {
         }
     }
 
+    /// `clientInfo.name` this session's `initialize` reported, if any.
+    pub fn client(&self) -> Option<String> {
+        self.client.lock().ok().and_then(|c| c.clone())
+    }
+
     /// Connect to the daemon socket with a 2 s timeout.
     pub async fn connect(&self) -> Result<()> {
         let timeout = std::time::Duration::from_secs(2);

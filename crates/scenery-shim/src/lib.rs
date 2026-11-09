@@ -390,7 +390,13 @@ async fn relay_via_socket(
                 // per-server entries in ~/.claude.json so the AI client
                 // doesn't see them under both namespaces. The native-key rule
                 // lives in `scenery_mcp::ownership` (single source of truth).
-                let exclusions = scenery_mcp::ownership::native_mcp_keys_from_claude_json();
+                // Only Claude Code reads ~/.claude.json; every other client
+                // (Cursor, Codex, Gemini, ...) reaches managed servers only
+                // through this aggregate, so nothing may be hidden from it.
+                let exclusions = aggregator_exclusions(
+                    backend.client().as_deref(),
+                    scenery_mcp::ownership::native_mcp_keys_from_claude_json(),
+                );
                 result = filter_tools_for_aggregator(result, &exclusions);
             }
 
@@ -442,6 +448,21 @@ fn filter_tools_for_server(
 
     result.tools = kept;
     result
+}
+
+/// The slugs to hide from an aggregator `tools/list`: the per-server entries
+/// in `~/.claude.json`, but only when the client is Claude Code. Any other
+/// client never sees those entries, so hiding the tools would strand them.
+#[cfg(unix)]
+fn aggregator_exclusions(
+    client: Option<&str>,
+    claude_native_keys: std::collections::HashSet<String>,
+) -> std::collections::HashSet<String> {
+    if client == Some(scenery_mcp::protocol::CLAUDE_CODE_CLIENT_NAME) {
+        claude_native_keys
+    } else {
+        std::collections::HashSet::new()
+    }
 }
 
 /// Filter `ToolsListResult` to drop any `<slug>__*` tools whose slug is in
