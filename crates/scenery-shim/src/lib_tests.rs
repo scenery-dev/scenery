@@ -284,8 +284,16 @@ async fn with_server_slug_daemon_required_still_returns_error() {
 #[test]
 fn aggregator_exclusions_apply_only_to_claude_code() {
     let keys: std::collections::HashSet<String> = std::iter::once("srv".to_string()).collect();
-    assert_eq!(crate::aggregator_exclusions(Some("claude-code"), keys.clone()), keys);
-    for client in [Some("cursor-vscode"), Some("codex"), Some("gemini-cli"), None] {
+    assert_eq!(
+        crate::aggregator_exclusions(Some("claude-code"), keys.clone()),
+        keys
+    );
+    for client in [
+        Some("cursor-vscode"),
+        Some("codex"),
+        Some("gemini-cli"),
+        None,
+    ] {
         assert!(crate::aggregator_exclusions(client, keys.clone()).is_empty());
     }
 }
