@@ -26,6 +26,7 @@ pub mod atomic_file;
 pub mod audit;
 pub mod binary_path;
 pub mod crash;
+mod crash_redact;
 pub mod managed;
 pub mod model;
 pub mod policy;

@@ -15,19 +15,6 @@ fn sample(kind: CrashKind) -> CrashRecord {
 }
 
 #[test]
-fn redact_rewrites_home_and_masks_tokens() {
-    let out = redact(
-        "failed reading /Users/alice/.config/x with scn_pat_abc123 and Bearer eyJhbGciOi.payload.sig",
-        Some("/Users/alice"),
-    );
-    assert!(out.contains("~/.config/x"));
-    assert!(!out.contains("alice"));
-    assert!(!out.contains("scn_pat_abc123"));
-    assert!(!out.contains("eyJhbGciOi"));
-    assert!(out.contains("[REDACTED]"));
-}
-
-#[test]
 fn truncate_respects_char_boundaries() {
     let s = "ab\u{1F600}cd";
     assert_eq!(truncate(s, 3), "ab");
@@ -140,8 +127,8 @@ fn upload_deletes_on_success() {
 }
 
 #[test]
-fn upload_keeps_records_on_server_error_and_auth_failure() {
-    for code in [500, 401, 429] {
+fn upload_keeps_records_on_retryable_or_auth_failures() {
+    for code in [401, 403, 404, 426, 429, 500, 502, 503] {
         let mut server = mockito::Server::new();
         let _m = server
             .mock("POST", "/api/sync/crash-reports")
@@ -149,7 +136,10 @@ fn upload_keeps_records_on_server_error_and_auth_failure() {
             .create();
         let (_d, root) = root();
         write_record(&root, &sample(CrashKind::Panic)).unwrap();
-        assert!(upload_pending(&root, &authed(server.url())).is_err());
+        assert!(
+            upload_pending(&root, &authed(server.url())).is_err(),
+            "HTTP {code}"
+        );
         assert_eq!(
             list_pending(&root).len(),
             1,
@@ -160,15 +150,24 @@ fn upload_keeps_records_on_server_error_and_auth_failure() {
 
 #[test]
 fn upload_drops_records_the_backend_rejects_as_invalid() {
-    let mut server = mockito::Server::new();
-    let _m = server
-        .mock("POST", "/api/sync/crash-reports")
-        .with_status(422)
-        .create();
-    let (_d, root) = root();
-    write_record(&root, &sample(CrashKind::Panic)).unwrap();
-    assert_eq!(upload_pending(&root, &authed(server.url())).unwrap(), 1);
-    assert!(list_pending(&root).is_empty());
+    for code in [400, 413, 422] {
+        let mut server = mockito::Server::new();
+        let _m = server
+            .mock("POST", "/api/sync/crash-reports")
+            .with_status(code)
+            .create();
+        let (_d, root) = root();
+        write_record(&root, &sample(CrashKind::Panic)).unwrap();
+        assert_eq!(
+            upload_pending(&root, &authed(server.url())).unwrap(),
+            1,
+            "HTTP {code}"
+        );
+        assert!(
+            list_pending(&root).is_empty(),
+            "HTTP {code} must drop the record"
+        );
+    }
 }
 
 #[test]
@@ -191,7 +190,11 @@ fn panic_hook_writes_record_and_clears_marker() {
     });
     let _ = std::panic::take_hook();
     assert!(result.is_err());
-    let pending = list_pending(&root);
+    // The hook is process-global: panics from other parallel tests may add records.
+    let pending: Vec<_> = list_pending(&root)
+        .into_iter()
+        .filter(|r| r.message.as_deref().is_some_and(|m| m.contains("boom")))
+        .collect();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].kind, CrashKind::Panic);
     assert!(pending[0].message.as_deref().unwrap().contains("boom"));

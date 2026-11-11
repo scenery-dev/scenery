@@ -25,6 +25,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::atomic_file::write_atomic;
+use crate::crash_redact::{backtrace_symbols, redact};
 
 pub const CRASH_DIR: &str = "crashes";
 pub const RUN_MARKER: &str = "running.marker";
@@ -95,41 +96,25 @@ fn truncate(s: &str, max: usize) -> String {
     s[..end].to_string()
 }
 
-fn is_secret_word(word: &str) -> bool {
-    let w = word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-');
-    w.starts_with("scn_pat_") || w.starts_with("eyJ") || w.starts_with("sk-")
-}
-
-/// Rewrite `$HOME` to `~` and mask token-shaped words. Pure.
-pub fn redact(text: &str, home: Option<&str>) -> String {
-    let mut out = text.to_string();
-    if let Some(h) = home {
-        if h.len() > 1 {
-            out = out.replace(h, "~");
-        }
-    }
-    let mut result = String::with_capacity(out.len());
-    let mut prev_bearer = false;
-    for (i, word) in out.split(' ').enumerate() {
-        if i > 0 {
-            result.push(' ');
-        }
-        if prev_bearer || is_secret_word(word) {
-            result.push_str("[REDACTED]");
-        } else {
-            result.push_str(word);
-        }
-        prev_bearer = word.eq_ignore_ascii_case("bearer");
-    }
-    result
-}
-
 fn home_dir_string() -> Option<String> {
     dirs::home_dir().map(|p| p.to_string_lossy().into_owned())
 }
 
+fn user_name_string() -> Option<String> {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .ok()
+}
+
 fn clean(text: &str, max: usize) -> String {
-    truncate(&redact(text, home_dir_string().as_deref()), max)
+    truncate(
+        &redact(
+            text,
+            home_dir_string().as_deref(),
+            user_name_string().as_deref(),
+        ),
+        max,
+    )
 }
 
 /// Build a `panic` record from the raw panic facts. Pure apart from the
@@ -143,7 +128,7 @@ pub fn build_panic_record(
     let mut rec = new_record(CrashKind::Panic, runner_version, now_rfc3339());
     rec.message = Some(clean(message, MAX_MESSAGE));
     rec.location = location.map(|l| clean(l, MAX_LOCATION));
-    rec.backtrace = backtrace.map(|b| clean(b, MAX_BACKTRACE));
+    rec.backtrace = backtrace.map(|b| clean(&backtrace_symbols(b), MAX_BACKTRACE));
     rec
 }
 

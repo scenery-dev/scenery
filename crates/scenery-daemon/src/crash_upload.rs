@@ -49,3 +49,13 @@ pub(crate) fn note_previous_run(record: Option<&crash::CrashRecord>) {
         );
     }
 }
+
+/// The accept loop has ended for a graceful reason (SIGTERM, SIGINT, binary
+/// replaced): this run no longer counts as crash-prone.
+pub(crate) fn mark_graceful_shutdown(root_dir: &Utf8PathBuf) {
+    crash::clear_run_marker(root_dir);
+}
+
+#[cfg(test)]
+#[path = "crash_lifecycle_tests.rs"]
+mod tests;

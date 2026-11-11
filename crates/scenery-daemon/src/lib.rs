@@ -1108,6 +1108,11 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
         }
     }
 
+    // Graceful stop begins here: from now on a SIGKILL during the (possibly
+    // slow) drain / audit flush is the service manager's timeout, not a crash,
+    // so the run marker goes first. Real crash paths never reach this line.
+    crash_upload::mark_graceful_shutdown(&state.root_dir);
+
     info!("draining in-flight connections (up to 2 s)");
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
