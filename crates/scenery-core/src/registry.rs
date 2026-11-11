@@ -568,6 +568,43 @@ impl RegistryClient {
         Ok(())
     }
 
+    /// Upload crash records (`POST /api/sync/crash-reports`, at most 10).
+    ///
+    /// Needs the device Bearer token and `X-Device-ID`, like the snapshot.
+    /// Returns `Ok` when the backend took the batch, and also for a 400/413/422
+    /// rejection (retrying the same bytes can never succeed, so the caller
+    /// should drop them). Auth failures (401/403/404), 429 and 5xx are `Err`
+    /// so the records stay queued.
+    pub fn upload_crash_reports(&self, reports: &[crate::crash::CrashRecord]) -> Result<()> {
+        let url = format!(
+            "{}/api/sync/crash-reports",
+            self.base_url.trim_end_matches('/')
+        );
+        let token = self
+            .get_auth_token()
+            .context("no auth token set; cannot upload crash reports")?;
+        let device_id = self
+            .get_device_id()
+            .context("no device_id set; cannot upload crash reports")?;
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(token)
+            .header("X-Device-ID", device_id)
+            .json(&serde_json::json!({ "reports": reports }))
+            .send_tracked()
+            .with_context(|| format!("failed to reach registry at {url}"))?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        if matches!(status.as_u16(), 400 | 413 | 422) {
+            warn!(%status, "registry rejected crash reports; dropping them");
+            return Ok(());
+        }
+        anyhow::bail!("registry returned HTTP {status} for crash reports")
+    }
+
     /// Fetch the full desired-state snapshot: `{"installations": [...],
     /// "mcp_installations": [...]}`, byte-identical to the SSE `snapshot`
     /// event's payload.

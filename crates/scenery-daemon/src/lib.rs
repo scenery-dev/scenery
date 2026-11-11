@@ -66,6 +66,7 @@
 
 mod auth_dispatch;
 mod binary_watch;
+mod crash_upload;
 pub mod daemon_takeover;
 pub mod daemon_takeover_signal;
 mod instance_lock;
@@ -241,6 +242,22 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     )?;
 
     state.seed_block_third_party_from_sync_state();
+
+    // Crash reporting: the lock above proves any run marker left on disk
+    // belongs to a dead daemon, so it is reported as an unclean shutdown.
+    crash_upload::note_previous_run(
+        scenery_core::crash::mark_run_started(&state.root_dir, scenery_core::http::RUNNER_VERSION)
+            .unwrap_or_else(|e| {
+                warn!(error = %e, "could not record daemon run marker");
+                None
+            })
+            .as_ref(),
+    );
+    let _run_marker_guard = scenery_core::crash::RunMarkerGuard::new(&state.root_dir);
+    scenery_core::crash::install_panic_hook(
+        state.root_dir.clone(),
+        scenery_core::http::RUNNER_VERSION,
+    );
 
     let registry_url_raw = opts
         .registry_url
@@ -732,6 +749,15 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     // every other part of the daemon that reads the live atomic.
     let sync_block_third_party = state.block_third_party_handle();
     tokio::spawn(async move {
+        // Crash reports go out right away, not after the first 5-minute tick.
+        spawn_crash_upload(
+            &sync_registry,
+            &sync_db_path,
+            &sync_root_dir,
+            &sync_block_third_party,
+        )
+        .await;
+
         let mut interval =
             tokio::time::interval(std::time::Duration::from_secs(SYNC_INTERVAL_SECS));
         // Skip the immediate first tick — let the accept loop start first.
@@ -764,6 +790,14 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
                     &block_third_party,
                 )
             })
+            .await;
+
+            spawn_crash_upload(
+                &sync_registry,
+                &sync_db_path,
+                &sync_root_dir,
+                &sync_block_third_party,
+            )
             .await;
 
             match result {
@@ -1121,6 +1155,7 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
         }
     }
 
+    scenery_core::crash::clear_run_marker(&state.root_dir);
     info!("scenery shut down cleanly");
 
     // Stand down with a non-zero code when the binary was replaced, so *every*
@@ -1139,6 +1174,26 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Upload queued crash reports on the blocking pool (best-effort, never fails).
+async fn spawn_crash_upload(
+    registry: &Arc<RegistryClient>,
+    db_path: &camino::Utf8PathBuf,
+    root_dir: &camino::Utf8PathBuf,
+    block_third_party: &Arc<std::sync::atomic::AtomicBool>,
+) {
+    let reg = Arc::clone(registry);
+    let db = db_path.clone();
+    let root = root_dir.clone();
+    let flag = Arc::clone(block_third_party);
+    let joined = tokio::task::spawn_blocking(move || {
+        crash_upload::upload_queued_crash_reports(&reg, &db, &root, &flag);
+    })
+    .await;
+    if let Err(e) = joined {
+        warn!(error = %e, "crash report upload task failed");
+    }
 }
 
 /// Acquire the daemon's Unix socket at `path`, refusing to steal it from a
@@ -2143,7 +2198,7 @@ async fn register_with_backend(
 /// `RegistryClient` so authenticated calls (audit upload, ratings, stats) send
 /// the current credentials. Used by every sync tick and by the final audit
 /// flush at shutdown, which may run before any tick or after a token rotation.
-fn install_registry_credentials(state_view: &AppState, registry: &RegistryClient) {
+pub(crate) fn install_registry_credentials(state_view: &AppState, registry: &RegistryClient) {
     // Load the current access token from SQLite and install it on the shared
     // RegistryClient so that all authenticated calls in this tick (audit upload,
     // execution stats, skill ratings) send the device Bearer token.
