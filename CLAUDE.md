@@ -80,6 +80,24 @@ cargo clippy
 cargo fmt
 ```
 
+## Releasing
+
+After bumping the workspace `Cargo.toml` version, tag `vX.Y.Z` and push the tag
+(CI builds a DRAFT release). Then, in your own terminal (it prompts for the
+minisign password), run one command:
+
+```bash
+SCENERY_MINISIGN_KEY=~/.ssh/scenery-release.key scripts/release.sh vX.Y.Z
+```
+
+It preflights (tag on origin, version match, homebrew-tap and scenery-backend
+clean on main), waits for the release workflow, runs `scripts/sign-release.sh
+--apply-formula` (skipped if already signed), verifies/commits/pushes the
+homebrew-tap formula (`scenery X.Y.Z`; refuses weekdays 9am-5pm ET unless
+`--force-hours`), and stages the runner on the demo box. Resume a failed run
+with `--from <preflight|wait|sign|formula|stage>`. Afterwards `brew upgrade
+scenery` on spaceghost (see the root CLAUDE.md). Test: `scripts/test_release.sh`.
+
 ## Things to remember (per project conventions)
 
 Before writing code:
