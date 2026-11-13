@@ -450,7 +450,11 @@ pub enum McpCommand {
 
     /// Write the Scenery MCP entry into the specified AI client's config.
     Setup {
-        /// Target AI client (currently only "claude-code" is supported in M0).
+        /// Target AI client. Omit (or "auto") to configure every detected client:
+        /// Claude Code, Claude Desktop, Cursor, Windsurf, VS Code, Gemini CLI,
+        /// Antigravity and Codex. Only "claude-code" can be named explicitly. Claude Code is the
+        /// only client that gets the HTTP + OAuth entry and the only verified one;
+        /// the others get a stdio entry and are not verified.
         #[arg(long)]
         client: Option<String>,
 
