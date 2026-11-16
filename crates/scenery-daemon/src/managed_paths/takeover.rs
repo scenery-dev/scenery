@@ -63,7 +63,7 @@ use scenery_core::{
     state::AppState,
 };
 use std::{fs, path::Path};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use super::pusher::managed_skill_present;
 
@@ -111,14 +111,27 @@ pub fn perform_if_pending(state: &AppState, slug: &str) -> Result<()> {
     // is destination — retire the record so it cannot fire again on the next
     // install, and stop.
     if source_is_canonical_dest(slug, Path::new(&source_path)) {
+        // Nothing to remove, but only claim success once the directory really
+        // is managed (marker present). An unmarked directory here means the
+        // push that should have converted it in place failed or has not run:
+        // keep the pending record so a later install retries, and say so.
+        if !scenery_mcp::ownership::is_scenery_managed(Path::new(&source_path)) {
+            warn!(
+                slug,
+                source = %source_path,
+                "adopt takeover: source_path is the canonical managed destination but is \
+                 not yet Scenery-managed — adoption NOT complete, will retry on next install"
+            );
+            return Ok(());
+        }
         state
             .clear_pending_adopt_takeover(slug)
             .context("takeover: failed to clear no-op pending-takeover record")?;
         info!(
             slug,
             source = %source_path,
-            "adopt takeover: source_path is the canonical managed destination — \
-             nothing to remove (adoption completed in place)"
+            "adopt takeover: source_path is the canonical managed destination and is \
+             managed — nothing to remove (adoption completed in place)"
         );
         return Ok(());
     }
@@ -161,7 +174,7 @@ pub fn perform_if_pending(state: &AppState, slug: &str) -> Result<()> {
 /// path can be canonicalized, this returns `false` and the normal
 /// presence-gated path runs — which is the pre-existing behaviour, still
 /// guarded by its own backup-before-delete.
-fn source_is_canonical_dest(slug: &str, source_path: &Path) -> bool {
+pub(crate) fn source_is_canonical_dest(slug: &str, source_path: &Path) -> bool {
     let Some(dest) = super::paths::agents_skills_dir().map(|d| d.join(slug)) else {
         return false;
     };
@@ -211,7 +224,7 @@ fn remove_source_path(state: &AppState, slug: &str, path: &Path) -> Result<()> {
         return Ok(());
     }
 
-    back_up_before_delete(state, slug, path).with_context(|| {
+    back_up_before_delete(&RestoreJournal::for_state(state), slug, path).with_context(|| {
         format!(
             "refusing to delete un-backed-up source_path: {}",
             path.display()
@@ -236,8 +249,11 @@ fn remove_source_path(state: &AppState, slug: &str, path: &Path) -> Result<()> {
 /// Returns `Err` (and leaves no partial journal entry) if either the copy or
 /// the journal append fails, so the caller can treat backup failure as a
 /// hard stop rather than proceeding to delete un-backed-up data.
-fn back_up_before_delete(state: &AppState, slug: &str, path: &Path) -> Result<()> {
-    let journal = RestoreJournal::for_state(state);
+pub(super) fn back_up_before_delete(
+    journal: &RestoreJournal,
+    slug: &str,
+    path: &Path,
+) -> Result<()> {
     let ts = new_backup_ts();
     let dest = journal.backup_dir_for(&ts).join("adopted").join(slug);
 

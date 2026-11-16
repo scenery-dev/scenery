@@ -963,6 +963,17 @@ async fn device_exchange_first_run(
                 if let Err(e) = state.ctx.state.mark_device_revoked() {
                     warn!(error = %e, "mcp http: failed to persist device-revoked state");
                 }
+                if crate::sync::sse_client::is_user_revoked_body(&body) {
+                    if let Some(url) = state
+                        .ctx
+                        .state
+                        .get_sync_state("registry_url")
+                        .ok()
+                        .flatten()
+                    {
+                        let _ = scenery_core::auth::handle_user_revoked(&state.ctx.state, &url);
+                    }
+                }
                 warn!(
                     "mcp http: device-exchange rejected — device/user revoked by an \
                      admin; re-pair required"

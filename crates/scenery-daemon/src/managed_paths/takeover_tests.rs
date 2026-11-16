@@ -573,3 +573,33 @@ fn perform_if_pending_backs_up_single_file_source_before_removing_it() {
         b"a lone SKILL.md, no directory wrapper"
     );
 }
+
+/// When the canonical source directory is still unmanaged (the push that
+/// should have converted it did not happen or failed), takeover must NOT
+/// claim the adoption completed: the pending record stays so a later install
+/// retries, and the user's directory is untouched.
+#[test]
+fn perform_if_pending_keeps_record_when_canonical_source_is_not_managed() {
+    let root = tempfile::tempdir().unwrap();
+    let state = make_state(&root);
+    let fake_home = tempfile::tempdir().unwrap();
+    let _home = HomeGuard::set(fake_home.path());
+    seed_managed_copy(fake_home.path(), "hello-world");
+    let canonical = fake_home
+        .path()
+        .join(".agents")
+        .join("skills")
+        .join("hello-world");
+    state
+        .record_pending_adopt_takeover("hello-world", &canonical.to_string_lossy())
+        .unwrap();
+
+    perform_if_pending(&state, "hello-world").unwrap();
+
+    assert!(canonical.join("SKILL.md").exists());
+    assert_eq!(
+        state.pending_adopt_takeover_source("hello-world").unwrap(),
+        Some(canonical.to_string_lossy().to_string()),
+        "pending record must be kept while the directory is not managed"
+    );
+}

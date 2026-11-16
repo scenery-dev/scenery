@@ -459,6 +459,10 @@ impl RegistryClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().unwrap_or_default();
+            if status == reqwest::StatusCode::FORBIDDEN && crate::auth::is_user_revoked_body(&body)
+            {
+                return Err(anyhow::Error::new(crate::auth::UserRevokedError));
+            }
             anyhow::bail!("registry returned HTTP {status} for approved servers: {body}");
         }
 

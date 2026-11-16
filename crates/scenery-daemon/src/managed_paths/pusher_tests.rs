@@ -1494,3 +1494,56 @@ fn no_antigravity_means_no_gemini_tree_is_created() {
         assert!(!home.join(".gemini").exists());
     });
 }
+
+/// Adopt of the canonical directory itself: the user's unmarked directory is
+/// converted to managed in place (content replaced, marker written, Claude
+/// link created) and the original is backed up first. A plain `push_skill`
+/// for the same directory still refuses (see the test above).
+#[test]
+fn push_skill_adopting_in_place_converts_unmanaged_dir_and_links_claude() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let (pusher, _tmp) = make_pusher();
+    let fake_home = tempfile::tempdir().unwrap();
+    let dir = fake_home
+        .path()
+        .join(".agents")
+        .join("skills")
+        .join("hello-world");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("SKILL.md"), b"the user's own SKILL.md").unwrap();
+    fs::write(dir.join("stale.md"), b"stale user file").unwrap();
+
+    let prev_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", fake_home.path());
+    let refused = pusher.push_skill("hello-world", Some("inst-1"), b"published", &[]);
+    let adopted =
+        pusher.push_skill_adopting_in_place("hello-world", Some("inst-1"), b"published", &[]);
+    if let Some(v) = prev_home {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+
+    assert!(refused.is_err(), "non-adopt push must still refuse");
+    let outcome = adopted.expect("adopt in place must succeed");
+    assert!(outcome.link_refused.is_none());
+    assert_eq!(fs::read(dir.join("SKILL.md")).unwrap(), b"published");
+    assert!(
+        dir.join(".scenery-managed.json").exists(),
+        "marker must be written"
+    );
+    assert!(!dir.join("stale.md").exists(), "old content is replaced");
+    let link = fake_home
+        .path()
+        .join(".claude")
+        .join("skills")
+        .join("hello-world");
+    assert!(link.exists(), "Claude link must exist");
+
+    // The user's original was backed up before being replaced.
+    let backups = _tmp.path().join("restore-backups");
+    assert!(
+        backups.exists(),
+        "restore-backups dir must exist after adopt in place"
+    );
+}

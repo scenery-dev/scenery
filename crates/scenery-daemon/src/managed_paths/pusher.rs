@@ -150,6 +150,46 @@ impl ManagedPathsPusher {
         skill_md_bytes: &[u8],
         referenced_files: &[(String, Vec<u8>)],
     ) -> Result<PushOutcome> {
+        self.push_skill_inner(
+            slug,
+            installation_id,
+            skill_md_bytes,
+            referenced_files,
+            false,
+        )
+    }
+
+    /// Like [`push_skill`](Self::push_skill), but an unmarked real directory
+    /// at the canonical path is converted to managed in place instead of
+    /// refused. ONLY for the adopt flow, when the adopted `source_path` is
+    /// that canonical directory (the user's own copy, which they just asked
+    /// Scenery to take over). The original is backed up through the restore
+    /// journal before being replaced; if the backup fails nothing is touched.
+    /// A foreign symlink at the path is still refused.
+    pub fn push_skill_adopting_in_place(
+        &self,
+        slug: &str,
+        installation_id: Option<&str>,
+        skill_md_bytes: &[u8],
+        referenced_files: &[(String, Vec<u8>)],
+    ) -> Result<PushOutcome> {
+        self.push_skill_inner(
+            slug,
+            installation_id,
+            skill_md_bytes,
+            referenced_files,
+            true,
+        )
+    }
+
+    fn push_skill_inner(
+        &self,
+        slug: &str,
+        installation_id: Option<&str>,
+        skill_md_bytes: &[u8],
+        referenced_files: &[(String, Vec<u8>)],
+        adopt_in_place: bool,
+    ) -> Result<PushOutcome> {
         if reconciler_disabled() {
             return Ok(PushOutcome::default());
         }
@@ -198,19 +238,35 @@ impl ManagedPathsPusher {
                 "pusher: replaced a Scenery-managed symlink with a real managed dir"
             );
         } else if skill_dir.is_dir() && !ownership::is_scenery_managed(&skill_dir) {
-            // The more common shape of the same collision: `npx skills`,
-            // Cursor and Codex all create real directories at the canonical
-            // path, and `discoveries.rs` deliberately reports them without
-            // adopting them, so they legitimately sit here unmanaged forever.
-            // Annexing one here would overwrite its SKILL.md, stamp it with
-            // our marker, and prime it for a later remove_skill to
-            // `remove_dir_all` content Scenery never wrote — refuse rather
-            // than clobber, exactly as the symlink branch above does.
-            return Err(anyhow::Error::new(CollisionRefused {
-                path: skill_dir.clone(),
-                what: "directory",
-                slug: slug.to_string(),
-            }));
+            if adopt_in_place {
+                // Adopt of the canonical directory itself: back up the user's
+                // copy, then clear it so the published version is written
+                // fresh (no stale files from the user's version survive).
+                super::takeover::back_up_before_delete(&self.journal(), slug, &skill_dir).context(
+                    "pusher: adopt in place: refusing to replace un-backed-up directory",
+                )?;
+                fs::remove_dir_all(&skill_dir).with_context(|| {
+                    format!(
+                        "pusher: adopt in place: failed to clear {}",
+                        skill_dir.display()
+                    )
+                })?;
+                info!(slug, "pusher: adopting user directory in place (backed up)");
+            } else {
+                // The more common shape of the same collision: `npx skills`,
+                // Cursor and Codex all create real directories at the canonical
+                // path, and `discoveries.rs` deliberately reports them without
+                // adopting them, so they legitimately sit here unmanaged forever.
+                // Annexing one here would overwrite its SKILL.md, stamp it with
+                // our marker, and prime it for a later remove_skill to
+                // `remove_dir_all` content Scenery never wrote — refuse rather
+                // than clobber, exactly as the symlink branch above does.
+                return Err(anyhow::Error::new(CollisionRefused {
+                    path: skill_dir.clone(),
+                    what: "directory",
+                    slug: slug.to_string(),
+                }));
+            }
         }
 
         fs::create_dir_all(&skill_dir).with_context(|| {
@@ -866,6 +922,20 @@ pub async fn push_adopted_discovery(
     }
     if kind != "skill" {
         tracing::debug!(slug, kind, "adopt: kind is not 'skill' — push deferred");
+        return Ok(());
+    }
+
+    // Source IS the canonical managed directory: pushing it onto itself would
+    // be refused as a collision. Conversion to managed happens when the
+    // published version installs (reconciler + takeover), not from here, so a
+    // pending-review adopt never marks the user's copy managed early.
+    if super::takeover::source_is_canonical_dest(slug, Path::new(source_path)) {
+        info!(
+            slug,
+            source = %source_path,
+            "adopt: source_path is the canonical managed directory — \
+             conversion to managed happens when the published version installs"
+        );
         return Ok(());
     }
 

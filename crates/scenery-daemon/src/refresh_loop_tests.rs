@@ -423,3 +423,56 @@ fn needs_refresh_boundary_at_exactly_300s() {
         "token expiring in 299s should need refresh"
     );
 }
+
+/// A refresh answered with 403 `{"detail":{"code":"user_revoked"}}` clears
+/// the stored tokens and device session once, stamps the revoked marker and
+/// does not enter the backoff schedule.
+#[test]
+fn refresh_one_tick_clears_session_on_user_revoked() {
+    let _guard = KeychainOff::enable();
+    let root = temp_root("user-revoked");
+    let state = AppState::bootstrap_in(root.clone()).expect("bootstrap");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+
+    let mut server = Server::new();
+    let registry_url = server.url();
+    let mock = server
+        .mock("POST", "/portal/auth/refresh")
+        .with_status(403)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"detail":{"code":"user_revoked","detail":"User has been revoked"}}"#)
+        .expect(1)
+        .create();
+
+    save_tokens(
+        &state,
+        &registry_url,
+        &make_jwt_with_exp(now + 120),
+        "refresh",
+    )
+    .unwrap();
+    state.set_sync_state("device_id", "dev-1").unwrap();
+
+    refresh_one_tick(&state, &registry_url).unwrap();
+    // Second tick: nothing left to refresh, no further HTTP call.
+    refresh_one_tick(&state, &registry_url).unwrap();
+
+    mock.assert();
+    assert!(load_tokens(&state, &registry_url).unwrap().is_none());
+    assert_eq!(state.get_sync_state("device_id").unwrap(), None);
+    assert!(state
+        .get_sync_state(scenery_core::auth::USER_REVOKED_KEY)
+        .unwrap()
+        .is_some());
+
+    // A fresh login clears the marker.
+    save_tokens(&state, &registry_url, "a", "r").unwrap();
+    assert!(state
+        .get_sync_state(scenery_core::auth::USER_REVOKED_KEY)
+        .unwrap()
+        .is_none());
+    let _ = std::fs::remove_dir_all(&root);
+}

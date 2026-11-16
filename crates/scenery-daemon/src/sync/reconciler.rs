@@ -3039,7 +3039,25 @@ fn push_skill_to_claude(
     // Collect referenced files (prompts/ etc.) for the push.
     let referenced = collect_referenced_files(active_dir.as_std_path());
 
-    match p.push_skill(skill_id, installation_id, &skill_md_bytes, &referenced) {
+    // Adopt of the canonical directory itself (source_path ==
+    // ~/.agents/skills/<slug>): convert the user's directory to managed in
+    // place. Every other install keeps the collision refusal.
+    let adopt_in_place = state
+        .pending_adopt_takeover_source(skill_id)
+        .ok()
+        .flatten()
+        .is_some_and(|src| {
+            crate::managed_paths::takeover::source_is_canonical_dest(
+                skill_id,
+                std::path::Path::new(&src),
+            )
+        });
+    let push_result = if adopt_in_place {
+        p.push_skill_adopting_in_place(skill_id, installation_id, &skill_md_bytes, &referenced)
+    } else {
+        p.push_skill(skill_id, installation_id, &skill_md_bytes, &referenced)
+    };
+    match push_result {
         Ok(push) => record_outcome(match push.link_refused {
             Some(path) => ProjectionOutcome::LinkRefused { path },
             None => ProjectionOutcome::Ok,

@@ -1584,6 +1584,25 @@ pub fn refresh_one_tick(state: &AppState, registry_url: &str) -> Result<()> {
                     }
                 }
             }
+            Err(err) if err.is_user_revoked() => {
+                // Terminal: the user was deleted/revoked. Clear the session
+                // once; with the token rows gone every later tick is a no-op,
+                // so the refresh loop is effectively stopped until a re-pair
+                // stores new tokens.
+                match scenery_core::auth::handle_user_revoked(state, &row.registry_url) {
+                    Ok(true) => warn!(
+                        registry_url = %row.registry_url,
+                        "refresh_one_tick: your Scenery account was removed or revoked by \
+                         an admin — session cleared. Run `scenery auth pair` to re-pair."
+                    ),
+                    Ok(false) => {}
+                    Err(e) => warn!(
+                        error = %e,
+                        registry_url = %row.registry_url,
+                        "refresh_one_tick: failed to clear the revoked session"
+                    ),
+                }
+            }
             Err(err) => {
                 let (status_label, backoff) = classify_refresh_failure(&err, row.refresh_failures);
                 let next_attempt_at = backoff.map(|secs| now_unix + secs as i64);
@@ -2512,6 +2531,16 @@ pub fn run_sync_tick(
             );
             if !resp.servers.is_empty() {
                 changed = true;
+            }
+        }
+        Err(e) if scenery_core::auth::is_user_revoked_error(&e) => {
+            match scenery_core::auth::handle_user_revoked(&state_view, &registry.base_url) {
+                Ok(true) => warn!(
+                    "sync: your Scenery account was removed or revoked by an admin — \
+                     session cleared. Run `scenery auth pair` to re-pair."
+                ),
+                Ok(false) => {}
+                Err(e) => warn!(error = %e, "sync: failed to clear the revoked session"),
             }
         }
         Err(e) => {

@@ -4775,6 +4775,9 @@ async fn cmd_auth_status(registry_url: &str) -> Result<()> {
 
     match tokens {
         None => {
+            if print_user_revoked_notice(&state) {
+                anyhow::bail!("account removed or revoked for {registry_url}");
+            }
             println!("Not logged in to {registry_url}.");
             anyhow::bail!("not logged in to {registry_url}");
         }
@@ -4790,6 +4793,12 @@ async fn cmd_auth_status(registry_url: &str) -> Result<()> {
                     print_sse_degraded_notice(&state);
                     Ok(())
                 }
+                Err(e) if scenery_core::auth::is_user_revoked_error(&e) => {
+                    // Same one-time session clear the daemon does.
+                    let _ = scenery_core::auth::handle_user_revoked(&state, registry_url);
+                    print_user_revoked_notice(&state);
+                    anyhow::bail!("account removed or revoked for {registry_url}")
+                }
                 Err(e) => {
                     println!("Token present for {registry_url} but validation failed: {e:#}");
                     println!("Try `scenery auth login` to refresh.");
@@ -4797,6 +4806,21 @@ async fn cmd_auth_status(registry_url: &str) -> Result<()> {
                 }
             }
         }
+    }
+}
+
+/// Print the "account removed or revoked" notice when the runner cleared its
+/// session after a `user_revoked` response (`sync_state["user_revoked_at"]`).
+/// Returns whether the marker was set.
+fn print_user_revoked_notice(state: &scenery_core::state::AppState) -> bool {
+    match state.get_sync_state(scenery_core::auth::USER_REVOKED_KEY) {
+        Ok(Some(at)) => {
+            println!("Your Scenery account was removed or revoked by an admin (at {at}).");
+            println!("The local session was cleared; installed tools were left in place.");
+            println!("Ask your admin to restore access, then run `scenery auth pair` to re-pair.");
+            true
+        }
+        _ => false,
     }
 }
 

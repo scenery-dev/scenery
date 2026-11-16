@@ -49,6 +49,61 @@ impl RefreshError {
     pub fn is_auth_failure(&self) -> bool {
         matches!(self, RefreshError::AuthFailed { .. })
     }
+
+    /// True when the backend rejected the refresh because the USER was
+    /// deleted or revoked (403 `user_revoked`) — terminal, no backoff retry.
+    pub fn is_user_revoked(&self) -> bool {
+        matches!(self, RefreshError::AuthFailed { body, .. } if is_user_revoked_body(body))
+    }
+}
+
+/// `sync_state` key stamped when the backend reports the user was removed or
+/// revoked. Cleared by [`save_tokens`] (any fresh login/pair).
+pub const USER_REVOKED_KEY: &str = "user_revoked_at";
+
+/// Does a 403 body carry the `user_revoked` code? Tolerant of both shapes:
+/// `{"detail":{"code":"user_revoked",...}}` (what the backend sends) and a
+/// top-level `{"code":"user_revoked"}`.
+pub fn is_user_revoked_body(body: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    let is = |x: &serde_json::Value| x.get("code").and_then(|c| c.as_str()) == Some("user_revoked");
+    v.get("detail").is_some_and(is) || is(&v)
+}
+
+/// Typed error for "the backend says this user was removed or revoked".
+/// Callers downcast an `anyhow::Error` to it, then call
+/// [`handle_user_revoked`].
+#[derive(Debug)]
+pub struct UserRevokedError;
+
+impl std::fmt::Display for UserRevokedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "your Scenery account was removed or revoked by an admin")
+    }
+}
+
+impl std::error::Error for UserRevokedError {}
+
+/// True when `err` (or anything in its chain) is a [`UserRevokedError`].
+pub fn is_user_revoked_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|e| e.is::<UserRevokedError>())
+}
+
+/// React to a `user_revoked` response from ANY bearer path: clear the stored
+/// tokens for `registry_url` (secrets file/keychain + SQLite row) and the
+/// local device session, and stamp [`USER_REVOKED_KEY`]. Nothing is
+/// uninstalled. Idempotent; returns `true` only the first time (when the
+/// marker was not already set), so callers log once.
+pub fn handle_user_revoked(state: &AppState, registry_url: &str) -> Result<bool> {
+    let first = state.get_sync_state(USER_REVOKED_KEY)?.is_none();
+    clear_tokens(state, registry_url)?;
+    state.clear_device_session()?;
+    if first {
+        state.set_sync_state(USER_REVOKED_KEY, &chrono::Utc::now().to_rfc3339())?;
+    }
+    Ok(first)
 }
 
 impl std::fmt::Display for RefreshError {
@@ -268,6 +323,9 @@ impl AuthClient {
     pub fn refresh(&self, refresh_token: &str) -> Result<TokenResponse> {
         match self.refresh_detailed(refresh_token) {
             Ok(t) => Ok(t),
+            Err(e @ RefreshError::AuthFailed { .. }) if e.is_user_revoked() => {
+                Err(anyhow::Error::new(UserRevokedError))
+            }
             Err(RefreshError::AuthFailed { status, body }) => {
                 anyhow::bail!("token refresh failed (HTTP {status}): {body}")
             }
@@ -343,6 +401,9 @@ impl AuthClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().unwrap_or_default();
+            if status == reqwest::StatusCode::FORBIDDEN && is_user_revoked_body(&body) {
+                return Err(anyhow::Error::new(UserRevokedError));
+            }
             anyhow::bail!("auth check failed (HTTP {status}): {body}");
         }
 
@@ -671,6 +732,8 @@ pub fn save_tokens(
     refresh_token: &str,
 ) -> Result<()> {
     secrets_set(state, registry_url, access_token, refresh_token)?;
+    // A fresh session supersedes any earlier "account revoked" marker.
+    state.delete_sync_state(USER_REVOKED_KEY)?;
 
     let conn = Connection::open(&state.db_path).context("failed to open state DB")?;
     conn.execute(
@@ -1446,6 +1509,45 @@ mod tests {
         assert_eq!(loaded.next_refresh_attempt_at, None);
         assert_eq!(loaded.last_refresh_status.as_deref(), Some("ok"));
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn user_revoked_body_accepts_nested_and_top_level_code() {
+        assert!(is_user_revoked_body(
+            r#"{"detail":{"code":"user_revoked","detail":"x"}}"#
+        ));
+        assert!(is_user_revoked_body(r#"{"code":"user_revoked"}"#));
+        assert!(!is_user_revoked_body(
+            r#"{"detail":{"code":"device_revoked"}}"#
+        ));
+        assert!(!is_user_revoked_body(r#"{"detail":"nope"}"#));
+        assert!(!is_user_revoked_body("not json"));
+    }
+
+    /// `me()` maps a 403 user_revoked to the typed error, and
+    /// `handle_user_revoked` clears the session exactly once.
+    #[test]
+    fn me_user_revoked_then_handle_clears_session_once() {
+        let _guard = KeychainOff::enable();
+        let root = temp_root("me-revoked");
+        let state = AppState::bootstrap_in(root.clone()).expect("bootstrap");
+        let mut server = mockito::Server::new();
+        let url = server.url();
+        let _m = server
+            .mock("GET", "/portal/auth/me")
+            .with_status(403)
+            .with_body(r#"{"detail":{"code":"user_revoked"}}"#)
+            .create();
+        save_tokens(&state, &url, "acc", "ref").unwrap();
+
+        let err = AuthClient::new(&url).me("acc").unwrap_err();
+        assert!(is_user_revoked_error(&err));
+
+        assert!(handle_user_revoked(&state, &url).unwrap(), "first call");
+        assert!(!handle_user_revoked(&state, &url).unwrap(), "second call");
+        assert!(load_tokens(&state, &url).unwrap().is_none());
+        assert!(state.get_sync_state(USER_REVOKED_KEY).unwrap().is_some());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

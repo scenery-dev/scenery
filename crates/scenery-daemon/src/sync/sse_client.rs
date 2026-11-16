@@ -330,6 +330,14 @@ pub(crate) async fn run_with_policy(
                         // what turned this into an unbounded ~120ms-interval
                         // request storm before this fix.
                     }
+                    Err(e) if scenery_core::auth::is_user_revoked_error(&e) => {
+                        // Session already cleared by try_refresh_token.
+                        info!(
+                            "SSE: your Scenery account was removed or revoked by an admin — \
+                             stopping sync. Run `scenery auth pair` to re-pair."
+                        );
+                        return;
+                    }
                     Err(e) => {
                         warn!(error = %e, "SSE: token refresh failed — backing off");
                     }
@@ -375,6 +383,11 @@ pub(crate) async fn run_with_policy(
                 // reinstating the user, then `auth login` + `auth pair`.
                 if let Err(e) = state.mark_device_revoked() {
                     warn!(error = %e, "SSE: failed to persist device-revoked state locally");
+                }
+                if let Err(e) =
+                    scenery_core::auth::handle_user_revoked(&state, &config.registry_url)
+                {
+                    warn!(error = %e, "SSE: failed to clear the revoked session");
                 }
                 info!(
                     "SSE: your Scenery account was revoked by an admin — stopping sync. \
@@ -454,12 +467,7 @@ pub(crate) fn is_device_revoked_body(body: &str) -> bool {
 /// revoked user's daemon gets `{"code": "user_revoked"}`, not
 /// `device_revoked`, even though user revoke also revokes every device.
 pub(crate) fn is_user_revoked_body(body: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| v.get("detail").cloned().or(Some(v)))
-        .and_then(|d| d.get("code").cloned())
-        .and_then(|c| c.as_str().map(|s| s == "user_revoked"))
-        .unwrap_or(false)
+    scenery_core::auth::is_user_revoked_body(body)
 }
 
 // ── SSE stream ────────────────────────────────────────────────────────────────
@@ -1735,6 +1743,11 @@ async fn try_refresh_token(
                 )
                 .context("failed to save refreshed tokens")?;
                 Ok(new_tokens.access_token)
+            }
+            Err(err) if err.is_user_revoked() => {
+                scenery_core::auth::handle_user_revoked(&state_clone, &reg_url)
+                    .context("failed to clear the revoked session")?;
+                Err(anyhow::Error::new(scenery_core::auth::UserRevokedError))
             }
             Err(err) => {
                 let now_unix = std::time::SystemTime::now()

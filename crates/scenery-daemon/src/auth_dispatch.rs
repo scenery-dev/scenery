@@ -180,12 +180,13 @@ pub async fn handle_get_portal_session(
     state: &AppState,
     registry_url: &str,
 ) -> JsonRpcResponse {
-    let state = state.clone();
+    let state_for_load = state.clone();
     let registry_url = registry_url.to_string();
 
-    let stored =
-        tokio::task::spawn_blocking(move || scenery_core::auth::load_tokens(&state, &registry_url))
-            .await;
+    let stored = tokio::task::spawn_blocking(move || {
+        scenery_core::auth::load_tokens(&state_for_load, &registry_url)
+    })
+    .await;
 
     let stored = match stored {
         Ok(Ok(Some(tokens))) => tokens,
@@ -224,6 +225,13 @@ pub async fn handle_get_portal_session(
     let user = match user {
         Ok(Ok(user)) => user,
         Ok(Err(e)) => {
+            if scenery_core::auth::is_user_revoked_error(&e) {
+                if let Err(ce) =
+                    scenery_core::auth::handle_user_revoked(&state, &stored.registry_url)
+                {
+                    tracing::warn!(error = %ce, "auth: failed to clear the revoked session");
+                }
+            }
             return JsonRpcResponse::error(
                 id,
                 INTERNAL_ERROR,
