@@ -227,7 +227,7 @@ pub async fn handle_get_portal_session(
         Ok(Err(e)) => {
             if scenery_core::auth::is_user_revoked_error(&e) {
                 if let Err(ce) =
-                    scenery_core::auth::handle_user_revoked(&state, &stored.registry_url)
+                    scenery_core::auth::handle_user_revoked(state, &stored.registry_url)
                 {
                     tracing::warn!(error = %ce, "auth: failed to clear the revoked session");
                 }
