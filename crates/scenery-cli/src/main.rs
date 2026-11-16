@@ -4816,7 +4816,7 @@ fn print_user_revoked_notice(state: &scenery_core::state::AppState) -> bool {
     match state.get_sync_state(scenery_core::auth::USER_REVOKED_KEY) {
         Ok(Some(at)) => {
             println!("Your Scenery account was removed or revoked by an admin (at {at}).");
-            println!("The local session was cleared; installed tools were left in place.");
+            println!("The local session was cleared; the runner did not uninstall anything itself.");
             println!("Ask your admin to restore access, then run `scenery auth pair` to re-pair.");
             true
         }
