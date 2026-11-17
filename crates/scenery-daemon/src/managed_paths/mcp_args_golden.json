@@ -1,5 +1,5 @@
 {
-  "_comment": "Golden vectors for MCP argument redaction. Shared with scenery-backend (sanitize_discovery_args): both sides must produce exactly `expected`. `command` may carry its own arguments; the runner splits it first. Vectors with \"added_by\": \"backend\" are leak cases the runner (as of b25e6f0) does not redact yet; `expected_command` is the executable basename the backend derives (the runner should send the same). Vectors with \"added_by\": \"runner\" are runner-originated and need adding to the backend fixture.",
+  "_comment": "Golden vectors for MCP argument redaction. Shared with scenery-backend (sanitize_discovery_args): both sides must produce exactly `expected`. `command` may carry its own arguments; the runner splits it first. Vectors with \"added_by\": \"backend\" are leak cases the runner (as of b25e6f0) does not redact yet; `expected_command` is the executable basename the backend derives (the runner should send the same). Vectors with \"added_by\": \"runner\" came from the runner fixture and were not in the backend one; \"short flag =value\" there originally expected -p=pw -> <redacted> and was updated to the backend rule -p=<redacted>.",
   "vectors": [
     {"name": "npx registry with userinfo", "command": "npx", "args": ["--registry", "https://user:tok@host", "pkg"], "expected": ["--registry", "<redacted>", "pkg"]},
     {"name": "docker -e TOKEN=x", "command": "docker", "args": ["run", "-e", "TOKEN=x", "image"], "expected": ["run", "-e", "<redacted>", "<redacted>"]},
@@ -34,6 +34,9 @@
     {"name": "mysql attached password with host", "command": "mysql", "args": ["-h", "localhost", "-pSECRET", "-uroot"], "expected": ["-h", "<redacted>", "<redacted>", "<redacted>"]},
     {"name": "attached value containing =", "command": "mysql", "args": ["-pMy=Pass", "-pc2VjcmV0cGFzcw=="], "expected": ["<redacted>", "<redacted>"], "added_by": "backend"},
     {"name": "short flag with equals keeps only its name", "command": "node", "args": ["-p=secret", "-x=1"], "expected": ["-p=<redacted>", "-x=<redacted>"], "added_by": "backend"},
-  {"name": "docker combined booleans stay", "command": "docker", "args": ["run", "-it", "--rm", "ghcr.io/org/img:1.4"], "expected": ["run", "-it", "--rm", "ghcr.io/org/img:1.4"], "added_by": "runner"}
+    {"name": "mysql -p with base64 password ending in ==", "command": "mysql", "args": ["-pc2VjcmV0cGFzcw=="], "expected": ["<redacted>"], "added_by": "runner"},
+    {"name": "mysql -p attached value containing =", "command": "mysql", "args": ["-pMy=Pass"], "expected": ["<redacted>"], "added_by": "runner"},
+    {"name": "short flag =value", "command": "node", "args": ["-p=pw", "--key=abc"], "expected": ["-p=<redacted>", "--key=<redacted>"], "added_by": "runner"},
+    {"name": "docker combined booleans stay", "command": "docker", "args": ["run", "-it", "--rm", "ghcr.io/org/img:1.4"], "expected": ["run", "-it", "--rm", "ghcr.io/org/img:1.4"], "added_by": "runner"}
   ]
 }
