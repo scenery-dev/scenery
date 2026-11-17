@@ -113,6 +113,21 @@ pub struct RestoreReport {
     /// Set when `--purge` kept `restore-backups/` (and the journal) because a
     /// restore failed: where those backups live.
     pub backups_kept_at: Option<String>,
+    /// The user's OWN skills (Scenery converted them from their own copy) that
+    /// they kept editing: their current version stays in place, unmanaged, and
+    /// the original is kept in the uninstall report folder. Restoring the old
+    /// original over newer work would be data loss.
+    pub kept_own: Vec<KeptOwnItem>,
+}
+
+/// A skill of the user's own whose later edits were kept (plan 4.5.5).
+#[derive(Debug, Serialize)]
+pub struct KeptOwnItem {
+    pub name: String,
+    /// Where the user's current (edited) version stays, now unmanaged.
+    pub current_version_at: String,
+    /// The original, as it was before Scenery converted it.
+    pub original_copy_at: String,
 }
 
 /// Both versions of something the user changed after Scenery converted it.
@@ -161,7 +176,12 @@ pub async fn run(opts: UninstallOpts) -> Result<()> {
 
     // ── 3. Restore first, so a failure mid-way never loses user data. ──
     // Native `~/.claude` takeovers + adopted originals from the restore journal.
-    restore_from_journal(&journal_entries, &mut report);
+    let originals_dir = report_folder(&opts);
+    restore_from_journal_in(&journal_entries, &mut report, &originals_dir);
+    forget_kept_own_markers(&report);
+    // Skills tracked in place were never changed; undo only what the kill
+    // switch did to them (links, SKILL.md renames).
+    restore_tracked_skills(&mut report);
 
     // ── 4. Clean every client config: restore, or strip only Scenery's keys. ──
     strip_client_configs(&plan, &journal_entries, &mut report);
@@ -649,7 +669,19 @@ fn load_journal_entries(report: &mut RestoreReport) -> Vec<JournalEntry> {
 ///
 /// A directory restore never destroys what is there now: see
 /// [`restore_one_entry`].
+#[cfg(test)]
 fn restore_from_journal(entries: &[JournalEntry], report: &mut RestoreReport) {
+    restore_from_journal_in(entries, report, &report_folder(&UninstallOpts::default()));
+}
+
+/// [`restore_from_journal`] with the folder that receives the originals of
+/// the user's own skills they kept editing (`originals_dir`, created only when
+/// needed).
+fn restore_from_journal_in(
+    entries: &[JournalEntry],
+    report: &mut RestoreReport,
+    originals_dir: &Path,
+) {
     use std::collections::HashSet;
 
     let mut handled: HashSet<&str> = HashSet::new();
@@ -677,7 +709,15 @@ fn restore_from_journal(entries: &[JournalEntry], report: &mut RestoreReport) {
         };
 
         let pristine = installed_tree_hash(entries, &chosen.target_path);
-        let outcome = match restore_one_entry(chosen, pristine.as_deref()) {
+        // The user's OWN skill (auto-managed): later edits win over the old
+        // original. Decided by the origin the pusher journaled, never by a
+        // marker file anyone could ship.
+        let own_dest = installed_origin_is_own(entries, &chosen.target_path).then(|| {
+            originals_dir
+                .join("originals")
+                .join(chosen.slug.clone().unwrap_or_else(|| "skill".to_string()))
+        });
+        let outcome = match restore_one_entry(chosen, pristine.as_deref(), own_dest.as_deref()) {
             Ok(o) => o,
             Err(e) => {
                 let msg = format!(
@@ -694,6 +734,14 @@ fn restore_from_journal(entries: &[JournalEntry], report: &mut RestoreReport) {
             .slug
             .clone()
             .unwrap_or_else(|| chosen.target_path.clone());
+        if let Some(original_copy) = outcome.kept_current_with_original_at {
+            report.kept_own.push(KeptOwnItem {
+                name,
+                current_version_at: chosen.target_path.clone(),
+                original_copy_at: original_copy.display().to_string(),
+            });
+            continue;
+        }
         if let Some(kept) = outcome.preserved_current_at {
             report.preserved.push(PreservedItem {
                 name: name.clone(),
@@ -779,9 +827,28 @@ fn installed_tree_hash(entries: &[JournalEntry], target_path: &str) -> Option<St
         })
 }
 
+/// Did Scenery convert this path from the user's own skill (`origin =
+/// auto_managed` on the newest push entry)?
+fn installed_origin_is_own(entries: &[JournalEntry], target_path: &str) -> bool {
+    use scenery_core::restore_journal::JournalSource;
+    entries
+        .iter()
+        .rev()
+        .find(|e| {
+            e.target_path == target_path
+                && e.source == JournalSource::Managed
+                && e.op == JournalOp::ArtifactPush
+        })
+        .and_then(|e| e.detail.get("origin").and_then(|v| v.as_str()))
+        == Some("auto_managed")
+}
+
 /// What a restore did besides putting the original back.
 #[derive(Debug, Default)]
 struct RestoreOutcome {
+    /// An OWN skill edited since conversion: its current tree was left in
+    /// place (unmanaged) and the original was copied here instead.
+    kept_current_with_original_at: Option<PathBuf>,
     /// Where the pre-existing tree was moved instead of being deleted.
     preserved_current_at: Option<PathBuf>,
     preserved_reason: String,
@@ -800,7 +867,11 @@ struct RestoreOutcome {
 /// to compare against) is renamed to `<name>.scenery-edited-<token>` beside
 /// the target, with its Scenery marker removed so the later managed-artifact
 /// sweep does not delete it, and reported in [`RestoreOutcome`].
-fn restore_one_entry(entry: &JournalEntry, installed_hash: Option<&str>) -> Result<RestoreOutcome> {
+fn restore_one_entry(
+    entry: &JournalEntry,
+    installed_hash: Option<&str>,
+    own_originals_dest: Option<&Path>,
+) -> Result<RestoreOutcome> {
     let target = Path::new(&entry.target_path);
     let mut outcome = RestoreOutcome::default();
     match &entry.backup_path {
@@ -813,7 +884,13 @@ fn restore_one_entry(entry: &JournalEntry, installed_hash: Option<&str>) -> Resu
                     .with_context(|| format!("creating {}", parent.display()))?;
             }
             if backup_meta.is_dir() {
-                restore_dir(backup, target, installed_hash, &mut outcome)?;
+                restore_dir(
+                    backup,
+                    target,
+                    installed_hash,
+                    own_originals_dest,
+                    &mut outcome,
+                )?;
             } else {
                 scenery_core::safe_copy::copy_tree(backup, target)
                     .with_context(|| format!("restoring {}", target.display()))?;
@@ -839,10 +916,51 @@ fn restore_dir(
     backup: &Path,
     target: &Path,
     installed_hash: Option<&str>,
+    own_originals_dest: Option<&Path>,
     outcome: &mut RestoreOutcome,
 ) -> Result<()> {
     use scenery_core::safe_copy::{copy_tree, tree_fingerprint, unique_token};
     use scenery_mcp::ownership::MANAGED_MARKER_FILENAME;
+
+    // The user's OWN skill, edited since Scenery converted it: keep the
+    // CURRENT tree in place and put the original beside the report. Putting
+    // the old original over newer work would be data loss.
+    if let Some(dest) = own_originals_dest {
+        let pristine = std::fs::symlink_metadata(target)
+            .map(|m| m.is_dir())
+            .unwrap_or(false)
+            && installed_hash.is_some_and(|h| {
+                tree_fingerprint(target, &[MANAGED_MARKER_FILENAME])
+                    .map(|cur| cur == h)
+                    .unwrap_or(false)
+            });
+        let live = std::fs::symlink_metadata(target)
+            .map(|m| m.is_dir())
+            .unwrap_or(false);
+        if live && !pristine {
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("creating {}", parent.display()))?;
+            }
+            // Never merge into an earlier copy.
+            let dest = if std::fs::symlink_metadata(dest).is_ok() {
+                dest.with_file_name(format!(
+                    "{}-{}",
+                    dest.file_name().and_then(|n| n.to_str()).unwrap_or("skill"),
+                    unique_token()
+                ))
+            } else {
+                dest.to_path_buf()
+            };
+            copy_tree(backup, &dest)
+                .with_context(|| format!("copying the original to {}", dest.display()))?;
+            // No longer Scenery's: the managed-artifact sweep must not delete it.
+            let _ = std::fs::remove_file(target.join(MANAGED_MARKER_FILENAME));
+            remove_client_links_to(target);
+            outcome.kept_current_with_original_at = Some(dest);
+            return Ok(());
+        }
+    }
 
     let parent = target
         .parent()
@@ -1041,15 +1159,101 @@ struct ReportPaths {
     json: PathBuf,
 }
 
+fn report_stamp() -> String {
+    // Stable, sortable basename. Timestamp is supplied by the caller/env rather
+    // than Date::now so the report path is deterministic in tests.
+    std::env::var("SCENERY_UNINSTALL_STAMP").unwrap_or_else(|_| "latest".into())
+}
+
+/// `<report dir>/Scenery-uninstall-<stamp>/`: the folder beside the report
+/// files that receives anything uninstall keeps for the user (the originals of
+/// their own skills they edited). Not created until something is put in it.
+fn report_folder(opts: &UninstallOpts) -> PathBuf {
+    opts.report_dir
+        .clone()
+        .or_else(dirs_home)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(format!("Scenery-uninstall-{}", report_stamp()))
+}
+
+/// Remove the client links (`~/.claude/skills/<name>`, the Antigravity alias)
+/// that point at `dir`, never anything else: a kept own skill must not leave a
+/// link that makes a client keep loading it as if Scenery still managed it.
+fn remove_client_links_to(dir: &Path) {
+    let Some(home) = dirs_home() else { return };
+    let Some(name) = dir.file_name() else { return };
+    let Ok(canon) = std::fs::canonicalize(dir) else {
+        return;
+    };
+    for base in [
+        home.join(".claude").join("skills"),
+        home.join(".gemini").join("config").join("skills"),
+    ] {
+        let link = base.join(name);
+        if link.is_symlink()
+            && std::fs::canonicalize(&link)
+                .map(|p| p == canon)
+                .unwrap_or(false)
+        {
+            let _ = std::fs::remove_file(&link);
+        }
+    }
+}
+
+/// Drop the `managed_path_markers` rows of own skills whose current version
+/// was kept: they are unmanaged now, and a later reinstall must not mistake
+/// them for managed or suspicious. Best effort.
+fn forget_kept_own_markers(report: &RestoreReport) {
+    if report.kept_own.is_empty() {
+        return;
+    }
+    let Ok(state) = scenery_core::state::AppState::bootstrap() else {
+        return;
+    };
+    let Ok(conn) = rusqlite::Connection::open(&state.db_path) else {
+        return;
+    };
+    for k in &report.kept_own {
+        let _ = conn.execute(
+            "DELETE FROM managed_path_markers WHERE path = ?1",
+            [&k.current_version_at],
+        );
+    }
+}
+
+/// Undo what the kill switch did to tracked skills (links removed,
+/// `SKILL.md` renamed). A tracked skill was never changed otherwise, so after
+/// this its files are exactly as found.
+fn restore_tracked_skills(report: &mut RestoreReport) {
+    let Ok(state) = scenery_core::state::AppState::bootstrap() else {
+        return;
+    };
+    match scenery_daemon::managed_paths::tracked::restore_all(&state) {
+        Ok(restored) => {
+            for (slug, entry) in restored {
+                report.restored.push(RestoredItem {
+                    client: "Scenery".into(),
+                    name: slug,
+                    restored_to: entry.display().to_string(),
+                    from_backup: "(the kill switch's change was reversed; the skill itself \
+                                  was never modified)"
+                        .into(),
+                });
+            }
+        }
+        Err(e) => report.warnings.push(format!(
+            "could not undo the kill switch on tracked skills: {e:#}"
+        )),
+    }
+}
+
 fn write_report(report: &RestoreReport, opts: &UninstallOpts) -> Result<ReportPaths> {
     let dir = opts
         .report_dir
         .clone()
         .or_else(dirs_home)
         .unwrap_or_else(|| PathBuf::from("."));
-    // Stable, sortable basename. Timestamp is supplied by the caller/env rather
-    // than Date::now so the report path is deterministic in tests.
-    let stamp = std::env::var("SCENERY_UNINSTALL_STAMP").unwrap_or_else(|_| "latest".into());
+    let stamp = report_stamp();
     let md = dir.join(format!("Scenery-uninstall-{stamp}.md"));
     let json = dir.join(format!("Scenery-uninstall-{stamp}.json"));
     std::fs::write(&md, render_markdown(report)).with_context(|| format!("writing {md:?}"))?;
@@ -1123,6 +1327,22 @@ fn render_markdown(r: &RestoreReport) -> String {
         s.push('\n');
     }
 
+    if !r.kept_own.is_empty() {
+        s.push_str("## Your own skills — your current version was kept\n\n");
+        s.push_str(
+            "You kept editing these after Scenery took them over, so your CURRENT version \
+             stays where it is, no longer managed by Scenery. The original (before Scenery) \
+             was copied next to this report:\n\n",
+        );
+        for k in &r.kept_own {
+            s.push_str(&format!(
+                "- **{}** — your version stays at `{}`; the original is at `{}`\n",
+                k.name, k.current_version_at, k.original_copy_at
+            ));
+        }
+        s.push('\n');
+    }
+
     if let Some(kept) = &r.backups_kept_at {
         s.push_str("## Restore backups kept\n\n");
         s.push_str(&format!(
@@ -1178,6 +1398,12 @@ fn print_summary(report: &RestoreReport, paths: &ReportPaths) {
         println!(
             "  Kept both versions of {}: original at {}, your edited copy at {}",
             p.name, p.restored_original_at, p.current_copy_at
+        );
+    }
+    for k in &report.kept_own {
+        println!(
+            "  Kept YOUR current version of {} at {} (original copy: {})",
+            k.name, k.current_version_at, k.original_copy_at
         );
     }
     if let Some(kept) = &report.backups_kept_at {
@@ -1964,6 +2190,187 @@ mod tests {
             fs::read_link(target.join("alias.md")).unwrap(),
             PathBuf::from("SKILL.md")
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── own (auto-managed) skills: later edits are never lost (plan 4.5.5) ────
+
+    fn own_push_entry(target: &Path, tree_sha256: Option<String>) -> JournalEntry {
+        JournalEntry::new(
+            JournalOp::ArtifactPush,
+            JournalSource::Managed,
+            target.to_string_lossy().to_string(),
+        )
+        .with_slug("demo")
+        .with_detail(serde_json::json!({
+            "tree_sha256": tree_sha256,
+            "origin": "auto_managed",
+            "skill_id": "adam~demo",
+        }))
+    }
+
+    /// The user kept editing their own converted skill: their CURRENT tree
+    /// stays, unmanaged; the original goes to the report folder.
+    #[test]
+    fn an_edited_own_skill_keeps_the_current_tree_and_puts_the_original_in_the_report_folder() {
+        let dir = temp_dir("own-edited");
+        let target = converted_target(&dir, "published");
+        let backup = backup_with(&dir, "t1", "the user's original");
+        let hash = tree_fingerprint(&target, &[MANAGED_MARKER_FILENAME]).unwrap();
+        let entries = [
+            adopted_entry(&target, &backup),
+            own_push_entry(&target, Some(hash)),
+        ];
+        fs::write(target.join("SKILL.md"), "published + months of my work").unwrap();
+        fs::write(target.join("new-ref.md"), "added later").unwrap();
+        let originals = dir.join("report-folder");
+
+        let mut report = RestoreReport::default();
+        restore_from_journal_in(&entries, &mut report, &originals);
+
+        // Current tree stays, no longer Scenery's.
+        assert_eq!(
+            fs::read(target.join("SKILL.md")).unwrap(),
+            b"published + months of my work"
+        );
+        assert_eq!(fs::read(target.join("new-ref.md")).unwrap(), b"added later");
+        assert!(!target.join(MANAGED_MARKER_FILENAME).exists());
+        // The original is kept beside the report.
+        assert_eq!(report.kept_own.len(), 1);
+        let k = &report.kept_own[0];
+        assert_eq!(k.current_version_at, target.to_string_lossy());
+        assert!(k
+            .original_copy_at
+            .starts_with(&originals.to_string_lossy().to_string()));
+        assert_eq!(
+            fs::read(PathBuf::from(&k.original_copy_at).join("SKILL.md")).unwrap(),
+            b"the user's original"
+        );
+        // Not reported as a restore, not as a both-versions preserve; nothing failed.
+        assert!(report.restored.is_empty() && report.preserved.is_empty());
+        assert!(report.failed.is_empty(), "{:?}", report.failed);
+        let md = render_markdown(&report);
+        assert!(md.contains("Your own skills") && md.contains("your version stays at"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unedited_own_skill_is_restored_byte_identical_and_listed_under_restored() {
+        let dir = temp_dir("own-pristine");
+        let target = converted_target(&dir, "published");
+        let backup = backup_with(&dir, "t1", "the user's original");
+        let hash = tree_fingerprint(&target, &[MANAGED_MARKER_FILENAME]).unwrap();
+        let entries = [
+            adopted_entry(&target, &backup),
+            own_push_entry(&target, Some(hash)),
+        ];
+
+        let mut report = RestoreReport::default();
+        restore_from_journal_in(&entries, &mut report, &dir.join("report-folder"));
+
+        assert_eq!(
+            fs::read(target.join("SKILL.md")).unwrap(),
+            b"the user's original"
+        );
+        assert!(report.kept_own.is_empty() && report.preserved.is_empty());
+        assert_eq!(report.restored.len(), 1);
+        assert_eq!(report.restored[0].restored_to, target.to_string_lossy());
+        assert!(
+            !dir.join("report-folder").exists(),
+            "nothing to keep, no folder"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An own skill from a non-canonical root (`~/.pi/agent/skills/x`) was
+    /// removed after backup; uninstall puts it back at its ORIGINAL path.
+    #[test]
+    fn a_taken_over_noncanonical_own_skill_is_restored_to_its_original_path() {
+        let dir = temp_dir("own-noncanonical");
+        let original_path = dir.join("pi/agent/skills/demo");
+        let backup = backup_with(&dir, "t1", "pi original");
+        // The managed copy lives at the canonical path, a different one.
+        let canonical = converted_target(&dir, "published");
+        let hash = tree_fingerprint(&canonical, &[MANAGED_MARKER_FILENAME]).unwrap();
+        let entries = [
+            adopted_entry(&original_path, &backup),
+            own_push_entry(&canonical, Some(hash)),
+        ];
+
+        let mut report = RestoreReport::default();
+        restore_from_journal_in(&entries, &mut report, &dir.join("report-folder"));
+
+        assert_eq!(
+            fs::read(original_path.join("SKILL.md")).unwrap(),
+            b"pi original"
+        );
+        assert_eq!(report.restored.len(), 1, "listed under RESTORED");
+        assert!(report.failed.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The kept own skill and its originals copy survive the managed sweep
+    /// that runs right after the restore, and the Claude link is dropped.
+    #[cfg(unix)]
+    #[test]
+    fn a_kept_own_skill_survives_the_sweep_and_loses_its_client_link() {
+        let fake_home = temp_dir("own-sweep");
+        with_fake_home(&fake_home, || {
+            let skills = fake_home.join(".agents").join("skills");
+            let claude = fake_home.join(".claude").join("skills");
+            fs::create_dir_all(&skills).unwrap();
+            fs::create_dir_all(&claude).unwrap();
+            let target = skills.join("demo");
+            fs::create_dir_all(&target).unwrap();
+            fs::write(target.join("SKILL.md"), "published").unwrap();
+            fs::write(target.join(MANAGED_MARKER_FILENAME), "{}").unwrap();
+            std::os::unix::fs::symlink(&target, claude.join("demo")).unwrap();
+            let backup = backup_with(&fake_home, "t1", "the user's original");
+            let hash = tree_fingerprint(&target, &[MANAGED_MARKER_FILENAME]).unwrap();
+            let entries = [
+                adopted_entry(&target, &backup),
+                own_push_entry(&target, Some(hash)),
+            ];
+            fs::write(target.join("SKILL.md"), "my later edit").unwrap();
+
+            let mut report = RestoreReport::default();
+            restore_from_journal_in(&entries, &mut report, &fake_home.join("rep"));
+            let plan = Plan {
+                brokered: vec![],
+                clients: vec![],
+            };
+            remove_managed_artifacts(&plan, &mut report);
+
+            assert_eq!(fs::read(target.join("SKILL.md")).unwrap(), b"my later edit");
+            assert!(
+                claude.join("demo").symlink_metadata().is_err(),
+                "client link removed"
+            );
+            assert!(
+                report.removed.iter().all(|r| r.name != "demo"),
+                "not swept as managed"
+            );
+            assert_eq!(report.kept_own.len(), 1);
+        });
+        let _ = fs::remove_dir_all(&fake_home);
+    }
+
+    /// A catalog skill (no auto_managed origin) keeps today's behaviour.
+    #[test]
+    fn a_catalog_skill_edit_still_restores_the_original_and_preserves_the_edit_beside_it() {
+        let dir = temp_dir("catalog-edited");
+        let target = converted_target(&dir, "published");
+        let backup = backup_with(&dir, "t1", "original");
+        let hash = tree_fingerprint(&target, &[MANAGED_MARKER_FILENAME]).unwrap();
+        let entries = [
+            adopted_entry(&target, &backup),
+            push_entry(&target, Some(hash)),
+        ];
+        fs::write(target.join("SKILL.md"), "edited").unwrap();
+        let mut report = RestoreReport::default();
+        restore_from_journal_in(&entries, &mut report, &dir.join("rep"));
+        assert!(report.kept_own.is_empty());
+        assert_eq!(report.preserved.len(), 1);
         let _ = fs::remove_dir_all(&dir);
     }
 

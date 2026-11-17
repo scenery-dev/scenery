@@ -238,6 +238,19 @@ async fn converts_a_canonical_skill_in_place_with_provenance_backup_and_links() 
         b"my reference"
     );
 
+    // The journal's push entry records the origin uninstall keys its own-skill
+    // rule on, plus the fingerprint of what Scenery wrote.
+    let push = scenery_core::restore_journal::RestoreJournal::for_state(&env.state)
+        .read_all()
+        .unwrap()
+        .into_iter()
+        .rev()
+        .find(|e| e.op == scenery_core::restore_journal::JournalOp::ArtifactPush)
+        .unwrap();
+    assert_eq!(push.detail["origin"], "auto_managed");
+    assert_eq!(push.detail["skill_id"], "adam~pdf");
+    assert!(push.detail["tree_sha256"].as_str().is_some());
+
     // Claude Code link, local-name mapping, namespace, attempt, audit, no leftovers.
     assert!(fs::read_link(env.claude().join("pdf")).is_ok());
     assert_eq!(env.state.skill_local_name("adam~pdf"), "pdf");
