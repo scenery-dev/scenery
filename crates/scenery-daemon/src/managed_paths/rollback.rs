@@ -566,35 +566,12 @@ fn restore_item(
     Ok(())
 }
 
-/// Recursively copy `src` directory into `dest` (same semantics as `migrator::copy_dir_recursive`).
+/// Recursively copy `src` directory into `dest`. Symlink-safe: links are
+/// copied as links and never followed, special files are skipped.
 fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
-    fs::create_dir_all(dest)
-        .with_context(|| format!("copy_dir_recursive: create dest: {}", dest.display()))?;
-
-    for entry in fs::read_dir(src)
-        .with_context(|| format!("copy_dir_recursive: read src: {}", src.display()))?
-    {
-        let entry = entry.context("copy_dir_recursive: read entry")?;
-        let entry_path = entry.path();
-        let dest_path = dest.join(entry.file_name());
-
-        let meta = entry
-            .metadata()
-            .with_context(|| format!("copy_dir_recursive: stat: {}", entry_path.display()))?;
-
-        if meta.is_dir() {
-            copy_dir_recursive(&entry_path, &dest_path)?;
-        } else {
-            fs::copy(&entry_path, &dest_path).with_context(|| {
-                format!(
-                    "copy_dir_recursive: copy {} → {}",
-                    entry_path.display(),
-                    dest_path.display()
-                )
-            })?;
-        }
-    }
-    Ok(())
+    scenery_core::safe_copy::copy_tree(src, dest)
+        .map(|_| ())
+        .with_context(|| format!("copy_dir_recursive: {} → {}", src.display(), dest.display()))
 }
 
 /// Delete the `managed_path_markers` row for `(kind, slug)`.

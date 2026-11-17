@@ -360,7 +360,13 @@ fn backup_and_remove(dir: &Path) -> Result<()> {
 
     let home = dirs::home_dir()
         .ok_or_else(|| anyhow::anyhow!("links: HOME directory not resolvable for backup"))?;
-    let ts = chrono::Utc::now().format("%Y-%m-%dT%H%M%SZ").to_string();
+    // Unique per call: a bare 1-second stamp let two backups in one second
+    // merge into the same directory.
+    let ts = format!(
+        "{}-{}",
+        chrono::Utc::now().format("%Y-%m-%dT%H%M%SZ"),
+        scenery_core::safe_copy::unique_token()
+    );
     let backup_root = home
         .join(".claude")
         .join(".scenery-backup")
@@ -412,22 +418,9 @@ fn backup_and_remove(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Recursive directory copy used only by the Windows fallback.
+/// Recursive directory copy used by the backup fallback. Symlink-safe.
 fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
-    fs::create_dir_all(dst)
-        .with_context(|| format!("links: failed to create {}", dst.display()))?;
-    for entry in
-        fs::read_dir(src).with_context(|| format!("links: failed to read {}", src.display()))?
-    {
-        let entry = entry.context("links: failed to read dir entry")?;
-        let from = entry.path();
-        let to = dst.join(entry.file_name());
-        if from.is_dir() {
-            copy_tree(&from, &to)?;
-        } else {
-            fs::copy(&from, &to)
-                .with_context(|| format!("links: failed to copy {}", from.display()))?;
-        }
-    }
-    Ok(())
+    scenery_core::safe_copy::copy_tree(src, dst)
+        .map(|_| ())
+        .with_context(|| format!("links: failed to copy {}", src.display()))
 }

@@ -417,35 +417,12 @@ fn backup_item(item: &MigrationItem, backup_root: &Path) -> Result<()> {
 }
 
 /// Recursively copy a directory, creating the destination if needed.
+/// Symlink-safe: links are copied as links and never followed, special files
+/// are skipped, and the walk is size-capped.
 fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
-    fs::create_dir_all(dest)
-        .with_context(|| format!("failed to create backup dest: {}", dest.display()))?;
-
-    for entry in fs::read_dir(src)
-        .with_context(|| format!("failed to read dir for backup: {}", src.display()))?
-    {
-        let entry = entry.context("failed to read dir entry during backup")?;
-        let entry_path = entry.path();
-        let file_name = entry.file_name();
-        let dest_path = dest.join(&file_name);
-
-        let meta = entry
-            .metadata()
-            .with_context(|| format!("failed to stat: {}", entry_path.display()))?;
-
-        if meta.is_dir() {
-            copy_dir_recursive(&entry_path, &dest_path)?;
-        } else {
-            fs::copy(&entry_path, &dest_path).with_context(|| {
-                format!(
-                    "failed to copy {} to {}",
-                    entry_path.display(),
-                    dest_path.display()
-                )
-            })?;
-        }
-    }
-    Ok(())
+    scenery_core::safe_copy::copy_tree(src, dest)
+        .map(|_| ())
+        .with_context(|| format!("failed to copy {} to {}", src.display(), dest.display()))
 }
 
 /// The backend refused a migrate/adopt with 403 `artifact_revoked`.

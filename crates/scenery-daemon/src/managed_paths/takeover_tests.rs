@@ -603,3 +603,100 @@ fn perform_if_pending_keeps_record_when_canonical_source_is_not_managed() {
         "pending record must be kept while the directory is not managed"
     );
 }
+
+// ── backup safety (symlinks, special files, unique names) ────────────────────
+
+fn journal_for(root: &TempDir) -> RestoreJournal {
+    RestoreJournal::new(camino::Utf8PathBuf::from_path_buf(root.path().join("vh-root")).unwrap())
+}
+
+/// Two backups of the same slug in the same second land in different
+/// directories; the second (of a possibly half-written tree) can never shadow
+/// or merge into the first (the original).
+#[test]
+fn back_up_before_delete_never_reuses_a_backup_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let journal = journal_for(&root);
+    let src = root.path().join("skill");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("SKILL.md"), "original").unwrap();
+
+    let first = back_up_before_delete(&journal, "demo", &src).unwrap();
+    fs::write(src.join("SKILL.md"), "half written").unwrap();
+    let second = back_up_before_delete(&journal, "demo", &src).unwrap();
+
+    assert_ne!(first, second);
+    assert_eq!(
+        fs::read(first.join("SKILL.md").as_std_path()).unwrap(),
+        b"original"
+    );
+    assert_eq!(
+        fs::read(second.join("SKILL.md").as_std_path()).unwrap(),
+        b"half written"
+    );
+    assert_eq!(journal.read_all().unwrap().len(), 2);
+}
+
+/// A symlink loop and a FIFO in the user's directory: the backup must finish
+/// (no stack overflow, no blocking on the FIFO), keep the link as a link, and
+/// leave the FIFO out.
+#[cfg(unix)]
+#[test]
+fn back_up_before_delete_handles_symlink_loops_and_fifos() {
+    let root = tempfile::tempdir().unwrap();
+    let journal = journal_for(&root);
+    let src = root.path().join("skill");
+    fs::create_dir_all(src.join("sub")).unwrap();
+    fs::write(src.join("SKILL.md"), "x").unwrap();
+    std::os::unix::fs::symlink("..", src.join("sub/up")).unwrap();
+    std::os::unix::fs::symlink(&src, src.join("self")).unwrap();
+    let made = std::process::Command::new("mkfifo")
+        .arg(src.join("pipe"))
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    let dest = back_up_before_delete(&journal, "demo", &src).unwrap();
+
+    assert_eq!(fs::read(dest.join("SKILL.md").as_std_path()).unwrap(), b"x");
+    assert_eq!(
+        fs::read_link(dest.join("sub/up").as_std_path()).unwrap(),
+        std::path::PathBuf::from("..")
+    );
+    assert!(fs::symlink_metadata(dest.join("self").as_std_path())
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    if made {
+        assert!(fs::symlink_metadata(dest.join("pipe").as_std_path()).is_err());
+    }
+}
+
+/// A symlink at the discovered path is backed up as a link (not as the
+/// possibly-huge tree it points at) and then only the link is unlinked.
+#[cfg(unix)]
+#[test]
+fn remove_source_path_backs_up_a_symlink_as_a_symlink() {
+    let root = tempfile::tempdir().unwrap();
+    let state = make_state(&root);
+    let target_dir = root.path().join("real-skill");
+    fs::create_dir_all(&target_dir).unwrap();
+    fs::write(target_dir.join("SKILL.md"), "real").unwrap();
+    let link = root.path().join("linked-skill");
+    std::os::unix::fs::symlink(&target_dir, &link).unwrap();
+
+    remove_source_path(&state, "demo", &link).unwrap();
+
+    assert!(fs::symlink_metadata(&link).is_err(), "link removed");
+    assert_eq!(
+        fs::read(target_dir.join("SKILL.md")).unwrap(),
+        b"real",
+        "target untouched"
+    );
+    let entries = RestoreJournal::for_state(&state).read_all().unwrap();
+    let backup = std::path::PathBuf::from(entries[0].backup_path.clone().unwrap());
+    assert!(fs::symlink_metadata(&backup)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+}

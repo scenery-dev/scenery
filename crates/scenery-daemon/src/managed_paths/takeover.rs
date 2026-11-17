@@ -59,7 +59,7 @@
 
 use anyhow::{Context, Result};
 use scenery_core::{
-    restore_journal::{new_backup_ts, JournalEntry, JournalOp, JournalSource, RestoreJournal},
+    restore_journal::{JournalEntry, JournalOp, JournalSource, RestoreJournal},
     state::AppState,
 };
 use std::{fs, path::Path};
@@ -241,81 +241,57 @@ fn remove_source_path(state: &AppState, slug: &str, path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Copy `path` byte-for-byte into
-/// `<root_dir>/restore-backups/<ts>/adopted/<slug>/` and append a
+/// Copy `path` into a fresh
+/// `<root_dir>/restore-backups/<unique ts>/adopted/<slug>/` and append a
 /// `source = adopted` restore-journal entry pointing at that copy — all
-/// *before* the caller deletes anything.
+/// *before* the caller deletes anything. Returns the backup path.
 ///
-/// Returns `Err` (and leaves no partial journal entry) if either the copy or
-/// the journal append fails, so the caller can treat backup failure as a
-/// hard stop rather than proceeding to delete un-backed-up data.
+/// The copy never follows symlinks (a link is backed up as a link), skips
+/// FIFOs/sockets/devices, and is size-capped; see
+/// [`scenery_core::safe_copy`]. The backup directory name is unique per call,
+/// so two attempts in the same second can never merge into one directory.
+///
+/// Returns `Err` (and leaves no partial copy or journal entry) if either the
+/// copy or the journal append fails, so the caller can treat backup failure as
+/// a hard stop rather than proceeding to delete un-backed-up data.
 pub(super) fn back_up_before_delete(
     journal: &RestoreJournal,
     slug: &str,
     path: &Path,
-) -> Result<()> {
-    let ts = new_backup_ts();
-    let dest = journal.backup_dir_for(&ts).join("adopted").join(slug);
-
-    if path.is_dir() {
-        copy_tree_recursive(path, dest.as_std_path())
-            .with_context(|| format!("failed to back up directory {} -> {dest}", path.display()))?;
-    } else {
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent.as_std_path())
-                .with_context(|| format!("failed to create backup dir {parent}"))?;
-        }
-        fs::copy(path, dest.as_std_path())
-            .with_context(|| format!("failed to back up file {} -> {dest}", path.display()))?;
-    }
-
-    journal
-        .append(
-            JournalEntry::new(
-                JournalOp::FileDelete,
-                JournalSource::Adopted,
-                path.to_string_lossy().to_string(),
-            )
-            .with_slug(slug)
-            .with_backup_path(dest.to_string())
-            .with_detail(serde_json::json!({"reason": "adopt_takeover"})),
-        )
-        .context("failed to append restore-journal entry for adopt takeover backup")?;
-
-    Ok(())
+) -> Result<camino::Utf8PathBuf> {
+    let dest = journal.new_backup_dest("adopted", slug);
+    back_up_before_delete_to(journal, slug, path, &dest)?;
+    Ok(dest)
 }
 
-/// Recursively copy a directory tree, creating destination directories as
-/// needed. Mirrors the equivalent private helper in
-/// `scenery_core::restore_journal` / `managed_paths::migrator` — kept
-/// local rather than shared since none of those are exported across the
-/// crate boundary.
-fn copy_tree_recursive(src: &Path, dest: &Path) -> Result<()> {
-    fs::create_dir_all(dest)
-        .with_context(|| format!("failed to create backup dest: {}", dest.display()))?;
+/// [`back_up_before_delete`] into a caller-chosen, not-yet-existing `dest`
+/// (the in-place conversion records `dest` in its crash-recovery intent before
+/// any copying starts).
+pub(super) fn back_up_before_delete_to(
+    journal: &RestoreJournal,
+    slug: &str,
+    path: &Path,
+    dest: &camino::Utf8Path,
+) -> Result<()> {
+    let src = camino::Utf8Path::from_path(path)
+        .ok_or_else(|| anyhow::anyhow!("path is not valid UTF-8: {}", path.display()))?;
+    journal
+        .backup_tree_to(src, dest)
+        .with_context(|| format!("failed to back up {}", path.display()))?;
 
-    for entry in fs::read_dir(src)
-        .with_context(|| format!("failed to read dir for backup: {}", src.display()))?
-    {
-        let entry = entry.context("failed to read dir entry during backup")?;
-        let entry_path = entry.path();
-        let dest_path = dest.join(entry.file_name());
-        let meta = entry
-            .metadata()
-            .with_context(|| format!("failed to stat: {}", entry_path.display()))?;
-
-        if meta.is_dir() {
-            copy_tree_recursive(&entry_path, &dest_path)?;
-        } else {
-            fs::copy(&entry_path, &dest_path).with_context(|| {
-                format!(
-                    "failed to copy {} to {}",
-                    entry_path.display(),
-                    dest_path.display()
-                )
-            })?;
-        }
+    if let Err(e) = journal.append(
+        JournalEntry::new(
+            JournalOp::FileDelete,
+            JournalSource::Adopted,
+            path.to_string_lossy().to_string(),
+        )
+        .with_slug(slug)
+        .with_backup_path(dest.to_string())
+        .with_detail(serde_json::json!({"reason": "adopt_takeover"})),
+    ) {
+        return Err(e).context("failed to append restore-journal entry for adopt takeover backup");
     }
+
     Ok(())
 }
 

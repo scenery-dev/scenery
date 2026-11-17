@@ -34,6 +34,7 @@ pub mod registry;
 pub mod registry_url;
 pub mod restore_journal;
 pub mod revocation;
+pub mod safe_copy;
 pub mod safe_path;
 pub mod safe_unpack;
 pub mod secret_file;

@@ -902,23 +902,15 @@ fn make_executable(_path: &Path) -> Result<()> {
     Ok(())
 }
 
-// `fs::copy` carries permissions over, so executables stay executable in the cache.
+// `fs::copy` carries permissions over, so executables stay executable in the
+// cache. Symlink-safe: links are copied as links, never followed.
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
-    fs::create_dir_all(dst)?;
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let from = entry.path();
-        let to = dst.join(entry.file_name());
-        if from.is_dir() {
-            copy_dir_recursive(&from, &to)?;
-        } else {
-            if let Some(p) = to.parent() {
-                fs::create_dir_all(p).ok();
-            }
-            fs::copy(&from, &to)?;
-            debug!(?to, "plugin_marketplace: cached file");
-        }
-    }
+    let stats = scenery_core::safe_copy::copy_tree(src, dst)?;
+    debug!(
+        files = stats.files,
+        ?dst,
+        "plugin_marketplace: cached plugin tree"
+    );
     Ok(())
 }
 

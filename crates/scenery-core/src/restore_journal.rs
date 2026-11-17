@@ -169,11 +169,17 @@ pub fn now_iso() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
-/// Filesystem-safe timestamp (no colons) for `restore-backups/<ts>/`
-/// directory names — mirrors the convention already used by the F1 migrator's
-/// `.scenery-backup/<ts>/` run directories.
+/// Filesystem-safe, **unique** name (no colons) for `restore-backups/<ts>/`
+/// directories. Starts with the familiar `%Y-%m-%dT%H%M%SZ` stamp but ends
+/// with a per-call token: the stamp alone has 1-second granularity, so two
+/// attempts in the same second used to share (and merge into) one directory,
+/// and a second backup of a half-converted tree could shadow the original.
 pub fn new_backup_ts() -> String {
-    chrono::Utc::now().format("%Y-%m-%dT%H%M%SZ").to_string()
+    format!(
+        "{}-{}",
+        chrono::Utc::now().format("%Y-%m-%dT%H%M%SZ"),
+        crate::safe_copy::unique_token()
+    )
 }
 
 // ── RestoreJournal ───────────────────────────────────────────────────────────
@@ -238,17 +244,61 @@ impl RestoreJournal {
             return Ok(dest);
         }
 
-        if source.is_dir() {
-            copy_dir_recursive(source.as_std_path(), dest.as_std_path()).with_context(|| {
-                format!("restore_journal: failed to back up directory {source} -> {dest}")
-            })?;
-        } else {
-            fs::copy(source.as_std_path(), dest.as_std_path()).with_context(|| {
-                format!("restore_journal: failed to back up file {source} -> {dest}")
-            })?;
-        }
+        // Symlink-safe: a link is backed up as a link, never followed.
+        crate::safe_copy::copy_tree(source.as_std_path(), dest.as_std_path())
+            .with_context(|| format!("restore_journal: failed to back up {source} -> {dest}"))?;
 
         Ok(dest)
+    }
+
+    /// A brand-new, never-before-used
+    /// `restore-backups/<unique ts>/<category>/<slug>` path. Nothing is
+    /// created. Callers that need to record the destination *before* copying
+    /// (crash-recovery intents) use this with
+    /// [`backup_tree_to`](Self::backup_tree_to).
+    pub fn new_backup_dest(&self, category: &str, slug: &str) -> Utf8PathBuf {
+        self.backup_dir_for(&new_backup_ts())
+            .join(category)
+            .join(slug)
+    }
+
+    /// Back up `source` (file, directory or symlink) into a brand-new,
+    /// never-before-used `restore-backups/<unique ts>/<category>/<slug>` and
+    /// return that path. Unlike [`backup_path_for`](Self::backup_path_for) it
+    /// can never merge with or reuse an earlier backup. See
+    /// [`backup_tree_to`](Self::backup_tree_to) for the copy semantics.
+    pub fn backup_tree_unique(
+        &self,
+        category: &str,
+        slug: &str,
+        source: &Utf8Path,
+    ) -> Result<Utf8PathBuf> {
+        let dest = self.new_backup_dest(category, slug);
+        self.backup_tree_to(source, &dest)?;
+        Ok(dest)
+    }
+
+    /// Copy `source` to `dest`, which must not exist yet. The copy is
+    /// symlink-safe and size-capped (see [`crate::safe_copy`]); on any error
+    /// the partial copy is removed and `Err` returned, so the caller must not
+    /// delete `source`.
+    pub fn backup_tree_to(&self, source: &Utf8Path, dest: &Utf8Path) -> Result<()> {
+        anyhow::ensure!(
+            fs::symlink_metadata(dest.as_std_path()).is_err(),
+            "restore_journal: backup destination already exists: {dest}"
+        );
+        if let Err(e) = crate::safe_copy::copy_tree(source.as_std_path(), dest.as_std_path()) {
+            let _ = fs::remove_dir_all(dest.as_std_path());
+            let _ = fs::remove_file(dest.as_std_path());
+            return Err(e)
+                .with_context(|| format!("restore_journal: failed to back up {source} -> {dest}"));
+        }
+        Ok(())
+    }
+
+    /// `<root_dir>/restore-backups`
+    pub fn backups_root(&self) -> Utf8PathBuf {
+        self.root_dir.join("restore-backups")
     }
 
     /// Back up the single file `source` for AI client `client` into
@@ -274,9 +324,9 @@ impl RestoreJournal {
         if dest.exists() {
             dest = unique_sibling(&dest);
         }
-        fs::copy(source.as_std_path(), dest.as_std_path()).with_context(|| {
-            format!("restore_journal: failed to back up file {source} -> {dest}")
-        })?;
+        crate::safe_copy::copy_tree(source.as_std_path(), dest.as_std_path()).with_context(
+            || format!("restore_journal: failed to back up file {source} -> {dest}"),
+        )?;
         Ok(dest)
     }
 
@@ -590,37 +640,6 @@ fn matching_brace(bytes: &[u8], start: usize) -> Option<usize> {
         }
     }
     None
-}
-
-// ── Recursive copy ───────────────────────────────────────────────────────────
-
-fn copy_dir_recursive(src: &std::path::Path, dest: &std::path::Path) -> Result<()> {
-    fs::create_dir_all(dest)
-        .with_context(|| format!("failed to create backup dest: {}", dest.display()))?;
-
-    for entry in fs::read_dir(src)
-        .with_context(|| format!("failed to read dir for backup: {}", src.display()))?
-    {
-        let entry = entry.context("failed to read dir entry during backup")?;
-        let entry_path = entry.path();
-        let dest_path = dest.join(entry.file_name());
-        let meta = entry
-            .metadata()
-            .with_context(|| format!("failed to stat: {}", entry_path.display()))?;
-
-        if meta.is_dir() {
-            copy_dir_recursive(&entry_path, &dest_path)?;
-        } else {
-            fs::copy(&entry_path, &dest_path).with_context(|| {
-                format!(
-                    "failed to copy {} to {}",
-                    entry_path.display(),
-                    dest_path.display()
-                )
-            })?;
-        }
-    }
-    Ok(())
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1022,6 +1041,92 @@ mod tests {
         assert_eq!(journal.read_all().expect("read").len(), 1);
         journal.clear().expect("clear");
         assert!(journal.read_all().expect("read").is_empty());
+        let _ = fs::remove_dir_all(root.as_std_path());
+    }
+
+    // ── unique, symlink-safe backups ──────────────────────────────────────────
+
+    /// Two backups taken in the same second must never share a directory.
+    /// `new_backup_ts` used to be second-granular, so a retried conversion
+    /// merged its backup of a half-written tree into the first (original) one.
+    #[test]
+    fn new_backup_ts_is_unique_within_one_second() {
+        let names: std::collections::HashSet<String> = (0..200).map(|_| new_backup_ts()).collect();
+        assert_eq!(names.len(), 200);
+    }
+
+    #[test]
+    fn backup_tree_unique_never_merges_with_an_earlier_backup() {
+        let root = temp_root("unique-backup");
+        let journal = RestoreJournal::new(root.clone());
+        let src = root.join("src");
+        fs::create_dir_all(src.as_std_path()).unwrap();
+        fs::write(src.join("SKILL.md").as_std_path(), "original").unwrap();
+
+        let first = journal.backup_tree_unique("adopted", "demo", &src).unwrap();
+        fs::write(src.join("SKILL.md").as_std_path(), "half-written").unwrap();
+        let second = journal.backup_tree_unique("adopted", "demo", &src).unwrap();
+
+        assert_ne!(first, second);
+        assert_eq!(
+            fs::read_to_string(first.join("SKILL.md").as_std_path()).unwrap(),
+            "original",
+            "the first backup must keep the original"
+        );
+        assert_eq!(
+            fs::read_to_string(second.join("SKILL.md").as_std_path()).unwrap(),
+            "half-written"
+        );
+        let _ = fs::remove_dir_all(root.as_std_path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backups_preserve_symlinks_and_survive_a_symlink_loop() {
+        let root = temp_root("symlink-backup");
+        let journal = RestoreJournal::new(root.clone());
+        let src = root.join("skill");
+        fs::create_dir_all(src.join("sub").as_std_path()).unwrap();
+        fs::write(src.join("SKILL.md").as_std_path(), "x").unwrap();
+        // A loop: followed by `metadata()`, this recursed until stack overflow.
+        std::os::unix::fs::symlink("..", src.join("sub/up").as_std_path()).unwrap();
+        std::os::unix::fs::symlink("/etc/hosts", src.join("link").as_std_path()).unwrap();
+
+        let dest = journal
+            .backup_tree_unique("adopted", "skill", &src)
+            .unwrap();
+
+        assert_eq!(
+            fs::read_link(dest.join("sub/up").as_std_path()).unwrap(),
+            std::path::PathBuf::from("..")
+        );
+        assert_eq!(
+            fs::read_link(dest.join("link").as_std_path()).unwrap(),
+            std::path::PathBuf::from("/etc/hosts")
+        );
+        // backup_path_for (links.rs / F1 users) is symlink-safe too.
+        let p = journal.backup_path_for("t", &src).unwrap();
+        assert!(fs::symlink_metadata(p.join("sub/up").as_std_path())
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let _ = fs::remove_dir_all(root.as_std_path());
+    }
+
+    #[test]
+    fn backup_tree_unique_cleans_up_a_failed_copy() {
+        let root = temp_root("failed-backup");
+        let journal = RestoreJournal::new(root.clone());
+        let dest = root.join("restore-backups/x/adopted/demo");
+        let err = journal.backup_tree_to(&root.join("does-not-exist"), &dest);
+        assert!(err.is_err());
+        assert!(
+            !dest.as_std_path().exists(),
+            "no partial backup left behind"
+        );
+        // And an existing destination is refused rather than merged into.
+        fs::create_dir_all(dest.as_std_path()).unwrap();
+        assert!(journal.backup_tree_to(&root, &dest).is_err());
         let _ = fs::remove_dir_all(root.as_std_path());
     }
 }
