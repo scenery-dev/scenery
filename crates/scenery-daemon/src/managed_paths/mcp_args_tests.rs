@@ -16,7 +16,7 @@ fn strings(v: &serde_json::Value) -> Vec<String> {
 }
 
 /// What the runner does to a config entry's `command` + `args`.
-fn run(command: &str, args: &[String]) -> Vec<String> {
+fn run(command: &str, args: &[String]) -> (String, Vec<String>) {
     let (exe, mut extra) = split_command(command);
     extra.extend(args.iter().cloned());
     let base = std::path::Path::new(&exe)
@@ -24,7 +24,8 @@ fn run(command: &str, args: &[String]) -> Vec<String> {
         .and_then(|n| n.to_str())
         .unwrap_or(&exe)
         .to_string();
-    redact_args(&base, &extra)
+    let out = redact_args(&base, &extra);
+    (base, out)
 }
 
 #[test]
@@ -32,8 +33,11 @@ fn golden_vectors_match_exactly() {
     let vectors = golden();
     assert!(vectors.len() >= 15);
     for v in vectors {
-        let got = run(v["command"].as_str().unwrap(), &strings(&v["args"]));
+        let (base, got) = run(v["command"].as_str().unwrap(), &strings(&v["args"]));
         assert_eq!(got, strings(&v["expected"]), "vector {:?}", v["name"]);
+        if let Some(want) = v.get("expected_command").and_then(|c| c.as_str()) {
+            assert_eq!(base, want, "vector {:?} expected_command", v["name"]);
+        }
     }
 }
 

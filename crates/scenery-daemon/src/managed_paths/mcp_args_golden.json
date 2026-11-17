@@ -1,296 +1,39 @@
 {
-  "_comment": "Golden vectors for MCP argument redaction. Shared with scenery-backend (sanitize_discovery_args): both sides must produce exactly `expected`. `command` may carry its own arguments; the runner splits it first.",
+  "_comment": "Golden vectors for MCP argument redaction. Shared with scenery-backend (sanitize_discovery_args): both sides must produce exactly `expected`. `command` may carry its own arguments; the runner splits it first. Vectors with \"added_by\": \"backend\" are leak cases the runner (as of b25e6f0) does not redact yet; `expected_command` is the executable basename the backend derives (the runner should send the same). Vectors with \"added_by\": \"runner\" are runner-originated and need adding to the backend fixture.",
   "vectors": [
-    {
-      "name": "npx registry with userinfo",
-      "command": "npx",
-      "args": [
-        "--registry",
-        "https://user:tok@host",
-        "pkg"
-      ],
-      "expected": [
-        "--registry",
-        "<redacted>",
-        "pkg"
-      ]
-    },
-    {
-      "name": "docker -e TOKEN=x",
-      "command": "docker",
-      "args": [
-        "run",
-        "-e",
-        "TOKEN=x",
-        "image"
-      ],
-      "expected": [
-        "run",
-        "-e",
-        "<redacted>",
-        "<redacted>"
-      ]
-    },
-    {
-      "name": "npx pinned public package",
-      "command": "npx",
-      "args": [
-        "-y",
-        "@modelcontextprotocol/server-everything@1.2.3"
-      ],
-      "expected": [
-        "-y",
-        "@modelcontextprotocol/server-everything@1.2.3"
-      ]
-    },
-    {
-      "name": "opaque --token value",
-      "command": "node",
-      "args": [
-        "srv.js",
-        "--token",
-        "opaque"
-      ],
-      "expected": [
-        "<redacted>",
-        "--token",
-        "<redacted>"
-      ]
-    },
-    {
-      "name": "Authorization header as one arg",
-      "command": "node",
-      "args": [
-        "Authorization: Bearer x"
-      ],
-      "expected": [
-        "<redacted>"
-      ]
-    },
-    {
-      "name": "uvx --from git url with token",
-      "command": "uvx",
-      "args": [
-        "--from",
-        "git+https://tok@host/repo.git",
-        "pkg"
-      ],
-      "expected": [
-        "--from",
-        "git+https://host",
-        "pkg"
-      ]
-    },
-    {
-      "name": "mysql -pSECRET",
-      "command": "mysql",
-      "args": [
-        "-pSECRET"
-      ],
-      "expected": [
-        "<redacted>"
-      ]
-    },
-    {
-      "name": "sshpass -p pw",
-      "command": "sshpass",
-      "args": [
-        "-p",
-        "pw",
-        "ssh",
-        "host"
-      ],
-      "expected": [
-        "-p",
-        "<redacted>",
-        "<redacted>",
-        "<redacted>"
-      ]
-    },
-    {
-      "name": "sh -c with env assignment",
-      "command": "sh",
-      "args": [
-        "-c",
-        "TOKEN=x node srv"
-      ],
-      "expected": [
-        "-c",
-        "<redacted>"
-      ]
-    },
-    {
-      "name": "everything after -c is redacted",
-      "command": "bash",
-      "args": [
-        "-c",
-        "echo",
-        "hi",
-        "--flag"
-      ],
-      "expected": [
-        "-c",
-        "<redacted>",
-        "<redacted>",
-        "<redacted>"
-      ]
-    },
-    {
-      "name": "command string carrying its own args",
-      "command": "npx -y pkg --api-key sk-ant-abcdefghijklmnopqrstuvwx",
-      "args": [],
-      "expected": [
-        "-y",
-        "pkg",
-        "--api-key",
-        "<redacted>"
-      ]
-    },
-    {
-      "name": "path keeps tilde, KEY=VALUE redacted",
-      "command": "node",
-      "args": [
-        "~/srv/server.js",
-        "API_KEY=abc"
-      ],
-      "expected": [
-        "~/srv/server.js",
-        "API_KEY=<redacted>"
-      ]
-    },
-    {
-      "name": "benign flags keep safe values",
-      "command": "node",
-      "args": [
-        "--port",
-        "3000",
-        "--transport",
-        "stdio",
-        "--stdio"
-      ],
-      "expected": [
-        "--port",
-        "3000",
-        "--transport",
-        "stdio",
-        "--stdio"
-      ]
-    },
-    {
-      "name": "benign --flag=word",
-      "command": "node",
-      "args": [
-        "--port=8080",
-        "--foo=bar"
-      ],
-      "expected": [
-        "--port=8080",
-        "--foo=<redacted>"
-      ]
-    },
-    {
-      "name": "credential-shaped bare arg",
-      "command": "node",
-      "args": [
-        "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
-      ],
-      "expected": [
-        "<redacted>"
-      ]
-    },
-    {
-      "name": "high-entropy bare arg",
-      "command": "node",
-      "args": [
-        "a8Fk29xLq0ZpW3mN7vB1cD5eR"
-      ],
-      "expected": [
-        "<redacted>"
-      ]
-    },
-    {
-      "name": "docker switches and image",
-      "command": "docker",
-      "args": [
-        "run",
-        "-i",
-        "--rm",
-        "ghcr.io/org/img:1.4"
-      ],
-      "expected": [
-        "run",
-        "-i",
-        "--rm",
-        "ghcr.io/org/img:1.4"
-      ]
-    },
-    {
-      "name": "bare url keeps origin only",
-      "command": "node",
-      "args": [
-        "https://user:pw@host:8443/path?q=1"
-      ],
-      "expected": [
-        "https://host:8443"
-      ]
-    },
-    {
-      "name": "unknown positional",
-      "command": "node",
-      "args": [
-        "some-private-thing"
-      ],
-      "expected": [
-        "<redacted>"
-      ]
-    },
-    {
-      "name": "mysql -p with base64 password ending in ==",
-      "command": "mysql",
-      "args": [
-        "-pc2VjcmV0cGFzcw=="
-      ],
-      "expected": [
-        "<redacted>"
-      ]
-    },
-    {
-      "name": "mysql -p attached value containing =",
-      "command": "mysql",
-      "args": [
-        "-pMy=Pass"
-      ],
-      "expected": [
-        "<redacted>"
-      ]
-    },
-    {
-      "name": "short flag =value",
-      "command": "node",
-      "args": [
-        "-p=pw",
-        "--key=abc"
-      ],
-      "expected": [
-        "<redacted>",
-        "--key=<redacted>"
-      ]
-    },
-    {
-      "name": "docker combined booleans stay",
-      "command": "docker",
-      "args": [
-        "run",
-        "-it",
-        "--rm",
-        "ghcr.io/org/img:1.4"
-      ],
-      "expected": [
-        "run",
-        "-it",
-        "--rm",
-        "ghcr.io/org/img:1.4"
-      ]
-    }
+    {"name": "npx registry with userinfo", "command": "npx", "args": ["--registry", "https://user:tok@host", "pkg"], "expected": ["--registry", "<redacted>", "pkg"]},
+    {"name": "docker -e TOKEN=x", "command": "docker", "args": ["run", "-e", "TOKEN=x", "image"], "expected": ["run", "-e", "<redacted>", "<redacted>"]},
+    {"name": "npx pinned public package", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-everything@1.2.3"], "expected": ["-y", "@modelcontextprotocol/server-everything@1.2.3"]},
+    {"name": "opaque --token value", "command": "node", "args": ["srv.js", "--token", "opaque"], "expected": ["<redacted>", "--token", "<redacted>"]},
+    {"name": "Authorization header as one arg", "command": "node", "args": ["Authorization: Bearer x"], "expected": ["<redacted>"]},
+    {"name": "uvx --from git url with token", "command": "uvx", "args": ["--from", "git+https://tok@host/repo.git", "pkg"], "expected": ["--from", "git+https://host", "pkg"]},
+    {"name": "mysql -pSECRET", "command": "mysql", "args": ["-pSECRET"], "expected": ["<redacted>"]},
+    {"name": "sshpass -p pw", "command": "sshpass", "args": ["-p", "pw", "ssh", "host"], "expected": ["-p", "<redacted>", "<redacted>", "<redacted>"]},
+    {"name": "sh -c with env assignment", "command": "sh", "args": ["-c", "TOKEN=x node srv"], "expected": ["-c", "<redacted>"]},
+    {"name": "everything after -c is redacted", "command": "bash", "args": ["-c", "echo", "hi", "--flag"], "expected": ["-c", "<redacted>", "<redacted>", "<redacted>"]},
+    {"name": "command string carrying its own args", "command": "npx -y pkg --api-key sk-ant-abcdefghijklmnopqrstuvwx", "args": [], "expected": ["-y", "pkg", "--api-key", "<redacted>"]},
+    {"name": "path keeps tilde, KEY=VALUE redacted", "command": "node", "args": ["~/srv/server.js", "API_KEY=abc"], "expected": ["~/srv/server.js", "API_KEY=<redacted>"]},
+    {"name": "benign flags keep safe values", "command": "node", "args": ["--port", "3000", "--transport", "stdio", "--stdio"], "expected": ["--port", "3000", "--transport", "stdio", "--stdio"]},
+    {"name": "benign --flag=word", "command": "node", "args": ["--port=8080", "--foo=bar"], "expected": ["--port=8080", "--foo=<redacted>"]},
+    {"name": "credential-shaped bare arg", "command": "node", "args": ["ghp_abcdefghijklmnopqrstuvwxyz0123456789"], "expected": ["<redacted>"]},
+    {"name": "high-entropy bare arg", "command": "node", "args": ["a8Fk29xLq0ZpW3mN7vB1cD5eR"], "expected": ["<redacted>"]},
+    {"name": "docker switches and image", "command": "docker", "args": ["run", "-i", "--rm", "ghcr.io/org/img:1.4"], "expected": ["run", "-i", "--rm", "ghcr.io/org/img:1.4"]},
+    {"name": "bare url keeps origin only", "command": "node", "args": ["https://user:pw@host:8443/path?q=1"], "expected": ["https://host:8443"]},
+    {"name": "unknown positional", "command": "node", "args": ["some-private-thing"], "expected": ["<redacted>"]},
+    {"name": "command string with leading env assignment", "command": "TOKEN=sk-live-abc123 node srv.js", "args": [], "expected": ["TOKEN=<redacted>", "<redacted>"], "expected_command": "node", "added_by": "backend"},
+    {"name": "Codex TOML command, env assignment then launcher", "command": "API_KEY=hunter2 npx -y @acme/mcp@1.0.0", "args": ["--stdio"], "expected": ["API_KEY=<redacted>", "-y", "@acme/mcp@1.0.0", "--stdio"], "expected_command": "npx", "added_by": "backend"},
+    {"name": "colon-attached flag value", "command": "node", "args": ["--token:abc123", "x"], "expected": ["<redacted>", "<redacted>"], "added_by": "backend"},
+    {"name": "colon-attached flag with equals", "command": "node", "args": ["--api-key:abc=xyz"], "expected": ["<redacted>"], "added_by": "backend"},
+    {"name": "secret-shaped flag name", "command": "node", "args": ["--ghp_abcdefghijklmnopqrstuvwxyz0123456789"], "expected": ["<redacted>"], "added_by": "backend"},
+    {"name": "second npm-shaped positional is not a package", "command": "npx", "args": ["-y", "pkg", "hunter2"], "expected": ["-y", "pkg", "<redacted>"], "added_by": "backend"},
+    {"name": "docker image then trailing word", "command": "docker", "args": ["run", "-i", "--rm", "ghcr.io/org/img:1.4", "hunter2"], "expected": ["run", "-i", "--rm", "ghcr.io/org/img:1.4", "<redacted>"], "added_by": "backend"},
+    {"name": "uvx --from value does not use up the package slot", "command": "uvx", "args": ["--from", "mcp-server-foo==1.0", "mcp-server-foo"], "expected": ["--from", "mcp-server-foo==1.0", "mcp-server-foo"]},
+    {"name": "sshpass with command path", "command": "/usr/bin/sshpass", "args": ["-p", "pw", "ssh", "host"], "expected": ["-p", "<redacted>", "<redacted>", "<redacted>"], "expected_command": "sshpass", "added_by": "backend"},
+    {"name": "Codex TOML sh -c with quoted script", "command": "sh -c 'TOKEN=x node srv'", "args": [], "expected": ["-c", "<redacted>", "<redacted>", "<redacted>"], "expected_command": "sh", "added_by": "backend"},
+    {"name": "env launcher carrying assignments", "command": "env", "args": ["TOKEN=x", "node", "srv.js"], "expected": ["TOKEN=<redacted>", "<redacted>", "<redacted>"]},
+    {"name": "mysql attached password with host", "command": "mysql", "args": ["-h", "localhost", "-pSECRET", "-uroot"], "expected": ["-h", "<redacted>", "<redacted>", "<redacted>"]},
+    {"name": "attached value containing =", "command": "mysql", "args": ["-pMy=Pass", "-pc2VjcmV0cGFzcw=="], "expected": ["<redacted>", "<redacted>"], "added_by": "backend"},
+    {"name": "short flag with equals keeps only its name", "command": "node", "args": ["-p=secret", "-x=1"], "expected": ["-p=<redacted>", "-x=<redacted>"], "added_by": "backend"},
+  {"name": "docker combined booleans stay", "command": "docker", "args": ["run", "-it", "--rm", "ghcr.io/org/img:1.4"], "expected": ["run", "-it", "--rm", "ghcr.io/org/img:1.4"], "added_by": "runner"}
   ]
 }

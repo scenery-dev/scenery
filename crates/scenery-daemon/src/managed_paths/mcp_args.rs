@@ -22,8 +22,13 @@
 //! - anything credential-shaped ([`scenery_core::skill_tree::looks_like_secret_token`])
 //!   or high-entropy;
 //! - any single argument containing whitespace (`Authorization: Bearer x`,
-//!   `TOKEN=x node srv`), and EVERYTHING after `-c`, `-e` or `--eval`;
-//! - every other bare positional.
+//!   `Authorization: Bearer x`), and EVERYTHING after `-c`, `-e` or `--eval`;
+//! - every other bare positional, including a SECOND identifier-shaped one
+//!   (`npx -y pkg hunter2` keeps `pkg` only);
+//! - a long flag whose name is not a plain word (`--token:abc`, `--ghp_...`).
+//!
+//! A command string's leading `KEY=VALUE` words are assignments
+//! (`TOKEN=x node srv` -> `TOKEN=<redacted>`, executable `node`).
 //!
 //! `-p` is deliberately NOT benign: `mysql -pSECRET`, `sshpass -p pw`.
 //!
@@ -112,19 +117,46 @@ fn secret_shaped(a: &str) -> bool {
     text_has_secret(a) || looks_like_secret_token(a)
 }
 
+/// A long flag is kept only when it is a plain `--[A-Za-z0-9][A-Za-z0-9_-]*`
+/// word (<= 64 chars after `--`) that is neither secret- nor high-entropy
+/// shaped. `--token:abc` and `--ghp_...` carry data in the name itself.
+/// Short flags are always fine here (attached values are handled apart).
+fn flag_name_ok(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("--") else {
+        return true;
+    };
+    let mut bytes = rest.bytes();
+    let plain = rest.len() <= 64
+        && bytes.next().is_some_and(|b| b.is_ascii_alphanumeric())
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+    plain && !secret_shaped(rest) && !high_entropy(rest)
+}
+
 /// A bare positional or a benign flag's value: keep it only if it is provably
 /// harmless, else `<redacted>`.
-fn keep_or_redact_value(command_basename: &str, a: &str) -> String {
+///
+/// Only the FIRST identifier-shaped positional is kept (`ident_kept`):
+/// `npx -y pkg hunter2` keeps `pkg` and redacts `hunter2`. A benign flag's
+/// value (`--from pkg`) never uses the slot up.
+fn keep_or_redact_value(
+    command_basename: &str,
+    a: &str,
+    ident_kept: &mut bool,
+    consume_identifier: bool,
+) -> String {
     if a.chars().any(char::is_whitespace) || secret_shaped(a) {
         return REDACTED.to_string();
     }
     if a.contains("://") {
         return url_origin(a).unwrap_or_else(|| REDACTED.to_string());
     }
-    if super::mcp_discovery::validate_identifier(a, command_basename).is_some() {
+    if SAFE_WORDS.contains(&a) || is_port(a) {
         return a.to_string();
     }
-    if SAFE_WORDS.contains(&a) || is_port(a) {
+    if !*ident_kept && super::mcp_discovery::validate_identifier(a, command_basename).is_some() {
+        if consume_identifier {
+            *ident_kept = true;
+        }
         return a.to_string();
     }
     if looks_like_path(a) && !high_entropy(a) {
@@ -138,6 +170,7 @@ fn keep_or_redact_value(command_basename: &str, a: &str) -> String {
 /// to the reviewer.
 pub fn redact_args(command_basename: &str, args: &[String]) -> Vec<String> {
     let mut out = Vec::with_capacity(args.len());
+    let mut ident_kept = false;
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
@@ -169,20 +202,18 @@ pub fn redact_args(command_basename: &str, args: &[String]) -> Vec<String> {
                 i += 1;
                 continue;
             }
-            // Single-dash flag with an attached value (`-pSECRET`, `-pMy=Pass`, `-pc2Vj..==`) — checked BEFORE the
-            // `--flag=value` split, which would otherwise leak the part before `=`:
-            // the whole token is the secret.
-            if !a.starts_with("--") && a.len() > 2 {
-                out.push(REDACTED.to_string());
-                i += 1;
-                continue;
-            }
             if let Some((flag, value)) = a.split_once('=') {
-                // `--flag=value`
-                if BENIGN_FLAGS.contains(&flag) {
+                // An attached single-dash value (`-pMy=Pass`, `-pc2Vj..==`) is
+                // checked BEFORE the split, which would otherwise leak the part
+                // before `=`: the whole token is the secret. A bare `-p=x`
+                // keeps only its name. A long flag whose name is not a plain
+                // word (`--api-key:abc=xyz`) is redacted whole.
+                if (!flag.starts_with("--") && flag.len() > 2) || !flag_name_ok(flag) {
+                    out.push(REDACTED.to_string());
+                } else if BENIGN_FLAGS.contains(&flag) {
                     out.push(format!(
                         "{flag}={}",
-                        keep_or_redact_value(command_basename, value)
+                        keep_or_redact_value(command_basename, value, &mut ident_kept, false)
                     ));
                 } else {
                     out.push(format!("{flag}={REDACTED}"));
@@ -190,18 +221,39 @@ pub fn redact_args(command_basename: &str, args: &[String]) -> Vec<String> {
                 i += 1;
                 continue;
             }
+            if BENIGN_BOOLEANS.contains(&a) || (BENIGN_FLAGS.contains(&a) && !takes_value(a)) {
+                out.push(a.to_string());
+                i += 1;
+                continue;
+            }
             if BENIGN_FLAGS.contains(&a) {
                 out.push(a.to_string());
                 if let Some(v) = args.get(i + 1).filter(|v| !is_flag(v)) {
-                    out.push(keep_or_redact_value(command_basename, v));
+                    out.push(keep_or_redact_value(
+                        command_basename,
+                        v,
+                        &mut ident_kept,
+                        false,
+                    ));
                     i += 2;
                 } else {
                     i += 1;
                 }
                 continue;
             }
-            // Any other flag: keep the name, redact a following value.
-            out.push(a.to_string());
+            // Single-dash flag with an attached value (`-pSECRET`): all secret.
+            if !a.starts_with("--") && a.len() > 2 {
+                out.push(REDACTED.to_string());
+                i += 1;
+                continue;
+            }
+            // Any other flag: keep the name (if it is a plain word), redact a
+            // following value.
+            out.push(if flag_name_ok(a) {
+                a.to_string()
+            } else {
+                REDACTED.to_string()
+            });
             if args.get(i + 1).is_some_and(|v| !is_flag(v)) {
                 out.push(REDACTED.to_string());
                 i += 2;
@@ -220,7 +272,12 @@ pub fn redact_args(command_basename: &str, args: &[String]) -> Vec<String> {
             }
         }
 
-        out.push(keep_or_redact_value(command_basename, a));
+        out.push(keep_or_redact_value(
+            command_basename,
+            a,
+            &mut ident_kept,
+            true,
+        ));
         i += 1;
     }
     out
@@ -231,19 +288,50 @@ fn takes_value(flag: &str) -> bool {
     matches!(flag, "--port" | "--transport" | "--from")
 }
 
-/// Split a `command` string that carries its own arguments (`npx -y pkg
-/// --api-key sk-...`) into `(executable, extra args)`. A command with no
-/// whitespace is returned unchanged with no extras.
-pub fn split_command(command: &str) -> (String, Vec<String>) {
-    let mut parts = command.split_whitespace();
-    let Some(first) = parts.next() else {
-        return (command.to_string(), Vec::new());
+/// A leading `KEY=VALUE` word (an environment assignment, not an executable).
+fn is_env_assignment(w: &str) -> bool {
+    let Some((k, _)) = w.split_once('=') else {
+        return false;
     };
-    let rest: Vec<String> = parts.map(str::to_string).collect();
-    if rest.is_empty() {
+    let mut b = k.bytes();
+    b.next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == b'_')
+        && b.all(|c| c.is_ascii_alphanumeric() || c == b'_')
+}
+
+/// Split a `command` string that carries its own arguments (`npx -y pkg
+/// --api-key sk-...`, or Codex's `TOKEN=x node srv`) into `(executable, extra
+/// args)`. Leading `KEY=VALUE` words are assignments, not the executable: they
+/// become the first extra args (so they come out `KEY=<redacted>`). A command
+/// with no whitespace is returned unchanged with no extras. The executable is
+/// empty when nothing usable is left (only assignments, or a name that looks
+/// like a credential); the caller then has no launcher context.
+pub fn split_command(command: &str) -> (String, Vec<String>) {
+    let mut words = command.split_whitespace().peekable();
+    let mut extras: Vec<String> = Vec::new();
+    while let Some(w) = words.peek() {
+        if !is_env_assignment(w) {
+            break;
+        }
+        extras.push((*w).to_string());
+        words.next();
+    }
+    let Some(first) = words.next() else {
+        if extras.is_empty() {
+            return (command.to_string(), Vec::new());
+        }
+        return (String::new(), extras);
+    };
+    let rest: Vec<String> = words.map(str::to_string).collect();
+    if rest.is_empty() && extras.is_empty() {
         return (command.trim().to_string(), Vec::new());
     }
-    (first.to_string(), rest)
+    let base = first.rsplit(['/', '\\']).next().unwrap_or(first);
+    extras.extend(rest);
+    if secret_shaped(base) {
+        return (String::new(), extras);
+    }
+    (first.to_string(), extras)
 }
 
 /// Public package a launcher invocation names, split for the registry fetch.

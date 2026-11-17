@@ -352,7 +352,7 @@ fn build_detail(
     let (exe, mut from_command) = match command {
         Some(c) => {
             let (e, rest) = super::mcp_args::split_command(c);
-            (Some(e), rest)
+            ((!e.is_empty()).then_some(e), rest)
         }
         None => (None, Vec::new()),
     };
