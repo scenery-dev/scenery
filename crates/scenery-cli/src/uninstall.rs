@@ -734,6 +734,14 @@ fn restore_from_journal_in(
             .slug
             .clone()
             .unwrap_or_else(|| chosen.target_path.clone());
+        // An own skill converted from ANOTHER root (`~/.pi/...` -> canonical):
+        // the original goes back to its own path, but the managed copy at the
+        // canonical path is swept next. If the user edited it, copy it out first.
+        if let Some(kept) =
+            save_edited_canonical_of_own_skill(entries, chosen, originals_dir, report)
+        {
+            report.preserved.push(kept);
+        }
         if let Some(original_copy) = outcome.kept_current_with_original_at {
             report.kept_own.push(KeptOwnItem {
                 name,
@@ -825,6 +833,81 @@ fn installed_tree_hash(entries: &[JournalEntry], target_path: &str) -> Option<St
                 .and_then(|v| v.as_str())
                 .map(str::to_string)
         })
+}
+
+/// For an adopted entry whose original lived at a path other than the managed
+/// canonical one: if the canonical managed copy is an auto-managed skill the
+/// user edited since conversion, copy it to
+/// `<originals_dir>/edited/<slug>` before the managed-artifact sweep deletes it.
+fn save_edited_canonical_of_own_skill(
+    entries: &[JournalEntry],
+    adopted: &JournalEntry,
+    originals_dir: &Path,
+    report: &mut RestoreReport,
+) -> Option<PreservedItem> {
+    use scenery_core::restore_journal::JournalSource;
+    use scenery_core::safe_copy::{copy_tree, tree_fingerprint, unique_token};
+    use scenery_mcp::ownership::MANAGED_MARKER_FILENAME;
+
+    let slug = adopted.slug.as_deref()?;
+    let push = entries.iter().rev().find(|e| {
+        e.source == JournalSource::Managed
+            && e.op == JournalOp::ArtifactPush
+            && e.slug.as_deref() == Some(slug)
+            && e.target_path != adopted.target_path
+            && e.detail.get("origin").and_then(|v| v.as_str()) == Some("auto_managed")
+    })?;
+    let canonical = Path::new(&push.target_path);
+    if !std::fs::symlink_metadata(canonical).ok()?.is_dir() {
+        return None;
+    }
+    let written = push.detail.get("tree_sha256").and_then(|v| v.as_str());
+    let pristine = written.is_some_and(|h| {
+        tree_fingerprint(canonical, &[MANAGED_MARKER_FILENAME])
+            .map(|cur| cur == h)
+            .unwrap_or(false)
+    });
+    if pristine {
+        return None;
+    }
+    let mut dest = originals_dir.join("edited").join(slug);
+    if std::fs::symlink_metadata(&dest).is_ok() {
+        dest = originals_dir
+            .join("edited")
+            .join(format!("{slug}-{}", unique_token()));
+    }
+    if let Some(parent) = dest.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            report
+                .warnings
+                .push(format!("could not keep your edited '{slug}': {e}"));
+            return None;
+        }
+    }
+    match copy_tree(canonical, &dest) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(dest.join(MANAGED_MARKER_FILENAME));
+            Some(PreservedItem {
+                name: slug.to_string(),
+                restored_original_at: adopted.target_path.clone(),
+                current_copy_at: dest.display().to_string(),
+                reason: "you edited the managed copy after Scenery converted it".into(),
+            })
+        }
+        Err(e) => {
+            // The sweep would delete the only copy of the edits: say so loudly
+            // and fail the item rather than lose them silently.
+            let msg = format!(
+                "could not copy your edited '{slug}' out of {} before removing it: {e:#}",
+                canonical.display()
+            );
+            report.warnings.push(msg.clone());
+            report.failed.push(msg);
+            // Leave the edits where they are, unmanaged, so the sweep keeps its hands off.
+            let _ = std::fs::remove_file(canonical.join(MANAGED_MARKER_FILENAME));
+            None
+        }
+    }
 }
 
 /// Did Scenery convert this path from the user's own skill (`origin =
@@ -2307,6 +2390,53 @@ mod tests {
         assert_eq!(report.restored.len(), 1, "listed under RESTORED");
         assert!(report.failed.is_empty());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Converted from `~/.pi/...` to the canonical root, then edited: the
+    /// original goes back to the pi path and the EDITED canonical copy is
+    /// copied out before the sweep deletes it.
+    #[test]
+    fn an_edited_noncanonical_origin_own_skill_keeps_its_edits_through_the_sweep() {
+        let fake_home = temp_dir("own-noncanonical-edited");
+        with_fake_home(&fake_home, || {
+            let canonical = fake_home.join(".agents/skills/demo");
+            fs::create_dir_all(&canonical).unwrap();
+            fs::write(canonical.join("SKILL.md"), "published").unwrap();
+            fs::write(canonical.join(MANAGED_MARKER_FILENAME), "{\"marker_version\":1,\"installation_id\":null,\"source_sha256\":\"x\",\"migrated_at\":\"t\"}").unwrap();
+            let hash = tree_fingerprint(&canonical, &[MANAGED_MARKER_FILENAME]).unwrap();
+            let original_path = fake_home.join(".pi/agent/skills/demo");
+            let backup = backup_with(&fake_home, "t1", "pi original");
+            let entries = [
+                adopted_entry(&original_path, &backup),
+                own_push_entry(&canonical, Some(hash)),
+            ];
+            fs::write(canonical.join("SKILL.md"), "published + my edits").unwrap();
+            fs::write(canonical.join("extra.md"), "mine").unwrap();
+
+            let mut report = RestoreReport::default();
+            restore_from_journal_in(&entries, &mut report, &fake_home.join("rep"));
+            let plan = Plan {
+                brokered: vec![],
+                clients: vec![],
+            };
+            remove_managed_artifacts(&plan, &mut report);
+
+            assert_eq!(
+                fs::read(original_path.join("SKILL.md")).unwrap(),
+                b"pi original"
+            );
+            assert!(!canonical.exists(), "the managed copy is swept as usual");
+            assert_eq!(report.preserved.len(), 1, "{:?}", report.preserved);
+            let kept = PathBuf::from(&report.preserved[0].current_copy_at);
+            assert_eq!(
+                fs::read(kept.join("SKILL.md")).unwrap(),
+                b"published + my edits"
+            );
+            assert_eq!(fs::read(kept.join("extra.md")).unwrap(), b"mine");
+            assert!(!kept.join(MANAGED_MARKER_FILENAME).exists());
+            assert!(report.failed.is_empty());
+        });
+        let _ = fs::remove_dir_all(&fake_home);
     }
 
     /// The kept own skill and its originals copy survive the managed sweep
