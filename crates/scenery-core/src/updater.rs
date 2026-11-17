@@ -107,7 +107,9 @@ pub fn tar_gz_skill_source(skill_dir: &Utf8Path) -> Result<Vec<u8>> {
     {
         let enc = GzEncoder::new(&mut out, Compression::default());
         let mut tar = tar::Builder::new(enc);
-        tar.append_dir_all(".", skill_dir.as_std_path())
+        // Shared safe packer: no symlink following, refuses escaping links,
+        // excludes secrets, capped.
+        crate::pack::append_skill_tree(&mut tar, skill_dir.as_std_path())
             .with_context(|| format!("failed to archive {skill_dir}"))?;
         let gz = tar.into_inner().context("failed to finalize tar")?;
         gz.finish().context("failed to finalize gzip stream")?;
@@ -136,7 +138,7 @@ pub fn package_skill(skill_dir: &Utf8Path) -> Result<(Utf8PathBuf, String)> {
         .with_context(|| format!("failed to create {archive_path}"))?;
     let enc = GzEncoder::new(file, Compression::default());
     let mut tar = tar::Builder::new(enc);
-    tar.append_dir_all(".", skill_dir.as_std_path())
+    crate::pack::append_skill_tree(&mut tar, skill_dir.as_std_path())
         .with_context(|| format!("failed to build archive from {skill_dir}"))?;
     tar.finish().context("failed to finalize archive")?;
     drop(tar);
@@ -1247,5 +1249,68 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&state_root);
+    }
+
+    // ── publish pack safety (shared with the daemon via `crate::pack`) ────────
+
+    #[test]
+    fn tar_gz_skill_source_excludes_secrets_and_vcs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("skill");
+        fs::create_dir_all(d.join(".git")).unwrap();
+        fs::write(d.join("SKILL.md"), "x").unwrap();
+        fs::write(d.join(".env"), "SECRET=1").unwrap();
+        fs::write(d.join("deploy.pem"), "KEY").unwrap();
+        fs::write(d.join(".git/config"), "g").unwrap();
+        let dir = Utf8PathBuf::from_path_buf(d).unwrap();
+
+        let gz = tar_gz_skill_source(&dir).unwrap();
+        let mut ar = tar::Archive::new(flate2::read::GzDecoder::new(&gz[..]));
+        let names: Vec<String> = ar
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert!(names.contains(&"SKILL.md".to_string()), "{names:?}");
+        for banned in [".env", "deploy.pem", ".git"] {
+            assert!(
+                !names.iter().any(|n| n.contains(banned)),
+                "{banned}: {names:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tar_gz_skill_source_refuses_a_symlink_out_of_the_skill() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("aws");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("credentials"), "AKIAFAKE").unwrap();
+        let d = tmp.path().join("skill");
+        fs::create_dir_all(&d).unwrap();
+        fs::write(d.join("SKILL.md"), "x").unwrap();
+        std::os::unix::fs::symlink(&outside, d.join("creds")).unwrap();
+        let dir = Utf8PathBuf::from_path_buf(d).unwrap();
+
+        let err = tar_gz_skill_source(&dir).unwrap_err();
+        assert!(
+            err.downcast_ref::<crate::pack::PackRefused>().is_some(),
+            "{err:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_skill_style_archive_never_follows_links() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("skill");
+        fs::create_dir_all(d.join("real")).unwrap();
+        fs::write(d.join("SKILL.md"), "x").unwrap();
+        std::os::unix::fs::symlink("real", d.join("alias")).unwrap();
+        std::os::unix::fs::symlink(".", d.join("real/self")).unwrap();
+        let dir = Utf8PathBuf::from_path_buf(d).unwrap();
+        // Loops used to recurse; now they are archived as links.
+        assert!(tar_gz_skill_source(&dir).is_ok());
     }
 }

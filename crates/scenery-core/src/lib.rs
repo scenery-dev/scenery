@@ -29,6 +29,7 @@ pub mod crash;
 mod crash_redact;
 pub mod managed;
 pub mod model;
+pub mod pack;
 pub mod policy;
 pub mod registry;
 pub mod registry_url;

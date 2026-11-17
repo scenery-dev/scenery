@@ -3899,7 +3899,9 @@ async fn cmd_skill_publish(
         let mut tar = Builder::new(enc);
 
         // Add all directory contents except SKILL.md.
-        tar.append_dir_all(".", &path)
+        // Shared safe packer: never follows symlinks, refuses links that
+        // escape the skill, excludes .git/.env*/keys/node_modules, capped.
+        scenery_core::pack::append_skill_tree(&mut tar, path.as_std_path())
             .with_context(|| format!("failed to pack skill directory '{path}'"))?;
 
         // Override SKILL.md with the (possibly patched) content.
