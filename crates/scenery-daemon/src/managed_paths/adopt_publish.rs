@@ -127,12 +127,27 @@ pub async fn handle_discovery_adopted(
         .context("adopt-publish: failed to record pending takeover")?;
 
     let token = load_token_for_registry(&state, &registry_url)?;
-    let gz_buf = build_tar_gz(source.clone()).await.with_context(|| {
-        format!(
-            "adopt-publish: failed to pack skill directory: {}",
-            source.display()
-        )
-    })?;
+    let gz_buf = match build_tar_gz(source.clone()).await {
+        Ok(b) => b,
+        Err(e) => {
+            // A skill that cannot be packed safely (a symlink out of its tree,
+            // over the size cap) is HELD: nothing is uploaded and the original
+            // stays exactly where it is. Drop the pending takeover so a later,
+            // unrelated install of the same slug cannot remove the original.
+            if e.downcast_ref::<super::publish::PackRefused>().is_some() {
+                warn!(slug, error = %e, "adopt-publish: skill held, not uploaded");
+                if let Err(e2) = state.clear_pending_adopt_takeover(&slug) {
+                    warn!(slug, error = %e2, "adopt-publish: could not clear pending takeover for held skill");
+                }
+            }
+            return Err(e).with_context(|| {
+                format!(
+                    "adopt-publish: failed to pack skill directory: {}",
+                    source.display()
+                )
+            });
+        }
+    };
 
     info!(
         slug,

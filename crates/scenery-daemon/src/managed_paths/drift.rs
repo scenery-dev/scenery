@@ -450,6 +450,12 @@ fn accept_local(state: &AppState, slug: &str, kind: &str) -> Result<()> {
 fn restore_canonical(state: &AppState, slug: &str, kind: &str) -> Result<()> {
     let marker = find_marker_by_slug_kind(state, slug, kind)?
         .ok_or_else(|| anyhow::anyhow!("drift: no marker for slug={slug} kind={kind}"))?;
+    // The directory being discarded may hold the user's edits (that is what
+    // "drifted" means). Back it up through the restore journal first; if the
+    // backup fails, nothing is removed.
+    if matches!(marker.kind.as_str(), "skill" | "plugin") {
+        back_up_before_restore(state, &marker)?;
+    }
     // Drop the file and the marker. The next desired-state snapshot from the
     // backend will trigger a fresh install via the F2 pusher.
     remove_path_for(&marker)?;
@@ -458,6 +464,50 @@ fn restore_canonical(state: &AppState, slug: &str, kind: &str) -> Result<()> {
         slug,
         "drift: restored canonical (removed local; awaiting re-install via snapshot)"
     );
+    Ok(())
+}
+
+/// Copy the skill/plugin directory a `restore_canonical` is about to delete
+/// into `restore-backups/<unique ts>/drift/<slug>` and journal it. The entry is
+/// `source = managed`: uninstall must not put a drifted edit back, but the
+/// copy stays on disk and the journal says where it is.
+fn back_up_before_restore(state: &AppState, marker: &ManagedPathMarker) -> Result<()> {
+    use scenery_core::restore_journal::{JournalEntry, JournalOp, JournalSource, RestoreJournal};
+
+    let dir = PathBuf::from(&marker.path);
+    // Same guard `remove_path_for` applies; checked first so no pointless
+    // backup of Anthropic-native content is taken.
+    ownership::ensure_not_native(&dir)?;
+    if fs::symlink_metadata(&dir).is_err() {
+        return Ok(()); // already gone: nothing to lose
+    }
+    let src = camino::Utf8Path::from_path(&dir)
+        .ok_or_else(|| anyhow::anyhow!("drift: path is not valid UTF-8: {}", dir.display()))?;
+    let journal = RestoreJournal::for_state(state);
+    let backup = journal
+        .backup_tree_unique("drift", &marker.slug, src)
+        .with_context(|| {
+            format!(
+                "drift: refusing to remove {} — could not back it up first",
+                dir.display()
+            )
+        })?;
+    journal
+        .append(
+            JournalEntry::new(
+                JournalOp::FileDelete,
+                JournalSource::Managed,
+                dir.to_string_lossy().to_string(),
+            )
+            .with_slug(&marker.slug)
+            .with_backup_path(backup.to_string())
+            .with_detail(serde_json::json!({
+                "reason": "drift_restore_canonical",
+                "kind": marker.kind,
+            })),
+        )
+        .context("drift: failed to journal the pre-restore backup")?;
+    info!(slug = %marker.slug, backup = %backup, "drift: backed up local copy before restore_canonical");
     Ok(())
 }
 
@@ -735,18 +785,7 @@ fn quarantine_item(outcome: &DriftOutcome) -> Result<PathBuf> {
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
-    fs::create_dir_all(dst)?;
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let typ = entry.file_type()?;
-        let dst_path = dst.join(entry.file_name());
-        if typ.is_dir() {
-            copy_dir_recursive(&entry.path(), &dst_path)?;
-        } else {
-            fs::copy(entry.path(), dst_path)?;
-        }
-    }
-    Ok(())
+    scenery_core::safe_copy::copy_tree(src, dst).map(|_| ())
 }
 
 // ── DB helpers ────────────────────────────────────────────────────────────────

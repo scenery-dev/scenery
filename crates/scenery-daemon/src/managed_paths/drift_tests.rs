@@ -689,3 +689,100 @@ fn drift_refuses_to_quarantine_or_remove_external_plugin_in_official_marketplace
     assert!(r.is_err(), "remove must refuse");
     assert_eq!(fs::read_to_string(ext.join("plugin.txt")).unwrap(), "x");
 }
+
+// ── restore_canonical backs up before it deletes ──────────────────────────────
+
+fn state_with_skill_marker(
+    td: &TempDir,
+    edited: &[u8],
+) -> (scenery_core::state::AppState, std::path::PathBuf) {
+    let root = camino::Utf8PathBuf::from_path_buf(td.path().join("data")).unwrap();
+    let state = scenery_core::state::AppState::bootstrap_in(root).unwrap();
+    let skill_dir = td.path().join("skills").join("hello");
+    fs::create_dir_all(skill_dir.join("prompts")).unwrap();
+    fs::write(skill_dir.join("SKILL.md"), edited).unwrap();
+    fs::write(skill_dir.join("prompts/p.md"), b"my prompt").unwrap();
+    let conn = Connection::open(state.db_path.as_std_path()).unwrap();
+    insert_db_marker(
+        &conn,
+        &ManagedPathMarker {
+            path: skill_dir.to_string_lossy().to_string(),
+            kind: "skill".to_string(),
+            slug: "hello".to_string(),
+            installation_id: None,
+            source_sha256: "original-hash".to_string(),
+            migrated_at: "2026-05-24T00:00:00Z".to_string(),
+        },
+    )
+    .unwrap();
+    (state, skill_dir)
+}
+
+/// `restore_canonical` used to `remove_dir_all` the drifted (user-edited)
+/// skill with no copy. It must back the tree up through the restore journal
+/// first, and the journal entry must be `managed` so uninstall never puts a
+/// drifted edit back.
+#[test]
+fn restore_canonical_backs_up_the_local_tree_before_removing_it() {
+    use scenery_core::restore_journal::{JournalOp, JournalSource, RestoreJournal};
+    let td = TempDir::new().unwrap();
+    let (state, skill_dir) = state_with_skill_marker(&td, b"my local edits");
+
+    restore_canonical(&state, "hello", "skill").unwrap();
+
+    assert!(!skill_dir.exists(), "local copy removed");
+    let entries = RestoreJournal::for_state(&state).read_all().unwrap();
+    assert_eq!(entries.len(), 1);
+    let e = &entries[0];
+    assert_eq!(e.op, JournalOp::FileDelete);
+    assert_eq!(e.source, JournalSource::Managed);
+    assert_eq!(e.target_path, skill_dir.to_string_lossy());
+    let backup = std::path::PathBuf::from(e.backup_path.clone().unwrap());
+    assert!(backup.to_string_lossy().contains("/drift/hello"));
+    assert_eq!(
+        fs::read(backup.join("SKILL.md")).unwrap(),
+        b"my local edits"
+    );
+    assert_eq!(fs::read(backup.join("prompts/p.md")).unwrap(), b"my prompt");
+}
+
+/// If the backup cannot be taken, nothing is deleted and the marker stays.
+#[test]
+fn restore_canonical_removes_nothing_when_the_backup_fails() {
+    let td = TempDir::new().unwrap();
+    let (state, skill_dir) = state_with_skill_marker(&td, b"my local edits");
+    // restore-backups is a file: the backup copy cannot be created.
+    fs::write(
+        state.root_dir.join("restore-backups").as_std_path(),
+        "blocker",
+    )
+    .unwrap();
+
+    assert!(restore_canonical(&state, "hello", "skill").is_err());
+
+    assert_eq!(
+        fs::read(skill_dir.join("SKILL.md")).unwrap(),
+        b"my local edits"
+    );
+    assert!(find_marker_by_slug_kind(&state, "hello", "skill")
+        .unwrap()
+        .is_some());
+}
+
+#[cfg(unix)]
+#[test]
+fn restore_canonical_backup_keeps_symlinks_as_symlinks() {
+    use scenery_core::restore_journal::RestoreJournal;
+    let td = TempDir::new().unwrap();
+    let (state, skill_dir) = state_with_skill_marker(&td, b"edited");
+    std::os::unix::fs::symlink("..", skill_dir.join("up")).unwrap();
+
+    restore_canonical(&state, "hello", "skill").unwrap();
+
+    let entries = RestoreJournal::for_state(&state).read_all().unwrap();
+    let backup = std::path::PathBuf::from(entries[0].backup_path.clone().unwrap());
+    assert!(fs::symlink_metadata(backup.join("up"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+}
