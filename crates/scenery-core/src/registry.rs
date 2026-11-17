@@ -175,6 +175,125 @@ pub enum AdoptPublishOutcome {
     Revoked { message: String },
 }
 
+// ── Auto-manage (2.3.0) ──────────────────────────────────────────────────────
+
+/// Client timeout for `POST /runner/skills/auto-manage`. The backend compiles
+/// and scans up to 5 MB of skill before it answers, far past the 30 s default.
+pub const AUTO_MANAGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// `outcome` of a successful auto-manage call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoManageOutcomeKind {
+    Managed,
+    Blocked,
+    Revoked,
+}
+
+/// Scan result carried by an auto-manage response.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AutoManageScan {
+    #[serde(default)]
+    pub verdict: Option<String>,
+    #[serde(default)]
+    pub decision: Option<String>,
+    #[serde(default)]
+    pub findings: serde_json::Value,
+}
+
+/// Body of a 200 from `POST /runner/skills/auto-manage`.
+///
+/// `skill_id` is the registry text id `<owner_namespace>~<slug>` (artifact
+/// URLs, snapshot rows, revocation matching); `skill_uuid` is the stable
+/// identity. In manage mode the install row is `state=desired` with the real
+/// `version`; in track mode there is no install row (`installation_id` is
+/// absent).
+#[derive(Debug, Clone, Deserialize)]
+pub struct AutoManageResponse {
+    pub outcome: AutoManageOutcomeKind,
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub skill_id: Option<String>,
+    #[serde(default)]
+    pub skill_uuid: Option<String>,
+    #[serde(default)]
+    pub owner_namespace: Option<String>,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub installation_id: Option<String>,
+    #[serde(default)]
+    pub installation_state: Option<String>,
+    #[serde(default)]
+    pub idempotent: bool,
+    #[serde(default)]
+    pub scan: AutoManageScan,
+    #[serde(default)]
+    pub errors: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub files: Vec<serde_json::Value>,
+}
+
+/// A non-200 answer that is a protocol outcome rather than a failure to
+/// reach the backend: 401, 403 (`api_key_not_allowed`, `auto_manage_disabled`),
+/// 404 (`device_not_found`, `discovery_not_found`), 409 (`held`,
+/// `mode_mismatch`, `already_shared`). Anything else non-2xx (5xx, an
+/// unexpected 4xx) is an `Err` so the caller retries with backoff.
+#[derive(Debug, Clone)]
+pub struct AutoManageRefusal {
+    pub status: u16,
+    /// The `detail.code` (or a bare string `detail`); empty when absent.
+    pub code: String,
+    pub message: String,
+}
+
+/// Result of [`RegistryClient::auto_manage`].
+#[derive(Debug, Clone)]
+pub enum AutoManageReply {
+    Done(AutoManageResponse),
+    Refused(AutoManageRefusal),
+}
+
+/// Fields of one auto-manage upload.
+#[derive(Debug, Clone)]
+pub struct AutoManageRequest<'a> {
+    pub tar_gz: Vec<u8>,
+    pub slug: &'a str,
+    pub tree_hash: &'a str,
+    pub device_id: &'a str,
+    pub source_path: &'a str,
+    /// `"manage"` or `"track"`.
+    pub mode: &'a str,
+    pub discovery_id: Option<&'a str>,
+}
+
+/// Pull `(code, message)` out of a FastAPI error body: `detail` is either an
+/// object with `code`/`message`, or a bare string.
+fn error_code_and_message(body: &str) -> (String, String) {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return (String::new(), body.chars().take(200).collect());
+    };
+    let detail = v.get("detail").unwrap_or(&v);
+    if let Some(s) = detail.as_str() {
+        return (s.to_string(), s.to_string());
+    }
+    let code = detail
+        .get("code")
+        .or_else(|| detail.get("error"))
+        .and_then(|c| c.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let message = detail
+        .get("message")
+        .and_then(|m| m.as_str())
+        .unwrap_or(code.as_str())
+        .to_string();
+    (code, message)
+}
+
 /// Does an HTTP 403 body carry the backend's `artifact_revoked` code
 /// (`{"detail": {"code": "artifact_revoked", "message": ...}}`)? Returns the
 /// message when it does.
@@ -1059,6 +1178,76 @@ impl RegistryClient {
                 Ok(AdoptPublishOutcome::PendingReview(parsed))
             }
         }
+    }
+
+    /// Upload a skill tree to `POST /runner/skills/auto-manage` (user bearer
+    /// only). Multipart fields: `file` (tar.gz from [`crate::pack`]), `slug`,
+    /// `tree_hash`, `device_id`, `source_path`, `mode`, and `discovery_id`
+    /// when known. A retry with the same (user, device, tree_hash) returns
+    /// `idempotent: true`.
+    ///
+    /// Uses its own client with [`AUTO_MANAGE_TIMEOUT`]: the backend compiles
+    /// and scans before answering.
+    pub fn auto_manage(&self, req: AutoManageRequest<'_>) -> Result<AutoManageReply> {
+        let token = self
+            .get_auth_token()
+            .ok_or_else(|| anyhow::anyhow!("not authenticated; run `scenery auth login` first"))?;
+        let url = format!(
+            "{}/runner/skills/auto-manage",
+            self.base_url.trim_end_matches('/')
+        );
+        debug!(
+            url,
+            size_bytes = req.tar_gz.len(),
+            slug = req.slug,
+            mode = req.mode,
+            "auto-manage: uploading skill"
+        );
+        let http = crate::http::blocking_client_builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(AUTO_MANAGE_TIMEOUT)
+            .build()
+            .context("failed to build the auto-manage HTTP client")?;
+
+        let file_part = reqwest::blocking::multipart::Part::bytes(req.tar_gz)
+            .file_name("skill-source.tar.gz")
+            .mime_str("application/gzip")
+            .context("invalid MIME type for auto-manage upload")?;
+        let mut form = reqwest::blocking::multipart::Form::new()
+            .part("file", file_part)
+            .text("slug", req.slug.to_string())
+            .text("tree_hash", req.tree_hash.to_string())
+            .text("device_id", req.device_id.to_string())
+            .text("source_path", req.source_path.to_string())
+            .text("mode", req.mode.to_string());
+        if let Some(id) = req.discovery_id {
+            form = form.text("discovery_id", id.to_string());
+        }
+
+        let resp = http
+            .post(&url)
+            .bearer_auth(token)
+            .multipart(form)
+            .send_tracked()
+            .with_context(|| format!("failed to reach registry at {url}"))?;
+        let status = resp.status();
+        if status.is_success() {
+            let parsed: AutoManageResponse = resp
+                .json()
+                .context("failed to deserialize auto-manage response")?;
+            return Ok(AutoManageReply::Done(parsed));
+        }
+        let code = status.as_u16();
+        let body = resp.text().unwrap_or_default();
+        if matches!(code, 401 | 403 | 404 | 409) {
+            let (c, message) = error_code_and_message(&body);
+            return Ok(AutoManageReply::Refused(AutoManageRefusal {
+                status: code,
+                code: c,
+                message,
+            }));
+        }
+        anyhow::bail!("auto-manage failed (HTTP {status}): {body}")
     }
 
     /// Fetch aggregated pre-install governance data for a skill.
@@ -2519,6 +2708,129 @@ mod tests {
         let result = client.compile_and_publish(gz_bytes, None, None);
         assert!(result.is_ok(), "compile_and_publish(None) should succeed");
         mock.assert();
+    }
+
+    // ── auto_manage ─────────────────────────────────────────────────────────────
+
+    fn auto_manage_req(gz: Vec<u8>) -> AutoManageRequest<'static> {
+        AutoManageRequest {
+            tar_gz: gz,
+            slug: "pdf",
+            tree_hash: "abc123",
+            device_id: "dev-1",
+            source_path: "/home/u/.agents/skills/pdf",
+            mode: "manage",
+            discovery_id: Some("disc-9"),
+        }
+    }
+
+    #[test]
+    fn auto_manage_sends_every_field_with_user_bearer_and_parses_the_response() {
+        use mockito::{Matcher, Server};
+        let mut server = Server::new();
+        let mock = server
+            .mock("POST", "/runner/skills/auto-manage")
+            .match_header("authorization", "Bearer tok")
+            .match_header("x-scenery-runner-version", Matcher::Any)
+            .match_body(Matcher::AllOf(vec![
+                Matcher::Regex("name=\"slug\"\r\n\r\npdf".to_string()),
+                Matcher::Regex("name=\"tree_hash\"\r\n\r\nabc123".to_string()),
+                Matcher::Regex("name=\"device_id\"\r\n\r\ndev-1".to_string()),
+                Matcher::Regex("name=\"mode\"\r\n\r\nmanage".to_string()),
+                Matcher::Regex("name=\"discovery_id\"\r\n\r\ndisc-9".to_string()),
+                Matcher::Regex("name=\"source_path\"".to_string()),
+                Matcher::Regex("name=\"file\"".to_string()),
+            ]))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "outcome": "managed", "mode": "manage", "reason": null,
+                    "skill_id": "adam~pdf", "skill_uuid": "u-1",
+                    "owner_namespace": "adam", "version": "0.1.0",
+                    "installation_id": "8b3f6b8a-6e1e-4f39-9b8a-000000000001",
+                    "installation_state": "desired", "idempotent": false,
+                    "scan": {"verdict": "ALLOW", "decision": "accept", "findings": []},
+                    "errors": [], "files": []
+                })
+                .to_string(),
+            )
+            .create();
+        let client = RegistryClient::new(server.url()).with_auth("tok");
+        let reply = client
+            .auto_manage(auto_manage_req(minimal_gz_bytes()))
+            .unwrap();
+        mock.assert();
+        match reply {
+            AutoManageReply::Done(r) => {
+                assert_eq!(r.outcome, AutoManageOutcomeKind::Managed);
+                assert_eq!(r.skill_id.as_deref(), Some("adam~pdf"));
+                assert_eq!(r.owner_namespace.as_deref(), Some("adam"));
+                assert_eq!(r.version.as_deref(), Some("0.1.0"));
+                assert_eq!(r.installation_state.as_deref(), Some("desired"));
+                assert!(!r.idempotent);
+                assert_eq!(r.scan.verdict.as_deref(), Some("ALLOW"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn auto_manage_maps_protocol_refusals_and_fails_on_server_errors() {
+        use mockito::Server;
+        for (status, body, code) in [
+            (401, serde_json::json!({"detail": "bad token"}), "bad token"),
+            (
+                403,
+                serde_json::json!({"detail": {"code": "auto_manage_disabled", "message": "off"}}),
+                "auto_manage_disabled",
+            ),
+            (
+                404,
+                serde_json::json!({"detail": {"code": "device_not_found"}}),
+                "device_not_found",
+            ),
+            (
+                409,
+                serde_json::json!({"detail": {"code": "mode_mismatch", "message": "m"}}),
+                "mode_mismatch",
+            ),
+        ] {
+            let mut server = Server::new();
+            let _m = server
+                .mock("POST", "/runner/skills/auto-manage")
+                .with_status(status)
+                .with_body(body.to_string())
+                .create();
+            let client = RegistryClient::new(server.url()).with_auth("tok");
+            match client
+                .auto_manage(auto_manage_req(minimal_gz_bytes()))
+                .unwrap()
+            {
+                AutoManageReply::Refused(r) => {
+                    assert_eq!(r.status as usize, status);
+                    assert_eq!(r.code, code);
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/runner/skills/auto-manage")
+            .with_status(502)
+            .with_body("bad gateway")
+            .create();
+        let client = RegistryClient::new(server.url()).with_auth("tok");
+        assert!(client
+            .auto_manage(auto_manage_req(minimal_gz_bytes()))
+            .is_err());
+    }
+
+    #[test]
+    fn auto_manage_uses_a_raised_timeout_and_requires_auth() {
+        assert!(AUTO_MANAGE_TIMEOUT > std::time::Duration::from_secs(30));
+        let client = RegistryClient::new("http://127.0.0.1:1");
+        assert!(client.auto_manage(auto_manage_req(vec![])).is_err());
     }
 
     // ── adopt_publish ───────────────────────────────────────────────────────────

@@ -38,14 +38,19 @@ const MAX_PACK_FILES: usize = 10_000;
 const MAX_PACK_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_PACK_DEPTH: usize = 32;
 
-/// Directories that never belong in an upload.
+/// Directories that never belong in an upload: `.git` and every other
+/// dot-directory, dependency trees and compiled-Python caches.
 fn is_excluded_dir(name: &str) -> bool {
-    name == ".git" || name == "node_modules"
+    name.starts_with('.') || name == "node_modules" || name == "__pycache__"
 }
 
 /// Files that commonly hold secrets: `.env*`, `*.pem`, `*.key`, and SSH
-/// private keys (`id_rsa`, `id_ed25519`, ... but not their `.pub` halves).
+/// private keys (`id_rsa`, `id_ed25519`, ... but not their `.pub` halves),
+/// plus editor swap files and OS litter ([`crate::skill_tree::is_noise_name`]).
 fn is_excluded_file(name: &str) -> bool {
+    if crate::skill_tree::is_noise_name(name) {
+        return true;
+    }
     let n = name.to_ascii_lowercase();
     if n.starts_with(".env") || n.ends_with(".pem") || n.ends_with(".key") {
         return true;
@@ -82,6 +87,9 @@ fn lexical_target_inside(parent_rel: &Path, target: &Path) -> bool {
 struct PackState {
     files: usize,
     bytes: u64,
+    /// Refuse ANY symlink, not only one that escapes the tree (auto-manage
+    /// uploads: a link cannot be shown to be safe once it leaves this machine).
+    refuse_links: bool,
 }
 
 /// Append `dir`'s tree to `tar` under `./`, safely: links are never followed
@@ -91,6 +99,15 @@ struct PackState {
 ///
 /// Shared by the daemon's adopt/publish uploads and the CLI's publish.
 pub fn append_skill_tree<W: std::io::Write>(tar: &mut tar::Builder<W>, dir: &Path) -> Result<()> {
+    append_skill_tree_with(tar, dir, false)
+}
+
+/// [`append_skill_tree`], optionally refusing every symlink (`refuse_links`).
+pub fn append_skill_tree_with<W: std::io::Write>(
+    tar: &mut tar::Builder<W>,
+    dir: &Path,
+    refuse_links: bool,
+) -> Result<()> {
     let root = std::fs::canonicalize(dir)
         .with_context(|| format!("failed to resolve skill directory: {}", dir.display()))?;
     // Never read through a link: a skill containing `creds -> ~/.aws` must not
@@ -99,19 +116,34 @@ pub fn append_skill_tree<W: std::io::Write>(tar: &mut tar::Builder<W>, dir: &Pat
     tar.follow_symlinks(false);
     tar.append_dir(".", &root)
         .with_context(|| format!("failed to pack directory: {}", dir.display()))?;
-    let mut state = PackState { files: 0, bytes: 0 };
+    let mut state = PackState {
+        files: 0,
+        bytes: 0,
+        refuse_links,
+    };
     pack_walk(tar, dir, &root, Path::new(""), 0, &mut state)
 }
 
 /// Pack the directory at `dir` into an in-memory gzipped tar archive (see
 /// [`append_skill_tree`] for the safety rules).
 pub fn pack_dir_to_tar_gz(dir: &Path) -> Result<Vec<u8>> {
+    pack_dir_to_tar_gz_with(dir, false)
+}
+
+/// [`pack_dir_to_tar_gz`] that refuses a tree containing ANY symlink with
+/// [`PackRefused`]. Used by the auto-manage upload: a skill with a link in it
+/// is held, never uploaded.
+pub fn pack_dir_to_tar_gz_no_links(dir: &Path) -> Result<Vec<u8>> {
+    pack_dir_to_tar_gz_with(dir, true)
+}
+
+fn pack_dir_to_tar_gz_with(dir: &Path, refuse_links: bool) -> Result<Vec<u8>> {
     use flate2::{write::GzEncoder, Compression};
 
     let mut gz_buf: Vec<u8> = Vec::new();
     let enc = GzEncoder::new(&mut gz_buf, Compression::default());
     let mut tar = tar::Builder::new(enc);
-    append_skill_tree(&mut tar, dir)?;
+    append_skill_tree_with(&mut tar, dir, refuse_links)?;
     tar.into_inner()
         .context("failed to finalize tar")?
         .finish()
@@ -165,6 +197,12 @@ fn pack_walk<W: std::io::Write>(
         if ft.is_symlink() {
             let target = std::fs::read_link(&abs)
                 .with_context(|| format!("failed to read link {}", abs.display()))?;
+            if state.refuse_links {
+                return Err(refuse(
+                    &abs,
+                    format!("contains a symbolic link ({})", target.display()),
+                ));
+            }
             let inside = match std::fs::canonicalize(&abs) {
                 Ok(resolved) => resolved.starts_with(root),
                 // Dangling or looping: judge the link text alone.
@@ -408,6 +446,43 @@ mod tests {
     /// `creds -> <dir outside the skill>`: the files behind it must not be
     /// uploaded. The skill is refused outright and the error says why.
     #[cfg(unix)]
+    #[cfg(unix)]
+    #[test]
+    fn no_links_pack_refuses_even_a_link_that_stays_inside_the_skill() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        fs::write(d.join("SKILL.md"), "x").unwrap();
+        fs::write(d.join("real.md"), "r").unwrap();
+        std::os::unix::fs::symlink("real.md", d.join("alias.md")).unwrap();
+        // The default pack keeps inside links...
+        assert!(pack_dir_to_tar_gz(d).is_ok());
+        // ...the auto-manage pack holds the skill.
+        let err = pack_dir_to_tar_gz_no_links(d).unwrap_err();
+        let held = err.downcast_ref::<PackRefused>().expect("PackRefused");
+        assert!(held.reason.contains("symbolic link"), "{}", held.reason);
+    }
+
+    #[test]
+    fn pack_drops_swap_files_pycache_and_other_dot_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        fs::write(d.join("SKILL.md"), "x").unwrap();
+        fs::write(d.join(".SKILL.md.swp"), "vim").unwrap();
+        fs::write(d.join("a.md~"), "emacs").unwrap();
+        fs::create_dir_all(d.join("__pycache__")).unwrap();
+        fs::write(d.join("__pycache__/a.pyc"), "x").unwrap();
+        fs::create_dir_all(d.join(".claude")).unwrap();
+        fs::write(d.join(".claude/settings.json"), "{}").unwrap();
+        let names = tar_names(&pack_dir_to_tar_gz(d).unwrap());
+        assert!(names.iter().any(|n| n.ends_with("SKILL.md")));
+        for gone in [".swp", "a.md~", "__pycache__", ".claude"] {
+            assert!(
+                !names.iter().any(|n| n.contains(gone)),
+                "{gone} packed: {names:?}"
+            );
+        }
+    }
+
     #[test]
     fn pack_refuses_a_symlink_that_points_outside_the_skill() {
         let tmp = tempfile::tempdir().unwrap();

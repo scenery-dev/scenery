@@ -47,6 +47,7 @@ http = "1"
 # already used by scenery-daemon's F2 pusher for the analogous
 # ~/.claude.json read-lock-modify-write cycle.
 fs2 = "0.4"
+unicode-normalization = "0.1"
 
 # Secure-by-default token storage:
 #   - macOS: Keychain unconditionally

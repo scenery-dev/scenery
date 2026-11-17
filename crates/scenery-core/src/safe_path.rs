@@ -17,7 +17,7 @@ pub enum SafePathError {
     Empty { what: String },
     #[error("{what}: longer than {MAX_COMPONENT_LEN} bytes")]
     TooLong { what: String },
-    #[error("{what}: contains a character outside [A-Za-z0-9._-]")]
+    #[error("{what}: contains a character outside [A-Za-z0-9._~-]")]
     BadChar { what: String },
     #[error("{what}: must not start with '.'")]
     LeadingDot { what: String },
@@ -40,8 +40,13 @@ pub fn validate_component(what: &str, s: &str) -> Result<(), SafePathError> {
     if s.starts_with('.') {
         return Err(SafePathError::LeadingDot { what: w() });
     }
+    if s.starts_with('~') {
+        return Err(SafePathError::BadChar { what: w() });
+    }
     for b in s.bytes() {
-        let ok = b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-';
+        // `~` is allowed (not leading): a private skill's registry id is
+        // `<owner_namespace>~<slug>`.
+        let ok = b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'~');
         if !ok {
             return Err(SafePathError::BadChar { what: w() });
         }

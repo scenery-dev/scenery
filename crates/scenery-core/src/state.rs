@@ -212,6 +212,25 @@ impl AppState {
         conn.execute_batch(SCHEMA_ADOPT_SQL)
             .context("failed to apply adopt-takeover schema additions")?;
 
+        // Auto-manage (2.3.0): provenance on markers and pending takeovers,
+        // tracked-in-place skills, neutralization ledger, attempt backoff.
+        // All additive; rows written by older runners read as `origin = NULL`
+        // (legacy), which every consumer treats as "not auto-managed".
+        for sql in [
+            "ALTER TABLE managed_path_markers ADD COLUMN origin TEXT",
+            "ALTER TABLE managed_path_markers ADD COLUMN skill_id TEXT",
+            "ALTER TABLE managed_path_markers ADD COLUMN skill_uuid TEXT",
+            "ALTER TABLE managed_path_markers ADD COLUMN tree_hash TEXT",
+            "ALTER TABLE managed_path_markers ADD COLUMN hash_version INTEGER",
+            "ALTER TABLE adopt_pending_takeovers ADD COLUMN origin TEXT",
+            "ALTER TABLE adopt_pending_takeovers ADD COLUMN skill_id TEXT",
+            "ALTER TABLE adopt_pending_takeovers ADD COLUMN skill_uuid TEXT",
+        ] {
+            add_column_if_missing(&conn, sql)?;
+        }
+        conn.execute_batch(SCHEMA_AUTO_MANAGE_SQL)
+            .context("failed to apply auto-manage schema additions")?;
+
         // Broadcast-model artifact revocation: durable local cache of the
         // backend's revocation list, reconciled on every snapshot/connect.
         conn.execute_batch(SCHEMA_REVOKE_SQL)
@@ -383,6 +402,43 @@ impl AppState {
                 .flatten()
             })
             .unwrap_or_else(|| registry_id.to_string())
+    }
+
+    /// The registry skill id recorded for local folder `local_slug`, if the
+    /// folder holds a skill registered under a different name (an auto-managed
+    /// private skill `<owner>~<slug>` lives in folder `<slug>`). `None` when
+    /// the folder name is the registry name.
+    pub fn registry_name_for_local(&self, local_slug: &str) -> Option<String> {
+        use rusqlite::OptionalExtension;
+        Connection::open(&self.db_path)
+            .ok()
+            .and_then(|conn| {
+                conn.query_row(
+                    "SELECT registry_id FROM skill_local_names WHERE local_slug = ?1 \
+                     ORDER BY registry_id LIMIT 1",
+                    [local_slug],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .ok()
+                .flatten()
+            })
+            .filter(|r| r != local_slug)
+    }
+
+    /// The last `policy` object a discovery upload returned
+    /// (`auto_manage_skills`, `auto_submit_mcp`). `None` until a backend that
+    /// sends one has answered. Defaults are NOT applied here: callers decide
+    /// what "never told" means.
+    pub fn cached_auto_manage_policy(&self) -> Option<AutoManagePolicy> {
+        let raw = self.get_sync_state(AUTO_MANAGE_POLICY_KEY).ok().flatten()?;
+        serde_json::from_str(&raw).ok()
+    }
+
+    /// Persist the backend's latest auto-manage policy.
+    pub fn cache_auto_manage_policy(&self, policy: &AutoManagePolicy) -> Result<()> {
+        let raw = serde_json::to_string(policy).context("serialise auto-manage policy")?;
+        self.set_sync_state(AUTO_MANAGE_POLICY_KEY, &raw)
     }
 
     pub fn get_sync_state(&self, key: &str) -> Result<Option<String>> {
@@ -807,6 +863,26 @@ impl AppState {
     }
 }
 
+// ── Auto-manage policy cache ─────────────────────────────────────────────────
+
+/// `sync_state` key holding the last policy a discovery upload returned.
+pub const AUTO_MANAGE_POLICY_KEY: &str = "auto_manage_policy";
+
+/// The org's auto-manage switches, as delivered with a discovery upload
+/// response. Both default to `true` on the backend; a field missing from a
+/// response deserializes as `true`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AutoManagePolicy {
+    #[serde(default = "policy_default_true")]
+    pub auto_manage_skills: bool,
+    #[serde(default = "policy_default_true")]
+    pub auto_submit_mcp: bool,
+}
+
+fn policy_default_true() -> bool {
+    true
+}
+
 // ── Adopt-publish takeover tracking ──────────────────────────────────────────
 
 impl AppState {
@@ -846,6 +922,60 @@ impl AppState {
             .optional()
             .context("failed to read adopt_pending_takeovers")?;
         Ok(result)
+    }
+
+    /// Record a pending takeover that carries the auto-manage provenance the
+    /// marker must be stamped with when the managed copy lands (`origin`,
+    /// registry `skill_id`, stable `skill_uuid`). Same upsert semantics as
+    /// [`record_pending_adopt_takeover`](Self::record_pending_adopt_takeover).
+    pub fn record_pending_auto_managed_takeover(
+        &self,
+        slug: &str,
+        source_path: &str,
+        skill_id: &str,
+        skill_uuid: &str,
+    ) -> Result<()> {
+        let conn = Connection::open(&self.db_path)
+            .context("failed to open state DB for pending-takeover upsert")?;
+        conn.execute(
+            "INSERT INTO adopt_pending_takeovers \
+                 (slug, source_path, origin, skill_id, skill_uuid) \
+             VALUES (?1, ?2, 'auto_managed', ?3, ?4) \
+             ON CONFLICT(slug) DO UPDATE SET source_path = excluded.source_path, \
+                 origin = excluded.origin, skill_id = excluded.skill_id, \
+                 skill_uuid = excluded.skill_uuid",
+            rusqlite::params![slug, source_path, skill_id, skill_uuid],
+        )
+        .context("failed to upsert adopt_pending_takeovers row")?;
+        Ok(())
+    }
+
+    /// The auto-manage provenance recorded with `slug`'s pending takeover:
+    /// `(origin, skill_id, skill_uuid)`. `None` when nothing is pending or the
+    /// takeover came from the legacy adopt flow (no `origin`).
+    pub fn pending_takeover_provenance(
+        &self,
+        slug: &str,
+    ) -> Result<Option<(String, Option<String>, Option<String>)>> {
+        use rusqlite::OptionalExtension;
+        let conn = Connection::open(&self.db_path)
+            .context("failed to open state DB for pending-takeover lookup")?;
+        let row = conn
+            .query_row(
+                "SELECT origin, skill_id, skill_uuid FROM adopt_pending_takeovers \
+                 WHERE slug = ?1",
+                [slug],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .context("failed to read adopt_pending_takeovers")?;
+        Ok(row.and_then(|(origin, id, uuid)| origin.map(|o| (o, id, uuid))))
     }
 
     /// Clear the pending-takeover record for `slug`, e.g. after its
@@ -1038,6 +1168,55 @@ CREATE TABLE IF NOT EXISTS adopt_pending_takeovers (
     slug        TEXT PRIMARY KEY,
     source_path TEXT NOT NULL,
     recorded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+"#;
+
+/// Auto-manage (2.3.0) runner state.
+///
+/// - `tracked_skills`: skills governed in place (dev symlinks, git trees,
+///   other installers' skills). Never converted, never marked. `path` is the
+///   discovered path. `neutralized*` record the kill switch.
+/// - `tracked_neutralizations`: one row per filesystem action the kill
+///   switch took, so unrevoke and `scenery uninstall` can reverse it exactly.
+/// - `auto_manage_attempts`: per (slug, source_path) backoff and "unchanged
+///   since the last terminal answer" bookkeeping so a failing or refused
+///   skill does not hit the backend every tick. `status` is one of
+///   `managed|tracked|held|blocked|revoked|skipped|failed`.
+const SCHEMA_AUTO_MANAGE_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS tracked_skills (
+    path               TEXT PRIMARY KEY,
+    slug               TEXT NOT NULL,
+    reason             TEXT NOT NULL,
+    skill_id           TEXT,
+    skill_uuid         TEXT,
+    version            TEXT,
+    last_tree_hash     TEXT,
+    last_upload_at     TEXT,
+    neutralized        INTEGER NOT NULL DEFAULT 0,
+    neutralized_reason TEXT,
+    neutralized_at     TEXT,
+    created_at         TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS tracked_neutralizations (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    tracked_path  TEXT NOT NULL,
+    entry_path    TEXT NOT NULL,
+    action        TEXT NOT NULL,
+    link_target   TEXT,
+    backup_path   TEXT,
+    renamed_to    TEXT,
+    created_at    TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS auto_manage_attempts (
+    slug         TEXT NOT NULL,
+    source_path  TEXT NOT NULL,
+    last_hash    TEXT,
+    status       TEXT NOT NULL,
+    reason       TEXT,
+    fail_count   INTEGER NOT NULL DEFAULT 0,
+    last_try     TEXT NOT NULL,
+    next_try_at  INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (slug, source_path)
 );
 "#;
 

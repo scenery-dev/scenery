@@ -33,6 +33,17 @@ fn rejects_traversal_and_absolute() {
 }
 
 #[test]
+fn private_skill_registry_ids_with_a_tilde_are_one_component() {
+    assert!(validate_component("t", "adam~pdf").is_ok());
+    assert!(
+        validate_component("t", "~pdf").is_err(),
+        "leading ~ stays refused"
+    );
+    assert!(validate_component("t", "a~/b").is_err());
+    assert!(safe_join(Path::new("/r/skills"), "adam~pdf").is_ok());
+}
+
+#[test]
 fn safe_join_stays_under_root() {
     let root = Path::new("/r/skills");
     assert_eq!(safe_join(root, "x").unwrap(), Path::new("/r/skills/x"));

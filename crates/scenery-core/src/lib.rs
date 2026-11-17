@@ -40,6 +40,7 @@ pub mod safe_path;
 pub mod safe_unpack;
 pub mod secret_file;
 pub mod signed;
+pub mod skill_tree;
 pub mod state;
 pub mod trust;
 pub mod verifier;
