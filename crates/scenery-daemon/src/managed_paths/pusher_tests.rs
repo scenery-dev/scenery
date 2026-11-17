@@ -426,8 +426,9 @@ fn atomic_write_leaves_no_tmp_on_success() {
     atomic_write(&dest, b"hello world").unwrap();
     assert_eq!(fs::read(&dest).unwrap(), b"hello world");
     // Temp file must be gone.
-    assert!(
-        !dir.path().join("output.tmp").exists(),
+    assert_eq!(
+        dir_names(dir.path()),
+        vec!["output.txt"],
         "tmp file must be cleaned up"
     );
 }
@@ -1710,12 +1711,12 @@ fn adopt_in_place_survives_a_symlink_loop_in_the_user_dir() {
     });
 }
 
-/// `collect_extras` (adopt of a non-canonical source) walks the user's tree
+/// `collect_tree_files` (adopt of a non-canonical source) walks the user's tree
 /// without following links: a directory loop cannot recurse forever and a
 /// link out of the tree is not read.
 #[cfg(unix)]
 #[test]
-fn collect_extras_does_not_follow_symlinks() {
+fn collect_tree_files_does_not_follow_symlinks() {
     let tmp = tempfile::tempdir().unwrap();
     let src = tmp.path().join("skill");
     fs::create_dir_all(src.join("prompts")).unwrap();
@@ -1727,8 +1728,100 @@ fn collect_extras_does_not_follow_symlinks() {
     std::os::unix::fs::symlink(&secret, src.join("creds")).unwrap();
     std::os::unix::fs::symlink(".", src.join("prompts/loop")).unwrap();
 
-    let mut out = Vec::new();
-    collect_extras(&src, &src, &mut out);
-    let names: Vec<&str> = out.iter().map(|(n, _)| n.as_str()).collect();
+    let out = scenery_core::pack::collect_tree_files(&src);
+    let names: Vec<&str> = out.iter().map(|f| f.rel.as_str()).collect();
     assert_eq!(names, vec!["prompts/p.md"]);
+}
+
+// ── Bundled files (scripts/, references/, binary assets) ──────────────────────
+
+fn tree_files() -> Vec<scenery_core::pack::TreeFile> {
+    use scenery_core::pack::TreeFile;
+    vec![
+        TreeFile {
+            rel: "notes.md".into(),
+            bytes: b"root level notes\n".to_vec(),
+            executable: false,
+        },
+        TreeFile {
+            rel: "scripts/run.sh".into(),
+            bytes: b"#!/bin/sh\necho ok\n".to_vec(),
+            executable: true,
+        },
+        TreeFile {
+            rel: "references/deep/api.md".into(),
+            bytes: b"# api\n".to_vec(),
+            executable: false,
+        },
+        TreeFile {
+            rel: "assets/logo.bin".into(),
+            bytes: (0..=255u8).chain([0x89, 0x00, 0xff]).collect(),
+            executable: false,
+        },
+        // Names that collide under `with_extension("tmp")`.
+        TreeFile {
+            rel: "scripts/x.tmp".into(),
+            bytes: b"tmp file\n".to_vec(),
+            executable: false,
+        },
+        TreeFile {
+            rel: "scripts/x.sh".into(),
+            bytes: b"#!/bin/sh\n".to_vec(),
+            executable: true,
+        },
+    ]
+}
+
+#[cfg(unix)]
+fn assert_tree_written(dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    for f in tree_files() {
+        let p = dir.join(&f.rel);
+        assert_eq!(fs::read(&p).unwrap(), f.bytes, "{} bytes", f.rel);
+        let exec = fs::metadata(&p).unwrap().permissions().mode() & 0o100 != 0;
+        assert_eq!(exec, f.executable, "{} executable bit", f.rel);
+    }
+    assert_eq!(
+        dir_names(dir)
+            .iter()
+            .filter(|n| n.contains("scenery-tmp"))
+            .count(),
+        0
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn push_skill_files_writes_every_file_with_its_mode() {
+    let (pusher, _tmp) = make_pusher();
+    with_fake_home(|home| {
+        pusher
+            .push_skill_files("demo", Some("i"), b"published", &tree_files(), false)
+            .unwrap();
+        let dir = home.join(".agents/skills/demo");
+        assert_eq!(fs::read(dir.join("SKILL.md")).unwrap(), b"published");
+        assert_tree_written(&dir);
+        // Claude Code reads the same files through its link.
+        assert!(home.join(".claude/skills/demo/scripts/run.sh").is_file());
+    });
+}
+
+/// The reported bug: converting the user's own `~/.agents/skills/<slug>` in
+/// place left only the SKILL.md. The converted directory carries every file,
+/// scripts still executable, and the original is backed up.
+#[cfg(unix)]
+#[test]
+fn adopt_in_place_conversion_writes_bundled_files_and_keeps_a_backup() {
+    let (pusher, tmp) = make_pusher();
+    with_fake_home(|home| {
+        let dir = seed_user_skill(home, "demo");
+        pusher
+            .push_skill_files("demo", Some("i"), b"published", &tree_files(), true)
+            .unwrap();
+        assert_eq!(fs::read(dir.join("SKILL.md")).unwrap(), b"published");
+        assert!(dir.join(".scenery-managed.json").is_file());
+        assert_tree_written(&dir);
+        let backups = tmp.path().join("restore-backups");
+        assert!(backups.is_dir(), "the user's original was backed up");
+    });
 }

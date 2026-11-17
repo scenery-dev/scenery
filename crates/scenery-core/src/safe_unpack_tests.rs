@@ -164,3 +164,41 @@ fn zip_regular_unpacks() {
     unpack_cskill_archive(&path, &dest).unwrap();
     assert_eq!(fs::read_to_string(dest.join("SKILL.md")).unwrap(), "hi");
 }
+
+fn add_file_mode<W: Write>(b: &mut tar::Builder<W>, name: &str, body: &[u8], mode: u32) {
+    let mut h = tar::Header::new_gnu();
+    h.set_size(body.len() as u64);
+    h.set_mode(mode);
+    h.set_cksum();
+    b.append_data(&mut h, name, body).unwrap();
+}
+
+/// A script that was executable when published must be executable after
+/// install, and binary bytes must be unchanged. Setuid and group/other bits
+/// from the archive are never applied.
+#[cfg(unix)]
+#[test]
+fn owner_execute_bit_survives_unpack_and_binary_is_exact() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_d, root) = tmp();
+    let bin: Vec<u8> = (0..=255u8).chain([0x89, 0x50, 0x00, 0xff]).collect();
+    let ar = tar_with(&root, |b| {
+        add_file_mode(b, "SKILL.md", b"hello", 0o644);
+        add_file_mode(b, "scripts/run.sh", b"#!/bin/sh\n", 0o755);
+        add_file_mode(b, "scripts/evil.sh", b"#!/bin/sh\n", 0o4777);
+        add_file_mode(b, "assets/logo.bin", &bin, 0o644);
+    });
+    let dest = root.join("out");
+    unpack_cskill_archive(&ar, &dest).unwrap();
+    let mode = |p: &str| fs::metadata(dest.join(p)).unwrap().permissions().mode();
+    assert!(mode("scripts/run.sh") & 0o100 != 0, "owner-exec kept");
+    assert!(mode("scripts/evil.sh") & 0o100 != 0);
+    assert_eq!(mode("scripts/evil.sh") & 0o7000, 0, "setuid never applied");
+    assert_eq!(
+        mode("SKILL.md") & 0o111,
+        0,
+        "plain files stay non-executable"
+    );
+    assert_eq!(mode("assets/logo.bin") & 0o111, 0);
+    assert_eq!(fs::read(dest.join("assets/logo.bin")).unwrap(), bin);
+}

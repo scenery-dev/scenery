@@ -1230,3 +1230,117 @@ async fn nothing_for_phantom_check_remains_after_uninstall() {
     assert!(marker_gone, "uninstall must delete the F2 marker row");
     cleanup(&root);
 }
+
+// ── Bundled files survive adopt → publish → install ──────────────────────────
+
+/// Every file of a skill tree, root SKILL.md included, as
+/// `rel -> (sha256 of the bytes, executable)`.
+#[cfg(unix)]
+fn snapshot_tree(dir: &std::path::Path) -> std::collections::BTreeMap<String, (String, bool)> {
+    use sha2::{Digest, Sha256};
+    let digest = |b: &[u8]| hex::encode(Sha256::digest(b));
+    let mut m: std::collections::BTreeMap<String, (String, bool)> =
+        scenery_core::pack::collect_tree_files(dir)
+            .into_iter()
+            .map(|f| (f.rel, (digest(&f.bytes), f.executable)))
+            .collect();
+    m.insert(
+        "SKILL.md".into(),
+        (digest(&std::fs::read(dir.join("SKILL.md")).unwrap()), false),
+    );
+    m
+}
+
+/// The user's skill at `~/.agents/skills/<slug>/` has scripts/ (executable),
+/// references/, root notes and a binary asset. It is packed the way the daemon
+/// uploads it, unpacked and installed the way the reconciler installs the
+/// published `.cskill`, and converted in place by the F2 push. The live
+/// directory must equal the original byte for byte, with the script still
+/// executable. (The registry's compile step is covered by the backend tests:
+/// it ships every file of the uploaded tree.)
+#[cfg(unix)]
+#[test]
+fn adopted_skill_with_bundled_files_round_trips_byte_for_byte() {
+    use scenery_core::installer::{install_unpacked_skill, InstallMode};
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::Arc;
+
+    let root = temp_root("adopt-roundtrip");
+    let state = Arc::new(AppState::bootstrap_in(root.clone()).unwrap());
+
+    with_fake_home(|home| {
+        let slug = "extras-skill";
+        let dir = home.join(".agents/skills").join(slug);
+        std::fs::create_dir_all(dir.join("scripts")).unwrap();
+        std::fs::create_dir_all(dir.join("references/deep")).unwrap();
+        std::fs::create_dir_all(dir.join("assets")).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!(
+                "---\nname: {slug}\ndescription: Round trip.\nmetadata:\n  scenery:\n    version: 0.1.0\n    publisher: acme\n---\n\nSee notes.md and scripts/run.sh.\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(dir.join("notes.md"), "root level notes\n").unwrap();
+        std::fs::write(dir.join("scripts/run.sh"), "#!/bin/sh\necho ok\n").unwrap();
+        std::fs::set_permissions(
+            dir.join("scripts/run.sh"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        std::fs::write(dir.join("references/deep/api.md"), "# api\n").unwrap();
+        let binary: Vec<u8> = (0..=255u8).chain([0x89, 0x50, 0x00, 0xff]).collect();
+        std::fs::write(dir.join("assets/logo.bin"), &binary).unwrap();
+        // Includes a file whose name would collide under `with_extension("tmp")`.
+        std::fs::write(dir.join("scripts/helper.tmp"), "kept\n").unwrap();
+        std::fs::write(dir.join("scripts/helper.sh"), "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(
+            dir.join("scripts/helper.sh"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let before = snapshot_tree(&dir);
+        assert!(
+            before["scripts/run.sh"].1,
+            "precondition: script is executable"
+        );
+
+        // Daemon upload -> registry stores the tree -> runner downloads it.
+        let tgz = scenery_core::pack::pack_dir_to_tar_gz(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let cskill = camino::Utf8PathBuf::from_path_buf(tmp.path().join("a.cskill")).unwrap();
+        std::fs::write(&cskill, tgz).unwrap();
+        let unpacked = camino::Utf8PathBuf::from_path_buf(tmp.path().join("unpacked")).unwrap();
+        scenery_core::safe_unpack::unpack_cskill_archive(&cskill, &unpacked).unwrap();
+        let pkg = scenery_manifest::SkillPackage::load_from_dir(&unpacked).unwrap();
+        install_unpacked_skill(&state, &pkg, InstallMode::Copy).unwrap();
+
+        // Adopt of the canonical directory: converted to managed in place.
+        state
+            .record_pending_adopt_takeover(slug, &dir.to_string_lossy())
+            .unwrap();
+        let pusher = crate::managed_paths::ManagedPathsPusher::new(&state);
+        super::push_skill_to_claude(Some(&pusher), slug, Some("inst-1"), &state);
+
+        let after = snapshot_tree(&dir);
+        assert_eq!(
+            after, before,
+            "the converted directory must equal the original"
+        );
+        assert!(after["scripts/run.sh"].1, "script must stay executable");
+        assert!(after["scripts/helper.sh"].1);
+        assert!(
+            dir.join(".scenery-managed.json").is_file(),
+            "converted to managed"
+        );
+        // Claude Code sees the same tree through its link.
+        let claude = home.join(".claude/skills").join(slug);
+        assert!(claude.join("scripts/run.sh").is_file());
+        assert_eq!(
+            std::fs::read(claude.join("assets/logo.bin")).unwrap(),
+            binary
+        );
+    });
+
+    cleanup(&root);
+}

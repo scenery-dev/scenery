@@ -37,6 +37,7 @@ use anyhow::{Context, Result};
 use fs2::FileExt;
 use rusqlite::Connection;
 use scenery_core::atomic_file;
+use scenery_core::pack::TreeFile;
 use scenery_core::restore_journal::{JournalEntry, JournalOp, JournalSource, RestoreJournal};
 use scenery_core::state::AppState;
 use scenery_mcp::ownership;
@@ -154,7 +155,7 @@ impl ManagedPathsPusher {
             slug,
             installation_id,
             skill_md_bytes,
-            referenced_files,
+            &as_plain_files(referenced_files),
             false,
         )
     }
@@ -177,8 +178,35 @@ impl ManagedPathsPusher {
             slug,
             installation_id,
             skill_md_bytes,
-            referenced_files,
+            &as_plain_files(referenced_files),
             true,
+        )
+    }
+
+    /// [`push_skill`](Self::push_skill) / [`push_skill_adopting_in_place`]
+    /// (selected by `adopt_in_place`) for a tree read with
+    /// [`scenery_core::pack::collect_tree_files`], which keeps each file's
+    /// executable bit. Every install path that has a real skill tree on disk
+    /// (registry install, adopt, heal) goes through here so `scripts/` stay
+    /// runnable.
+    pub fn push_skill_files(
+        &self,
+        slug: &str,
+        installation_id: Option<&str>,
+        skill_md_bytes: &[u8],
+        files: &[TreeFile],
+        adopt_in_place: bool,
+    ) -> Result<PushOutcome> {
+        let borrowed: Vec<(&str, &[u8], bool)> = files
+            .iter()
+            .map(|f| (f.rel.as_str(), f.bytes.as_slice(), f.executable))
+            .collect();
+        self.push_skill_inner(
+            slug,
+            installation_id,
+            skill_md_bytes,
+            &borrowed,
+            adopt_in_place,
         )
     }
 
@@ -187,7 +215,7 @@ impl ManagedPathsPusher {
         slug: &str,
         installation_id: Option<&str>,
         skill_md_bytes: &[u8],
-        referenced_files: &[(String, Vec<u8>)],
+        referenced_files: &[(&str, &[u8], bool)],
         adopt_in_place: bool,
     ) -> Result<PushOutcome> {
         if reconciler_disabled() {
@@ -297,7 +325,7 @@ impl ManagedPathsPusher {
                 .context("pusher: failed to write SKILL.md")?;
 
             // Write referenced files.
-            for (rel_path, content) in referenced_files {
+            for &(rel_path, content, executable) in referenced_files {
                 let dest = write_root.join(rel_path);
                 if let Some(parent) = dest.parent() {
                     fs::create_dir_all(parent).with_context(|| {
@@ -307,7 +335,7 @@ impl ManagedPathsPusher {
                         )
                     })?;
                 }
-                atomic_write(&dest, content).with_context(|| {
+                atomic_write_with_mode(&dest, content, executable).with_context(|| {
                     format!(
                         "pusher: failed to write referenced file: {}",
                         dest.display()
@@ -924,10 +952,9 @@ pub fn push_missing_active_skills(state: &AppState, pusher: &ManagedPathsPusher)
                 continue;
             }
         };
-        let mut refs: Vec<(String, Vec<u8>)> = Vec::new();
-        collect_extras(&active_dir, &active_dir, &mut refs);
+        let refs = scenery_core::pack::collect_tree_files(&active_dir);
 
-        match pusher.push_skill(&skill_id, None, &bytes, &refs) {
+        match pusher.push_skill_files(&skill_id, None, &bytes, &refs, false) {
             Ok(_) => {
                 healed += 1;
                 info!(skill_id, "heal: re-pushed missing installed skill dir");
@@ -995,14 +1022,13 @@ pub async fn push_adopted_discovery(
         })?;
 
         // Collect sibling files (everything except SKILL.md and our own
-        // marker) so prompts/ and other adjacent assets travel with the
-        // skill into the managed dir.
-        let mut refs: Vec<(String, Vec<u8>)> = Vec::new();
-        collect_extras(&source_dir, &source_dir, &mut refs);
+        // marker) so prompts/, scripts/ and other adjacent assets travel with
+        // the skill into the managed dir, executable bits included.
+        let refs = scenery_core::pack::collect_tree_files(&source_dir);
 
         let pusher = ManagedPathsPusher::new(&state_clone);
         pusher
-            .push_skill(&slug, None, &skill_md_bytes, &refs)
+            .push_skill_files(&slug, None, &skill_md_bytes, &refs, false)
             .context("adopt: push_skill failed")?;
         info!(
             slug,
@@ -1013,76 +1039,6 @@ pub async fn push_adopted_discovery(
     })
     .await
     .context("adopt: spawn_blocking panicked")?
-}
-
-/// Recursively walk `dir`, appending `(relative_path, bytes)` for every
-/// regular file except `SKILL.md` and `.scenery-managed.json`. Errors on
-/// individual reads are skipped silently — adoption is best-effort.
-///
-/// Walks with `symlink_metadata` and never follows links: a symlinked file or
-/// directory is skipped (so `creds -> ~/.aws` is not copied into the managed
-/// dir, and a directory loop cannot recurse until the stack overflows), as are
-/// FIFOs/sockets/devices (reading a FIFO blocks forever). File count, total
-/// bytes and depth are capped.
-fn collect_extras(root: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) {
-    let mut bytes = 0u64;
-    collect_extras_inner(root, dir, out, 0, &mut bytes);
-}
-
-const MAX_EXTRAS_FILES: usize = 10_000;
-const MAX_EXTRAS_BYTES: u64 = 256 * 1024 * 1024;
-const MAX_EXTRAS_DEPTH: usize = 32;
-
-fn collect_extras_inner(
-    root: &Path,
-    dir: &Path,
-    out: &mut Vec<(String, Vec<u8>)>,
-    depth: usize,
-    bytes: &mut u64,
-) {
-    if depth > MAX_EXTRAS_DEPTH {
-        warn!(dir = %dir.display(), "adopt: directory nesting too deep — not descending");
-        return;
-    }
-    let entries = match fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = match path.file_name().and_then(|n| n.to_str()) {
-            Some(n) => n,
-            None => continue,
-        };
-        let Ok(meta) = fs::symlink_metadata(&path) else {
-            continue;
-        };
-        let ft = meta.file_type();
-        if ft.is_file() {
-            if name == "SKILL.md" || name == ".scenery-managed.json" {
-                continue;
-            }
-            if out.len() >= MAX_EXTRAS_FILES || bytes.saturating_add(meta.len()) > MAX_EXTRAS_BYTES
-            {
-                warn!(dir = %dir.display(), "adopt: size cap reached — remaining files not copied");
-                return;
-            }
-            if let Ok(rel) = path.strip_prefix(root) {
-                if let Some(rel_str) = rel.to_str() {
-                    if let Ok(data) = fs::read(&path) {
-                        *bytes += data.len() as u64;
-                        out.push((rel_str.to_string(), data));
-                    }
-                }
-            }
-        } else if ft.is_dir() {
-            collect_extras_inner(root, &path, out, depth + 1, bytes);
-        } else if ft.is_symlink() {
-            debug!(path = %path.display(), "adopt: skipping symlink");
-        } else {
-            warn!(path = %path.display(), "adopt: skipping special file");
-        }
-    }
 }
 
 // ── Path resolution ───────────────────────────────────────────────────────────
@@ -1212,11 +1168,47 @@ fn resolve_claude_json() -> Result<PathBuf> {
 
 // ── Atomic write ──────────────────────────────────────────────────────────────
 
-/// Write `content` to `dest` via a sibling `.tmp` file + atomic rename.
+/// Write `content` to `dest` via a sibling temp file + atomic rename.
 fn atomic_write(dest: &Path, content: &[u8]) -> Result<()> {
-    let tmp = dest.with_extension("tmp");
+    atomic_write_with_mode(dest, content, false)
+}
+
+/// Borrow `(path, bytes)` pairs as non-executable files for the shared writer.
+fn as_plain_files(files: &[(String, Vec<u8>)]) -> Vec<(&str, &[u8], bool)> {
+    files
+        .iter()
+        .map(|(rel, bytes)| (rel.as_str(), bytes.as_slice(), false))
+        .collect()
+}
+
+/// Write `content` to `dest` through a temp file in the same directory.
+/// `executable` gives the file execute bits matching its read bits (the umask
+/// still decides who may read it), so a skill's `scripts/` stay runnable.
+///
+/// The temp name is the full file name plus a suffix, not `with_extension`:
+/// that would map both `run.sh` and `run.tmp` to `run.tmp`, and the second
+/// write would clobber the first file.
+fn atomic_write_with_mode(dest: &Path, content: &[u8], executable: bool) -> Result<()> {
+    let mut tmp_name = dest.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(".scenery-tmp");
+    let tmp = dest.with_file_name(tmp_name);
     fs::write(&tmp, content)
         .with_context(|| format!("pusher: failed to write tmp file: {}", tmp.display()))?;
+    #[cfg(unix)]
+    if executable {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&tmp)
+            .with_context(|| format!("pusher: failed to stat {}", tmp.display()))?
+            .permissions()
+            .mode();
+        fs::set_permissions(
+            &tmp,
+            fs::Permissions::from_mode(mode | ((mode & 0o444) >> 2)),
+        )
+        .with_context(|| format!("pusher: failed to chmod {}", tmp.display()))?;
+    }
+    #[cfg(not(unix))]
+    let _ = executable;
     fs::rename(&tmp, dest).with_context(|| {
         format!(
             "pusher: failed to rename {} → {}",

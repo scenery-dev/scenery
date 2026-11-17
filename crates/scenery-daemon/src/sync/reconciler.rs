@@ -1309,13 +1309,20 @@ async fn do_install_plugin(
                 skill.skill_id, skill.version
             )
         })?;
-        let files = collect_referenced_files(version_dir.as_std_path());
+        let tree = scenery_core::pack::collect_tree_files(version_dir.as_std_path());
         drop(skill_guard);
+        let executables = tree
+            .iter()
+            .filter(|f| f.executable)
+            .map(|f| f.rel.clone())
+            .collect();
+        let files = tree.into_iter().map(|f| (f.rel, f.bytes)).collect();
         bundled.push(crate::managed_paths::BundledSkill {
             skill_id: skill.skill_id.clone(),
             version: skill.version.clone(),
             skill_md,
             files,
+            executables,
         });
     }
 
@@ -3036,8 +3043,10 @@ fn push_skill_to_claude(
         }
     };
 
-    // Collect referenced files (prompts/ etc.) for the push.
-    let referenced = collect_referenced_files(active_dir.as_std_path());
+    // Every file of the installed version (prompts/, scripts/, references/,
+    // assets/, notes...), with its executable bit, so the managed copy is the
+    // whole skill and not just its SKILL.md.
+    let referenced = scenery_core::pack::collect_tree_files(active_dir.as_std_path());
 
     // Adopt of the canonical directory itself (source_path ==
     // ~/.agents/skills/<slug>): convert the user's directory to managed in
@@ -3052,11 +3061,13 @@ fn push_skill_to_claude(
                 std::path::Path::new(&src),
             )
         });
-    let push_result = if adopt_in_place {
-        p.push_skill_adopting_in_place(skill_id, installation_id, &skill_md_bytes, &referenced)
-    } else {
-        p.push_skill(skill_id, installation_id, &skill_md_bytes, &referenced)
-    };
+    let push_result = p.push_skill_files(
+        skill_id,
+        installation_id,
+        &skill_md_bytes,
+        &referenced,
+        adopt_in_place,
+    );
     match push_result {
         Ok(push) => record_outcome(match push.link_refused {
             Some(path) => ProjectionOutcome::LinkRefused { path },
@@ -3094,43 +3105,6 @@ fn push_skill_to_claude(
             "reconciler: adopt takeover check failed (non-fatal)"
         );
     }
-}
-
-/// Walk `dir` and collect all files that aren't SKILL.md or the marker, returning
-/// `(relative_path_string, bytes)` pairs.
-fn collect_referenced_files(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
-    let mut out = Vec::new();
-    let walker = match std::fs::read_dir(dir) {
-        Ok(w) => w,
-        Err(_) => return out,
-    };
-
-    for entry in walker.flatten() {
-        let path = entry.path();
-        let name = match path.file_name().and_then(|n| n.to_str()) {
-            Some(n) => n.to_string(),
-            None => continue,
-        };
-
-        // Skip SKILL.md (written separately) and the marker file.
-        if name == "SKILL.md" || name == ".scenery-managed.json" {
-            continue;
-        }
-
-        if path.is_file() {
-            if let Ok(bytes) = std::fs::read(&path) {
-                out.push((name, bytes));
-            }
-        } else if path.is_dir() {
-            // Recurse one level for prompts/ etc.
-            let sub = collect_referenced_files(&path);
-            for (rel, bytes) in sub {
-                out.push((format!("{name}/{rel}"), bytes));
-            }
-        }
-    }
-
-    out
 }
 
 /// Return true if `managed_path_markers` has a `kind='skill'` row for this slug.

@@ -209,6 +209,106 @@ fn pack_walk<W: std::io::Write>(
     Ok(())
 }
 
+// ── Reading a skill tree back for installation ──────────────────────────────
+
+/// One file of a skill tree other than its root `SKILL.md`, read for writing
+/// into a managed directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeFile {
+    /// Path relative to the skill root, `/`-separated.
+    pub rel: String,
+    pub bytes: Vec<u8>,
+    /// The owner-execute bit was set. Skills ship `scripts/` that the AI
+    /// client runs; an install that drops the bit breaks them.
+    pub executable: bool,
+}
+
+/// Read every regular file under `root` except the root `SKILL.md` (written
+/// separately) and the root `.scenery-managed.json` marker.
+///
+/// Same safety rules as the pack: walks with `symlink_metadata` and never
+/// follows a link (a symlinked file or directory is skipped, so a
+/// `creds -> ~/.aws` cannot be copied in and a directory loop cannot recurse),
+/// skips FIFOs/sockets/devices (reading a FIFO blocks forever), and caps file
+/// count, total bytes and depth. Best-effort: an unreadable file is skipped.
+/// Sorted, so the result is deterministic.
+pub fn collect_tree_files(root: &Path) -> Vec<TreeFile> {
+    let mut out = Vec::new();
+    let mut bytes = 0u64;
+    collect_tree_files_inner(root, root, &mut out, 0, &mut bytes);
+    out
+}
+
+fn is_executable(meta: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o100 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        false
+    }
+}
+
+fn collect_tree_files_inner(
+    root: &Path,
+    dir: &Path,
+    out: &mut Vec<TreeFile>,
+    depth: usize,
+    bytes: &mut u64,
+) {
+    if depth > MAX_PACK_DEPTH {
+        warn!(dir = %dir.display(), "skill tree: nesting too deep, not descending");
+        return;
+    }
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut paths: Vec<std::path::PathBuf> = read.flatten().map(|e| e.path()).collect();
+    paths.sort();
+    for path in paths {
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        let ft = meta.file_type();
+        if ft.is_file() {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if dir == root && (name == "SKILL.md" || name == ".scenery-managed.json") {
+                continue;
+            }
+            if out.len() >= MAX_PACK_FILES || bytes.saturating_add(meta.len()) > MAX_PACK_BYTES {
+                warn!(dir = %dir.display(), "skill tree: size cap reached, remaining files not read");
+                return;
+            }
+            let Ok(rel) = path.strip_prefix(root) else {
+                continue;
+            };
+            let parts: Option<Vec<&str>> =
+                rel.components().map(|c| c.as_os_str().to_str()).collect();
+            let Some(parts) = parts else {
+                warn!(path = %path.display(), "skill tree: skipping file with a non-UTF-8 name");
+                continue;
+            };
+            if let Ok(data) = std::fs::read(&path) {
+                *bytes += data.len() as u64;
+                out.push(TreeFile {
+                    rel: parts.join("/"),
+                    bytes: data,
+                    executable: is_executable(&meta),
+                });
+            }
+        } else if ft.is_dir() {
+            collect_tree_files_inner(root, &path, out, depth + 1, bytes);
+        } else if ft.is_symlink() {
+            debug!(path = %path.display(), "skill tree: skipping symlink");
+        } else {
+            warn!(path = %path.display(), "skill tree: skipping special file");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -453,5 +553,67 @@ mod tests {
         }
         let err = pack_dir_to_tar_gz(&d).unwrap_err();
         assert!(err.downcast_ref::<PackRefused>().is_some());
+    }
+
+    // ── collect_tree_files ────────────────────────────────────────────────────
+
+    #[test]
+    fn collect_reads_extras_with_modes_and_skips_root_skill_md_and_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("skill");
+        fs::create_dir_all(d.join("scripts")).unwrap();
+        fs::create_dir_all(d.join("references/deep")).unwrap();
+        fs::write(d.join("SKILL.md"), "root").unwrap();
+        fs::write(d.join(".scenery-managed.json"), "{}").unwrap();
+        fs::write(d.join("notes.md"), "notes").unwrap();
+        fs::write(d.join("scripts/run.sh"), "#!/bin/sh\n").unwrap();
+        // A nested SKILL.md is content, not the skill's manifest.
+        fs::write(d.join("references/SKILL.md"), "nested").unwrap();
+        fs::write(d.join("references/deep/a.bin"), [0u8, 255, 1, 254]).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(d.join("scripts/run.sh"), fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+
+        let files = collect_tree_files(&d);
+        let rels: Vec<&str> = files.iter().map(|f| f.rel.as_str()).collect();
+        assert_eq!(
+            rels,
+            vec![
+                "notes.md",
+                "references/SKILL.md",
+                "references/deep/a.bin",
+                "scripts/run.sh"
+            ]
+        );
+        let by = |n: &str| files.iter().find(|f| f.rel == n).unwrap();
+        assert_eq!(by("references/deep/a.bin").bytes, vec![0u8, 255, 1, 254]);
+        #[cfg(unix)]
+        {
+            assert!(by("scripts/run.sh").executable);
+            assert!(!by("notes.md").executable);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_never_follows_links_or_reads_fifos() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("skill");
+        fs::create_dir_all(d.join("prompts")).unwrap();
+        fs::write(d.join("SKILL.md"), "x").unwrap();
+        fs::write(d.join("prompts/p.md"), "p").unwrap();
+        let secret = tmp.path().join("secret");
+        fs::create_dir_all(&secret).unwrap();
+        fs::write(secret.join("creds"), "AKIA").unwrap();
+        std::os::unix::fs::symlink(&secret, d.join("creds")).unwrap();
+        std::os::unix::fs::symlink("prompts/p.md", d.join("alias.md")).unwrap();
+        std::os::unix::fs::symlink(".", d.join("prompts/loop")).unwrap();
+
+        let files = collect_tree_files(&d);
+        let rels: Vec<&str> = files.iter().map(|f| f.rel.as_str()).collect();
+        assert_eq!(rels, vec!["prompts/p.md"]);
     }
 }

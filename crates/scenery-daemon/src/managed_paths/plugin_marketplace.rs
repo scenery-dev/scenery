@@ -59,6 +59,8 @@ pub struct BundledSkill {
     pub version: String,
     pub skill_md: Vec<u8>,
     pub files: Vec<(String, Vec<u8>)>,
+    /// Entries of `files` that must be written executable (`scripts/`).
+    pub executables: Vec<String>,
 }
 
 /// Everything needed to materialize a governed plugin into the local
@@ -655,11 +657,15 @@ fn write_plugin_source(plugin_src: &Path, bundle: &PluginBundle) -> Result<()> {
             .with_context(|| format!("plugin_marketplace: mkdir {skill_dir:?}"))?;
         atomic_write(&skill_dir.join("SKILL.md"), &skill.skill_md)?;
         for (rel, bytes) in &skill.files {
-            let dest = skill_dir.join(rel);
+            let dest = scenery_core::safe_path::safe_join_rel(&skill_dir, rel)
+                .map_err(|e| anyhow::anyhow!("plugin_marketplace: unsafe file path: {e}"))?;
             if let Some(parent) = dest.parent() {
                 fs::create_dir_all(parent).ok();
             }
             atomic_write(&dest, bytes)?;
+            if skill.executables.iter().any(|e| e == rel) {
+                make_executable(&dest)?;
+            }
         }
     }
     Ok(())

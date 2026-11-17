@@ -17,6 +17,7 @@ fn bundle() -> PluginBundle {
             version: "1.0.0".to_string(),
             skill_md: b"---\nname: tdd\n---\nWrite tests first.".to_vec(),
             files: vec![("prompts/x.md".to_string(), b"p".to_vec())],
+            executables: vec![],
         }],
         files: vec![],
         executables: vec![],
@@ -533,4 +534,48 @@ fn absent_user_files_are_created() {
         assert!(h.join(".claude/settings.json").exists());
         assert!(h.join(".claude/plugins/installed_plugins.json").exists());
     });
+}
+
+/// A registry skill bundled in a plugin keeps its scripts executable, in the
+/// marketplace source and in the cache Claude Code runs from.
+#[cfg(unix)]
+#[test]
+fn bundled_skill_scripts_stay_executable() {
+    use std::os::unix::fs::PermissionsExt;
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let fake_home = tempfile::tempdir().unwrap();
+    let prev = std::env::var_os("HOME");
+    std::env::set_var("HOME", fake_home.path());
+
+    let mut b = bundle();
+    b.skills[0].files = vec![
+        ("scripts/run.sh".to_string(), b"#!/bin/sh\n".to_vec()),
+        ("references/guide.md".to_string(), b"g".to_vec()),
+    ];
+    b.skills[0].executables = vec!["scripts/run.sh".to_string()];
+    let result = install_plugin_bundle(&b);
+
+    let h = fake_home.path();
+    let mode = |p: &str| {
+        std::fs::metadata(h.join(p))
+            .map(|m| m.permissions().mode())
+            .unwrap_or(0)
+    };
+    let src =
+        mode(".claude/plugins/marketplaces/scenery/plugins/superpowers/skills/tdd/scripts/run.sh");
+    let cache = mode(".claude/plugins/cache/scenery/superpowers/5.0.7/skills/tdd/scripts/run.sh");
+    let guide = mode(
+        ".claude/plugins/marketplaces/scenery/plugins/superpowers/skills/tdd/references/guide.md",
+    );
+
+    if let Some(v) = prev {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+
+    assert!(result.is_ok(), "install must succeed: {result:?}");
+    assert_eq!(src & 0o111, 0o111, "script executable in the source");
+    assert_eq!(cache & 0o111, 0o111, "script executable in the cache");
+    assert_eq!(guide & 0o111, 0, "plain files stay plain");
 }

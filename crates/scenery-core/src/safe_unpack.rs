@@ -96,12 +96,36 @@ fn ensure_dirs(dest: &Path, comps: &[std::ffi::OsString]) -> Result<PathBuf> {
     Ok(cur)
 }
 
+/// Give the file the execute bits matching its read bits (so the process
+/// umask still decides who may read it). Only the owner-execute bit of the
+/// archive entry is honoured; setuid/setgid/sticky and group/other bits from
+/// the archive are never applied.
+#[cfg(unix)]
+fn make_executable(file: &fs::File) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = file
+        .metadata()
+        .context("failed to stat unpacked file")?
+        .permissions()
+        .mode();
+    file.set_permissions(fs::Permissions::from_mode(mode | ((mode & 0o444) >> 2)))
+        .context("failed to set the executable bit")
+}
+
+#[cfg(not(unix))]
+fn make_executable(_file: &fs::File) -> Result<()> {
+    Ok(())
+}
+
 /// Write one regular file under `dest`, counting bytes actually written.
+/// `executable` is the archive entry's owner-execute bit: scripts must still
+/// be runnable after install.
 fn write_file<R: Read>(
     dest: &Path,
     comps: &[std::ffi::OsString],
     reader: &mut R,
     budget: &mut Budget,
+    executable: bool,
 ) -> Result<()> {
     let (name, parents) = comps
         .split_last()
@@ -143,6 +167,9 @@ fn write_file<R: Read>(
         );
         out.write_all(&buf[..n])
             .context("error writing archive entry")?;
+    }
+    if executable {
+        make_executable(&out)?;
     }
     Ok(())
 }
@@ -226,7 +253,18 @@ fn unpack_tar_gz(archive_path: &Utf8Path, dest: &Utf8Path) -> Result<()> {
         if ty.is_dir() {
             ensure_dirs(dest.as_std_path(), &comps)?;
         } else {
-            write_file(dest.as_std_path(), &comps, &mut entry, &mut budget)?;
+            let executable = entry
+                .header()
+                .mode()
+                .map(|m| m & 0o100 != 0)
+                .unwrap_or(false);
+            write_file(
+                dest.as_std_path(),
+                &comps,
+                &mut entry,
+                &mut budget,
+                executable,
+            )?;
         }
     }
     Ok(())
@@ -261,7 +299,14 @@ fn unpack_zip(archive_path: &Utf8Path, dest: &Utf8Path) -> Result<()> {
         if entry.is_dir() {
             ensure_dirs(dest.as_std_path(), &comps)?;
         } else {
-            write_file(dest.as_std_path(), &comps, &mut entry, &mut budget)?;
+            let executable = entry.unix_mode().is_some_and(|m| m & 0o100 != 0);
+            write_file(
+                dest.as_std_path(),
+                &comps,
+                &mut entry,
+                &mut budget,
+                executable,
+            )?;
         }
     }
     Ok(())
