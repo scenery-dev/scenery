@@ -4816,7 +4816,9 @@ fn print_user_revoked_notice(state: &scenery_core::state::AppState) -> bool {
     match state.get_sync_state(scenery_core::auth::USER_REVOKED_KEY) {
         Ok(Some(at)) => {
             println!("Your Scenery account was removed or revoked by an admin (at {at}).");
-            println!("The local session was cleared; the runner did not uninstall anything itself.");
+            println!(
+                "The local session was cleared; the runner did not uninstall anything itself."
+            );
             println!("Ask your admin to restore access, then run `scenery auth pair` to re-pair.");
             true
         }
@@ -4843,13 +4845,42 @@ fn print_device_revoked_notice(state: &scenery_core::state::AppState) {
 /// daemon after repeated 401s following token refreshes; cleared on the next
 /// clean connect). Live kill-switch delivery is impaired while it is set.
 fn print_sse_degraded_notice(state: &scenery_core::state::AppState) {
-    if let Ok(Some(since)) =
-        state.get_sync_state(scenery_daemon::sync::sse_client::SSE_DEGRADED_KEY)
-    {
+    if let Some(notice) = sse_degraded_notice(state) {
         println!();
-        println!("⚠ Live sync is degraded since {since}: the backend keeps rejecting this");
-        println!("  device's token (401). The daemon is retrying every 5-15 minutes and");
-        println!("  recovers on its own; if it persists, run `scenery auth login`.");
+        println!("{notice}");
+    }
+}
+
+fn sse_degraded_notice(state: &scenery_core::state::AppState) -> Option<String> {
+    let since = state
+        .get_sync_state(scenery_daemon::sync::sse_client::SSE_DEGRADED_KEY)
+        .ok()
+        .flatten()?;
+    Some(format!(
+        "⚠ Live sync is degraded since {since}: the backend keeps rejecting this\n  \
+         device's token (401). The daemon is retrying every 5-15 minutes and\n  \
+         recovers on its own; if it persists, run `scenery auth login`."
+    ))
+}
+
+#[cfg(test)]
+mod sse_degraded_notice_tests {
+    use super::*;
+
+    #[test]
+    fn notice_shown_while_degraded_and_gone_once_cleared() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let state = scenery_core::state::AppState::bootstrap_in(root).unwrap();
+        let key = scenery_daemon::sync::sse_client::SSE_DEGRADED_KEY;
+
+        assert!(sse_degraded_notice(&state).is_none());
+        state.set_sync_state(key, "2026-11-16T06:00:00Z").unwrap();
+        assert!(sse_degraded_notice(&state)
+            .unwrap()
+            .contains("degraded since 2026-11-16T06:00:00Z"));
+        state.delete_sync_state(key).unwrap();
+        assert!(sse_degraded_notice(&state).is_none());
     }
 }
 

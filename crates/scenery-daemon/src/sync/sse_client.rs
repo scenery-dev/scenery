@@ -256,9 +256,10 @@ pub(crate) async fn run_with_policy(
                 if degraded {
                     info!("SSE: connection recovered — leaving degraded mode");
                     degraded = false;
-                    if let Err(e) = state.delete_sync_state(SSE_DEGRADED_KEY) {
-                        warn!(error = %e, "SSE: failed to clear degraded marker");
-                    }
+                }
+                // Unconditional: the marker may be stale from a prior process.
+                if let Err(e) = state.delete_sync_state(SSE_DEGRADED_KEY) {
+                    warn!(error = %e, "SSE: failed to clear degraded marker");
                 }
                 post_refresh_unauthorized_streak = 0;
                 awaiting_post_refresh_check = false;
@@ -545,6 +546,14 @@ async fn connect_and_stream(
     }
 
     info!(device_id, "SSE: connected to {url}");
+    // A successful authenticated connect is proof the credentials are good:
+    // drop any persisted degraded marker now (not only when the stream ends),
+    // including one left by a previous daemon process.
+    if matches!(state.get_sync_state(SSE_DEGRADED_KEY), Ok(Some(_))) {
+        if let Err(e) = state.delete_sync_state(SSE_DEGRADED_KEY) {
+            warn!(error = %e, "SSE: failed to clear degraded marker");
+        }
+    }
     // Signal genuine connectivity — this is what `ensure_started` waits on
     // (with a bounded timeout) instead of returning as soon as this task was
     // merely spawned. See `run`'s doc comment.

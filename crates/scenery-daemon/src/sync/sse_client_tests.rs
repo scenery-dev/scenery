@@ -943,6 +943,45 @@ async fn degraded_marker_set_then_cleared_on_recovery() {
     task.abort();
 }
 
+/// A marker left by a previous daemon process (in-memory `degraded` is false
+/// after restart) must still be cleared by the next successful connect.
+#[tokio::test]
+async fn stale_degraded_marker_cleared_on_successful_connect() {
+    use scenery_core::auth::save_tokens;
+    use std::time::Duration;
+
+    let (state, _tmp) = bootstrap_state();
+    let state = Arc::new(state);
+    let key = crate::sync::sse_client::SSE_DEGRADED_KEY;
+    state.set_sync_state(key, "2026-11-16T06:00:00Z").unwrap();
+    let fake = fake_backend(vec![(200, "")]).await;
+    save_tokens(&state, &fake.url, "stale", "refresh-tok").unwrap();
+
+    let (event_tx, _rx) = tokio::sync::mpsc::channel(8);
+    let (connected_tx, mut connected_rx) = tokio::sync::watch::channel(false);
+    let task = tokio::spawn(crate::sync::sse_client::run_with_policy(
+        sync_config(&fake.url),
+        Arc::clone(&state),
+        event_tx,
+        connected_tx,
+        test_policy(),
+    ));
+    tokio::time::timeout(Duration::from_secs(10), connected_rx.wait_for(|c| *c))
+        .await
+        .unwrap()
+        .unwrap();
+    let mut cleared = false;
+    for _ in 0..200 {
+        if state.get_sync_state(key).unwrap().is_none() {
+            cleared = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(cleared, "stale degraded marker must clear on connect");
+    task.abort();
+}
+
 /// Even after the streak trips, an explicit 403 `device_revoked` still
 /// stops the task permanently (the only terminal signals are explicit 403s).
 #[tokio::test]
