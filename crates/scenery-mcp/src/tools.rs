@@ -1205,6 +1205,20 @@ pub fn handle_login_with_oauth(
         .flatten()
         .is_some()
     {
+        // Already logged in is not proof that sync is running: after a
+        // binary upgrade the token read can be blocked at daemon boot, so
+        // sync never starts even though the session is fine. Ask the daemon
+        // to (re)start it; the hook is idempotent and a no-op when sync is
+        // already healthy. No hook (shim) means no daemon-side sync to nudge.
+        if let Some(registry) = backend_registry.cloned() {
+            tokio::runtime::Handle::current().spawn(async move {
+                registry.notify_tokens_saved().await;
+            });
+            return ToolCallResult::success(
+                "Already logged in to Scenery. Asked the daemon to start syncing in the \
+                 background if it was not running. No other action needed.",
+            );
+        }
         return ToolCallResult::success("Already logged in to Scenery. No action needed.");
     }
 
@@ -3559,7 +3573,7 @@ mod tests {
     //
     // These exercise `handle_login_with_oauth`'s `backend_registry` hook: a
     // successful PKCE completion must fire `TokensSavedHook::on_tokens_saved`
-    // exactly once, and the "already logged in" short-circuit must never fire
+    // exactly once, and the "already logged in" short-circuit also fires
     // it (mirrors the CLI's idempotent `auth/reload` behavior, but this test
     // only needs to prove the tool path *reaches* the hook — idempotency of
     // repeated `ensure_started` calls is the daemon-side `SyncController`'s
@@ -3671,17 +3685,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn login_with_oauth_does_not_trigger_hook_when_already_logged_in() {
+    async fn login_with_oauth_already_logged_in_kicks_sync_without_new_flow() {
         let state_root = temp_root("login-hook-short-circuit");
         let state = AppState::bootstrap_in(state_root.clone()).unwrap();
         let registry_url = Some("http://localhost:1".to_string());
         fake_login(&state, registry_url.as_ref().unwrap());
 
         let registry = BackendRegistry::new();
+        let notify = Arc::new(tokio::sync::Notify::new());
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         registry.set_tokens_saved_hook(Arc::new(SpyHook {
             calls: Arc::clone(&calls),
-            notify: Arc::new(tokio::sync::Notify::new()),
+            notify: Arc::clone(&notify),
         }));
 
         let oauth_ctx = crate::oauth::OAuthContext {
@@ -3707,10 +3722,13 @@ mod tests {
         assert_ne!(result.is_error, Some(true));
         assert!(result.content[0].text.contains("Already logged in"));
 
-        // No OAuth flow was started at all, so nothing should ever fire the
-        // hook — give any accidental background task a moment to (not) run.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        // No OAuth flow was started, but the daemon is asked once to start
+        // sync if it is not running (the hook is idempotent daemon-side).
+        tokio::time::timeout(std::time::Duration::from_secs(5), notify.notified())
+            .await
+            .expect("already-logged-in login must kick sync via the hook");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(result.content[0].text.contains("syncing"));
 
         let _ = fs::remove_dir_all(&state_root);
     }

@@ -82,6 +82,7 @@ mod protocol_frame;
 mod socket_dispatch;
 mod socket_watch;
 pub mod sync;
+mod sync_retry;
 use scenery_core::http::AsyncSendTrackedExt;
 use sync::SyncEvent;
 
@@ -307,39 +308,6 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     // the reconciler's channel, and that sender doesn't exist until the SSE
     // sync subsystem has (possibly) started. See "RUN2: Device registration"
     // below for where it's spawned.
-
-    // Spawn the token refresh loop (60 s interval).
-    // Checks every stored access token and refreshes any that are within 5 min
-    // of expiry.  All sync I/O (SQLite + HTTP) happens inside spawn_blocking
-    // per the spawn_blocking discipline documented at the top of this file.
-    let refresh_state = state.clone();
-    let refresh_registry_url = registry_url.clone();
-    tokio::spawn(async move {
-        let mut interval =
-            tokio::time::interval(std::time::Duration::from_secs(REFRESH_INTERVAL_SECS));
-        // Skip the immediate first tick — let the accept loop start first.
-        interval.tick().await;
-
-        loop {
-            interval.tick().await;
-
-            let state_view = refresh_state.clone();
-            let reg_url = refresh_registry_url.clone();
-
-            let result =
-                tokio::task::spawn_blocking(move || refresh_one_tick(&state_view, &reg_url)).await;
-
-            match result {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    warn!(error = %e, "token refresh tick failed; will retry on next interval");
-                }
-                Err(join_err) => {
-                    warn!(error = %join_err, "token refresh task panicked; will retry");
-                }
-            }
-        }
-    });
 
     let managed_config = scenery_core::managed::load_managed_config(&state);
 
@@ -708,16 +676,69 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
     // takes; sync starting a few seconds late is a background concern
     // (logged below, from the spawned task) and still self-heals via the
     // periodic sync tick / `auth/reload` / the `scenery_login` hook.
+    let sync_retry_kick = Arc::new(Notify::new());
     let boot_sync_controller = Arc::clone(&sync_controller);
+    let boot_kick = Arc::clone(&sync_retry_kick);
     tokio::spawn(async move {
         if boot_sync_controller.ensure_started().await {
             info!("sync subsystem started");
         } else {
             info!(
-                "sync subsystem not started (no auth token, registration failed, or the \
-                 SSE connection did not come up in time) — will keep retrying in the \
-                 background and start automatically on `auth login` / `auth pair`"
+                "sync subsystem not started (no readable auth token, registration failed, or \
+                 the SSE connection did not come up in time) — retrying in the background \
+                 every 30s, backing off to 5 min, and right away on a token refresh or \
+                 `auth login` / `auth pair`"
             );
+        }
+        // Keep trying for as long as sync is not running; this is what makes
+        // the message above true.
+        boot_sync_controller
+            .run_start_retry(sync_retry::RetryConfig::default(), boot_kick)
+            .await;
+    });
+
+    // Spawn the token refresh loop (60 s interval).
+    // Checks every stored access token and refreshes any that are within 5 min
+    // of expiry.  All sync I/O (SQLite + HTTP) happens inside spawn_blocking
+    // per the spawn_blocking discipline documented at the top of this file.
+    //
+    // Spawned after `sync_controller` exists: a tick that read the token
+    // store successfully hands the daemon's token to the controller, and if
+    // sync is not running, wakes the start-retry loop (see `sync_retry`).
+    let refresh_state = state.clone();
+    let refresh_registry_url = registry_url.clone();
+    let refresh_controller = Arc::clone(&sync_controller);
+    let refresh_kick = Arc::clone(&sync_retry_kick);
+    tokio::spawn(async move {
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_secs(REFRESH_INTERVAL_SECS));
+        // Skip the immediate first tick — let the accept loop start first.
+        interval.tick().await;
+
+        loop {
+            interval.tick().await;
+
+            let state_view = refresh_state.clone();
+            let reg_url = refresh_registry_url.clone();
+
+            let result =
+                tokio::task::spawn_blocking(move || refresh_tick(&state_view, &reg_url)).await;
+
+            match result {
+                Ok(Ok(token)) => {
+                    let have_token = token.is_some();
+                    refresh_controller.note_token(token);
+                    if have_token && !refresh_controller.is_started() {
+                        refresh_kick.notify_one();
+                    }
+                }
+                Ok(Err(e)) => {
+                    warn!(error = %e, "token refresh tick failed; will retry on next interval");
+                }
+                Err(join_err) => {
+                    warn!(error = %join_err, "token refresh task panicked; will retry");
+                }
+            }
         }
     });
 
@@ -1524,6 +1545,16 @@ async fn attempt_socket_rebind_takeover(socket_path: &camino::Utf8Path) -> Optio
 /// This function is exposed as `pub` so tests can drive a single tick
 /// without running the full 60-second loop.
 pub fn refresh_one_tick(state: &AppState, registry_url: &str) -> Result<()> {
+    refresh_tick(state, registry_url).map(|_| ())
+}
+
+/// [`refresh_one_tick`] that also reports the access token the daemon holds
+/// for `registry_url` after the tick: the rotated token, or the stored one
+/// when it did not need refreshing. `None` when there is no session, the
+/// refresh failed, or the user was revoked, so callers never act on a token
+/// that is known bad.
+pub(crate) fn refresh_tick(state: &AppState, registry_url: &str) -> Result<Option<String>> {
+    let mut current: Option<String> = None;
     let rows = load_all_tokens(state).context("refresh_one_tick: failed to load auth_tokens")?;
 
     let now_unix = std::time::SystemTime::now()
@@ -1532,7 +1563,11 @@ pub fn refresh_one_tick(state: &AppState, registry_url: &str) -> Result<()> {
         .unwrap_or(0);
 
     for row in rows {
+        let is_primary = row.registry_url == registry_url;
         if !AuthClient::needs_refresh(&row.access_token) {
+            if is_primary {
+                current = Some(row.access_token.clone());
+            }
             continue;
         }
 
@@ -1574,6 +1609,9 @@ pub fn refresh_one_tick(state: &AppState, registry_url: &str) -> Result<()> {
                             registry_url = %row.registry_url,
                             "refresh_one_tick: token rotated successfully"
                         );
+                        if is_primary {
+                            current = Some(new_tokens.access_token.clone());
+                        }
                     }
                     Err(e) => {
                         warn!(
@@ -1634,8 +1672,7 @@ pub fn refresh_one_tick(state: &AppState, registry_url: &str) -> Result<()> {
         }
     }
 
-    let _ = registry_url; // primary registry_url param kept for future rate-limit context
-    Ok(())
+    Ok(current)
 }
 
 /// Decide the next backoff window and the status label to persist for a
@@ -1752,6 +1789,13 @@ pub struct SyncController {
     /// started yet (or was torn down because credentials vanished). The mutex
     /// also serializes concurrent `ensure_started` callers.
     handle: tokio::sync::Mutex<Option<RunningSync>>,
+    /// The access token for `registry_url` the daemon already holds in
+    /// memory, set by the refresh loop after a tick that read the token store
+    /// successfully. The background start-retry (see `sync_retry`) prefers it
+    /// over re-reading the token store, because on macOS every read of a
+    /// keychain item the user has not approved can raise an ACL prompt.
+    /// Cleared when the session is revoked or a refresh fails.
+    token_hint: std::sync::Mutex<Option<String>>,
 }
 
 impl SyncController {
@@ -1769,6 +1813,7 @@ impl SyncController {
             backend_registry,
             pusher,
             handle: tokio::sync::Mutex::new(None),
+            token_hint: std::sync::Mutex::new(None),
         }
     }
 
@@ -1845,12 +1890,25 @@ impl SyncController {
             *guard = None;
         }
 
+        self.start_locked(guard, None).await
+    }
+
+    /// Start sync from scratch while holding the `handle` lock: register the
+    /// device, spawn the SSE client + reconciler, and wait (bounded) for the
+    /// connection. `token_hint`, when given, is used instead of reading the
+    /// token store.
+    async fn start_locked(
+        &self,
+        mut guard: tokio::sync::MutexGuard<'_, Option<RunningSync>>,
+        token_hint: Option<String>,
+    ) -> bool {
         let started = try_start_sync(
             &self.registry_url,
             Arc::clone(&self.state),
             self.list_changed_tx.clone(),
             Arc::clone(&self.backend_registry),
             self.pusher.clone(),
+            token_hint,
         )
         .await;
         let mut connected_rx = started.as_ref().map(|r| r.connected_rx.clone());
@@ -1952,22 +2010,24 @@ async fn try_start_sync(
     list_changed_tx: broadcast::Sender<()>,
     backend_registry: Arc<BackendRegistry>,
     pusher: Option<Arc<managed_paths::ManagedPathsPusher>>,
+    token_hint: Option<String>,
 ) -> Option<RunningSync> {
     // M3: never sync against a registry other than the one this device was
     // paired with.
     if !registry_origin_matches(&state, registry_url) {
         return None;
     }
-    // Load the access token from SQLite.
-    let token = match load_all_tokens(&state) {
-        Ok(rows) => rows
-            .into_iter()
-            .find(|r| r.registry_url == registry_url)
-            .map(|r| r.access_token),
-        Err(e) => {
-            warn!(error = %e, "sync: failed to load auth tokens");
-            return None;
-        }
+    // Use the in-memory token when the caller has one (no token-store read);
+    // otherwise do exactly one read of the token store.
+    let token = match token_hint {
+        Some(t) => Some(t),
+        None => match scenery_core::auth::load_tokens(&state, registry_url) {
+            Ok(row) => row.map(|r| r.access_token),
+            Err(e) => {
+                warn!(error = %e, "sync: failed to load auth tokens");
+                return None;
+            }
+        },
     };
 
     let token = match token {
