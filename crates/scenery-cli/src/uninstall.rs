@@ -106,6 +106,25 @@ pub struct RestoreReport {
     /// Restores that did not happen. Any entry makes the command exit non-zero.
     pub failed: Vec<String>,
     pub purged_data_dir: bool,
+    /// Copies of the user's work that were set aside rather than overwritten
+    /// or deleted: the user edited a converted directory after Scenery took
+    /// it over, so both the restored original and the edited version exist.
+    pub preserved: Vec<PreservedItem>,
+    /// Set when `--purge` kept `restore-backups/` (and the journal) because a
+    /// restore failed: where those backups live.
+    pub backups_kept_at: Option<String>,
+}
+
+/// Both versions of something the user changed after Scenery converted it.
+#[derive(Debug, Serialize)]
+pub struct PreservedItem {
+    pub name: String,
+    /// The original, restored at its original path.
+    pub restored_original_at: String,
+    /// What was at that path before the restore (the converted/edited tree),
+    /// moved here untouched.
+    pub current_copy_at: String,
+    pub reason: String,
 }
 
 /// Entry point wired from `main.rs`.
@@ -164,12 +183,7 @@ pub async fn run(opts: UninstallOpts) -> Result<()> {
 
     // ── 7. Optional hard purge of local state. ──
     if opts.purge {
-        match purge_data_dir() {
-            Ok(()) => report.purged_data_dir = true,
-            Err(e) => report
-                .warnings
-                .push(format!("failed to purge data directory: {e:#}")),
-        }
+        run_purge_step(&mut report);
     }
 
     // ── 8. Write + print the restore report. ──
@@ -620,52 +634,79 @@ fn load_journal_entries(report: &mut RestoreReport) -> Vec<JournalEntry> {
 
 /// Restore native takeovers + adopted originals from the restore journal.
 ///
-/// Replays `entries` in reverse (most-recent mutation first) and restores
-/// only entries whose `source` is `Native`/`Adopted` — `Brokered`/`Managed`
-/// entries are handled by `strip_client_configs`/`remove_managed_artifacts`
-/// instead, since there's nothing of the user's to put back. A single bad
-/// entry (missing backup, permission error) is recorded as a warning and
-/// never aborts the rest of the replay.
+/// Restores only entries whose `source` is `Native`/`Adopted` — `Brokered`/
+/// `Managed` entries are handled by `strip_client_configs`/
+/// `remove_managed_artifacts` instead, since there's nothing of the user's to
+/// put back. A single bad entry (missing backup, permission error) is
+/// recorded as a warning and never aborts the rest of the replay.
+///
+/// Which backup wins for a path:
+/// - If the path has any `Adopted` entry with a backup, the **oldest** one that
+///   still exists. The oldest is the pre-Scenery state; a later one can be a
+///   backup of a half-converted tree taken by a retried conversion.
+/// - Otherwise (native takeovers, config files) the most recent entry, which
+///   reuses the same original backup anyway.
+///
+/// A directory restore never destroys what is there now: see
+/// [`restore_one_entry`].
 fn restore_from_journal(entries: &[JournalEntry], report: &mut RestoreReport) {
     use std::collections::HashSet;
 
     let mut handled: HashSet<&str> = HashSet::new();
 
-    for entry in entries.iter().rev() {
-        if !entry.source.should_restore() {
+    for newest in entries.iter().rev() {
+        if !newest.source.should_restore() || newest.op == JournalOp::ConfigEdit {
             continue;
         }
         // Client-config edits are handled key by key in `strip_client_configs`:
         // copying a backup over a live config would destroy later edits.
-        if entry.op == JournalOp::ConfigEdit {
-            continue;
-        }
+        //
         // A file can be journaled repeatedly (e.g. every `mcp setup` re-run
-        // re-edits the same client config); every such entry reuses the same
-        // original `backup_path`, so only the most-recent one — first seen
-        // walking in reverse — needs replaying.
-        if !handled.insert(entry.target_path.as_str()) {
+        // re-edits the same client config), so each path is handled once.
+        if !handled.insert(newest.target_path.as_str()) {
             continue;
         }
 
-        if let Err(e) = restore_one_entry(entry) {
-            let msg = format!(
-                "could not restore '{}' from the restore journal: {e:#}",
-                entry.target_path
-            );
-            report.warnings.push(msg.clone());
-            report.failed.push(msg);
-            continue;
-        }
+        let chosen = match choose_entry(entries, newest, report) {
+            Ok(e) => e,
+            Err(msg) => {
+                report.warnings.push(msg.clone());
+                report.failed.push(msg);
+                continue;
+            }
+        };
 
+        let pristine = installed_tree_hash(entries, &chosen.target_path);
+        let outcome = match restore_one_entry(chosen, pristine.as_deref()) {
+            Ok(o) => o,
+            Err(e) => {
+                let msg = format!(
+                    "could not restore '{}' from the restore journal: {e:#}",
+                    chosen.target_path
+                );
+                report.warnings.push(msg.clone());
+                report.failed.push(msg);
+                continue;
+            }
+        };
+
+        let name = chosen
+            .slug
+            .clone()
+            .unwrap_or_else(|| chosen.target_path.clone());
+        if let Some(kept) = outcome.preserved_current_at {
+            report.preserved.push(PreservedItem {
+                name: name.clone(),
+                restored_original_at: chosen.target_path.clone(),
+                current_copy_at: kept.display().to_string(),
+                reason: outcome.preserved_reason,
+            });
+        }
         report.restored.push(RestoredItem {
-            client: entry.client.clone().unwrap_or_else(|| "Scenery".into()),
-            name: entry
-                .slug
-                .clone()
-                .unwrap_or_else(|| entry.target_path.clone()),
-            restored_to: entry.target_path.clone(),
-            from_backup: entry
+            client: chosen.client.clone().unwrap_or_else(|| "Scenery".into()),
+            name,
+            restored_to: chosen.target_path.clone(),
+            from_backup: chosen
                 .backup_path
                 .clone()
                 .unwrap_or_else(|| "(nothing — it did not exist before Scenery)".into()),
@@ -673,28 +714,108 @@ fn restore_from_journal(entries: &[JournalEntry], report: &mut RestoreReport) {
     }
 }
 
-/// Perform the filesystem side effect for one restorable journal entry: copy
-/// `backup_path` → `target_path`, or — when `backup_path` is `None`, meaning
-/// `target_path` did not exist before Scenery touched it — delete
+/// Pick the journal entry to replay for `newest`'s path (see
+/// [`restore_from_journal`]). `Err` carries the message for `report.failed`.
+fn choose_entry<'a>(
+    entries: &'a [JournalEntry],
+    newest: &'a JournalEntry,
+    report: &mut RestoreReport,
+) -> std::result::Result<&'a JournalEntry, String> {
+    use scenery_core::restore_journal::JournalSource;
+
+    let adopted: Vec<&JournalEntry> = entries
+        .iter() // oldest first
+        .filter(|e| {
+            e.target_path == newest.target_path
+                && e.op != JournalOp::ConfigEdit
+                && e.source == JournalSource::Adopted
+                && e.backup_path.is_some()
+        })
+        .collect();
+    if adopted.is_empty() {
+        return Ok(newest);
+    }
+    let mut missing: Vec<&str> = Vec::new();
+    for e in &adopted {
+        let bp = e.backup_path.as_deref().unwrap_or_default();
+        if std::fs::symlink_metadata(bp).is_ok() {
+            for m in missing {
+                report.warnings.push(format!(
+                    "backup {m} for '{}' no longer exists; restored from the next-oldest backup",
+                    e.target_path
+                ));
+            }
+            return Ok(e);
+        }
+        missing.push(bp);
+    }
+    Err(format!(
+        "could not restore '{}' from the restore journal: none of its {} adopted \
+         backup(s) exist on disk",
+        newest.target_path,
+        adopted.len()
+    ))
+}
+
+/// The fingerprint of the tree Scenery last installed at `target_path`
+/// (newest `managed` push entry that recorded one). `None` for installs made
+/// by a runner that predates the fingerprint; those are treated as possibly
+/// edited, so nothing is deleted on a guess.
+fn installed_tree_hash(entries: &[JournalEntry], target_path: &str) -> Option<String> {
+    use scenery_core::restore_journal::JournalSource;
+    entries
+        .iter()
+        .rev()
+        .filter(|e| {
+            e.target_path == target_path
+                && e.source == JournalSource::Managed
+                && e.op == JournalOp::ArtifactPush
+        })
+        .find_map(|e| {
+            e.detail
+                .get("tree_sha256")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+}
+
+/// What a restore did besides putting the original back.
+#[derive(Debug, Default)]
+struct RestoreOutcome {
+    /// Where the pre-existing tree was moved instead of being deleted.
+    preserved_current_at: Option<PathBuf>,
+    preserved_reason: String,
+}
+
+/// Perform the filesystem side effect for one restorable journal entry: put
+/// `backup_path` back at `target_path`, or — when `backup_path` is `None`,
+/// meaning `target_path` did not exist before Scenery touched it — delete
 /// `target_path` outright rather than fabricate a restore.
-fn restore_one_entry(entry: &JournalEntry) -> Result<()> {
+///
+/// A directory restore is staged then renamed into place, copies symlinks as
+/// symlinks, and never destroys what is at `target_path` now unless that is
+/// provably the tree Scenery installed (`installed_hash`, the fingerprint
+/// recorded when it was pushed, matches). Anything else (the user edited it
+/// after the conversion, it is a different tree, or there is no fingerprint
+/// to compare against) is renamed to `<name>.scenery-edited-<token>` beside
+/// the target, with its Scenery marker removed so the later managed-artifact
+/// sweep does not delete it, and reported in [`RestoreOutcome`].
+fn restore_one_entry(entry: &JournalEntry, installed_hash: Option<&str>) -> Result<RestoreOutcome> {
     let target = Path::new(&entry.target_path);
+    let mut outcome = RestoreOutcome::default();
     match &entry.backup_path {
         Some(bp) => {
             let backup = Path::new(bp);
-            anyhow::ensure!(backup.exists(), "backup path {bp} no longer exists");
+            let backup_meta = std::fs::symlink_metadata(backup)
+                .map_err(|_| anyhow::anyhow!("backup path {bp} no longer exists"))?;
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent)
                     .with_context(|| format!("creating {}", parent.display()))?;
             }
-            if backup.is_dir() {
-                if target.exists() {
-                    std::fs::remove_dir_all(target)
-                        .with_context(|| format!("clearing {} before restore", target.display()))?;
-                }
-                copy_dir_recursive(backup, target)?;
+            if backup_meta.is_dir() {
+                restore_dir(backup, target, installed_hash, &mut outcome)?;
             } else {
-                std::fs::copy(backup, target)
+                scenery_core::safe_copy::copy_tree(backup, target)
                     .with_context(|| format!("restoring {}", target.display()))?;
             }
         }
@@ -708,40 +829,129 @@ fn restore_one_entry(entry: &JournalEntry) -> Result<()> {
             }
         }
     }
+    Ok(outcome)
+}
+
+/// Directory half of [`restore_one_entry`]. Order matters: copy the backup to
+/// a hidden staging sibling first (a failure here changes nothing), then move
+/// what is at `target` out of the way, then rename the staging dir in.
+fn restore_dir(
+    backup: &Path,
+    target: &Path,
+    installed_hash: Option<&str>,
+    outcome: &mut RestoreOutcome,
+) -> Result<()> {
+    use scenery_core::safe_copy::{copy_tree, tree_fingerprint, unique_token};
+    use scenery_mcp::ownership::MANAGED_MARKER_FILENAME;
+
+    let parent = target
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("{} has no parent directory", target.display()))?;
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .ok_or_else(|| anyhow::anyhow!("{} has no file name", target.display()))?;
+    let token = unique_token();
+    let staging = parent.join(format!(".{name}.scenery-restore-{token}"));
+
+    if let Err(e) = copy_tree(backup, &staging) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(e).with_context(|| format!("staging the restore of {}", target.display()));
+    }
+
+    let mut aside: Option<PathBuf> = None;
+    match std::fs::symlink_metadata(target) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(e).with_context(|| format!("stat {}", target.display()));
+        }
+        Ok(meta) => {
+            let pristine = meta.is_dir()
+                && installed_hash.is_some_and(|h| {
+                    tree_fingerprint(target, &[MANAGED_MARKER_FILENAME])
+                        .map(|cur| cur == h)
+                        .unwrap_or(false)
+                });
+            if pristine {
+                // Exactly what Scenery installed (and published): safe to drop.
+                if let Err(e) = std::fs::remove_dir_all(target) {
+                    let _ = std::fs::remove_dir_all(&staging);
+                    return Err(e).with_context(|| format!("clearing {}", target.display()));
+                }
+            } else {
+                let dest = parent.join(format!("{name}.scenery-edited-{token}"));
+                if let Err(e) = std::fs::rename(target, &dest) {
+                    let _ = std::fs::remove_dir_all(&staging);
+                    return Err(e).with_context(|| {
+                        format!("moving {} aside to preserve it", target.display())
+                    });
+                }
+                // No longer Scenery's: it must not be swept as a managed dir.
+                let _ = std::fs::remove_file(dest.join(MANAGED_MARKER_FILENAME));
+                outcome.preserved_reason = if installed_hash.is_some() {
+                    "it changed after Scenery installed it".into()
+                } else {
+                    "no record of what Scenery installed there, so it was not assumed unchanged"
+                        .into()
+                };
+                aside = Some(dest);
+            }
+        }
+    }
+
+    if let Err(e) = std::fs::rename(&staging, target) {
+        if let Some(a) = &aside {
+            let _ = std::fs::rename(a, target);
+        }
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(e)
+            .with_context(|| format!("moving the restored copy into {}", target.display()));
+    }
+    outcome.preserved_current_at = aside;
     Ok(())
 }
 
-/// Recursively copy `src` into `dest`, creating `dest` (and parents) as needed.
-fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
-    std::fs::create_dir_all(dest).with_context(|| format!("creating {}", dest.display()))?;
-    for entry in std::fs::read_dir(src).with_context(|| format!("reading {}", src.display()))? {
-        let entry = entry.context("reading restore-journal backup dir entry")?;
-        let dest_path = dest.join(entry.file_name());
-        let file_type = entry
-            .file_type()
-            .with_context(|| format!("stat {}", entry.path().display()))?;
-        if file_type.is_dir() {
-            copy_dir_recursive(&entry.path(), &dest_path)?;
-        } else {
-            std::fs::copy(entry.path(), &dest_path)
-                .with_context(|| format!("copying to {}", dest_path.display()))?;
+/// Step 7 of `run` (`--purge`). The data dir holds `restore-backups/` and the
+/// journal needed to re-run the restore. If ANY restore failed those are the
+/// only copy of the user's originals, so they are never purged (everything
+/// else still is) and the report says where they live.
+fn run_purge_step(report: &mut RestoreReport) {
+    let keep_restore_data = !report.failed.is_empty();
+    match purge_data_dir(keep_restore_data) {
+        Ok(root) if keep_restore_data => {
+            let kept = root.join("restore-backups");
+            report.warnings.push(format!(
+                "--purge kept your restore backups because {} item(s) could not be \
+                 restored: {} (the restore journal beside it lets `scenery uninstall` \
+                 be re-run). Everything else in {} was purged.",
+                report.failed.len(),
+                kept.display(),
+                root.display()
+            ));
+            report.backups_kept_at = Some(kept.display().to_string());
         }
+        Ok(_) => report.purged_data_dir = true,
+        Err(e) => report
+            .warnings
+            .push(format!("failed to purge data directory: {e:#}")),
     }
-    Ok(())
 }
 
 /// Delete the Scenery data directory + logs + lock file + keychain token
-/// (`--purge`). Best-effort beyond the data directory itself: a missing log
-/// dir, an absent lock file, or an unavailable keychain must not fail the
-/// purge — `auth logout` (step 6 of `run`) already released the token row
-/// for `opts.registry_url`; this is defense-in-depth for the raw secret.
-fn purge_data_dir() -> Result<()> {
+/// (`--purge`) and return its path. Best-effort beyond the data directory
+/// itself: a missing log dir, an absent lock file, or an unavailable keychain
+/// must not fail the purge — `auth logout` (step 6 of `run`) already released
+/// the token row for `opts.registry_url`; this is defense-in-depth for the raw
+/// secret.
+///
+/// With `keep_restore_data` the restore backups and the journal beside them
+/// survive (see [`purge_data_dir_at`]).
+fn purge_data_dir(keep_restore_data: bool) -> Result<PathBuf> {
     use scenery_core::state::AppState;
     let state = AppState::bootstrap()?;
     let root = state.root_dir.as_std_path().to_path_buf();
-    if root.exists() {
-        std::fs::remove_dir_all(&root).with_context(|| format!("removing {}", root.display()))?;
-    }
+    purge_data_dir_at(&root, keep_restore_data)?;
 
     // macOS: `scenery daemon install` points the LaunchAgent's
     // StandardOut/ErrorPath at `~/Library/Logs/Scenery/` (see
@@ -756,6 +966,41 @@ fn purge_data_dir() -> Result<()> {
         }
     }
 
+    Ok(root)
+}
+
+/// Names under the data dir that hold the user's originals and the ledger
+/// needed to restore them again.
+const RESTORE_DATA: [&str; 3] = [
+    "restore-backups",
+    "restore-journal.json",
+    "restore-journal.json.lock",
+];
+
+/// Remove `root`; or, with `keep_restore_data`, everything in it except
+/// [`RESTORE_DATA`].
+fn purge_data_dir_at(root: &Path, keep_restore_data: bool) -> Result<()> {
+    if !root.exists() {
+        return Ok(());
+    }
+    if !keep_restore_data {
+        return std::fs::remove_dir_all(root)
+            .with_context(|| format!("removing {}", root.display()));
+    }
+    for entry in std::fs::read_dir(root).with_context(|| format!("reading {}", root.display()))? {
+        let entry = entry?;
+        if RESTORE_DATA.iter().any(|k| entry.file_name() == *k) {
+            continue;
+        }
+        let path = entry.path();
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        let removed = if is_dir {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        removed.with_context(|| format!("removing {}", path.display()))?;
+    }
     Ok(())
 }
 
@@ -862,6 +1107,30 @@ fn render_markdown(r: &RestoreReport) -> String {
         s.push('\n');
     }
 
+    if !r.preserved.is_empty() {
+        s.push_str("## Preserved — both versions kept\n\n");
+        s.push_str(
+            "You changed these after Scenery took them over, so nothing was overwritten \
+             or deleted. The original is back at its path and your current version was \
+             moved beside it:\n\n",
+        );
+        for p in &r.preserved {
+            s.push_str(&format!(
+                "- **{}** — original restored at `{}`; the other version is at `{}` ({})\n",
+                p.name, p.restored_original_at, p.current_copy_at, p.reason
+            ));
+        }
+        s.push('\n');
+    }
+
+    if let Some(kept) = &r.backups_kept_at {
+        s.push_str("## Restore backups kept\n\n");
+        s.push_str(&format!(
+            "`--purge` did not delete your restore backups because some items could not \
+             be restored. They are at `{kept}`.\n\n"
+        ));
+    }
+
     if !r.failed.is_empty() {
         s.push_str("## Not restored\n\n");
         for f in &r.failed {
@@ -905,6 +1174,15 @@ fn print_summary(report: &RestoreReport, paths: &ReportPaths) {
         report.kept.len(),
         report.restored.len()
     );
+    for p in &report.preserved {
+        println!(
+            "  Kept both versions of {}: original at {}, your edited copy at {}",
+            p.name, p.restored_original_at, p.current_copy_at
+        );
+    }
+    if let Some(kept) = &report.backups_kept_at {
+        println!("  Restore backups kept (not purged because a restore failed): {kept}");
+    }
     if !report.warnings.is_empty() {
         println!("  ⚠ {} warning(s) — see the report.", report.warnings.len());
     }
@@ -1410,6 +1688,385 @@ mod tests {
             restore_from_journal(&entries, &mut report);
         });
         let _ = fs::remove_dir_all(&fake_home);
+    }
+
+    // ── restore: oldest backup, never destroy edits ───────────────────────────
+
+    use scenery_core::safe_copy::tree_fingerprint;
+    use scenery_mcp::ownership::MANAGED_MARKER_FILENAME;
+
+    /// Lay out `<dir>/skills/demo` as a converted (marked) tree, plus the
+    /// given backups, and return the target path.
+    fn converted_target(dir: &Path, body: &str) -> PathBuf {
+        let target = dir.join("skills").join("demo");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("SKILL.md"), body).unwrap();
+        fs::write(target.join(MANAGED_MARKER_FILENAME), "{}").unwrap();
+        target
+    }
+
+    fn backup_with(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let b = dir
+            .join("restore-backups")
+            .join(name)
+            .join("adopted")
+            .join("demo");
+        fs::create_dir_all(&b).unwrap();
+        fs::write(b.join("SKILL.md"), body).unwrap();
+        b
+    }
+
+    fn adopted_entry(target: &Path, backup: &Path) -> JournalEntry {
+        JournalEntry::new(
+            JournalOp::FileDelete,
+            JournalSource::Adopted,
+            target.to_string_lossy().to_string(),
+        )
+        .with_slug("demo")
+        .with_backup_path(backup.to_string_lossy().to_string())
+    }
+
+    fn push_entry(target: &Path, tree_sha256: Option<String>) -> JournalEntry {
+        JournalEntry::new(
+            JournalOp::ArtifactPush,
+            JournalSource::Managed,
+            target.to_string_lossy().to_string(),
+        )
+        .with_slug("demo")
+        .with_detail(serde_json::json!({ "tree_sha256": tree_sha256 }))
+    }
+
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// A retried conversion journals a SECOND adopted backup, of the
+    /// half-written tree. Newest-first replay used to restore that one.
+    #[test]
+    fn restore_uses_the_oldest_adopted_backup_per_path() {
+        let dir = temp_dir("restore-oldest");
+        let target = converted_target(&dir, "published");
+        let first = backup_with(&dir, "t1", "the user's original");
+        let second = backup_with(&dir, "t2", "half-written shadow");
+        let entries = [
+            adopted_entry(&target, &first),
+            adopted_entry(&target, &second),
+        ];
+
+        let mut report = RestoreReport::default();
+        restore_from_journal(&entries, &mut report);
+
+        assert_eq!(
+            fs::read(target.join("SKILL.md")).unwrap(),
+            b"the user's original"
+        );
+        assert_eq!(report.restored.len(), 1, "one restore per path");
+        assert_eq!(report.restored[0].from_backup, first.to_string_lossy());
+        assert!(report.failed.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_falls_back_to_the_next_oldest_backup_when_the_oldest_is_gone() {
+        let dir = temp_dir("restore-fallback");
+        let target = converted_target(&dir, "published");
+        let gone = dir.join("restore-backups/t1/adopted/demo");
+        let second = backup_with(&dir, "t2", "second backup");
+        let entries = [
+            adopted_entry(&target, &gone),
+            adopted_entry(&target, &second),
+        ];
+
+        let mut report = RestoreReport::default();
+        restore_from_journal(&entries, &mut report);
+
+        assert_eq!(fs::read(target.join("SKILL.md")).unwrap(), b"second backup");
+        assert!(report.failed.is_empty());
+        assert_eq!(report.warnings.len(), 1, "the missing backup is reported");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_fails_loudly_when_no_adopted_backup_exists() {
+        let dir = temp_dir("restore-none");
+        let target = converted_target(&dir, "published");
+        let entries = [adopted_entry(&target, &dir.join("nope"))];
+        let mut report = RestoreReport::default();
+        restore_from_journal(&entries, &mut report);
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(
+            fs::read(target.join("SKILL.md")).unwrap(),
+            b"published",
+            "untouched"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The live tree is exactly what Scenery installed: nothing of the user's
+    /// to lose, so no stray copy is left behind.
+    #[test]
+    fn restore_replaces_the_pristine_installed_tree_without_leaving_copies() {
+        let dir = temp_dir("restore-pristine");
+        let target = converted_target(&dir, "published");
+        let backup = backup_with(&dir, "t1", "the user's original");
+        let hash = tree_fingerprint(&target, &[MANAGED_MARKER_FILENAME]).unwrap();
+        let entries = [
+            adopted_entry(&target, &backup),
+            push_entry(&target, Some(hash)),
+        ];
+
+        let mut report = RestoreReport::default();
+        restore_from_journal(&entries, &mut report);
+
+        assert_eq!(
+            fs::read(target.join("SKILL.md")).unwrap(),
+            b"the user's original"
+        );
+        assert!(!target.join(MANAGED_MARKER_FILENAME).exists());
+        assert_eq!(
+            names_in(&dir.join("skills")),
+            vec!["demo"],
+            "no stray copies"
+        );
+        assert!(report.preserved.is_empty());
+        assert!(report.failed.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The user kept working in the converted directory. Restoring the
+    /// original must not destroy that: both versions survive, and the report
+    /// says where each went.
+    #[test]
+    fn restore_preserves_edits_made_after_the_conversion() {
+        let dir = temp_dir("restore-edited");
+        let target = converted_target(&dir, "published");
+        let backup = backup_with(&dir, "t1", "the user's original");
+        let hash = tree_fingerprint(&target, &[MANAGED_MARKER_FILENAME]).unwrap();
+        let entries = [
+            adopted_entry(&target, &backup),
+            push_entry(&target, Some(hash)),
+        ];
+        // The user's later edit, plus a brand-new file.
+        fs::write(target.join("SKILL.md"), "published + my new work").unwrap();
+        fs::write(target.join("extra.md"), "added later").unwrap();
+
+        let mut report = RestoreReport::default();
+        restore_from_journal(&entries, &mut report);
+
+        // Original is back at the path...
+        assert_eq!(
+            fs::read(target.join("SKILL.md")).unwrap(),
+            b"the user's original"
+        );
+        assert!(!target.join("extra.md").exists());
+        // ...and the edited version sits beside it, intact.
+        assert_eq!(report.preserved.len(), 1);
+        let p = &report.preserved[0];
+        assert_eq!(p.restored_original_at, target.to_string_lossy());
+        let kept = PathBuf::from(&p.current_copy_at);
+        assert!(kept.parent() == target.parent() && kept != target);
+        assert_eq!(
+            fs::read(kept.join("SKILL.md")).unwrap(),
+            b"published + my new work"
+        );
+        assert_eq!(fs::read(kept.join("extra.md")).unwrap(), b"added later");
+        assert!(
+            !kept.join(MANAGED_MARKER_FILENAME).exists(),
+            "the preserved copy must not look Scenery-managed"
+        );
+        assert!(report.failed.is_empty());
+        assert_eq!(report.restored.len(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Journals written by 2.2.4 and earlier carry no fingerprint, so
+    /// "unchanged" cannot be proven: the live tree is kept, never guessed at.
+    #[test]
+    fn restore_without_a_fingerprint_preserves_the_live_tree() {
+        let dir = temp_dir("restore-legacy");
+        let target = converted_target(&dir, "published");
+        let backup = backup_with(&dir, "t1", "the user's original");
+        let entries = [adopted_entry(&target, &backup), push_entry(&target, None)];
+
+        let mut report = RestoreReport::default();
+        restore_from_journal(&entries, &mut report);
+
+        assert_eq!(
+            fs::read(target.join("SKILL.md")).unwrap(),
+            b"the user's original"
+        );
+        assert_eq!(report.preserved.len(), 1);
+        assert_eq!(
+            fs::read(PathBuf::from(&report.preserved[0].current_copy_at).join("SKILL.md")).unwrap(),
+            b"published"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A preserved copy must survive the managed-artifact sweep that runs
+    /// right after the restore (it deletes every marked dir under
+    /// `~/.agents/skills`).
+    #[test]
+    fn preserved_copy_survives_the_managed_artifact_sweep() {
+        let fake_home = temp_dir("restore-sweep");
+        with_fake_home(&fake_home, || {
+            let skills = fake_home.join(".agents").join("skills");
+            fs::create_dir_all(&skills).unwrap();
+            let target = skills.join("demo");
+            fs::create_dir_all(&target).unwrap();
+            fs::write(target.join("SKILL.md"), "published, edited").unwrap();
+            fs::write(target.join(MANAGED_MARKER_FILENAME), "{\"marker_version\":1,\"installation_id\":null,\"source_sha256\":\"x\",\"migrated_at\":\"t\"}").unwrap();
+            let backup = backup_with(&fake_home, "t1", "original");
+            let entries = [adopted_entry(&target, &backup), push_entry(&target, None)];
+
+            let mut report = RestoreReport::default();
+            restore_from_journal(&entries, &mut report);
+            let plan = Plan {
+                brokered: vec![],
+                clients: vec![],
+            };
+            remove_managed_artifacts(&plan, &mut report);
+
+            assert_eq!(fs::read(target.join("SKILL.md")).unwrap(), b"original");
+            let kept = PathBuf::from(&report.preserved[0].current_copy_at);
+            assert_eq!(
+                fs::read(kept.join("SKILL.md")).unwrap(),
+                b"published, edited"
+            );
+        });
+        let _ = fs::remove_dir_all(&fake_home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_keeps_symlinks_as_symlinks_and_does_not_loop() {
+        let dir = temp_dir("restore-symlinks");
+        let target = converted_target(&dir, "published");
+        let backup = backup_with(&dir, "t1", "original");
+        std::os::unix::fs::symlink("..", backup.join("up")).unwrap();
+        std::os::unix::fs::symlink("SKILL.md", backup.join("alias.md")).unwrap();
+        let entries = [adopted_entry(&target, &backup)];
+
+        let mut report = RestoreReport::default();
+        restore_from_journal(&entries, &mut report);
+
+        assert!(report.failed.is_empty(), "{:?}", report.failed);
+        assert_eq!(
+            fs::read_link(target.join("up")).unwrap(),
+            PathBuf::from("..")
+        );
+        assert_eq!(
+            fs::read_link(target.join("alias.md")).unwrap(),
+            PathBuf::from("SKILL.md")
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── --purge keeps the backups when a restore failed ───────────────────────
+
+    fn seed_data_dir(root: &Path) {
+        fs::create_dir_all(root.join("restore-backups/t1/adopted/demo")).unwrap();
+        fs::write(
+            root.join("restore-backups/t1/adopted/demo/SKILL.md"),
+            "precious",
+        )
+        .unwrap();
+        fs::write(root.join("restore-journal.json"), "[]").unwrap();
+        fs::write(root.join("restore-journal.json.lock"), "").unwrap();
+        fs::write(root.join("scratch.txt"), "db").unwrap();
+        fs::create_dir_all(root.join("skills/x")).unwrap();
+        fs::write(root.join("skills/x/f"), "f").unwrap();
+    }
+
+    #[test]
+    fn purge_data_dir_at_keeps_restore_data_but_removes_everything_else() {
+        let root = temp_dir("purge-keep");
+        seed_data_dir(&root);
+        purge_data_dir_at(&root, true).unwrap();
+        assert_eq!(
+            fs::read(root.join("restore-backups/t1/adopted/demo/SKILL.md")).unwrap(),
+            b"precious"
+        );
+        assert!(root.join("restore-journal.json").exists());
+        assert!(!root.join("scratch.txt").exists());
+        assert!(!root.join("skills").exists());
+
+        purge_data_dir_at(&root, false).unwrap();
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn purge_step_never_deletes_backups_when_a_restore_failed() {
+        let fake_home = temp_dir("purge-step-failed");
+        with_fake_home(&fake_home, || {
+            let state = AppState::bootstrap().unwrap();
+            let root = state.root_dir.as_std_path().to_path_buf();
+            seed_data_dir(&root);
+
+            let mut report = RestoreReport::default();
+            report.failed.push("could not restore '/x'".into());
+            run_purge_step(&mut report);
+
+            let kept = root.join("restore-backups");
+            assert!(
+                kept.join("t1/adopted/demo/SKILL.md").exists(),
+                "backups survive"
+            );
+            assert!(!report.purged_data_dir);
+            assert_eq!(
+                report.backups_kept_at.as_deref(),
+                Some(kept.to_str().unwrap())
+            );
+            assert!(report
+                .warnings
+                .iter()
+                .any(|w| w.contains(kept.to_str().unwrap())));
+            assert!(
+                !root.join("scratch.txt").exists(),
+                "the rest is still purged"
+            );
+
+            let md = render_markdown(&report);
+            assert!(md.contains("Restore backups kept") && md.contains(kept.to_str().unwrap()));
+        });
+        let _ = fs::remove_dir_all(&fake_home);
+    }
+
+    #[test]
+    fn purge_step_removes_the_whole_data_dir_when_every_restore_succeeded() {
+        let fake_home = temp_dir("purge-step-ok");
+        with_fake_home(&fake_home, || {
+            let state = AppState::bootstrap().unwrap();
+            let root = state.root_dir.as_std_path().to_path_buf();
+            seed_data_dir(&root);
+
+            let mut report = RestoreReport::default();
+            run_purge_step(&mut report);
+
+            assert!(!root.exists());
+            assert!(report.purged_data_dir);
+            assert!(report.backups_kept_at.is_none());
+        });
+        let _ = fs::remove_dir_all(&fake_home);
+    }
+
+    #[test]
+    fn report_lists_preserved_copies() {
+        let mut report = RestoreReport::default();
+        report.preserved.push(PreservedItem {
+            name: "demo".into(),
+            restored_original_at: "/h/.agents/skills/demo".into(),
+            current_copy_at: "/h/.agents/skills/demo.scenery-edited-x".into(),
+            reason: "it changed".into(),
+        });
+        let md = render_markdown(&report);
+        assert!(md.contains("/h/.agents/skills/demo.scenery-edited-x"));
+        assert!(md.contains("/h/.agents/skills/demo`"));
     }
 
     // ── remove_managed_artifacts / remove_marked_dirs ─────────────────────────
