@@ -281,3 +281,81 @@ fn treatment_detail_shapes_match_the_backend_contract() {
     assert_eq!(t["tracked_reason"], "git_tracked");
     assert!(Treatment::Convert.detail().is_none());
 }
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_ancestor_below_home_is_a_stow_target_and_tracks() {
+    let home = tempfile::tempdir().unwrap();
+    let real = home.path().join("dotfiles/agents/skills");
+    skill(&real, "stowed");
+    // stow folded the whole `.agents` directory.
+    std::os::unix::fs::symlink(
+        home.path().join("dotfiles/agents"),
+        home.path().join(".agents"),
+    )
+    .unwrap();
+    let root = home.path().join(".agents/skills");
+    let d = root.join("stowed");
+    assert_eq!(
+        treat(&d, "stowed", &old_ctx(Some(&root), Some(home.path()))),
+        Treatment::Track("dotfiles_managed:symlinked_ancestor".into())
+    );
+    // Symlinks ABOVE home (like /var -> /private/var) never count.
+    assert!(!symlinked_ancestor_below(&d, Path::new("/nonexistent")));
+}
+
+fn git_available() -> bool {
+    std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_ok()
+}
+
+#[test]
+fn a_bare_dotfiles_repo_with_home_as_worktree_tracks_the_skill() {
+    if !git_available() {
+        return;
+    }
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join(".agents/skills");
+    let d = skill(&root, "yadmed");
+    let other = skill(&root, "untracked");
+    let repo = home.path().join(".local/share/yadm/repo.git");
+    let git = |args: &[&str]| {
+        let ok = std::process::Command::new("git")
+            .arg("--git-dir")
+            .arg(&repo)
+            .arg("--work-tree")
+            .arg(home.path())
+            .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            ok.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&ok.stderr)
+        );
+    };
+    fs::create_dir_all(&repo).unwrap();
+    std::process::Command::new("git")
+        .args(["init", "--bare", "-q"])
+        .arg(&repo)
+        .status()
+        .unwrap();
+    git(&["add", ".agents/skills/yadmed/SKILL.md"]);
+
+    assert_eq!(
+        treat(&d, "yadmed", &old_ctx(Some(&root), Some(home.path()))),
+        Treatment::Track("git_tracked:dotfiles_repo".into())
+    );
+    // Only what the repo tracks: a sibling skill still converts.
+    assert_eq!(
+        treat(
+            &other,
+            "untracked",
+            &old_ctx(Some(&root), Some(home.path()))
+        ),
+        Treatment::Convert
+    );
+}

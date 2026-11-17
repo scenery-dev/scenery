@@ -22,6 +22,12 @@
 //!    `track` nothing is installed and nothing is written into the skill;
 //!    `tracked_skills` records it.
 //!
+//! Conversion replaces the directory with the registry copy. Editor litter
+//! (`*~`, `*.swp`, `.#*`, `.DS_Store`) and compiled-Python caches
+//! (`__pycache__`) are never uploaded, so they are NOT in the converted
+//! directory; they remain in the original's backup under
+//! `restore-backups/<ts>/adopted/<slug>` (and come back on uninstall).
+//!
 //! The local folder name and the frontmatter `name` are never changed. A
 //! private skill's registry id is `<owner_namespace>~<slug>`; the runner
 //! records that id against the local folder (`skill_local_names`) so the sync
@@ -366,11 +372,19 @@ async fn process_directives(
         match d.action.as_str() {
             "skip" => {
                 summary.skipped += 1;
-                record_skip(&ctx.state, item, &reported_hash, d.reason.as_deref());
+                // A skip never downgrades a LOCAL hold: the skill stays held
+                // (and visible in `scenery doctor`), noted once per hold.
+                if let Some(reason) = local_hold(item) {
+                    note_held(&ctx.state, item, &reported_hash, &reason);
+                } else {
+                    record_skip(&ctx.state, item, &reported_hash, d.reason.as_deref());
+                }
             }
             "hold" => {
                 summary.held += 1;
-                let reason = d.reason.clone().unwrap_or_else(|| "held_by_backend".into());
+                let reason = local_hold(item)
+                    .or_else(|| d.reason.clone())
+                    .unwrap_or_else(|| "held_by_backend".into());
                 note_held(&ctx.state, item, &reported_hash, &reason);
             }
             "manage" | "track" => {
@@ -382,6 +396,9 @@ async fn process_directives(
                     continue;
                 }
                 match act_on(ctx, item, &d, wants_track).await {
+                    // The caps count ATTEMPTS that reached the backend, not just
+                    // successes: a failing backend must not turn one tick into
+                    // an upload storm.
                     Acted::Managed => {
                         conversions += 1;
                         summary.managed += 1;
@@ -391,10 +408,24 @@ async fn process_directives(
                         summary.tracked += 1;
                     }
                     Acted::Held => summary.held += 1,
-                    Acted::Blocked => summary.blocked += 1,
+                    Acted::Blocked => {
+                        if wants_track {
+                            tracked_uploads += 1;
+                        } else {
+                            conversions += 1;
+                        }
+                        summary.blocked += 1;
+                    }
                     Acted::Deferred => summary.deferred += 1,
                     Acted::Skipped => summary.skipped += 1,
-                    Acted::Failed => summary.failed += 1,
+                    Acted::Failed => {
+                        if wants_track {
+                            tracked_uploads += 1;
+                        } else {
+                            conversions += 1;
+                        }
+                        summary.failed += 1;
+                    }
                     Acted::Unauthorized => {
                         summary.unauthorized = true;
                         warn!(
@@ -409,6 +440,14 @@ async fn process_directives(
                 "auto-manage: unknown directive action — ignored"
             ),
         }
+    }
+}
+
+/// The hold reason the LOCAL classifier gave this item, if it holds it.
+fn local_hold(item: &DiscoveryItem) -> Option<String> {
+    match item.local.as_ref().map(|l| &l.treatment) {
+        Some(Treatment::Hold(r)) => Some(r.clone()),
+        _ => None,
     }
 }
 
@@ -1000,6 +1039,10 @@ async fn convert(
     .await;
     if let Err(e) = installed {
         warn!(slug = %slug, error = %e, "auto-manage: install failed — the original is untouched; retrying");
+        // The next attempt re-uploads (idempotent) and records it again; a
+        // stale record must not let an unrelated install of this slug convert
+        // the user's directory later.
+        let _ = state.clear_pending_adopt_takeover(slug);
         record_attempt(
             state,
             slug,
@@ -1021,6 +1064,7 @@ async fn convert(
         || super::takeover::source_is_canonical_dest(slug, Path::new(source_path));
     if !marked || !source_gone_or_canonical {
         warn!(slug = %slug, "auto-manage: install finished but the conversion did not complete; retrying");
+        let _ = state.clear_pending_adopt_takeover(slug);
         record_attempt(
             state,
             slug,

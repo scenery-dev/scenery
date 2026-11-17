@@ -164,6 +164,19 @@ pub fn redact_args(command_basename: &str, args: &[String]) -> Vec<String> {
         }
 
         if is_flag(a) {
+            if BENIGN_BOOLEANS.contains(&a) || (BENIGN_FLAGS.contains(&a) && !takes_value(a)) {
+                out.push(a.to_string());
+                i += 1;
+                continue;
+            }
+            // Single-dash flag with an attached value (`-pSECRET`, `-pMy=Pass`, `-pc2Vj..==`) — checked BEFORE the
+            // `--flag=value` split, which would otherwise leak the part before `=`:
+            // the whole token is the secret.
+            if !a.starts_with("--") && a.len() > 2 {
+                out.push(REDACTED.to_string());
+                i += 1;
+                continue;
+            }
             if let Some((flag, value)) = a.split_once('=') {
                 // `--flag=value`
                 if BENIGN_FLAGS.contains(&flag) {
@@ -177,11 +190,6 @@ pub fn redact_args(command_basename: &str, args: &[String]) -> Vec<String> {
                 i += 1;
                 continue;
             }
-            if BENIGN_BOOLEANS.contains(&a) || (BENIGN_FLAGS.contains(&a) && !takes_value(a)) {
-                out.push(a.to_string());
-                i += 1;
-                continue;
-            }
             if BENIGN_FLAGS.contains(&a) {
                 out.push(a.to_string());
                 if let Some(v) = args.get(i + 1).filter(|v| !is_flag(v)) {
@@ -190,13 +198,6 @@ pub fn redact_args(command_basename: &str, args: &[String]) -> Vec<String> {
                 } else {
                     i += 1;
                 }
-                continue;
-            }
-            // Single-dash flag with an attached value (`-pSECRET`, `-Ptoken`):
-            // the whole token is the secret.
-            if !a.starts_with("--") && a.len() > 2 {
-                out.push(REDACTED.to_string());
-                i += 1;
                 continue;
             }
             // Any other flag: keep the name, redact a following value.

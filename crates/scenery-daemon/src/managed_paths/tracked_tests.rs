@@ -293,3 +293,29 @@ fn tracked_slug_lookup_is_case_folded() {
     assert!(is_slug_tracked(&h.state, "mixed"));
     assert!(!is_slug_tracked(&h.state, "other"));
 }
+
+/// The ledger row is written BEFORE the rename, and removed again if the
+/// rename fails, so there is never a change without a record.
+#[cfg(unix)]
+#[test]
+fn a_failed_rename_leaves_no_ledger_row_and_the_skill_untouched() {
+    use std::os::unix::fs::PermissionsExt;
+    let h = Home::new();
+    let dir = h.agents().join("locked");
+    write_skill(&dir, "x");
+    let row = h.track(&dir, "locked", Some("adam~locked"));
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+    let res = neutralize(&h.state, &row, REASON_SKILL_REVOKED);
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+    if res.is_ok() {
+        return; // running as root: permissions are not enforced
+    }
+    assert_eq!(fs::read(dir.join("SKILL.md")).unwrap(), b"x");
+    let n: i64 = Connection::open(&h.state.db_path)
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM tracked_neutralizations", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(n, 0);
+}

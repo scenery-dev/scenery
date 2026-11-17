@@ -662,12 +662,12 @@ async fn a_failed_backup_mid_conversion_rolls_back_and_a_later_tick_converts() {
             .as_deref(),
         Some("conversion_incomplete")
     );
-    // The pending takeover survives, so the conversion converges later.
+    // A stale pending takeover is cleared (the next attempt re-records it).
     assert!(env
         .state
         .pending_adopt_takeover_source("fragile")
         .unwrap()
-        .is_some());
+        .is_none());
 
     // Disk is healthy again; backoff elapsed.
     fs::remove_file(blocker.as_std_path()).unwrap();
@@ -980,4 +980,216 @@ async fn local_holds_are_surfaced_without_any_directive_and_pruned_when_the_skil
     fs::remove_dir_all(&dir).unwrap();
     note_local_holds(&env.state, &[]);
     assert!(attention_list(&env.state).is_empty());
+}
+
+// ── The periodic sync must never treat a private skill as "unknown" ─────────
+
+/// Regression: `check_skill_updates` used to send the FOLDER name (`pdf`) to
+/// `/skills/status`; the registry only knows `adam~pdf`, answered "unknown", and
+/// the lifecycle phase uninstalled the skill every sync tick (destroying the
+/// owner's edits, dropping provenance and, in strict mode, bypassing the
+/// drift guard through a reinstall storm).
+#[tokio::test]
+async fn two_sync_ticks_leave_a_mapped_private_skill_installed_edited_and_marked() {
+    let mut env = Env::new().await;
+    env.state
+        .set_sync_state("managed_paths_mode", "quarantine")
+        .unwrap();
+    env.state
+        .record_skill_local_name("adam~pdf", "pdf")
+        .unwrap();
+    env.state
+        .record_pending_auto_managed_takeover(
+            "pdf",
+            &env.agents().join("pdf").to_string_lossy(),
+            "adam~pdf",
+            "uuid-7",
+        )
+        .unwrap();
+    ManagedPathsPusher::new(&env.state)
+        .push_skill("pdf", None, b"---\nname: pdf\n---\nconverted", &[])
+        .unwrap();
+    env.state.clear_pending_adopt_takeover("pdf").unwrap();
+    // The internal install row the reconciler keeps for it.
+    env.seed_registry_version("pdf", "0.1.0");
+    let root = env.state.root_dir.join("skills/pdf");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(
+        root.join("versions/0.1.0").as_std_path(),
+        root.join("active").as_std_path(),
+    )
+    .unwrap();
+    Connection::open(&env.state.db_path)
+        .unwrap()
+        .execute(
+            "INSERT OR REPLACE INTO installed_skills \
+             (skill_id, active_version, install_root, current_status, deactivated) \
+             VALUES ('pdf', '0.1.0', ?1, 'active', 0)",
+            [root.as_str()],
+        )
+        .unwrap();
+
+    // The owner keeps working.
+    let dir = env.agents().join("pdf");
+    fs::write(dir.join("SKILL.md"), "---\nname: pdf\n---\nMY EDITS").unwrap();
+
+    // The registry answers "unknown" for every id it is asked about, including
+    // the private one: that is what an anonymous status call gets.
+    let status = env
+        .server
+        .mock("POST", "/skills/status")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"statuses":{},"unknown":["pdf","adam~pdf"]}"#)
+        .expect(0) // private skills are never sent to the anonymous endpoint
+        .create();
+    let detail = env
+        .server
+        .mock("GET", Matcher::Regex("^/skills/pdf".into()))
+        .with_status(404)
+        .expect(0)
+        .create();
+    for _tick in 0..2 {
+        let state = Arc::clone(&env.state);
+        let url = env.server.url();
+        let changes = tokio::task::spawn_blocking(move || {
+            let registry = RegistryClient::new(url);
+            let policy = scenery_core::policy::MockPolicyClient::new();
+            scenery_core::updater::check_skill_updates(&state, &registry, &policy).unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(changes, 0);
+
+        assert_eq!(
+            fs::read_to_string(dir.join("SKILL.md")).unwrap(),
+            "---\nname: pdf\n---\nMY EDITS",
+            "the owner's edits survive"
+        );
+        assert!(root.join("versions/0.1.0").exists(), "install not removed");
+        let row: i64 = Connection::open(&env.state.db_path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM installed_skills WHERE skill_id = 'pdf'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(row, 1);
+        let mk = marker_file(&dir);
+        assert_eq!(mk["origin"], "auto_managed");
+        assert_eq!(mk["skill_id"], "adam~pdf");
+    }
+    status.assert();
+    detail.assert();
+}
+
+#[tokio::test]
+async fn a_mapped_non_private_skill_is_asked_about_by_registry_id_and_never_uninstalled_on_unknown()
+{
+    let mut env = Env::new().await;
+    env.state.record_skill_local_name("x-bob", "x").unwrap();
+    env.seed_registry_version("x", "1.0.0");
+    let root = env.state.root_dir.join("skills/x");
+    Connection::open(&env.state.db_path)
+        .unwrap()
+        .execute(
+            "INSERT OR REPLACE INTO installed_skills \
+             (skill_id, active_version, install_root, current_status, deactivated) \
+             VALUES ('x', '1.0.0', ?1, 'active', 0)",
+            [root.as_str()],
+        )
+        .unwrap();
+    let status = env
+        .server
+        .mock("POST", "/skills/status")
+        .match_body(Matcher::Regex(r#""x-bob""#.into()))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"statuses":{},"unknown":["x-bob"]}"#)
+        .expect(1)
+        .create();
+    let state = Arc::clone(&env.state);
+    let url = env.server.url();
+    let changes = tokio::task::spawn_blocking(move || {
+        scenery_core::updater::check_skill_updates(
+            &state,
+            &RegistryClient::new(url),
+            &scenery_core::policy::MockPolicyClient::new(),
+        )
+        .unwrap()
+    })
+    .await
+    .unwrap();
+    assert_eq!(changes, 0);
+    status.assert();
+    assert!(root.join("versions/1.0.0").exists());
+}
+
+#[tokio::test]
+async fn a_backend_skip_or_hold_never_downgrades_a_local_hold_and_is_noted_once() {
+    let env = Env::new().await;
+    let dir = env.user_skill(&env.agents(), "held-one");
+    fs::write(dir.join(".env"), "T=1").unwrap();
+    let items = env.scan();
+    for action in ["skip", "hold", "skip", "skip"] {
+        let mut d = directive(&dir, action);
+        d.reason = Some("secrets_detected".into());
+        process_response(&env.ctx(true), response(vec![d]), &items).await;
+        let att = attention_list(&env.state);
+        assert_eq!(att.len(), 1, "still listed as held after {action}");
+        assert_eq!(att[0].status, "held");
+        assert_eq!(att[0].reason.as_deref(), Some("secrets_detected"));
+    }
+    let n: i64 = Connection::open(&env.state.db_path)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM audit_events WHERE event_type = 'skill_held'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 1, "one audit event per hold, not per tick");
+}
+
+#[tokio::test]
+async fn caps_count_attempts_so_a_failing_backend_gets_at_most_five_calls_per_tick() {
+    let mut env = Env::new().await;
+    let mut ds = Vec::new();
+    for i in 0..9 {
+        let d = env.user_skill(&env.agents(), &format!("storm{i}"));
+        ds.push(directive(&d, "manage"));
+    }
+    let m = env
+        .server
+        .mock("POST", "/runner/skills/auto-manage")
+        .with_status(503)
+        .expect(MAX_CONVERSIONS_PER_TICK)
+        .create();
+    let items = env.scan();
+    let s = process_response(&env.ctx(true), response(ds), &items).await;
+    m.assert();
+    assert_eq!(s.failed, MAX_CONVERSIONS_PER_TICK, "{s:?}");
+}
+
+#[tokio::test]
+async fn a_failed_install_clears_the_pending_takeover() {
+    let mut env = Env::new().await;
+    let dir = env.user_skill(&env.agents(), "noinstall");
+    // No registry version seeded and nothing to fetch: the install fails.
+    let _m = env.managed_response("adam~noinstall", "0.1.0", "manage", 1);
+    let items = env.scan();
+    let s = process_response(
+        &env.ctx(true),
+        response(vec![directive(&dir, "manage")]),
+        &items,
+    )
+    .await;
+    assert_eq!(s.failed, 1, "{s:?}");
+    assert!(env
+        .state
+        .pending_adopt_takeover_source("noinstall")
+        .unwrap()
+        .is_none());
+    assert!(!dir.join(".scenery-managed.json").exists());
 }

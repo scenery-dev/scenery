@@ -159,6 +159,14 @@ fn decide(dir: &Path, slug: &str, ctx: &ClassifyContext, survey: &TreeSurvey) ->
     if in_git_work_tree(dir) {
         return Treatment::Track("git_tracked".into());
     }
+    if let Some(home) = &ctx.home {
+        if symlinked_ancestor_below(dir, home) {
+            return Treatment::Track("dotfiles_managed:symlinked_ancestor".into());
+        }
+        if bare_dotfiles_repo_tracks(dir, home) {
+            return Treatment::Track("git_tracked:dotfiles_repo".into());
+        }
+    }
     for marker in FOREIGN_MARKERS {
         if fs::symlink_metadata(dir.join(marker)).is_ok() {
             return Treatment::Track(format!("foreign_installer:{marker}"));
@@ -223,6 +231,77 @@ pub fn in_git_work_tree(dir: &Path) -> bool {
         Ok(resolved) if resolved != dir => has_git(&resolved),
         _ => false,
     }
+}
+
+/// Is any ancestor of `dir` that lies strictly BELOW `home` a symlink? That is
+/// how stow folds a directory (`~/.agents -> ~/dotfiles/agents`): the skill
+/// then lives inside the user's dotfiles repo and must not be rewritten.
+/// Ancestors at or above `home` (`/var` -> `/private/var`) never count.
+pub fn symlinked_ancestor_below(dir: &Path, home: &Path) -> bool {
+    let Ok(rel) = dir.strip_prefix(home) else {
+        return false;
+    };
+    let mut cur = home.to_path_buf();
+    let comps: Vec<_> = rel.components().collect();
+    // Every component except the skill directory itself (checked as dev_symlink).
+    for c in comps.iter().take(comps.len().saturating_sub(1)) {
+        cur.push(c);
+        if fs::symlink_metadata(&cur)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Is `dir` tracked by a BARE dotfiles repository whose work tree is `home`
+/// (yadm; the `git --git-dir=$HOME/.cfg --work-tree=$HOME` pattern; a repo
+/// pointed at by `GIT_DIR`)? No `.git` exists in any ancestor for those, so
+/// the ancestor walk misses them. Candidates are the well-known locations plus
+/// `GIT_DIR`; each is asked `git ls-files` for this exact path. Best effort: no
+/// `git` on the machine, or no candidate, means `false`.
+pub fn bare_dotfiles_repo_tracks(dir: &Path, home: &Path) -> bool {
+    let Ok(rel) = dir.strip_prefix(home) else {
+        return false;
+    };
+    let mut candidates: Vec<PathBuf> = vec![
+        home.join(".local/share/yadm/repo.git"),
+        home.join(".config/yadm/repo.git"),
+        home.join(".yadm/repo.git"),
+        home.join(".cfg"),
+        home.join(".dotfiles"),
+        home.join(".dotfiles.git"),
+        home.join(".cfg.git"),
+        home.join(".mydotfiles"),
+    ];
+    if let Some(g) = std::env::var_os("GIT_DIR") {
+        candidates.push(PathBuf::from(g));
+    }
+    for repo in candidates {
+        // A bare git directory has HEAD and objects/.
+        if !(repo.join("HEAD").is_file() && repo.join("objects").is_dir()) {
+            continue;
+        }
+        let tracked = std::process::Command::new("git")
+            .arg("--git-dir")
+            .arg(&repo)
+            .arg("--work-tree")
+            .arg(home)
+            .args(["ls-files", "--error-unmatch", "--"])
+            .arg(rel)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if tracked {
+            return true;
+        }
+    }
+    false
 }
 
 /// Does the `npx skills` global lock file (`~/.agents/.skill-lock.json`) list

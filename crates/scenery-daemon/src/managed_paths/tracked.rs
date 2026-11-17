@@ -291,9 +291,8 @@ pub fn neutralize(state: &AppState, row: &TrackedRow, reason: &str) -> Result<Ne
                 fs::copy(&skill_md, backup_file.as_std_path())
                     .with_context(|| format!("tracked: backing up {}", skill_md.display()))?;
                 let disabled = free_disabled_name(&entry);
-                fs::rename(&skill_md, &disabled)
-                    .with_context(|| format!("tracked: disabling {}", skill_md.display()))?;
-                record(
+                // Ledger FIRST (see above).
+                let id = record(
                     &conn,
                     &row.path,
                     &entry,
@@ -302,6 +301,11 @@ pub fn neutralize(state: &AppState, row: &TrackedRow, reason: &str) -> Result<Ne
                     Some(backup.as_str()),
                     Some(&disabled.to_string_lossy()),
                 )?;
+                if let Err(e) = fs::rename(&skill_md, &disabled) {
+                    forget(&conn, id);
+                    return Err(e)
+                        .with_context(|| format!("tracked: disabling {}", skill_md.display()));
+                }
                 report.skill_md_disabled += 1;
                 info!(slug = %row.slug, dir = %entry.display(), "tracked: disabled SKILL.md of revoked skill (original backed up)");
             }
@@ -348,6 +352,10 @@ fn free_disabled_name(dir: &Path) -> PathBuf {
     unreachable!("an unused disabled-file name always exists")
 }
 
+fn forget(conn: &Connection, id: i64) {
+    let _ = conn.execute("DELETE FROM tracked_neutralizations WHERE id = ?1", [id]);
+}
+
 fn record(
     conn: &Connection,
     tracked_path: &str,
@@ -356,7 +364,7 @@ fn record(
     link_target: Option<&str>,
     backup: Option<&str>,
     renamed_to: Option<&str>,
-) -> Result<()> {
+) -> Result<i64> {
     conn.execute(
         "INSERT INTO tracked_neutralizations \
              (tracked_path, entry_path, action, link_target, backup_path, renamed_to) \
@@ -371,7 +379,7 @@ fn record(
         ],
     )
     .context("tracked: recording neutralization")?;
-    Ok(())
+    Ok(conn.last_insert_rowid())
 }
 
 // ── Restore ─────────────────────────────────────────────────────────────────
