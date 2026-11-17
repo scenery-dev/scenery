@@ -379,8 +379,8 @@ fn build_detail(
     });
 
     McpDiscoveryDetail {
-        client_name: client.name.clone(),
-        server_key: key.to_string(),
+        client_name: super::mcp_args::mask_secret_text(&client.name),
+        server_key: super::mcp_args::mask_secret_text(key),
         transport: transport.to_string(),
         command: command_basename.clone(),
         command_basename,
@@ -396,12 +396,17 @@ fn build_detail(
 }
 
 /// Key names of an object-valued field (`env`/`headers`). Values are never
-/// read — only `.keys()` is ever touched.
+/// read — only `.keys()` is ever touched. A name that carries a
+/// credential-shaped token has the token masked ([`super::mcp_args::mask_secret_text`]).
 fn object_keys(value: &serde_json::Value, field: &str) -> Vec<String> {
     value
         .get(field)
         .and_then(|v| v.as_object())
-        .map(|obj| obj.keys().cloned().collect())
+        .map(|obj| {
+            obj.keys()
+                .map(|k| super::mcp_args::mask_secret_text(k))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -1110,6 +1115,40 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].detail.env_keys, vec!["API_KEY".to_string()]);
         assert_never_leaks(&items[0], "sk-abc123secretvalue");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn secret_shaped_names_are_masked_in_the_detail() {
+        let tmp = temp_root("secret-names");
+        let token = format!("ghp_{}", "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8");
+        let client = write_json_client(
+            &tmp,
+            "Cursor",
+            "mcpServers",
+            serde_json::json!({
+                format!("gh-{token}"): {
+                    "command": "npx",
+                    "args": ["-y", "@github/mcp"],
+                    "env": {token.clone(): "v", "GITHUB_TOKEN": "v"},
+                    "headers": {format!("X-{token}"): "v"}
+                }
+            }),
+        );
+        let (state, _guard) = temp_state();
+
+        let items = collect_mcp_discoveries(&[client], &state, "https://app.scenery.dev");
+
+        assert_eq!(items.len(), 1);
+        let d = &items[0].detail;
+        assert_eq!(d.server_key, "gh-<redacted>");
+        assert_eq!(d.client_name, "Cursor");
+        assert_eq!(d.header_keys, vec!["X-<redacted>".to_string()]);
+        assert!(d.env_keys.contains(&"<redacted>".to_string()));
+        assert!(d.env_keys.contains(&"GITHUB_TOKEN".to_string()));
+        let blob = serde_json::to_string(d).unwrap();
+        assert!(!blob.contains(&token), "detail leaks the token: {blob}");
 
         let _ = fs::remove_dir_all(&tmp);
     }

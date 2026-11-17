@@ -1,5 +1,5 @@
 {
-  "_comment": "Golden vectors for MCP argument redaction. Shared with scenery-backend (sanitize_discovery_args): both sides must produce exactly `expected`. `command` may carry its own arguments; the runner splits it first. Vectors with \"added_by\": \"backend\" are leak cases the runner (as of b25e6f0) does not redact yet; `expected_command` is the executable basename the backend derives (the runner should send the same). Vectors with \"added_by\": \"runner\" came from the runner fixture and were not in the backend one; \"short flag =value\" there originally expected -p=pw -> <redacted> and was updated to the backend rule -p=<redacted>.",
+  "_comment": "Golden vectors for MCP argument redaction. Shared with scenery-backend (sanitize_discovery_args): both sides must produce exactly `expected`. `command` may carry its own arguments; the runner splits it first. Vectors with \"added_by\": \"backend\" are leak cases the runner (as of b25e6f0) does not redact yet; `expected_command` is the executable basename the backend derives (the runner should send the same). Vectors with \"added_by\": \"runner\" came from the runner fixture and were not in the backend one; \"short flag =value\" there originally expected -p=pw -> <redacted> and was updated to the backend rule -p=<redacted>. Vectors with \"added_by\": \"review\" came from the AUTO-MANAGE P2 validation follow-up (benign flag values, home-path masking); both sides pass them. \"field_vectors\" cover the identifying names a device reports (server_key, client_name, env_key): a credential-shaped token inside one is replaced by <redacted> wherever it starts.",
   "vectors": [
     {"name": "npx registry with userinfo", "command": "npx", "args": ["--registry", "https://user:tok@host", "pkg"], "expected": ["--registry", "<redacted>", "pkg"]},
     {"name": "docker -e TOKEN=x", "command": "docker", "args": ["run", "-e", "TOKEN=x", "image"], "expected": ["run", "-e", "<redacted>", "<redacted>"]},
@@ -37,6 +37,33 @@
     {"name": "mysql -p with base64 password ending in ==", "command": "mysql", "args": ["-pc2VjcmV0cGFzcw=="], "expected": ["<redacted>"], "added_by": "runner"},
     {"name": "mysql -p attached value containing =", "command": "mysql", "args": ["-pMy=Pass"], "expected": ["<redacted>"], "added_by": "runner"},
     {"name": "short flag =value", "command": "node", "args": ["-p=pw", "--key=abc"], "expected": ["-p=<redacted>", "--key=<redacted>"], "added_by": "runner"},
-    {"name": "docker combined booleans stay", "command": "docker", "args": ["run", "-it", "--rm", "ghcr.io/org/img:1.4"], "expected": ["run", "-it", "--rm", "ghcr.io/org/img:1.4"], "added_by": "runner"}
+    {"name": "docker combined booleans stay", "command": "docker", "args": ["run", "-it", "--rm", "ghcr.io/org/img:1.4"], "expected": ["run", "-it", "--rm", "ghcr.io/org/img:1.4"], "added_by": "runner"},
+    {"name": "port value that is a word", "command": "npx", "args": ["--port=mypassword", "-y", "pkg"], "expected": ["--port=<redacted>", "-y", "pkg"], "added_by": "review"},
+    {"name": "port as separate word", "command": "npx", "args": ["--port", "mypassword", "-y", "pkg"], "expected": ["--port", "<redacted>", "-y", "pkg"], "added_by": "review"},
+    {"name": "transport value that is not a known word", "command": "npx", "args": ["--transport", "s3cretpw", "pkg"], "expected": ["--transport", "<redacted>", "pkg"], "added_by": "review"},
+    {"name": "transport attached value that is not a known word", "command": "npx", "args": ["--transport=s3cretpw", "pkg"], "expected": ["--transport=<redacted>", "pkg"], "added_by": "review"},
+    {"name": "transport known words stay", "command": "node", "args": ["--transport", "streamable-http", "--transport=sse", "--transport", "http"], "expected": ["--transport", "streamable-http", "--transport=sse", "--transport", "http"], "added_by": "review"},
+    {"name": "port that is not a number or too long", "command": "node", "args": ["--port", "80a", "--port=123456"], "expected": ["--port", "<redacted>", "--port=<redacted>"], "added_by": "review"},
+    {"name": "yes, short yes and stdio take no value", "command": "npx", "args": ["--yes=hunter2", "-y=hunter2", "--stdio=hunter2", "pkg"], "expected": ["--yes=<redacted>", "-y=<redacted>", "--stdio=<redacted>", "pkg"], "added_by": "review"},
+    {"name": "yes and stdio followed by a package", "command": "npx", "args": ["--yes", "--stdio", "pkg"], "expected": ["--yes", "--stdio", "pkg"], "added_by": "review"},
+    {"name": "double slash home path", "command": "node", "args": ["//Users/adam/x"], "expected": ["~/x"], "added_by": "review"},
+    {"name": "repeated slashes inside a home path", "command": "node", "args": ["/home/adam//proj///srv.js"], "expected": ["~/proj/srv.js"], "added_by": "review"},
+    {"name": "external volume home", "command": "node", "args": ["/Volumes/Data/Users/adam/srv.js"], "expected": ["~/srv.js"], "added_by": "review"},
+    {"name": "external volume home dir on linux layout", "command": "node", "args": ["/Volumes/Data/home/adam/srv.js"], "expected": ["~/srv.js"], "added_by": "review"},
+    {"name": "volume named home", "command": "node", "args": ["/Volumes/home/adam/x"], "expected": ["~/x"], "added_by": "review"},
+    {"name": "Shared is not a home", "command": "node", "args": ["/Users/Shared/x"], "expected": ["/Users/Shared/x"], "added_by": "review"},
+    {"name": "Shared with repeated slashes is not a home", "command": "node", "args": ["//Users//Shared/x"], "expected": ["/Users/Shared/x"], "added_by": "review"},
+    {"name": "system dir under /home is not a home", "command": "node", "args": ["/home/linuxbrew/.linuxbrew/bin/node"], "expected": ["/home/linuxbrew/.linuxbrew/bin/node"], "added_by": "review"}
+  ],
+  "field_vectors": [
+    {"name": "server key with an embedded token", "field": "server_key", "input": "gh-ghp_abcdefghijklmnopqrstuvwxyz0123456789", "expected": "gh-<redacted>"},
+    {"name": "plain server key", "field": "server_key", "input": "filesystem-mcp", "expected": "filesystem-mcp"},
+    {"name": "client name with a token", "field": "client_name", "input": "Cursor ghp_abcdefghijklmnopqrstuvwxyz0123456789", "expected": "Cursor <redacted>"},
+    {"name": "client name with a space", "field": "client_name", "input": "VS Code", "expected": "VS Code"},
+    {"name": "env key that is a token", "field": "env_key", "input": "ghp_abcdefghijklmnopqrstuvwxyz0123456789", "expected": "<redacted>"},
+    {"name": "env key that is an AWS key id", "field": "env_key", "input": "AKIAABCDEFGHIJKLMNOP", "expected": "<redacted>"},
+    {"name": "env key with a prefix and an Anthropic key", "field": "env_key", "input": "X_sk-ant-abcdefghijklmnopqrstuvwx", "expected": "X_<redacted>"},
+    {"name": "slack token after a dash", "field": "server_key", "input": "slack-xoxb-1234567890", "expected": "slack-<redacted>"},
+    {"name": "plain env key", "field": "env_key", "input": "GITHUB_PERSONAL_ACCESS_TOKEN", "expected": "GITHUB_PERSONAL_ACCESS_TOKEN"}
   ]
 }

@@ -8,11 +8,14 @@
 //!
 //! Kept verbatim:
 //! - flags with no value, and `--flag=word` / `--flag word` for the small
-//!   benign set ([`BENIGN_FLAGS`]) when the value is itself safe;
+//!   benign set ([`BENIGN_FLAGS`]) when the value is itself safe: `--port`
+//!   takes only a port number, `--transport` only a known word
+//!   ([`TRANSPORT_WORDS`]), `-y` / `--yes` / `--stdio` no value at all, and only
+//!   `--from` may carry a package identifier;
 //! - package or image identifiers that pass the per-launcher grammar
 //!   (`mcp_discovery::validate_identifier`), version pins included;
 //! - a handful of structural words (`run`, `dlx`, `exec`, `serve`...), bare
-//!   port numbers, and paths (with `$HOME` masked to `~`).
+//!   port numbers, and paths (a home directory masked to `~`, see [`mask_path`]).
 //!
 //! Redacted:
 //! - the value after any other flag (`--token opaque`, `-p pw`);
@@ -42,6 +45,9 @@ pub const REDACTED: &str = "<redacted>";
 /// Flags that carry no secret on their own and whose (safe) value may stay.
 /// `-p` is NOT here.
 const BENIGN_FLAGS: &[&str] = &["-y", "--yes", "--stdio", "--port", "--transport", "--from"];
+
+/// What `--transport` may be set to.
+const TRANSPORT_WORDS: &[&str] = &["stdio", "sse", "http", "streamable-http"];
 
 /// Valueless docker/launcher switches that are safe to show. Not value-taking.
 const BENIGN_BOOLEANS: &[&str] = &["-i", "-t", "-it", "-ti", "--rm", "--quiet", "-q"];
@@ -109,8 +115,65 @@ fn looks_like_path(a: &str) -> bool {
         || a == "~"
 }
 
-fn mask_home(a: &str) -> String {
-    super::mcp_discovery::mask_home_dir(a)
+/// Directories under `/Users` or `/home` that are not a person's home.
+const SYSTEM_HOMES: &[&str] = &[
+    "shared",
+    "guest",
+    "deleted users",
+    ".localized",
+    "linuxbrew",
+];
+
+fn is_home_root(parts: &[&str], i: usize) -> bool {
+    parts.get(i + 1).is_some_and(|u| !u.is_empty())
+        && parts
+            .get(i)
+            .is_some_and(|d| d.eq_ignore_ascii_case("users") || d.eq_ignore_ascii_case("home"))
+}
+
+/// Mask a person's home directory to `~` in an absolute path.
+///
+/// Repeated slashes collapse first (`//Users/adam/x`). Handles `/Users/<u>`,
+/// `/home/<u>`, `/Volumes/<vol>/Users|home/<u>` and a volume that is itself
+/// named `home` or `Users` (`/Volumes/home/<u>`). `/Users/Shared`, `/Guest`,
+/// `/home/linuxbrew` and similar system directories are not a person's home and
+/// are kept (only the slashes are normalised). The current `$HOME` is masked as
+/// well (a home outside these layouts). Same rules as the backend's
+/// `_mask_home`, tested by the shared golden vectors.
+pub(super) fn mask_path(a: &str) -> String {
+    if !a.starts_with('/') {
+        return a.to_string();
+    }
+    let mut norm = String::with_capacity(a.len());
+    for c in a.chars() {
+        if c == '/' && norm.ends_with('/') {
+            continue;
+        }
+        norm.push(c);
+    }
+    let parts: Vec<&str> = norm.split('/').collect();
+    let start = if is_home_root(&parts, 1) {
+        Some(1)
+    } else if parts.len() > 2 && parts[1].eq_ignore_ascii_case("volumes") {
+        if is_home_root(&parts, 3) {
+            Some(3)
+        } else if is_home_root(&parts, 2) {
+            Some(2)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    match start {
+        Some(i) if !SYSTEM_HOMES.contains(&parts[i + 1].to_lowercase().as_str()) => {
+            let mut out = vec!["~"];
+            out.extend_from_slice(&parts[i + 2..]);
+            out.join("/")
+        }
+        Some(_) => norm,
+        None => super::mcp_discovery::mask_home_dir(&norm),
+    }
 }
 
 fn secret_shaped(a: &str) -> bool {
@@ -160,7 +223,7 @@ fn keep_or_redact_value(
         return a.to_string();
     }
     if looks_like_path(a) && !high_entropy(a) {
-        return mask_home(a);
+        return mask_path(a);
     }
     REDACTED.to_string()
 }
@@ -168,6 +231,63 @@ fn keep_or_redact_value(
 /// Redact one launcher's `args` (see the module docs). The result has one
 /// element per input element, so the shape of the command line stays legible
 /// to the reviewer.
+/// The value of a benign flag. Only `--from` may carry a package identifier; a
+/// port is a number and a transport one of a few words, so `--port=pw` and
+/// `--transport pw` (which would pass as an npm package name) are redacted.
+/// `-y`, `--yes` and `--stdio` take no value.
+fn benign_flag_value(
+    command_basename: &str,
+    flag: &str,
+    value: &str,
+    ident_kept: &mut bool,
+) -> String {
+    match flag {
+        "--port" if is_port(value) => value.to_string(),
+        "--transport" if TRANSPORT_WORDS.contains(&value) => value.to_string(),
+        "--from" => keep_or_redact_value(command_basename, value, ident_kept, false),
+        _ => REDACTED.to_string(),
+    }
+}
+
+/// Mask any credential-shaped token inside `text` with `<redacted>`, wherever
+/// the token starts: `gh-ghp_<36 chars>` keeps `gh-` (a token usually sits
+/// after a separator the run-based check does not split on). For the
+/// identifying names a device reports (server key, client name, env and header
+/// key names), which are kept for IT to read but must not carry a secret. A
+/// private key block redacts the whole text. Same rules as the backend's
+/// `mask_secret_text`, tested by the golden `field_vectors`.
+pub fn mask_secret_text(text: &str) -> String {
+    if text.contains("-----BEGIN") && text.contains("PRIVATE KEY-----") {
+        return REDACTED.to_string();
+    }
+    let is_tok = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-';
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while !rest.is_empty() {
+        let tok_len: usize = rest
+            .chars()
+            .take_while(|&c| is_tok(c))
+            .map(char::len_utf8)
+            .sum();
+        if tok_len == 0 {
+            let c = rest.chars().next().unwrap_or(' ');
+            out.push(c);
+            rest = &rest[c.len_utf8()..];
+            continue;
+        }
+        let (run, tail) = rest.split_at(tok_len);
+        match (0..run.len()).find(|&i| looks_like_secret_token(&run[i..])) {
+            Some(i) => {
+                out.push_str(&run[..i]);
+                out.push_str(REDACTED);
+            }
+            None => out.push_str(run),
+        }
+        rest = tail;
+    }
+    out
+}
+
 pub fn redact_args(command_basename: &str, args: &[String]) -> Vec<String> {
     let mut out = Vec::with_capacity(args.len());
     let mut ident_kept = false;
@@ -213,7 +333,7 @@ pub fn redact_args(command_basename: &str, args: &[String]) -> Vec<String> {
                 } else if BENIGN_FLAGS.contains(&flag) {
                     out.push(format!(
                         "{flag}={}",
-                        keep_or_redact_value(command_basename, value, &mut ident_kept, false)
+                        benign_flag_value(command_basename, flag, value, &mut ident_kept)
                     ));
                 } else {
                     out.push(format!("{flag}={REDACTED}"));
@@ -229,12 +349,7 @@ pub fn redact_args(command_basename: &str, args: &[String]) -> Vec<String> {
             if BENIGN_FLAGS.contains(&a) {
                 out.push(a.to_string());
                 if let Some(v) = args.get(i + 1).filter(|v| !is_flag(v)) {
-                    out.push(keep_or_redact_value(
-                        command_basename,
-                        v,
-                        &mut ident_kept,
-                        false,
-                    ));
+                    out.push(benign_flag_value(command_basename, a, v, &mut ident_kept));
                     i += 2;
                 } else {
                     i += 1;

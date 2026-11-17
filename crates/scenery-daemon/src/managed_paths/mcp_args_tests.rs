@@ -42,6 +42,21 @@ fn golden_vectors_match_exactly() {
 }
 
 #[test]
+fn golden_field_vectors_match_exactly() {
+    let v: serde_json::Value = serde_json::from_str(include_str!("mcp_args_golden.json")).unwrap();
+    let fields = v["field_vectors"].as_array().unwrap();
+    assert!(fields.len() >= 9);
+    for f in fields {
+        assert_eq!(
+            mask_secret_text(f["input"].as_str().unwrap()),
+            f["expected"].as_str().unwrap(),
+            "field vector {:?}",
+            f["name"]
+        );
+    }
+}
+
+#[test]
 fn no_golden_expected_value_contains_a_secret_input() {
     for v in golden() {
         for secret in [
