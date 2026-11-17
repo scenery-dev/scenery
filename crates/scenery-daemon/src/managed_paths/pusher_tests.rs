@@ -1547,3 +1547,188 @@ fn push_skill_adopting_in_place_converts_unmanaged_dir_and_links_claude() {
         "restore-backups dir must exist after adopt in place"
     );
 }
+
+// ── crash-/disk-full-safe in-place conversion ─────────────────────────────────
+
+/// `~/.agents/skills/<slug>` under `home`, created with the user's two files.
+fn seed_user_skill(home: &std::path::Path, slug: &str) -> std::path::PathBuf {
+    let dir = home.join(".agents/skills").join(slug);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("SKILL.md"), b"the user's own SKILL.md").unwrap();
+    fs::write(dir.join("notes.md"), b"user notes").unwrap();
+    dir
+}
+
+fn dir_names(dir: &std::path::Path) -> Vec<String> {
+    let mut v: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .collect();
+    v.sort();
+    v
+}
+
+/// A write error while building the new tree (the shape of ENOSPC midway)
+/// must leave the user's directory exactly as it was: no marker, no
+/// half-written files, no leftovers for discovery to re-find and re-upload.
+#[test]
+fn adopt_in_place_write_failure_leaves_the_original_untouched() {
+    let (pusher, tmp) = make_pusher();
+    with_fake_home(|home| {
+        let dir = seed_user_skill(home, "demo");
+        // SKILL.md is a file, so creating "SKILL.md/nested.md" fails mid-write.
+        let refs = vec![("SKILL.md/nested.md".to_string(), b"x".to_vec())];
+        let result = pusher.push_skill_adopting_in_place("demo", None, b"published", &refs);
+        assert!(result.is_err());
+
+        assert_eq!(
+            fs::read(dir.join("SKILL.md")).unwrap(),
+            b"the user's own SKILL.md"
+        );
+        assert_eq!(fs::read(dir.join("notes.md")).unwrap(), b"user notes");
+        assert!(!dir.join(".scenery-managed.json").exists());
+        assert_eq!(dir_names(&home.join(".agents/skills")), vec!["demo"]);
+        let intents = tmp.path().join("conversions-in-progress");
+        assert!(
+            !intents.exists() || dir_names(&intents).is_empty(),
+            "the conversion intent must be cleaned up"
+        );
+        assert!(
+            !tmp.path().join("restore-backups").exists(),
+            "nothing was swapped, so nothing was backed up"
+        );
+    });
+}
+
+/// A backup failure (disk full, unwritable data dir) aborts before the
+/// original is touched.
+#[test]
+fn adopt_in_place_backup_failure_leaves_the_original_untouched() {
+    let (pusher, tmp) = make_pusher();
+    with_fake_home(|home| {
+        let dir = seed_user_skill(home, "demo");
+        fs::write(tmp.path().join("restore-backups"), "blocker").unwrap();
+        let result = pusher.push_skill_adopting_in_place("demo", None, b"published", &[]);
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read(dir.join("SKILL.md")).unwrap(),
+            b"the user's own SKILL.md"
+        );
+        assert_eq!(fs::read(dir.join("notes.md")).unwrap(), b"user notes");
+        assert!(!dir.join(".scenery-managed.json").exists());
+        assert_eq!(dir_names(&home.join(".agents/skills")), vec!["demo"]);
+    });
+}
+
+/// Success: marked, complete, no staging/old leftovers, a backup that holds
+/// the original, and the pushed tree's fingerprint recorded for uninstall.
+#[test]
+fn adopt_in_place_success_leaves_no_leftovers_and_journals_the_fingerprint() {
+    let (pusher, tmp) = make_pusher();
+    with_fake_home(|home| {
+        let dir = seed_user_skill(home, "demo");
+        let refs = vec![("prompts/a.md".to_string(), b"A".to_vec())];
+        pusher
+            .push_skill_adopting_in_place("demo", Some("inst"), b"published", &refs)
+            .unwrap();
+
+        assert_eq!(fs::read(dir.join("SKILL.md")).unwrap(), b"published");
+        assert_eq!(fs::read(dir.join("prompts/a.md")).unwrap(), b"A");
+        assert!(dir.join(".scenery-managed.json").exists());
+        assert!(!dir.join("notes.md").exists());
+        assert_eq!(dir_names(&home.join(".agents/skills")), vec!["demo"]);
+        let intents = tmp.path().join("conversions-in-progress");
+        assert!(!intents.exists() || dir_names(&intents).is_empty());
+
+        let journal = RestoreJournal::new(
+            camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap(),
+        );
+        let entries = journal.read_all().unwrap();
+        let adopted = entries
+            .iter()
+            .find(|e| e.source == JournalSource::Adopted)
+            .expect("adopted entry");
+        let backup = std::path::PathBuf::from(adopted.backup_path.clone().unwrap());
+        assert_eq!(
+            fs::read(backup.join("SKILL.md")).unwrap(),
+            b"the user's own SKILL.md"
+        );
+        assert_eq!(fs::read(backup.join("notes.md")).unwrap(), b"user notes");
+
+        let push = entries
+            .iter()
+            .find(|e| e.op == JournalOp::ArtifactPush)
+            .expect("push entry");
+        let recorded = push.detail["tree_sha256"]
+            .as_str()
+            .expect("fingerprint recorded");
+        let actual =
+            scenery_core::safe_copy::tree_fingerprint(&dir, &[ownership::MANAGED_MARKER_FILENAME])
+                .unwrap();
+        assert_eq!(recorded, actual);
+    });
+}
+
+/// A symlink loop inside the user's directory used to overflow the stack in
+/// the backup walk (an abort, so the daemon crash-looped on the retry). It
+/// must now convert cleanly, and the backup keeps the link as a link.
+#[cfg(unix)]
+#[test]
+fn adopt_in_place_survives_a_symlink_loop_in_the_user_dir() {
+    let (pusher, tmp) = make_pusher();
+    with_fake_home(|home| {
+        let dir = seed_user_skill(home, "demo");
+        std::os::unix::fs::symlink(".", dir.join("loop")).unwrap();
+        std::os::unix::fs::symlink("/etc/hosts", dir.join("hosts")).unwrap();
+
+        pusher
+            .push_skill_adopting_in_place("demo", None, b"published", &[])
+            .unwrap();
+
+        let journal = RestoreJournal::new(
+            camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap(),
+        );
+        let entries = journal.read_all().unwrap();
+        let backup = std::path::PathBuf::from(
+            entries
+                .iter()
+                .find(|e| e.source == JournalSource::Adopted)
+                .unwrap()
+                .backup_path
+                .clone()
+                .unwrap(),
+        );
+        assert!(fs::symlink_metadata(backup.join("loop"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            fs::read_link(backup.join("hosts")).unwrap(),
+            std::path::PathBuf::from("/etc/hosts")
+        );
+        assert!(!dir.join("loop").exists() && fs::symlink_metadata(dir.join("loop")).is_err());
+    });
+}
+
+/// `collect_extras` (adopt of a non-canonical source) walks the user's tree
+/// without following links: a directory loop cannot recurse forever and a
+/// link out of the tree is not read.
+#[cfg(unix)]
+#[test]
+fn collect_extras_does_not_follow_symlinks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("skill");
+    fs::create_dir_all(src.join("prompts")).unwrap();
+    fs::write(src.join("SKILL.md"), "x").unwrap();
+    fs::write(src.join("prompts/p.md"), "p").unwrap();
+    let secret = tmp.path().join("secret");
+    fs::create_dir_all(&secret).unwrap();
+    fs::write(secret.join("creds"), "AKIA...").unwrap();
+    std::os::unix::fs::symlink(&secret, src.join("creds")).unwrap();
+    std::os::unix::fs::symlink(".", src.join("prompts/loop")).unwrap();
+
+    let mut out = Vec::new();
+    collect_extras(&src, &src, &mut out);
+    let names: Vec<&str> = out.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, vec!["prompts/p.md"]);
+}

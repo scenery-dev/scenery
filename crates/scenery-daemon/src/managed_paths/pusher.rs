@@ -198,6 +198,7 @@ impl ManagedPathsPusher {
 
         let skills_dir = resolve_skills_dir()?;
         let skill_dir = skills_dir.join(slug);
+        let mut conversion: Option<super::conversion::Conversion> = None;
 
         // A symlink at the canonical path must be unlinked before we create a
         // real directory here: writing files THROUGH a symlink would leak
@@ -239,19 +240,21 @@ impl ManagedPathsPusher {
             );
         } else if skill_dir.is_dir() && !ownership::is_scenery_managed(&skill_dir) {
             if adopt_in_place {
-                // Adopt of the canonical directory itself: back up the user's
-                // copy, then clear it so the published version is written
-                // fresh (no stale files from the user's version survive).
-                super::takeover::back_up_before_delete(&self.journal(), slug, &skill_dir).context(
-                    "pusher: adopt in place: refusing to replace un-backed-up directory",
-                )?;
-                fs::remove_dir_all(&skill_dir).with_context(|| {
-                    format!(
-                        "pusher: adopt in place: failed to clear {}",
-                        skill_dir.display()
+                // Adopt of the canonical directory itself. The new tree is
+                // built in a sibling staging dir, the user's copy is backed up,
+                // then the two are swapped with renames (see
+                // `managed_paths::conversion`): a crash or a full disk midway
+                // leaves either the complete original or the complete new
+                // tree at the canonical path, never a half-written one.
+                conversion = Some(
+                    super::conversion::Conversion::begin(
+                        self.root_dir.as_std_path(),
+                        slug,
+                        &skill_dir,
                     )
-                })?;
-                info!(slug, "pusher: adopting user directory in place (backed up)");
+                    .context("pusher: adopt in place: could not start the conversion")?,
+                );
+                info!(slug, "pusher: adopting user directory in place");
             } else {
                 // The more common shape of the same collision: `npx skills`,
                 // Cursor and Codex all create real directories at the canonical
@@ -269,43 +272,70 @@ impl ManagedPathsPusher {
             }
         }
 
-        fs::create_dir_all(&skill_dir).with_context(|| {
-            format!(
-                "pusher: failed to create skill dir: {}",
-                skill_dir.display()
-            )
-        })?;
+        // Where the new tree is written: the staging dir during an in-place
+        // conversion, the canonical dir otherwise.
+        let write_root: PathBuf = match &conversion {
+            Some(c) => c.staging().to_path_buf(),
+            None => {
+                fs::create_dir_all(&skill_dir).with_context(|| {
+                    format!(
+                        "pusher: failed to create skill dir: {}",
+                        skill_dir.display()
+                    )
+                })?;
+                skill_dir.clone()
+            }
+        };
 
         // Compute source hash from SKILL.md content.
         let sha256 = hex_sha256(skill_md_bytes);
+        let now_ts = chrono::Utc::now().to_rfc3339();
 
-        // Write SKILL.md atomically.
-        atomic_write(&skill_dir.join("SKILL.md"), skill_md_bytes)
-            .context("pusher: failed to write SKILL.md")?;
+        let written = (|| -> Result<()> {
+            // Write SKILL.md atomically.
+            atomic_write(&write_root.join("SKILL.md"), skill_md_bytes)
+                .context("pusher: failed to write SKILL.md")?;
 
-        // Write referenced files.
-        for (rel_path, content) in referenced_files {
-            let dest = skill_dir.join(rel_path);
-            if let Some(parent) = dest.parent() {
-                fs::create_dir_all(parent).with_context(|| {
+            // Write referenced files.
+            for (rel_path, content) in referenced_files {
+                let dest = write_root.join(rel_path);
+                if let Some(parent) = dest.parent() {
+                    fs::create_dir_all(parent).with_context(|| {
+                        format!(
+                            "pusher: failed to create dir for referenced file: {}",
+                            parent.display()
+                        )
+                    })?;
+                }
+                atomic_write(&dest, content).with_context(|| {
                     format!(
-                        "pusher: failed to create dir for referenced file: {}",
-                        parent.display()
+                        "pusher: failed to write referenced file: {}",
+                        dest.display()
                     )
                 })?;
             }
-            atomic_write(&dest, content).with_context(|| {
-                format!(
-                    "pusher: failed to write referenced file: {}",
-                    dest.display()
-                )
-            })?;
-        }
 
-        // Write file marker into the skill directory.
-        let now_ts = chrono::Utc::now().to_rfc3339();
-        write_file_marker(&skill_dir, installation_id, &sha256, &now_ts)
-            .context("pusher: failed to write .scenery-managed.json for skill")?;
+            // In-place conversion: back up the original and swap the fully
+            // written staging tree in. Only now does the canonical path change.
+            if let Some(c) = conversion.as_mut() {
+                c.swap(&self.journal())?;
+            }
+
+            // Write file marker into the skill directory (after the swap, so
+            // a marked directory is always complete).
+            write_file_marker(&skill_dir, installation_id, &sha256, &now_ts)
+                .context("pusher: failed to write .scenery-managed.json for skill")
+        })();
+        if let Err(e) = written {
+            if let Some(c) = conversion.take() {
+                c.rollback();
+            }
+            return Err(e);
+        }
+        // Marked: the conversion (if any) is complete; drop the old dir.
+        if let Some(c) = conversion.take() {
+            c.commit();
+        }
 
         // Upsert SQLite marker.
         let path_key = skill_dir.to_string_lossy().to_string();
@@ -315,11 +345,25 @@ impl ManagedPathsPusher {
         // Restore journal: this directory only exists because Scenery put
         // it there (source=managed) — uninstall removes it outright, no
         // backup needed.
+        //
+        // `tree_sha256` fingerprints exactly what Scenery installed (marker
+        // excluded). Uninstall compares the live tree against it to tell
+        // "still what Scenery wrote" from "the user edited it since", and
+        // preserves the latter instead of deleting it.
+        let tree_sha256 = scenery_core::safe_copy::tree_fingerprint(
+            &skill_dir,
+            &[ownership::MANAGED_MARKER_FILENAME],
+        )
+        .map_err(|e| debug!(slug, error = %e, "pusher: could not fingerprint installed tree"))
+        .ok();
         self.journal_push(
             JournalEntry::new(JournalOp::ArtifactPush, JournalSource::Managed, path_key)
                 .with_slug(slug)
                 .with_client("all")
-                .with_detail(serde_json::json!({"installation_id": installation_id})),
+                .with_detail(serde_json::json!({
+                    "installation_id": installation_id,
+                    "tree_sha256": tree_sha256,
+                })),
         );
 
         // Surface the skill to Claude Code, which does not read
@@ -971,10 +1015,35 @@ pub async fn push_adopted_discovery(
     .context("adopt: spawn_blocking panicked")?
 }
 
-/// Recursively walk `dir`, appending `(relative_path, bytes)` for every file
-/// except `SKILL.md` and `.scenery-managed.json`. Errors on individual
-/// reads are skipped silently — adoption is best-effort.
+/// Recursively walk `dir`, appending `(relative_path, bytes)` for every
+/// regular file except `SKILL.md` and `.scenery-managed.json`. Errors on
+/// individual reads are skipped silently — adoption is best-effort.
+///
+/// Walks with `symlink_metadata` and never follows links: a symlinked file or
+/// directory is skipped (so `creds -> ~/.aws` is not copied into the managed
+/// dir, and a directory loop cannot recurse until the stack overflows), as are
+/// FIFOs/sockets/devices (reading a FIFO blocks forever). File count, total
+/// bytes and depth are capped.
 fn collect_extras(root: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) {
+    let mut bytes = 0u64;
+    collect_extras_inner(root, dir, out, 0, &mut bytes);
+}
+
+const MAX_EXTRAS_FILES: usize = 10_000;
+const MAX_EXTRAS_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_EXTRAS_DEPTH: usize = 32;
+
+fn collect_extras_inner(
+    root: &Path,
+    dir: &Path,
+    out: &mut Vec<(String, Vec<u8>)>,
+    depth: usize,
+    bytes: &mut u64,
+) {
+    if depth > MAX_EXTRAS_DEPTH {
+        warn!(dir = %dir.display(), "adopt: directory nesting too deep — not descending");
+        return;
+    }
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return,
@@ -985,19 +1054,33 @@ fn collect_extras(root: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) {
             Some(n) => n,
             None => continue,
         };
-        if path.is_file() {
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        let ft = meta.file_type();
+        if ft.is_file() {
             if name == "SKILL.md" || name == ".scenery-managed.json" {
                 continue;
             }
+            if out.len() >= MAX_EXTRAS_FILES || bytes.saturating_add(meta.len()) > MAX_EXTRAS_BYTES
+            {
+                warn!(dir = %dir.display(), "adopt: size cap reached — remaining files not copied");
+                return;
+            }
             if let Ok(rel) = path.strip_prefix(root) {
                 if let Some(rel_str) = rel.to_str() {
-                    if let Ok(bytes) = fs::read(&path) {
-                        out.push((rel_str.to_string(), bytes));
+                    if let Ok(data) = fs::read(&path) {
+                        *bytes += data.len() as u64;
+                        out.push((rel_str.to_string(), data));
                     }
                 }
             }
-        } else if path.is_dir() {
-            collect_extras(root, &path, out);
+        } else if ft.is_dir() {
+            collect_extras_inner(root, &path, out, depth + 1, bytes);
+        } else if ft.is_symlink() {
+            debug!(path = %path.display(), "adopt: skipping symlink");
+        } else {
+            warn!(path = %path.display(), "adopt: skipping special file");
         }
     }
 }

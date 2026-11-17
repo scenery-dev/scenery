@@ -381,6 +381,21 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
         }
     }
 
+    // ── Interrupted in-place conversions ──────────────────────────────────────
+    //
+    // A crash or full disk during an adopt-in-place conversion leaves a
+    // sibling staging dir and/or the original moved aside. Roll those back
+    // BEFORE anything can push, so the user's directory is whole again and the
+    // half-finished tree is never rediscovered as a "user skill". Runs even
+    // under the killswitch: it only restores, never installs.
+    let recovery = managed_paths::recover_interrupted_conversions(&state);
+    if !recovery.failed.is_empty() {
+        warn!(
+            failed = ?recovery.failed,
+            "startup: could not roll back interrupted skill conversions (will retry next start)"
+        );
+    }
+
     // ── Active-skill self-heal ────────────────────────────────────────────────
     //
     // The pre-v1.0.51 `reclaim_active_skills` pass that used to run here was

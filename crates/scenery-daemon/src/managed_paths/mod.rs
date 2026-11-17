@@ -36,6 +36,7 @@
 //! even opening the DB.  Migration failure must NOT crash the daemon.
 
 pub mod adopt_publish;
+pub mod conversion;
 pub mod discoveries;
 pub mod drift;
 pub mod links;
@@ -66,6 +67,7 @@ use scenery_core::state::AppState;
 use std::{path::PathBuf, sync::Arc};
 use tracing::{info, warn};
 
+pub use conversion::recover_interrupted as recover_interrupted_conversions;
 pub use discoveries::DiscoveriesScanner;
 pub use drift::DriftScanner;
 pub use marker::ManagedPathMarker;

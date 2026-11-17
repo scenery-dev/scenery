@@ -442,6 +442,13 @@ fn scan_root(root: &Path) -> Result<Vec<DiscoveryItem>> {
             }
         };
 
+        // Hidden directories are never skills. In particular the in-place
+        // conversion's `.<slug>.scenery-staging-*` / `.scenery-old-*` siblings
+        // (see `conversion`) must not be rediscovered as a user skill.
+        if slug.starts_with('.') {
+            continue;
+        }
+
         let skill_md = path.join("SKILL.md");
         if !skill_md.exists() {
             continue;
@@ -657,6 +664,22 @@ mod tests {
             assert!(!item.canonical_hash.is_empty());
             assert!(!item.source_path.is_empty());
         }
+    }
+
+    /// The in-place conversion's hidden staging / old siblings carry a
+    /// SKILL.md while a conversion runs (or after a crash, until startup
+    /// recovery); they must never be rediscovered as a user skill.
+    #[test]
+    fn hidden_conversion_siblings_are_never_discovered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        write_skill(&root, "demo");
+        write_skill(&root, ".demo.scenery-staging-abc");
+        write_skill(&root, ".demo.scenery-old-abc");
+
+        let items = scan_root(&root).unwrap();
+        let slugs: Vec<&str> = items.iter().map(|i| i.slug.as_str()).collect();
+        assert_eq!(slugs, vec!["demo"]);
     }
 
     // ── 2. Skips slugs already in managed_path_markers ────────────────────────
