@@ -348,6 +348,16 @@ fn localize_skill_names(event: SyncEvent, state: &AppState) -> SyncEvent {
             org_policy,
             org_id,
         } => {
+            // Catalog records for a folder held by a different registry skill
+            // are dropped BEFORE any mapping is recorded or derived
+            // install/purge events are built.
+            installations.retain(|r| {
+                let held = folder_held_by_other_registry_id(state, &r.skill_id);
+                if held {
+                    warn!(skill_id = %r.skill_id, "reconciler: snapshot record ignored — folder held by a different registry skill");
+                }
+                !held
+            });
             for record in &mut installations {
                 if let Some(folder) = record
                     .local_slug
@@ -411,6 +421,42 @@ async fn dispatch_event(
     list_changed_tx: broadcast::Sender<()>,
     pusher: Option<Arc<ManagedPathsPusher>>,
 ) {
+    // A CATALOG event (key `K`, unmapped) for a folder the user's private skill
+    // `<owner>~K` occupies must never act on that folder: an install would
+    // fetch/overwrite it, a purge would delete the user's work. Refused here,
+    // before localization maps `K` onto the folder.
+    match &event {
+        SyncEvent::Install {
+            installation_id,
+            skill_id,
+            version,
+            ..
+        } if folder_held_by_other_registry_id(state, skill_id) => {
+            warn!(
+                skill_id = %skill_id, version = %version,
+                "reconciler: install refused — the folder is held by a different registry skill (the user's own)"
+            );
+            report_installation_status(
+                *installation_id,
+                "error",
+                Some("not installed: a skill with this name already exists on this device"),
+                registry_url,
+                state,
+            )
+            .await;
+            return;
+        }
+        SyncEvent::Deactivate { skill_id, .. } | SyncEvent::Purge { skill_id, .. }
+            if folder_held_by_other_registry_id(state, skill_id) =>
+        {
+            warn!(
+                skill_id = %skill_id,
+                "reconciler: deactivate/purge ignored — the folder is held by a different registry skill"
+            );
+            return;
+        }
+        _ => {}
+    }
     let event = localize_skill_names(event, state);
     match event {
         SyncEvent::Install {

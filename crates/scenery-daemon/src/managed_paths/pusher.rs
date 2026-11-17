@@ -547,6 +547,11 @@ impl ManagedPathsPusher {
                 );
                 return Ok(removed);
             }
+            if !skill_dir.is_symlink() {
+                // The user's OWN skill may hold edits nothing else has: back
+                // them up first, and refuse to delete if that fails.
+                self.back_up_own_skill_before_removal(slug, &skill_dir, &path_key)?;
+            }
             if skill_dir.is_symlink() {
                 fs::remove_file(&skill_dir)
             } else {
@@ -573,6 +578,60 @@ impl ManagedPathsPusher {
             .context("pusher: failed to delete managed_path_markers for skill")?;
 
         Ok(removed)
+    }
+
+    /// Before a teardown (revoke, purge, deactivate) deletes an auto-managed
+    /// skill whose tree differs from what Scenery last wrote, copy the current
+    /// tree into `restore-backups/<unique ts>/removed-own/<slug>` and journal
+    /// it (`source = managed`, so uninstall does not put it back over newer
+    /// work; the copy just stays on disk). An unedited own skill needs no
+    /// backup. If the backup fails the delete is refused.
+    fn back_up_own_skill_before_removal(
+        &self,
+        slug: &str,
+        skill_dir: &Path,
+        path_key: &str,
+    ) -> Result<()> {
+        let prov = {
+            let conn = Connection::open(&self.db_path)
+                .context("pusher: failed to open state DB for provenance")?;
+            marker_provenance(&conn, path_key)
+        };
+        if !prov.is_auto_managed() {
+            return Ok(());
+        }
+        let current = scenery_core::skill_tree::survey(skill_dir).map(|s| s.tree_hash);
+        if let (Ok(cur), Some(written)) = (&current, &prov.tree_hash) {
+            if cur == written {
+                return Ok(()); // exactly what Scenery wrote
+            }
+        }
+        let journal = self.journal();
+        let src = camino::Utf8Path::from_path(skill_dir).ok_or_else(|| {
+            anyhow::anyhow!("pusher: path is not valid UTF-8: {}", skill_dir.display())
+        })?;
+        let backup = journal
+            .backup_tree_unique("removed-own", slug, src)
+            .with_context(|| {
+                format!(
+                    "pusher: refusing to remove {}: could not back up the user's own skill first",
+                    skill_dir.display()
+                )
+            })?;
+        journal
+            .append(
+                JournalEntry::new(
+                    JournalOp::FileDelete,
+                    JournalSource::Managed,
+                    skill_dir.to_string_lossy().to_string(),
+                )
+                .with_slug(slug)
+                .with_backup_path(backup.to_string())
+                .with_detail(serde_json::json!({"reason": "teardown_of_own_skill"})),
+            )
+            .context("pusher: failed to journal the own-skill backup")?;
+        info!(slug, backup = %backup, "pusher: backed up own skill before removal");
+        Ok(())
     }
 
     // ── MCP ───────────────────────────────────────────────────────────────────

@@ -844,3 +844,149 @@ async fn install_gates_check_the_registry_id() {
     )
     .unwrap());
 }
+
+// ── A catalog event never acts on a folder the user's own skill occupies ──────
+
+#[tokio::test]
+async fn catalog_install_deactivate_and_purge_for_a_held_folder_are_refused() {
+    let home = FakeHome::new();
+    let (_t, state) = new_state();
+    private_pdf(&state);
+    let iid = uuid::Uuid::new_v4();
+
+    run(
+        SyncEvent::Purge {
+            installation_id: iid,
+            skill_id: "pdf".into(),
+        },
+        &state,
+    )
+    .await;
+    run(
+        SyncEvent::Deactivate {
+            installation_id: iid,
+            skill_id: "pdf".into(),
+        },
+        &state,
+    )
+    .await;
+    assert!(
+        home.projected("pdf"),
+        "purge/deactivate of CATALOG pdf must not touch adam~pdf"
+    );
+    assert!(skill_row_exists(&state, "pdf"));
+
+    run(
+        SyncEvent::Install {
+            installation_id: iid,
+            skill_id: "pdf".into(),
+            version: "9.9.9".into(),
+            source: None,
+        },
+        &state,
+    )
+    .await;
+    assert!(
+        !state.root_dir.join("skills/pdf/versions/9.9.9").exists(),
+        "the catalog version was never fetched or installed over the private skill"
+    );
+    assert!(home.projected("pdf"));
+}
+
+#[tokio::test]
+async fn a_snapshot_with_the_catalog_record_leaves_the_private_skill_alone() {
+    use crate::sync::sse_client::InstallationRecord;
+    let home = FakeHome::new();
+    let (_t, state) = new_state();
+    private_pdf(&state);
+    let snap = SyncEvent::Snapshot {
+        installations: vec![InstallationRecord {
+            installation_id: uuid::Uuid::new_v4(),
+            skill_id: "pdf".into(),
+            version: "9.9.9".into(),
+            state: "installed".into(),
+            source: None,
+            local_slug: None,
+        }],
+        mcp_installations: None,
+        plugin_installations: vec![],
+        revocations: None,
+        org_policy: None,
+        org_id: None,
+    };
+    run(snap, &state).await;
+    assert!(home.projected("pdf"));
+    assert!(skill_row_exists(&state, "pdf"));
+    assert!(!state.root_dir.join("skills/pdf/versions/9.9.9").exists());
+}
+
+// ── Revoking an EDITED own skill keeps the edits ──────────────────────────────
+
+#[tokio::test]
+async fn revoking_an_edited_own_skill_backs_up_the_current_tree_first() {
+    let home = FakeHome::new();
+    let (_t, state) = new_state();
+    state.record_skill_local_name("adam~pdf", "pdf").unwrap();
+    state
+        .record_pending_auto_managed_takeover(
+            "pdf",
+            &home.agents("pdf").to_string_lossy(),
+            "adam~pdf",
+            "u",
+        )
+        .unwrap();
+    seed_skill(&state, "pdf", "0.1.0", true);
+    project(&state, "pdf");
+    std::fs::write(home.agents("pdf").join("SKILL.md"), "MY MONTHS OF EDITS").unwrap();
+    std::fs::write(home.agents("pdf").join("mine.md"), "added").unwrap();
+
+    run(revoke_event("skill", "adam~pdf", None), &state).await;
+
+    assert!(!home.projected("pdf"), "the kill switch still removes it");
+    let backups = state.root_dir.join("restore-backups");
+    let found: Vec<std::path::PathBuf> = walk(backups.as_std_path())
+        .into_iter()
+        .filter(|p| p.ends_with("removed-own/pdf/SKILL.md"))
+        .collect();
+    assert_eq!(found.len(), 1, "one backup of the edited tree");
+    assert_eq!(std::fs::read(&found[0]).unwrap(), b"MY MONTHS OF EDITS");
+    assert_eq!(
+        std::fs::read(found[0].with_file_name("mine.md")).unwrap(),
+        b"added"
+    );
+}
+
+#[tokio::test]
+async fn revoking_an_unedited_own_skill_takes_no_backup() {
+    let home = FakeHome::new();
+    let (_t, state) = new_state();
+    state.record_skill_local_name("adam~pdf", "pdf").unwrap();
+    state
+        .record_pending_auto_managed_takeover(
+            "pdf",
+            &home.agents("pdf").to_string_lossy(),
+            "adam~pdf",
+            "u",
+        )
+        .unwrap();
+    seed_skill(&state, "pdf", "0.1.0", true);
+    project(&state, "pdf");
+    run(revoke_event("skill", "adam~pdf", None), &state).await;
+    assert!(!home.projected("pdf"));
+    assert!(walk(state.root_dir.join("restore-backups").as_std_path()).is_empty());
+}
+
+fn walk(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                out.extend(walk(&p));
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
