@@ -12,52 +12,37 @@
 //! (`discoveries.rs`) is a separate task (R2) — this module only collects
 //! and redacts.
 //!
-//! # Privacy (binding controller ruling) — ALLOWLIST, not denylist
+//! # Privacy (revised 2026-11-16, owner decision 6) — shape-based over-redaction
 //!
-//! An earlier revision of this module screened `args`/`url` with a denylist
-//! of secret-shaped patterns (known token prefixes, `--flag` name hints,
-//! query-param names). Code review found that approach leaks by
-//! construction: any secret shape not on the list — a space-separated
-//! `["--token", "opaque-value"]` pair, a `"Authorization: Bearer <token>"`
-//! string arg, a token embedded in a URL *path* segment rather than a query
-//! param, or a query param the list didn't happen to name (`refresh_token`,
-//! `client_secret`, ...) — passes straight through. **A denylist can only
-//! ever be as complete as the patterns someone thought to write down.**
+//! History: an earlier revision screened `args`/`url` with a denylist of
+//! secret-shaped patterns, and code review found that leaks by construction
+//! (`["--token", "opaque-value"]`, a `"Authorization: Bearer <token>"` string,
+//! a token in a URL path, ...). The ruling that followed was that `args` never
+//! leave the device at all. The owner has since decided IT needs the command
+//! line to review an MCP server, so `args` now travel, under rules that do
+//! not depend on guessing which strings look secret.
 //!
-//! [`McpDiscoveryDetail`] now emits an **allowlist** of fields instead:
-//! nothing derived from `args` or `env` values, ever, full stop. Only:
-//! - `client_name`, `server_key`, `transport` — identifying metadata, never
-//!   secret.
-//! - `command_basename` — the executable's file name only (never its full
-//!   path — see [`command_basename_of`]).
-//! - `package_identifier` — derived *only* from a closed set of well-known
-//!   package-launcher invocations (`npx`, `bunx`, `pnpm dlx`, `uvx`, `pipx
-//!   run`, `docker run <image>`) — see [`derive_package_identifier`]. This is
-//!   the one place a raw arg value is surfaced, because a package/image
-//!   reference is by definition public, not a secret — but getting there is
-//!   a **two-layer** check, both required (round 2 of review): (1) the scan
-//!   knows each launcher's value-taking flags and skips the flag *and* its
-//!   value together, rather than treating any `-`-free token as positional —
-//!   otherwise `npx --registry https://user:tok@host pkg` or `docker run -e
-//!   TOKEN=secret image` hands back the flag's *value* instead of the
-//!   package; (2) whatever candidate that scan lands on is validated against
-//!   a strict per-ecosystem grammar (npm / PyPI requirement / docker image
-//!   reference) before being accepted at all — a `uvx --from
-//!   git+https://tok@host/...` value fails this and yields `None` rather
-//!   than being trusted just because it sat in the right position. See
-//!   [`scan_for_identifier`] and [`validate_identifier`].
-//! - `url` — reduced to `scheme://host[:port]` only; userinfo, path, query,
-//!   and fragment are always dropped, unconditionally — see
-//!   [`safe_url_origin`]. An unparsable or schemeless `url` value emits
-//!   `None`, never the raw string.
-//! - `env_keys` / `header_keys` — key/header *names* only; values are never
-//!   read out of the source JSON into this struct at all (not merely
-//!   redacted after the fact).
-//! - `arg_count` — a count, not content.
+//! What is sent in [`McpDiscoveryDetail`]:
+//! - identifying metadata (`client_name`, `server_key`, `transport`);
+//! - `command_basename` / `command` — the executable's file name only, never
+//!   its path. A `command` string that carries its own arguments is split and
+//!   the arguments redacted exactly like `args`;
+//! - `package_identifier` / `package` / `source_kind` — derived only from a
+//!   closed set of launchers (`npx`, `bunx`, `pnpm dlx`, `uvx`, `pipx run`,
+//!   `docker run`), grammar-validated (see [`derive_package_identifier`]);
+//! - `url` — `scheme://host[:port]` only ([`safe_url_origin`]);
+//! - `env_keys` / `header_keys` — NAMES only. Env and header VALUES never
+//!   leave the machine and are never read into this struct;
+//! - `args` — the REDACTED list ([`super::mcp_args::redact_args`], over-
+//!   redacting and shape-based: see that module for the rules and the shared
+//!   golden vectors), and only once the backend has answered an upload with
+//!   `policy.auto_submit_mcp = true`. The first batch goes without args, and
+//!   an org that switches `auto_submit_mcp` off stops them again.
+//!   `arg_count` is always sent.
 //!
-//! `args` (the raw list) and the raw `command` string are **not** fields on
-//! this struct at all — there is nothing to remember to redact because
-//! there is nowhere for a raw value to leak into.
+//! Residual risk, accepted by the owner: a low-entropy secret in a bare
+//! positional argument that happens to satisfy a launcher's package grammar
+//! is not detectable from syntax. The backend repeats the redaction.
 //!
 //! [`McpDiscoveryItem::source_path`] gets the same `$HOME`-masking treatment
 //! as `command_basename` (via [`mask_home_dir`], never the raw absolute
@@ -152,6 +137,20 @@ pub struct McpDiscoveryDetail {
     pub header_keys: Vec<String>,
     /// Count of `args`, not their content.
     pub arg_count: usize,
+    /// The executable's file name (same value as `command_basename`); the
+    /// contract name the backend reads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// The REDACTED argument list ([`super::mcp_args::redact_args`]). `None`
+    /// until the backend has said `auto_submit_mcp = true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub args: Option<Vec<String>>,
+    /// `public_package` | `local_path` | `remote_url`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_kind: Option<String>,
+    /// The public package a launcher invocation names, when it names one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub package: Option<super::mcp_args::PackageRef>,
 }
 
 /// One discovered shadow MCP server, ready to be folded into the existing
@@ -213,6 +212,11 @@ pub fn collect_mcp_discoveries(
     };
 
     let mut items = Vec::new();
+    // Redacted args leave the machine only after the backend has told us (in
+    // an upload response) that the org auto-submits MCP servers.
+    let include_args = state
+        .cached_auto_manage_policy()
+        .is_some_and(|p| p.auto_submit_mcp);
 
     for client in clients {
         if !client.config_path.exists() {
@@ -232,7 +236,7 @@ pub fn collect_mcp_discoveries(
                 continue;
             }
 
-            let detail = build_detail(client, &entry.key, &entry.value);
+            let detail = build_detail(client, &entry.key, &entry.value, include_args);
             let canonical_hash = hex_sha256_of(&detail);
 
             let masked_config_path = mask_home_dir(&client.config_path.display().to_string());
@@ -323,9 +327,14 @@ fn url_host_matches(url: &str, registry_url: &str) -> bool {
 
 // ── Detail construction (allowlist) ─────────────────────────────────────────
 
-fn build_detail(client: &ClientConfig, key: &str, value: &serde_json::Value) -> McpDiscoveryDetail {
+fn build_detail(
+    client: &ClientConfig,
+    key: &str,
+    value: &serde_json::Value,
+    include_args: bool,
+) -> McpDiscoveryDetail {
     let command = value.get("command").and_then(|v| v.as_str());
-    let raw_args: Vec<String> = value
+    let mut raw_args: Vec<String> = value
         .get("args")
         .and_then(|v| v.as_array())
         .map(|arr| {
@@ -337,17 +346,48 @@ fn build_detail(client: &ClientConfig, key: &str, value: &serde_json::Value) -> 
     let raw_url = remote_url_of(value);
     let type_field = value.get("type").and_then(|v| v.as_str());
 
-    let command_basename = command.map(command_basename_of);
+    // A `command` that carries its own arguments (`npx -y pkg --api-key ..`)
+    // is split: the executable is the command, the rest are ordinary args and
+    // get the same redaction.
+    let (exe, mut from_command) = match command {
+        Some(c) => {
+            let (e, rest) = super::mcp_args::split_command(c);
+            (Some(e), rest)
+        }
+        None => (None, Vec::new()),
+    };
+    from_command.extend(raw_args);
+    raw_args = from_command;
+
+    let command_basename = exe.as_deref().map(command_basename_of);
     let package_identifier = command_basename
         .as_deref()
         .and_then(|basename| derive_package_identifier(basename, &raw_args));
+    let package = command_basename
+        .as_deref()
+        .zip(package_identifier.as_deref())
+        .and_then(|(b, id)| super::mcp_args::package_of(b, id));
+    let transport = infer_transport(command, raw_url, type_field);
+    let source_kind = match (transport, &package) {
+        (_, Some(_)) => Some("public_package"),
+        ("http" | "sse", None) => Some("remote_url"),
+        ("stdio", None) => Some("local_path"),
+        _ => None,
+    };
+    let args = (include_args && command_basename.is_some()).then(|| {
+        super::mcp_args::redact_args(command_basename.as_deref().unwrap_or_default(), &raw_args)
+    });
 
     McpDiscoveryDetail {
         client_name: client.name.clone(),
         server_key: key.to_string(),
-        transport: infer_transport(command, raw_url, type_field).to_string(),
+        transport: transport.to_string(),
+        command: command_basename.clone(),
         command_basename,
         package_identifier,
+        package,
+        source_kind: source_kind.map(str::to_string),
+        args,
         url: raw_url.and_then(safe_url_origin),
         env_keys: object_keys(value, "env"),
         header_keys: object_keys(value, "headers"),
@@ -415,7 +455,7 @@ fn command_basename_of(command: &str) -> String {
 /// the local username (`/Users/<username>/...`), which the allowlist policy
 /// (module docs) treats the same as any other locally-identifying detail:
 /// mask it rather than transmit it.
-fn mask_home_dir(value: &str) -> String {
+pub(super) fn mask_home_dir(value: &str) -> String {
     if let Some(home) = dirs::home_dir().and_then(|h| h.to_str().map(str::to_string)) {
         if !home.is_empty() && value.contains(&home) {
             return value.replacen(&home, "~", 1);
@@ -701,7 +741,7 @@ fn scan_for_identifier(
 /// This is the second, independent layer: even a value the flag-scan
 /// correctly identified as "the package position" is rejected here if it
 /// isn't actually shaped like a package/image reference.
-fn validate_identifier(candidate: &str, command_basename: &str) -> Option<String> {
+pub(super) fn validate_identifier(candidate: &str, command_basename: &str) -> Option<String> {
     let valid = match command_basename {
         "npx" | "bunx" | "pnpm" => is_valid_npm_identifier(candidate),
         "uvx" | "pipx" => is_valid_pypi_identifier(candidate),
@@ -2075,3 +2115,7 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp);
     }
 }
+
+#[cfg(test)]
+#[path = "mcp_discovery_args_tests.rs"]
+mod args_tests;

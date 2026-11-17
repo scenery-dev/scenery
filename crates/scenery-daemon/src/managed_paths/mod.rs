@@ -43,6 +43,7 @@ pub mod drift;
 pub mod foreign;
 pub mod links;
 pub mod marker;
+pub mod mcp_args;
 pub mod mcp_discovery;
 pub mod migrator;
 pub mod native_cleanup;
