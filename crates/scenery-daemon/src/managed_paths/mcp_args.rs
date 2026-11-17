@@ -38,7 +38,7 @@
 //! The backend applies the same rules again (shared golden vectors in
 //! `mcp_args_golden.json`).
 
-use scenery_core::skill_tree::{looks_like_secret_token, text_has_secret};
+use scenery_core::skill_tree::looks_like_secret_token;
 
 pub const REDACTED: &str = "<redacted>";
 
@@ -131,29 +131,48 @@ fn is_home_root(parts: &[&str], i: usize) -> bool {
             .is_some_and(|d| d.eq_ignore_ascii_case("users") || d.eq_ignore_ascii_case("home"))
 }
 
+/// Lexical normalisation of an absolute path, no filesystem access: repeated
+/// slashes, `.` and `..` segments go (`..` at the root stays at the root); a
+/// trailing slash stays.
+fn normalize_path(a: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for seg in a.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                out.pop();
+            }
+            s => out.push(s),
+        }
+    }
+    let trailing = if a.ends_with('/') && !out.is_empty() {
+        "/"
+    } else {
+        ""
+    };
+    format!("/{}{trailing}", out.join("/"))
+}
+
 /// Mask a person's home directory to `~` in an absolute path.
 ///
-/// Repeated slashes collapse first (`//Users/adam/x`). Handles `/Users/<u>`,
-/// `/home/<u>`, `/Volumes/<vol>/Users|home/<u>` and a volume that is itself
-/// named `home` or `Users` (`/Volumes/home/<u>`). `/Users/Shared`, `/Guest`,
-/// `/home/linuxbrew` and similar system directories are not a person's home and
-/// are kept (only the slashes are normalised). The current `$HOME` is masked as
-/// well (a home outside these layouts). Same rules as the backend's
-/// `_mask_home`, tested by the shared golden vectors.
+/// The path is normalised first (`//Users/adam/x`, `/./Users/adam/x`,
+/// `/Users/../Users/adam/x`, `/home/linuxbrew/../adam/x`). Handles `/Users/<u>`,
+/// `/home/<u>`, `/var/home/<u>`, `/Volumes/<vol>/Users|home/<u>` and a volume
+/// that is itself named `home` or `Users` (`/Volumes/home/<u>`). `/Users/Shared`,
+/// `/Guest`, `/home/linuxbrew` and similar system directories are not a person's
+/// home and are kept. The current `$HOME` is masked as well (a home outside
+/// these layouts). Same rules as the backend's `_mask_home`, tested by the
+/// shared golden vectors.
 pub(super) fn mask_path(a: &str) -> String {
     if !a.starts_with('/') {
         return a.to_string();
     }
-    let mut norm = String::with_capacity(a.len());
-    for c in a.chars() {
-        if c == '/' && norm.ends_with('/') {
-            continue;
-        }
-        norm.push(c);
-    }
+    let norm = normalize_path(a);
     let parts: Vec<&str> = norm.split('/').collect();
     let start = if is_home_root(&parts, 1) {
         Some(1)
+    } else if parts.len() > 3 && parts[1].eq_ignore_ascii_case("var") && is_home_root(&parts, 2) {
+        Some(2)
     } else if parts.len() > 2 && parts[1].eq_ignore_ascii_case("volumes") {
         if is_home_root(&parts, 3) {
             Some(3)
@@ -176,8 +195,52 @@ pub(super) fn mask_path(a: &str) -> String {
     }
 }
 
-fn secret_shaped(a: &str) -> bool {
-    text_has_secret(a) || looks_like_secret_token(a)
+/// No name, version, path segment or identifier is this long in one run of
+/// token characters; and the offset scan is quadratic in a run, so a longer run
+/// counts as a secret. Same limit as the backend's `MAX_RUN`.
+const MAX_RUN: usize = 256;
+
+fn is_token_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-'
+}
+
+/// `text` cut into runs of token characters (`[A-Za-z0-9_.-]+`, flagged
+/// `true`) and the text between them (`false`, kept verbatim by callers).
+fn token_runs(text: &str) -> Vec<(&str, bool)> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        let is_run = rest.starts_with(is_token_char);
+        let len: usize = rest
+            .chars()
+            .take_while(|&c| is_token_char(c) == is_run)
+            .map(char::len_utf8)
+            .sum();
+        let (piece, tail) = rest.split_at(len);
+        out.push((piece, is_run));
+        rest = tail;
+    }
+    out
+}
+
+/// Where in a run a credential-shaped token starts, trying every offset (the
+/// run is ASCII): `pkg@1.0.0-ghp_...` has one in `1.0.0-ghp_...`, at offset 6.
+fn secret_offset(run: &str) -> Option<usize> {
+    (0..run.len()).find(|&i| looks_like_secret_token(&run[i..]))
+}
+
+fn has_private_key(text: &str) -> bool {
+    text.contains("-----BEGIN") && text.contains("PRIVATE KEY-----")
+}
+
+/// A credential-shaped token anywhere in `a`, whatever it follows
+/// (`pkg@1.0.0-ghp_...`, `/tmp/x-ghp_...`, `cfg.ghp_...`): not only at the start
+/// of a run. Same rule as the backend's `text_has_secret`.
+pub(super) fn secret_shaped(a: &str) -> bool {
+    has_private_key(a)
+        || token_runs(a)
+            .into_iter()
+            .any(|(run, is_run)| is_run && (run.len() > MAX_RUN || secret_offset(run).is_some()))
 }
 
 /// A long flag is kept only when it is a plain `--[A-Za-z0-9][A-Za-z0-9_-]*`
@@ -251,39 +314,27 @@ fn benign_flag_value(
 
 /// Mask any credential-shaped token inside `text` with `<redacted>`, wherever
 /// the token starts: `gh-ghp_<36 chars>` keeps `gh-` (a token usually sits
-/// after a separator the run-based check does not split on). For the
-/// identifying names a device reports (server key, client name, env and header
-/// key names), which are kept for IT to read but must not carry a secret. A
-/// private key block redacts the whole text. Same rules as the backend's
-/// `mask_secret_text`, tested by the golden `field_vectors`.
+/// after a separator). For the identifying names a device reports (server key,
+/// client name, env and header key names, the discovery slug and source path),
+/// which are kept for IT to read but must not carry a secret. A private key
+/// block, or a run longer than `MAX_RUN`, is redacted whole. Same rules as the
+/// backend's `mask_secret_text`, tested by the golden `field_vectors`.
 pub fn mask_secret_text(text: &str) -> String {
-    if text.contains("-----BEGIN") && text.contains("PRIVATE KEY-----") {
+    if has_private_key(text) {
         return REDACTED.to_string();
     }
-    let is_tok = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-';
     let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while !rest.is_empty() {
-        let tok_len: usize = rest
-            .chars()
-            .take_while(|&c| is_tok(c))
-            .map(char::len_utf8)
-            .sum();
-        if tok_len == 0 {
-            let c = rest.chars().next().unwrap_or(' ');
-            out.push(c);
-            rest = &rest[c.len_utf8()..];
-            continue;
+    for (piece, is_run) in token_runs(text) {
+        if !is_run {
+            out.push_str(piece);
+        } else if piece.len() > MAX_RUN {
+            out.push_str(REDACTED);
+        } else if let Some(i) = secret_offset(piece) {
+            out.push_str(&piece[..i]);
+            out.push_str(REDACTED);
+        } else {
+            out.push_str(piece);
         }
-        let (run, tail) = rest.split_at(tok_len);
-        match (0..run.len()).find(|&i| looks_like_secret_token(&run[i..])) {
-            Some(i) => {
-                out.push_str(&run[..i]);
-                out.push_str(REDACTED);
-            }
-            None => out.push_str(run),
-        }
-        rest = tail;
     }
     out
 }
@@ -438,14 +489,17 @@ pub fn split_command(command: &str) -> (String, Vec<String>) {
         return (String::new(), extras);
     };
     let rest: Vec<String> = words.map(str::to_string).collect();
+    let base = first.rsplit(['/', '\\']).next().unwrap_or(first);
+    // A token-shaped executable name (`/Users/a/bin/ghp_...`) is no executable,
+    // with or without arguments next to it.
+    if secret_shaped(base) {
+        extras.extend(rest);
+        return (String::new(), extras);
+    }
     if rest.is_empty() && extras.is_empty() {
         return (command.trim().to_string(), Vec::new());
     }
-    let base = first.rsplit(['/', '\\']).next().unwrap_or(first);
     extras.extend(rest);
-    if secret_shaped(base) {
-        return (String::new(), extras);
-    }
     (first.to_string(), extras)
 }
 

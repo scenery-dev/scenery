@@ -243,13 +243,20 @@ pub fn collect_mcp_discoveries(
 
             items.push(McpDiscoveryItem {
                 kind: "mcp".to_string(),
-                slug: format!("{}:{}", client.name, entry.key),
+                // The key is user-chosen text: a credential-shaped token in it
+                // is masked here too (nothing dereferences an MCP slug or
+                // source path downstream; the backend masks again for old
+                // runners).
+                slug: super::mcp_args::mask_secret_text(&format!("{}:{}", client.name, entry.key)),
                 // `#<server key>` suffix keeps this unique per server — see
                 // the field doc on `McpDiscoveryItem::source_path` (review
                 // round 4: without it, every server in the same client
                 // config file collided on the backend's dedupe key and only
                 // the first one ever got reported).
-                source_path: format!("{masked_config_path}#{}", entry.key),
+                source_path: super::mcp_args::mask_secret_text(&format!(
+                    "{masked_config_path}#{}",
+                    entry.key
+                )),
                 canonical_hash,
                 detail,
             });
@@ -360,9 +367,12 @@ fn build_detail(
     raw_args = from_command;
 
     let command_basename = exe.as_deref().map(command_basename_of);
+    // A version or tag can carry a token after a separator (`pkg@1.0.0-ghp_...`),
+    // which the grammar accepts: such an identifier is not a package.
     let package_identifier = command_basename
         .as_deref()
-        .and_then(|basename| derive_package_identifier(basename, &raw_args));
+        .and_then(|basename| derive_package_identifier(basename, &raw_args))
+        .filter(|id| !super::mcp_args::secret_shaped(id));
     let package = command_basename
         .as_deref()
         .zip(package_identifier.as_deref())
@@ -960,7 +970,8 @@ pub(crate) fn migrate_mcp_config(value: &serde_json::Value) -> serde_json::Value
     let command_basename = command.and_then(migrate_command_basename_of);
     let package_identifier = command_basename
         .as_deref()
-        .and_then(|basename| derive_package_identifier(basename, &raw_args));
+        .and_then(|basename| derive_package_identifier(basename, &raw_args))
+        .filter(|id| !super::mcp_args::secret_shaped(id));
 
     serde_json::json!({
         "transport": infer_transport(command, raw_url, type_field),
@@ -1149,6 +1160,41 @@ mod tests {
         assert!(d.env_keys.contains(&"GITHUB_TOKEN".to_string()));
         let blob = serde_json::to_string(d).unwrap();
         assert!(!blob.contains(&token), "detail leaks the token: {blob}");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_token_after_a_separator_never_reaches_the_identifier_or_the_slug() {
+        let tmp = temp_root("token-after-separator");
+        let token = format!("ghp_{}", "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8");
+        let client = write_json_client(
+            &tmp,
+            "Cursor",
+            "mcpServers",
+            serde_json::json!({
+                format!("valprobe-{token}"): {
+                    "command": "npx",
+                    "args": ["-y", format!("pkg@1.0.0-{token}")]
+                }
+            }),
+        );
+        let (state, _guard) = temp_state();
+
+        let items = collect_mcp_discoveries(&[client], &state, "https://app.scenery.dev");
+
+        assert_eq!(items.len(), 1);
+        let item = &items[0];
+        assert_eq!(item.slug, "Cursor:valprobe-<redacted>");
+        assert!(
+            item.source_path.ends_with("#valprobe-<redacted>"),
+            "{}",
+            item.source_path
+        );
+        assert_eq!(item.detail.package_identifier, None);
+        assert!(item.detail.package.is_none());
+        let blob = serde_json::to_string(item).unwrap();
+        assert!(!blob.contains(&token), "item leaks the token: {blob}");
 
         let _ = fs::remove_dir_all(&tmp);
     }

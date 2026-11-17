@@ -18,6 +18,10 @@ fn strings(v: &serde_json::Value) -> Vec<String> {
 /// What the runner does to a config entry's `command` + `args`.
 fn run(command: &str, args: &[String]) -> (String, Vec<String>) {
     let (exe, mut extra) = split_command(command);
+    if exe.is_empty() {
+        // No usable executable: the runner sends neither command nor args.
+        return (String::new(), Vec::new());
+    }
     extra.extend(args.iter().cloned());
     let base = std::path::Path::new(&exe)
         .file_name()
@@ -35,8 +39,19 @@ fn golden_vectors_match_exactly() {
     for v in vectors {
         let (base, got) = run(v["command"].as_str().unwrap(), &strings(&v["args"]));
         assert_eq!(got, strings(&v["expected"]), "vector {:?}", v["name"]);
-        if let Some(want) = v.get("expected_command").and_then(|c| c.as_str()) {
-            assert_eq!(base, want, "vector {:?} expected_command", v["name"]);
+        match v.get("expected_command") {
+            Some(serde_json::Value::String(want)) => {
+                assert_eq!(&base, want, "vector {:?} expected_command", v["name"]);
+            }
+            // null: no usable command
+            Some(serde_json::Value::Null) => {
+                assert!(
+                    base.is_empty(),
+                    "vector {:?} expected no command",
+                    v["name"]
+                );
+            }
+            _ => {}
         }
     }
 }
@@ -45,7 +60,7 @@ fn golden_vectors_match_exactly() {
 fn golden_field_vectors_match_exactly() {
     let v: serde_json::Value = serde_json::from_str(include_str!("mcp_args_golden.json")).unwrap();
     let fields = v["field_vectors"].as_array().unwrap();
-    assert!(fields.len() >= 9);
+    assert!(fields.len() >= 14);
     for f in fields {
         assert_eq!(
             mask_secret_text(f["input"].as_str().unwrap()),

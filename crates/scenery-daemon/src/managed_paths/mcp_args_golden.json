@@ -1,5 +1,5 @@
 {
-  "_comment": "Golden vectors for MCP argument redaction. Shared with scenery-backend (sanitize_discovery_args): both sides must produce exactly `expected`. `command` may carry its own arguments; the runner splits it first. Vectors with \"added_by\": \"backend\" are leak cases the runner (as of b25e6f0) does not redact yet; `expected_command` is the executable basename the backend derives (the runner should send the same). Vectors with \"added_by\": \"runner\" came from the runner fixture and were not in the backend one; \"short flag =value\" there originally expected -p=pw -> <redacted> and was updated to the backend rule -p=<redacted>. Vectors with \"added_by\": \"review\" came from the AUTO-MANAGE P2 validation follow-up (benign flag values, home-path masking); both sides pass them. \"field_vectors\" cover the identifying names a device reports (server_key, client_name, env_key): a credential-shaped token inside one is replaced by <redacted> wherever it starts.",
+  "_comment": "Golden vectors for MCP argument redaction. Shared with scenery-backend (sanitize_discovery_args): both sides must produce exactly `expected`. `command` may carry its own arguments; the runner splits it first. Vectors with \"added_by\": \"backend\" are leak cases the runner (as of b25e6f0) does not redact yet; `expected_command` is the executable basename the backend derives (the runner should send the same). Vectors with \"added_by\": \"runner\" came from the runner fixture and were not in the backend one; \"short flag =value\" there originally expected -p=pw -> <redacted> and was updated to the backend rule -p=<redacted>. Vectors with \"added_by\": \"review\" came from the AUTO-MANAGE P2 validation follow-up (benign flag values, home-path masking); both sides pass them. \"field_vectors\" cover the identifying names a device reports (server_key, client_name, env_key): a credential-shaped token inside one is replaced by <redacted> wherever it starts. Vectors with \"added_by\": \"review2\" are the second validation round: a token after a separator in a version, tag or path, lexical path normalisation before home masking, and a token-shaped executable name (expected_command null: no usable command, so no args).",
   "vectors": [
     {"name": "npx registry with userinfo", "command": "npx", "args": ["--registry", "https://user:tok@host", "pkg"], "expected": ["--registry", "<redacted>", "pkg"]},
     {"name": "docker -e TOKEN=x", "command": "docker", "args": ["run", "-e", "TOKEN=x", "image"], "expected": ["run", "-e", "<redacted>", "<redacted>"]},
@@ -53,7 +53,20 @@
     {"name": "volume named home", "command": "node", "args": ["/Volumes/home/adam/x"], "expected": ["~/x"], "added_by": "review"},
     {"name": "Shared is not a home", "command": "node", "args": ["/Users/Shared/x"], "expected": ["/Users/Shared/x"], "added_by": "review"},
     {"name": "Shared with repeated slashes is not a home", "command": "node", "args": ["//Users//Shared/x"], "expected": ["/Users/Shared/x"], "added_by": "review"},
-    {"name": "system dir under /home is not a home", "command": "node", "args": ["/home/linuxbrew/.linuxbrew/bin/node"], "expected": ["/home/linuxbrew/.linuxbrew/bin/node"], "added_by": "review"}
+    {"name": "system dir under /home is not a home", "command": "node", "args": ["/home/linuxbrew/.linuxbrew/bin/node"], "expected": ["/home/linuxbrew/.linuxbrew/bin/node"], "added_by": "review"},
+    {"name": "token after a separator in a pinned npm version", "command": "npx", "args": ["pkg@1.0.0-ghp_a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8"], "expected": ["<redacted>"], "added_by": "review2"},
+    {"name": "Anthropic key after a separator in an npm tag", "command": "npx", "args": ["pkg@latest-sk-ant-abcdefghijklmnopqrstuvwx"], "expected": ["<redacted>"], "added_by": "review2"},
+    {"name": "token in a uvx --from package", "command": "uvx", "args": ["--from", "pkg-ghp_a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8"], "expected": ["--from", "<redacted>"], "added_by": "review2"},
+    {"name": "token in a docker image tag", "command": "docker", "args": ["run", "img:v1-ghp_a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8"], "expected": ["run", "<redacted>"], "added_by": "review2"},
+    {"name": "token at the end of a path segment", "command": "node", "args": ["/tmp/x-ghp_a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8"], "expected": ["<redacted>"], "added_by": "review2"},
+    {"name": "token after a dot in a relative path", "command": "node", "args": ["./cfg.ghp_a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8"], "expected": ["<redacted>"], "added_by": "review2"},
+    {"name": "var/home is a home", "command": "node", "args": ["/var/home/adam/x"], "expected": ["~/x"], "added_by": "review2"},
+    {"name": "dot segment before a home", "command": "node", "args": ["/./Users/adam/x"], "expected": ["~/x"], "added_by": "review2"},
+    {"name": "dot-dot back into a home", "command": "node", "args": ["/Users/../Users/adam/x"], "expected": ["~/x"], "added_by": "review2"},
+    {"name": "dot-dot out of a system home into a user home", "command": "node", "args": ["/home/linuxbrew/../adam/x"], "expected": ["~/x"], "added_by": "review2"},
+    {"name": "dot-dot in a plain path is resolved lexically", "command": "node", "args": ["/tmp/a/../b"], "expected": ["/tmp/b"], "added_by": "review2"},
+    {"name": "trailing slash on a home path", "command": "node", "args": ["/home/adam/"], "expected": ["~/"], "added_by": "review2"},
+    {"name": "token-shaped executable basename drops the command", "command": "/Users/a/bin/ghp_a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8", "args": ["--port", "3000"], "expected": [], "expected_command": null, "added_by": "review2"}
   ],
   "field_vectors": [
     {"name": "server key with an embedded token", "field": "server_key", "input": "gh-ghp_abcdefghijklmnopqrstuvwxyz0123456789", "expected": "gh-<redacted>"},
@@ -64,6 +77,11 @@
     {"name": "env key that is an AWS key id", "field": "env_key", "input": "AKIAABCDEFGHIJKLMNOP", "expected": "<redacted>"},
     {"name": "env key with a prefix and an Anthropic key", "field": "env_key", "input": "X_sk-ant-abcdefghijklmnopqrstuvwx", "expected": "X_<redacted>"},
     {"name": "slack token after a dash", "field": "server_key", "input": "slack-xoxb-1234567890", "expected": "slack-<redacted>"},
-    {"name": "plain env key", "field": "env_key", "input": "GITHUB_PERSONAL_ACCESS_TOKEN", "expected": "GITHUB_PERSONAL_ACCESS_TOKEN"}
+    {"name": "plain env key", "field": "env_key", "input": "GITHUB_PERSONAL_ACCESS_TOKEN", "expected": "GITHUB_PERSONAL_ACCESS_TOKEN"},
+    {"name": "server key with a token after a dash", "field": "server_key", "input": "valprobe-ghp_a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8", "expected": "valprobe-<redacted>"},
+    {"name": "discovery slug with a token", "field": "slug", "input": "Cursor:valprobe-ghp_a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8", "expected": "Cursor:valprobe-<redacted>"},
+    {"name": "discovery source path with a token", "field": "source_path", "input": "~/.cursor/mcp.json#valprobe-ghp_a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8", "expected": "~/.cursor/mcp.json#valprobe-<redacted>"},
+    {"name": "discovery slug without a token", "field": "slug", "input": "Cursor:jira", "expected": "Cursor:jira"},
+    {"name": "a run longer than any name is redacted whole", "field": "server_key", "input": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "expected": "<redacted>"}
   ]
 }
