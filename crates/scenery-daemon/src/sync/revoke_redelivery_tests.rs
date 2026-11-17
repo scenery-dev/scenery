@@ -770,3 +770,77 @@ fn snapshot_noop_for_an_installed_skill_writes_no_projection_outcome() {
         "the periodic diff must not churn sync_state"
     );
 }
+
+// ── Private skills: revocation by registry skill_id, never bare slug ──────────
+
+/// adam's private `pdf` lives in folder `pdf`; its registry id is `adam~pdf`.
+fn private_pdf(state: &AppState) {
+    state.record_skill_local_name("adam~pdf", "pdf").unwrap();
+    seed_skill(state, "pdf", "0.1.0", true);
+    project(state, "pdf");
+}
+
+#[tokio::test]
+async fn revoking_the_private_registry_id_removes_the_local_private_skill() {
+    let home = FakeHome::new();
+    let (_t, state) = new_state();
+    private_pdf(&state);
+
+    run(revoke_event("skill", "adam~pdf", None), &state).await;
+
+    assert!(!home.projected("pdf"));
+    assert!(!skill_row_exists(&state, "pdf"));
+    assert!(revocation::is_revoked(&state, "skill", "adam~pdf", None).unwrap());
+}
+
+#[tokio::test]
+async fn revoking_the_catalog_skill_with_the_same_bare_slug_leaves_the_private_skill() {
+    let home = FakeHome::new();
+    let (_t, state) = new_state();
+    private_pdf(&state);
+
+    // Event, and the same revocation delivered in a snapshot.
+    run(revoke_event("skill", "pdf", None), &state).await;
+    run(snapshot(&[("skill", "pdf", None)]), &state).await;
+
+    assert!(home.projected("pdf"), "adam's private pdf is untouched");
+    assert!(skill_row_exists(&state, "pdf"));
+    // The catalog revocation itself is still recorded (under its own id).
+    assert!(revocation::is_revoked(&state, "skill", "pdf", None).unwrap());
+    assert!(!revocation::is_revoked(&state, "skill", "adam~pdf", None).unwrap());
+}
+
+#[tokio::test]
+async fn an_unrelated_users_private_id_does_not_reach_this_users_folder() {
+    let home = FakeHome::new();
+    let (_t, state) = new_state();
+    private_pdf(&state);
+    run(revoke_event("skill", "bob~pdf", None), &state).await;
+    assert!(home.projected("pdf"));
+    assert!(skill_row_exists(&state, "pdf"));
+}
+
+#[tokio::test]
+async fn install_gates_check_the_registry_id() {
+    let _home = FakeHome::new();
+    let (_t, state) = new_state();
+    state.record_skill_local_name("adam~pdf", "pdf").unwrap();
+    // Catalog `pdf` revoked: must not block adam's private pdf.
+    revocation::upsert_revocation(&state, "skill", "pdf", None).unwrap();
+    assert!(!revocation::is_revoked(
+        &state,
+        "skill",
+        &crate::sync::reconciler::registry_key_for(&state, "pdf"),
+        None
+    )
+    .unwrap());
+    // adam~pdf revoked: blocks it.
+    revocation::upsert_revocation(&state, "skill", "adam~pdf", None).unwrap();
+    assert!(revocation::is_revoked(
+        &state,
+        "skill",
+        &crate::sync::reconciler::registry_key_for(&state, "pdf"),
+        None
+    )
+    .unwrap());
+}

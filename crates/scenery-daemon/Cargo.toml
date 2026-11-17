@@ -69,6 +69,7 @@ jsonwebtoken = { version = "10.3", default-features = false, features = ["rust_c
 # Imported plugins' binary files arrive base64-encoded from the registry.
 # Already linked through scenery-core.
 base64.workspace = true
+unicode-normalization = "0.1"
 
 [dev-dependencies]
 serde_json.workspace = true

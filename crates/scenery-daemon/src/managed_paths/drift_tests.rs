@@ -786,3 +786,172 @@ fn restore_canonical_backup_keeps_symlinks_as_symlinks() {
         .file_type()
         .is_symlink());
 }
+
+// ── Own (auto-managed) skills: never quarantined (plan 4.5.4) ─────────────────
+
+mod own_skill_guard {
+    use super::*;
+    use crate::managed_paths::{marker::marker_provenance, ManagedPathsPusher};
+    use scenery_core::state::AppState;
+
+    struct Fixture {
+        _tmp: TempDir,
+        home: std::path::PathBuf,
+        state: std::sync::Arc<AppState>,
+        prev: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            let tmp = TempDir::new().unwrap();
+            let home = tmp.path().join("home");
+            fs::create_dir_all(&home).unwrap();
+            let prev = std::env::var_os("HOME");
+            std::env::set_var("HOME", &home);
+            let root = camino::Utf8PathBuf::from_path_buf(tmp.path().join("data")).unwrap();
+            let state = std::sync::Arc::new(AppState::bootstrap_in(root).unwrap());
+            Self {
+                _tmp: tmp,
+                home,
+                state,
+                prev,
+                _lock: lock,
+            }
+        }
+
+        /// Push `slug` the way the reconciler does; `own` stamps auto_managed
+        /// provenance via a pending takeover.
+        fn push(&self, slug: &str, own: bool) -> std::path::PathBuf {
+            if own {
+                self.state
+                    .record_pending_auto_managed_takeover(
+                        slug,
+                        &self
+                            .home
+                            .join(".agents/skills")
+                            .join(slug)
+                            .to_string_lossy(),
+                        &format!("adam~{slug}"),
+                        "uuid-1",
+                    )
+                    .unwrap();
+            }
+            ManagedPathsPusher::new(&self.state)
+                .push_skill(slug, None, b"---\nname: x\n---\noriginal", &[])
+                .unwrap();
+            self.home.join(".agents/skills").join(slug)
+        }
+
+        fn set_mode(&self, mode: &str) {
+            self.state
+                .set_sync_state("managed_paths_mode", mode)
+                .unwrap();
+        }
+
+        async fn cycle(&self) -> CycleStats {
+            DriftScanner::new(
+                std::sync::Arc::clone(&self.state),
+                "http://127.0.0.1:1".into(),
+            )
+            .unwrap()
+            .run_cycle()
+            .await
+            .unwrap()
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn an_edited_own_skill_is_reported_not_quarantined_in_every_strict_mode() {
+        for mode in ["quarantine", "approve_required"] {
+            let f = Fixture::new();
+            f.set_mode(mode);
+            let dir = f.push("mine", true);
+            let conn = Connection::open(&f.state.db_path).unwrap();
+            assert!(marker_provenance(&conn, &dir.to_string_lossy()).is_auto_managed());
+
+            fs::write(dir.join("SKILL.md"), "my edit, still running").unwrap();
+            let stats = f.cycle().await;
+            assert_eq!(stats.drifted, 1, "{mode}: drift is reported");
+            assert_eq!(
+                fs::read_to_string(dir.join("SKILL.md")).unwrap(),
+                "my edit, still running",
+                "{mode}: the edit keeps running in place"
+            );
+            assert!(dir.join(".scenery-managed.json").exists());
+            assert!(
+                !f.home.join(".claude/.scenery-quarantine").exists(),
+                "{mode}: nothing was moved aside"
+            );
+            // The marker row survives and was re-baselined: the same edit is
+            // not re-reported every cycle.
+            assert!(is_auto_managed_row(&f, &dir));
+            assert_eq!(f.cycle().await.drifted, 0, "{mode}: reported once");
+        }
+    }
+
+    fn is_auto_managed_row(f: &Fixture, dir: &std::path::Path) -> bool {
+        let conn = Connection::open(&f.state.db_path).unwrap();
+        marker_provenance(&conn, &dir.to_string_lossy()).is_auto_managed()
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_catalog_skill_is_still_quarantined_in_strict_mode() {
+        let f = Fixture::new();
+        f.set_mode("quarantine");
+        let dir = f.push("catalog", false);
+        fs::write(dir.join("SKILL.md"), "someone edited the catalog copy").unwrap();
+        f.cycle().await;
+        assert!(!dir.exists(), "catalog behaviour is unchanged: moved aside");
+        assert!(f.home.join(".claude/.scenery-quarantine").exists());
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn restore_canonical_is_refused_for_an_own_skill_but_not_a_catalog_one() {
+        let f = Fixture::new();
+        let own = f.push("own", true);
+        let cat = f.push("cat", false);
+        fs::write(own.join("SKILL.md"), "my work").unwrap();
+
+        let err = restore_canonical(&f.state, "own", "skill").unwrap_err();
+        assert!(format!("{err:#}").contains("own"), "{err:#}");
+        assert_eq!(fs::read_to_string(own.join("SKILL.md")).unwrap(), "my work");
+        assert!(own.join(".scenery-managed.json").exists());
+
+        restore_canonical(&f.state, "cat", "skill").unwrap();
+        assert!(!cat.exists());
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn an_upgrade_push_keeps_the_marker_origin_and_ids() {
+        let f = Fixture::new();
+        let dir = f.push("upgrader", true);
+        // Pending record is cleared once takeover completes in production.
+        f.state.clear_pending_adopt_takeover("upgrader").unwrap();
+        ManagedPathsPusher::new(&f.state)
+            .push_skill("upgrader", None, b"---\nname: x\n---\nv2", &[])
+            .unwrap();
+        let marker: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.join(".scenery-managed.json")).unwrap()).unwrap();
+        assert_eq!(marker["origin"], "auto_managed");
+        assert_eq!(marker["skill_id"], "adam~upgrader");
+        assert_eq!(marker["skill_uuid"], "uuid-1");
+        assert_eq!(marker["hash_version"], 2);
+        let conn = Connection::open(&f.state.db_path).unwrap();
+        assert!(marker_provenance(&conn, &dir.to_string_lossy()).is_auto_managed());
+    }
+}

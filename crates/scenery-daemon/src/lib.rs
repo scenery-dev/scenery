@@ -1642,7 +1642,9 @@ pub(crate) fn refresh_tick(state: &AppState, registry_url: &str) -> Result<Optio
                 // once; with the token rows gone every later tick is a no-op,
                 // so the refresh loop is effectively stopped until a re-pair
                 // stores new tokens.
-                match scenery_core::auth::handle_user_revoked(state, &row.registry_url) {
+                let cleared = scenery_core::auth::handle_user_revoked(state, &row.registry_url);
+                managed_paths::tracked::reconcile(&state);
+                match cleared {
                     Ok(true) => warn!(
                         registry_url = %row.registry_url,
                         "refresh_one_tick: your Scenery account was removed or revoked by \
@@ -2241,6 +2243,7 @@ async fn register_with_backend(
             if let Err(e) = state.mark_device_revoked() {
                 warn!(error = %e, "failed to persist device-revoked state locally");
             }
+            managed_paths::tracked::reconcile(&state);
             warn!(
                 "device registration rejected — this device was revoked by an admin. \
                  Run `scenery auth pair` to re-pair as a new device."
@@ -2609,7 +2612,9 @@ pub fn run_sync_tick(
             }
         }
         Err(e) if scenery_core::auth::is_user_revoked_error(&e) => {
-            match scenery_core::auth::handle_user_revoked(&state_view, &registry.base_url) {
+            let cleared = scenery_core::auth::handle_user_revoked(&state_view, &registry.base_url);
+            managed_paths::tracked::reconcile(&state_view);
+            match cleared {
                 Ok(true) => warn!(
                     "sync: your Scenery account was removed or revoked by an admin — \
                      session cleared. Run `scenery auth pair` to re-pair."

@@ -1051,7 +1051,8 @@ fn snapshot_records_folder_name_and_later_events_use_it() {
             ..
         } => {
             assert_eq!(installations[0].skill_id, "x");
-            assert_eq!(revocations.unwrap()[0].artifact_key, "x");
+            // Revocations stay keyed by REGISTRY id; the teardown maps them.
+            assert_eq!(revocations.unwrap()[0].artifact_key, "x-bob");
         }
         other => panic!("unexpected {other:?}"),
     }

@@ -30,8 +30,9 @@
 //! continue.  `remove_*` failures are also non-fatal.
 
 use super::marker::{
-    insert_db_marker, is_already_marked, update_db_marker_installation_id, write_file_marker,
-    ManagedPathMarker,
+    insert_db_marker, is_already_marked, marker_provenance, set_marker_provenance,
+    update_db_marker_installation_id, write_file_marker_with, ManagedPathMarker, Provenance,
+    ORIGIN_AUTO_MANAGED,
 };
 use anyhow::{Context, Result};
 use fs2::FileExt;
@@ -319,6 +320,12 @@ impl ManagedPathsPusher {
         let sha256 = hex_sha256(skill_md_bytes);
         let now_ts = chrono::Utc::now().to_rfc3339();
 
+        // Provenance: a pending auto-manage takeover for this slug stamps the
+        // marker (`origin = auto_managed`, registry ids); otherwise whatever
+        // the existing row already says carries forward, so an upgrade of an
+        // auto-managed skill stays auto-managed.
+        let mut prov = self.provenance_for(slug, &skill_dir.to_string_lossy());
+
         let written = (|| -> Result<()> {
             // Write SKILL.md atomically.
             atomic_write(&write_root.join("SKILL.md"), skill_md_bytes)
@@ -350,8 +357,15 @@ impl ManagedPathsPusher {
             }
 
             // Write file marker into the skill directory (after the swap, so
-            // a marked directory is always complete).
-            write_file_marker(&skill_dir, installation_id, &sha256, &now_ts)
+            // a marked directory is always complete). The tree hash is of what
+            // Scenery just wrote (marker excluded), the baseline uninstall and
+            // drift compare later edits against.
+            prov.tree_hash = scenery_core::skill_tree::survey(&skill_dir)
+                .map(|s| s.tree_hash)
+                .map_err(|e| debug!(slug, error = %e, "pusher: could not hash the installed tree"))
+                .ok();
+            prov.hash_version = prov.tree_hash.as_ref().map(|_| 2);
+            write_file_marker_with(&skill_dir, installation_id, &sha256, &now_ts, &prov)
                 .context("pusher: failed to write .scenery-managed.json for skill")
         })();
         if let Err(e) = written {
@@ -369,6 +383,14 @@ impl ManagedPathsPusher {
         let path_key = skill_dir.to_string_lossy().to_string();
         self.upsert_db_marker(&path_key, "skill", slug, installation_id, &sha256, &now_ts)
             .context("pusher: failed to upsert managed_path_markers for skill")?;
+        match Connection::open(&self.db_path) {
+            Ok(conn) => {
+                if let Err(e) = set_marker_provenance(&conn, &path_key, &prov) {
+                    warn!(slug, error = %e, "pusher: could not record marker provenance");
+                }
+            }
+            Err(e) => warn!(slug, error = %e, "pusher: could not open state DB for provenance"),
+        }
 
         // Restore journal: this directory only exists because Scenery put
         // it there (source=managed) — uninstall removes it outright, no
@@ -391,6 +413,8 @@ impl ManagedPathsPusher {
                 .with_detail(serde_json::json!({
                     "installation_id": installation_id,
                     "tree_sha256": tree_sha256,
+                    "origin": prov.origin,
+                    "skill_id": prov.skill_id,
                 })),
         );
 
@@ -824,6 +848,41 @@ impl ManagedPathsPusher {
     }
 
     // ── SQLite helpers ────────────────────────────────────────────────────────
+
+    /// Provenance for the marker about to be written at `path` for `slug`:
+    /// the pending auto-manage takeover's ids when one exists, else the
+    /// existing row's, else legacy (all `None`).
+    fn provenance_for(&self, slug: &str, path: &str) -> Provenance {
+        let Ok(conn) = Connection::open(&self.db_path) else {
+            return Provenance::default();
+        };
+        let pending = conn
+            .query_row(
+                "SELECT origin, skill_id, skill_uuid FROM adopt_pending_takeovers \
+                 WHERE slug = ?1 AND origin IS NOT NULL",
+                [slug],
+                |row| {
+                    Ok(Provenance {
+                        origin: row.get(0)?,
+                        skill_id: row.get(1)?,
+                        skill_uuid: row.get(2)?,
+                        ..Default::default()
+                    })
+                },
+            )
+            .ok();
+        match pending {
+            Some(p) if p.origin.as_deref() == Some(ORIGIN_AUTO_MANAGED) => p,
+            _ => {
+                let existing = marker_provenance(&conn, path);
+                Provenance {
+                    tree_hash: None,
+                    hash_version: None,
+                    ..existing
+                }
+            }
+        }
+    }
 
     fn upsert_db_marker(
         &self,

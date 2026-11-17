@@ -65,6 +65,7 @@ use std::{
 use tokio::{sync::Notify, time::interval};
 use tracing::{debug, info, warn};
 
+use super::foreign::{self, ClassifyContext, Treatment};
 use super::marker::{db_ownership, DbOwnership};
 use super::mcp_discovery;
 
@@ -98,6 +99,20 @@ pub struct DiscoveryItem {
     /// constraint already allows `'mcp'`, so this is additive on both ends
     /// (see the module-level MCP-wiring doc below).
     pub detail: Option<serde_json::Value>,
+    /// What the local classifier decided and measured. Never serialized: the
+    /// backend only sees its `detail` projection (`treatment`, `tracked_reason`,
+    /// `hold_reason`, `suspicious`). Directive processing re-reads it.
+    #[serde(skip)]
+    pub local: Option<LocalSkillInfo>,
+}
+
+/// Local classification of a discovered skill (skills only).
+#[derive(Debug, Clone)]
+pub struct LocalSkillInfo {
+    pub treatment: Treatment,
+    /// Whole-tree hash at scan time (see `scenery_core::skill_tree`).
+    pub tree_hash: String,
+    pub recently_modified: bool,
 }
 
 /// Top-level reporter: wraps state + registry URL. Cheaply clonable via `Arc`.
@@ -223,6 +238,10 @@ pub async fn run_once(state: Arc<AppState>, registry_url: String) -> Result<usiz
         let state_for_scan = Arc::clone(&state);
         let registry_url_for_scan = registry_url.clone();
         tokio::task::spawn_blocking(move || {
+            // Tracked skills: converge them with the revocation state first
+            // (neutralize what is revoked, restore what no longer is, and
+            // re-neutralize one an installer recreated).
+            super::tracked::reconcile(&state_for_scan);
             let roots = extra_roots();
             let clients = scenery_mcp::setup::detect_ai_clients();
             collect_all_discoveries(&roots, &clients, &state_for_scan, &registry_url_for_scan)
@@ -248,7 +267,29 @@ pub async fn run_once(state: Arc<AppState>, registry_url: String) -> Result<usiz
         }
     };
 
-    post_discoveries(&items, &state, &registry_url, &http_client).await;
+    // ONE token read per tick (the OS keychain is read once, not once per
+    // skill); the same token serves the upload and every auto-manage call.
+    let token = access_token_for(&state, &registry_url).await;
+    let Some(response) =
+        post_discoveries(&items, &state, &registry_url, &http_client, &token).await
+    else {
+        return Ok(count);
+    };
+
+    let device_id = state.get_sync_state("device_id").ok().flatten();
+    match device_id {
+        Some(device_id) if !token.is_empty() => {
+            let ctx = super::auto_manage::TickCtx {
+                state: Arc::clone(&state),
+                registry_url: registry_url.clone(),
+                token,
+                device_id,
+                classify: ClassifyContext::from_env(),
+            };
+            super::auto_manage::process_response(&ctx, response, &items).await;
+        }
+        _ => debug!("discoveries: no device id or token — auto-manage skipped this tick"),
+    }
 
     Ok(count)
 }
@@ -315,6 +356,7 @@ pub fn collect_discoveries(roots: &[PathBuf], state: &AppState) -> Vec<Discovery
         }
     };
 
+    let classify_ctx = ClassifyContext::from_env();
     for root in roots {
         if !root.exists() {
             debug!(root = %root.display(), "discoveries: root does not exist — skipping");
@@ -328,6 +370,10 @@ pub fn collect_discoveries(roots: &[PathBuf], state: &AppState) -> Vec<Discovery
                     let reason = match db_ownership(&conn, "skill", path) {
                         DbOwnership::Verified => {
                             debug!(slug = %item.slug, "discoveries: verified managed — skipping");
+                            continue;
+                        }
+                        DbOwnership::EditedOwn => {
+                            debug!(slug = %item.slug, "discoveries: auto-managed skill edited by its owner — not suspicious");
                             continue;
                         }
                         DbOwnership::HashMismatch => Some("managed_hash_mismatch"),
@@ -344,13 +390,43 @@ pub fn collect_discoveries(roots: &[PathBuf], state: &AppState) -> Vec<Discovery
                         item.detail = Some(serde_json::json!({
                             "suspicious": true,
                             "suspicious_reason": reason,
+                            "treatment": "hold",
+                            "hold_reason": "suspicious",
                         }));
                     }
+                    let mut cls = foreign::classify_skill(path, &item.slug, &classify_ctx);
+                    if reason.is_some() {
+                        // `suspicious` implies hold: never uploaded or converted.
+                        cls.treatment = Treatment::Hold("suspicious".into());
+                    } else {
+                        item.detail = cls.treatment.detail();
+                    }
+                    item.local = Some(LocalSkillInfo {
+                        treatment: cls.treatment,
+                        tree_hash: cls.tree_hash,
+                        recently_modified: cls.recently_modified,
+                    });
                     items.push(item);
                 }
             }
             Err(e) => {
                 warn!(root = %root.display(), error = %e, "discoveries: scan failed — skipping root");
+            }
+        }
+    }
+
+    // Two non-canonical sources for one slug would race to convert into the
+    // same canonical folder: hold both (case-folded, NFC).
+    let keyed: Vec<(String, PathBuf)> = items
+        .iter()
+        .map(|i| (i.slug.clone(), PathBuf::from(&i.source_path)))
+        .collect();
+    for idx in foreign::duplicate_non_canonical(&keyed, classify_ctx.canonical_root.as_deref()) {
+        let item = &mut items[idx];
+        if let Some(local) = item.local.as_mut() {
+            if !matches!(local.treatment, Treatment::Hold(_)) {
+                local.treatment = Treatment::Hold("duplicate_slug".into());
+                item.detail = local.treatment.detail();
             }
         }
     }
@@ -396,6 +472,7 @@ fn mcp_item_to_discovery_item(item: mcp_discovery::McpDiscoveryItem) -> Discover
         source_path: item.source_path,
         canonical_hash: item.canonical_hash,
         detail,
+        local: None,
     }
 }
 
@@ -482,6 +559,7 @@ fn scan_root(root: &Path) -> Result<Vec<DiscoveryItem>> {
             source_path,
             canonical_hash,
             detail: None,
+            local: None,
         });
     }
 
@@ -497,18 +575,24 @@ struct DiscoveriesBody {
 }
 
 /// POST the batch to the backend. Logs warnings on failure but never returns
-/// an error — this function is best-effort.
+/// an error — this function is best-effort. Returns the parsed response (the
+/// per-item `directives` and the org `policy`) on success; `None` when nothing
+/// was sent or the backend refused.
+///
+/// `X-Scenery-Runner-Version` is sent explicitly (it is also a default header
+/// of every runner client): the backend only answers with directives to a
+/// runner it knows to be >= 2.3.0. `token` is the tick's already-loaded access
+/// token.
 async fn post_discoveries(
     items: &[DiscoveryItem],
     state: &AppState,
     registry_url: &str,
     http_client: &reqwest::Client,
-) {
-    let token = access_token_for(state, registry_url).await;
-
+    token: &str,
+) -> Option<super::auto_manage::DiscoveryResponse> {
     if token.is_empty() {
         debug!("discoveries: no auth token — skipping POST (will try again next daemon start)");
-        return;
+        return None;
     }
 
     let device_id = state.get_sync_state("device_id").ok().flatten();
@@ -517,7 +601,6 @@ async fn post_discoveries(
         device_id,
         items: items.to_vec(),
     };
-
     let url = format!(
         "{}/portal/managed-paths/discoveries",
         registry_url.trim_end_matches('/')
@@ -525,6 +608,10 @@ async fn post_discoveries(
 
     let resp = match http_client
         .post(&url)
+        .header(
+            scenery_core::http::RUNNER_VERSION_HEADER,
+            scenery_core::http::RUNNER_VERSION,
+        )
         .bearer_auth(token)
         .json(&body)
         .send_tracked()
@@ -533,7 +620,7 @@ async fn post_discoveries(
         Ok(r) => r,
         Err(e) => {
             warn!(error = %e, "discoveries: POST failed — will retry on next daemon start");
-            return;
+            return None;
         }
     };
 
@@ -541,13 +628,16 @@ async fn post_discoveries(
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         warn!(%status, body = %text, "discoveries: backend rejected discovery batch");
-        return;
+        return None;
     }
 
     info!(
         count = items.len(),
         "discoveries: batch reported to backend"
     );
+    // Older backends return a body without `directives`/`policy`, or none at
+    // all: both parse as "no directives".
+    Some(resp.json().await.unwrap_or_default())
 }
 
 // ── Auth helper ───────────────────────────────────────────────────────────────
@@ -1191,3 +1281,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "discoveries_wiring_tests.rs"]
+mod wiring_tests;

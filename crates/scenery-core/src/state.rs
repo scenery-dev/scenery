@@ -898,7 +898,8 @@ impl AppState {
             .context("failed to open state DB for pending-takeover upsert")?;
         conn.execute(
             "INSERT INTO adopt_pending_takeovers (slug, source_path) VALUES (?1, ?2) \
-             ON CONFLICT(slug) DO UPDATE SET source_path = excluded.source_path",
+             ON CONFLICT(slug) DO UPDATE SET source_path = excluded.source_path, \
+                 origin = NULL, skill_id = NULL, skill_uuid = NULL",
             rusqlite::params![slug, source_path],
         )
         .context("failed to upsert adopt_pending_takeovers row")?;
@@ -1513,6 +1514,77 @@ mod tests {
         );
 
         cleanup(&root);
+    }
+
+    #[test]
+    fn auto_managed_takeover_carries_provenance_and_a_legacy_upsert_clears_it() {
+        let root = temp_root("pending-prov");
+        let state = AppState::bootstrap_in(root.clone()).unwrap();
+        assert!(state.pending_takeover_provenance("pdf").unwrap().is_none());
+
+        state
+            .record_pending_auto_managed_takeover("pdf", "/p", "adam~pdf", "uuid-1")
+            .unwrap();
+        assert_eq!(
+            state.pending_takeover_provenance("pdf").unwrap(),
+            Some((
+                "auto_managed".to_string(),
+                Some("adam~pdf".to_string()),
+                Some("uuid-1".to_string())
+            ))
+        );
+        assert_eq!(
+            state
+                .pending_adopt_takeover_source("pdf")
+                .unwrap()
+                .as_deref(),
+            Some("/p")
+        );
+
+        // The legacy adopt flow re-records the slug: no auto-manage provenance.
+        state.record_pending_adopt_takeover("pdf", "/q").unwrap();
+        assert!(state.pending_takeover_provenance("pdf").unwrap().is_none());
+        cleanup(&state.root_dir);
+    }
+
+    #[test]
+    fn registry_name_lookup_is_the_reverse_of_the_local_name_mapping() {
+        let root = temp_root("reg-name");
+        let state = AppState::bootstrap_in(root.clone()).unwrap();
+        assert_eq!(state.registry_name_for_local("pdf"), None);
+        state.record_skill_local_name("adam~pdf", "pdf").unwrap();
+        assert_eq!(
+            state.registry_name_for_local("pdf").as_deref(),
+            Some("adam~pdf")
+        );
+        assert_eq!(state.skill_local_name("adam~pdf"), "pdf");
+        // Identity mappings do not count as "registered under another name".
+        state.record_skill_local_name("same", "same").unwrap();
+        assert_eq!(state.registry_name_for_local("same"), None);
+        cleanup(&state.root_dir);
+    }
+
+    #[test]
+    fn auto_manage_policy_cache_roundtrips_and_defaults_missing_fields_to_true() {
+        let root = temp_root("policy");
+        let state = AppState::bootstrap_in(root.clone()).unwrap();
+        assert!(state.cached_auto_manage_policy().is_none());
+        state
+            .cache_auto_manage_policy(&AutoManagePolicy {
+                auto_manage_skills: false,
+                auto_submit_mcp: true,
+            })
+            .unwrap();
+        assert_eq!(
+            state.cached_auto_manage_policy(),
+            Some(AutoManagePolicy {
+                auto_manage_skills: false,
+                auto_submit_mcp: true
+            })
+        );
+        let p: AutoManagePolicy = serde_json::from_str("{}").unwrap();
+        assert!(p.auto_manage_skills && p.auto_submit_mcp);
+        cleanup(&state.root_dir);
     }
 
     #[test]

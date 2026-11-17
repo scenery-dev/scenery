@@ -305,6 +305,13 @@ async fn run_loop(
 /// private skill held the folder name), so translate them to this device's
 /// folder names first, recording any mapping a snapshot carries. Everything
 /// downstream then works on folder names, as it always has.
+///
+/// REVOCATIONS are the exception: they stay keyed by REGISTRY id (`pdf` is the
+/// org catalog's skill, `adam~pdf` is adam's private one living in folder
+/// `pdf`). Mapping them onto folder names made a revoked catalog `pdf` hit the
+/// private `pdf`. The teardown maps the registry id to its folder itself
+/// ([`revoke_target_folder`]) and the install gates check the registry id
+/// ([`registry_key_for`]).
 fn localize_skill_names(event: SyncEvent, state: &AppState) -> SyncEvent {
     let local = |name: &str| state.skill_local_name(name);
     match event {
@@ -333,26 +340,6 @@ fn localize_skill_names(event: SyncEvent, state: &AppState) -> SyncEvent {
             installation_id,
             skill_id: local(&skill_id),
         },
-        SyncEvent::Revoke {
-            artifact_type,
-            artifact_key,
-            version,
-        } if artifact_type == "skill" => SyncEvent::Revoke {
-            artifact_key: local(&artifact_key),
-            artifact_type,
-            version,
-        },
-        SyncEvent::Unrevoke {
-            artifact_type,
-            artifact_key,
-            version,
-            signed,
-        } if artifact_type == "skill" => SyncEvent::Unrevoke {
-            artifact_key: local(&artifact_key),
-            artifact_type,
-            version,
-            signed,
-        },
         SyncEvent::Snapshot {
             mut installations,
             mcp_installations,
@@ -373,14 +360,6 @@ fn localize_skill_names(event: SyncEvent, state: &AppState) -> SyncEvent {
                 }
                 record.skill_id = local(&record.skill_id);
             }
-            let revocations = revocations.map(|mut revs| {
-                for rev in &mut revs {
-                    if rev.artifact_type == "skill" {
-                        rev.artifact_key = local(&rev.artifact_key);
-                    }
-                }
-                revs
-            });
             SyncEvent::Snapshot {
                 installations,
                 mcp_installations,
@@ -392,6 +371,30 @@ fn localize_skill_names(event: SyncEvent, state: &AppState) -> SyncEvent {
         }
         other => other,
     }
+}
+
+/// Does local folder `key` hold a skill registered under a different id (an
+/// auto-managed private skill `<owner>~<key>`), while `key` itself has no
+/// mapping, i.e. `key` names some OTHER registry skill?
+fn folder_held_by_other_registry_id(state: &AppState, key: &str) -> bool {
+    state.skill_local_name(key) == key && state.registry_name_for_local(key).is_some()
+}
+
+/// The local folder a revocation of registry skill `registry_key` tears down,
+/// or `None` when that folder belongs to a different registry skill (revoking
+/// catalog `pdf` must not remove the user's private `adam~pdf` kept in `pdf`).
+fn revoke_target_folder(state: &AppState, registry_key: &str) -> Option<String> {
+    if folder_held_by_other_registry_id(state, registry_key) {
+        return None;
+    }
+    Some(state.skill_local_name(registry_key))
+}
+
+/// The registry id the revocation cache knows local folder `local` by.
+pub(crate) fn registry_key_for(state: &AppState, local: &str) -> String {
+    state
+        .registry_name_for_local(local)
+        .unwrap_or_else(|| local.to_string())
 }
 
 // Event handler fans out over shared reconciler state; grouping into a struct is churn without clarity.
@@ -1595,6 +1598,9 @@ fn spawn_revoke(
 ) {
     let lock_key = match artifact_type.as_str() {
         "plugin" => format!("plugin:{artifact_key}"),
+        // Installs lock by LOCAL folder name; a revoke of the same skill must
+        // take the same lock.
+        "skill" => state.skill_local_name(&artifact_key),
         _ => artifact_key.clone(),
     };
     let lock = skill_lock(skill_locks, &lock_key);
@@ -1640,10 +1646,14 @@ fn spawn_revoke(
         let mut changed = match artifact_type.as_str() {
             "skill" => {
                 let state2 = Arc::clone(&state);
-                let skill_id = artifact_key.clone();
+                let registry_key = artifact_key.clone();
                 let ver = scoped_version.clone();
                 match tokio::task::spawn_blocking(move || {
-                    revoke_skill_locally(&state2, &skill_id, ver.as_deref())
+                    match revoke_target_folder(&state2, &registry_key) {
+                        Some(folder) => revoke_skill_locally(&state2, &folder, ver.as_deref()),
+                        // The folder holds a different registry skill.
+                        None => Ok(false),
+                    }
                 })
                 .await
                 {
@@ -1740,6 +1750,21 @@ fn spawn_revoke(
             }
         };
 
+        // A skill tracked in place is neutralized (never deleted): matched by
+        // its registry `skill_id` only, across every client root.
+        if artifact_type == "skill" {
+            let st = Arc::clone(&state);
+            let (key, ver) = (artifact_key.clone(), scoped_version.clone());
+            match tokio::task::spawn_blocking(move || {
+                crate::managed_paths::tracked::on_skill_revoked(&st, &key, ver.as_deref())
+            })
+            .await
+            {
+                Ok(c) => changed |= c,
+                Err(e) => warn!(error = %e, "reconciler: tracked-skill neutralize task panicked"),
+            }
+        }
+
         // Lock order (see `SkillLockMap`): release the skill lock BEFORE
         // taking any plugin lock. A plugin install holds its plugin lock and
         // then takes skill locks, so holding both here in the opposite
@@ -1754,10 +1779,13 @@ fn spawn_revoke(
         // writing its bundle, so it is covered either way.
         let mut stripped_from: Vec<String> = Vec::new();
         if artifact_type == "skill" {
-            let skill_id = artifact_key.clone();
+            let skill_id = revoke_target_folder(&state, &artifact_key);
             let ver = scoped_version.clone();
-            let slugs = tokio::task::spawn_blocking(move || {
-                crate::managed_paths::plugins_bundling_skill(&skill_id, ver.as_deref())
+            let slugs = tokio::task::spawn_blocking(move || match skill_id {
+                Some(folder) => {
+                    crate::managed_paths::plugins_bundling_skill(&folder, ver.as_deref())
+                }
+                None => Ok(Vec::new()),
             })
             .await
             .unwrap_or_else(|e| Err(anyhow::anyhow!("plugin lookup task panicked: {e}")))
@@ -1770,7 +1798,8 @@ fn spawn_revoke(
                     .lock_owned()
                     .await;
                 let s2 = slug.clone();
-                let sid = artifact_key.clone();
+                let sid = revoke_target_folder(&state, &artifact_key)
+                    .unwrap_or_else(|| artifact_key.clone());
                 match tokio::task::spawn_blocking(move || {
                     crate::managed_paths::remove_bundled_skill(&s2, &sid)
                 })
@@ -1947,6 +1976,10 @@ fn spawn_unrevoke(
                 return Ok(false);
             }
             revocation::clear_revocation(&state_for_clear, &at, &ak, ver.as_deref())?;
+            if at == "skill" {
+                // Tracked skills neutralized by this revocation come back.
+                crate::managed_paths::tracked::reconcile(&state_for_clear);
+            }
             Ok(true)
         })
         .await
@@ -2671,7 +2704,9 @@ async fn handle_install(
     // this SSE/snapshot-driven handler.
     {
         let state_check = Arc::clone(state);
-        let skill_id_check = skill_id.to_string();
+        // The cache is keyed by REGISTRY id: a private skill kept in folder
+        // `pdf` is `adam~pdf`, never gated by a revoked catalog `pdf`.
+        let skill_id_check = registry_key_for(state, skill_id);
         let version_check = version.to_string();
         let revoked = tokio::task::spawn_blocking(move || {
             revocation::is_revoked(&state_check, "skill", &skill_id_check, Some(&version_check))
@@ -2699,6 +2734,25 @@ async fn handle_install(
             decrement_pending_inc_errors(stats);
             return false;
         }
+    }
+
+    // A skill the owner keeps under their own control (tracked in place) is
+    // never overwritten by a registry copy of the same folder name.
+    if crate::managed_paths::tracked::is_slug_tracked(state, skill_id) {
+        warn!(
+            skill_id,
+            version, "reconciler: install skipped — a skill with this name is tracked in place on this device"
+        );
+        report_installation_status(
+            installation_id,
+            "error",
+            Some("not installed: a skill with this name is managed in place on this device"),
+            registry_url,
+            state,
+        )
+        .await;
+        decrement_pending_inc_errors(stats);
+        return false;
     }
 
     let result = do_install(
@@ -2928,7 +2982,11 @@ pub(crate) async fn install_verified_version(
     // future caller can install a revoked artifact. Whole-skill revokes block;
     // a version-scoped one blocks only that version. Fail closed.
     {
-        let (st, id, ver) = (Arc::clone(state), skill_id.to_string(), version.to_string());
+        let (st, id, ver) = (
+            Arc::clone(state),
+            registry_key_for(state, skill_id),
+            version.to_string(),
+        );
         let revoked = tokio::task::spawn_blocking(move || {
             revocation::is_revoked(&st, "skill", &id, Some(&ver))
         })
@@ -3280,16 +3338,28 @@ fn install_from_registry_blocking(
 
     let registry = RegistryClient::new(registry_url).with_stored_auth(state);
 
+    // `skill_id` is the LOCAL folder name. A private skill is registered as
+    // `<owner_namespace>~<slug>`: the registry (artifact URL, signed statement)
+    // knows it by that id, never by the bare folder name, which would fetch the
+    // org catalog's skill of the same name.
+    let registry_id = state
+        .registry_name_for_local(skill_id)
+        .unwrap_or_else(|| skill_id.to_string());
+
     // Fetch artifact metadata (download URL + signed statement).
     let meta = registry
-        .fetch_artifact_metadata(skill_id, version)
-        .with_context(|| format!("failed to fetch artifact metadata for {skill_id}@{version}"))?;
+        .fetch_artifact_metadata(&registry_id, version)
+        .with_context(|| {
+            format!("failed to fetch artifact metadata for {registry_id}@{version}")
+        })?;
 
     // M2: the digest and size come from the verified `skill_artifact.v1`
     // payload, never from the unsigned fields beside it.
     let (sha256, size) =
-        scenery_core::verifier::verify_skill_artifact(state, skill_id, version, &meta)
-            .with_context(|| format!("artifact for {skill_id}@{version} is not validly signed"))?;
+        scenery_core::verifier::verify_skill_artifact(state, &registry_id, version, &meta)
+            .with_context(|| {
+                format!("artifact for {registry_id}@{version} is not validly signed")
+            })?;
 
     // Download to a temp path.
     let tmp_path = state

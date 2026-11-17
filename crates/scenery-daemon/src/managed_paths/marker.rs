@@ -23,6 +23,41 @@ pub struct ManagedMarkerFile {
     pub installation_id: Option<String>,
     pub source_sha256: String,
     pub migrated_at: String,
+    /// `"auto_managed"` for a skill Scenery converted from the user's own
+    /// copy; absent for catalog installs and markers older than 2.3.0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    /// Registry text id (`<owner_namespace>~<slug>` for a private skill).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_id: Option<String>,
+    /// Stable registry identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_uuid: Option<String>,
+    /// Whole-tree hash of what Scenery wrote (see `scenery_core::skill_tree`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash_version: Option<u32>,
+}
+
+/// Origin value for a skill Scenery converted from the user's own copy.
+pub const ORIGIN_AUTO_MANAGED: &str = "auto_managed";
+
+/// Provenance carried beside a marker: where the skill came from and what
+/// Scenery last wrote. All-`None` is a legacy/catalog marker.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Provenance {
+    pub origin: Option<String>,
+    pub skill_id: Option<String>,
+    pub skill_uuid: Option<String>,
+    pub tree_hash: Option<String>,
+    pub hash_version: Option<u32>,
+}
+
+impl Provenance {
+    pub fn is_auto_managed(&self) -> bool {
+        self.origin.as_deref() == Some(ORIGIN_AUTO_MANAGED)
+    }
 }
 
 /// Row in the `managed_path_markers` SQLite table.
@@ -48,11 +83,33 @@ pub fn write_file_marker(
     source_sha256: &str,
     migrated_at: &str,
 ) -> Result<()> {
+    write_file_marker_with(
+        dir_path,
+        installation_id,
+        source_sha256,
+        migrated_at,
+        &Provenance::default(),
+    )
+}
+
+/// [`write_file_marker`] with provenance (`origin`, ids, `tree_hash`).
+pub fn write_file_marker_with(
+    dir_path: &Path,
+    installation_id: Option<&str>,
+    source_sha256: &str,
+    migrated_at: &str,
+    prov: &Provenance,
+) -> Result<()> {
     let marker = ManagedMarkerFile {
         marker_version: MARKER_FILE_VERSION,
         installation_id: installation_id.map(str::to_string),
         source_sha256: source_sha256.to_string(),
         migrated_at: migrated_at.to_string(),
+        origin: prov.origin.clone(),
+        skill_id: prov.skill_id.clone(),
+        skill_uuid: prov.skill_uuid.clone(),
+        tree_hash: prov.tree_hash.clone(),
+        hash_version: prov.hash_version,
     };
 
     let json = serde_json::to_string_pretty(&marker)
@@ -116,6 +173,60 @@ pub fn insert_db_marker(conn: &Connection, marker: &ManagedPathMarker) -> Result
     Ok(())
 }
 
+/// Read the provenance columns of the marker row at exactly `path`.
+/// Missing row, or a row written before 2.3.0, yields the default (legacy).
+pub fn marker_provenance(conn: &Connection, path: &str) -> Provenance {
+    use rusqlite::OptionalExtension;
+    conn.query_row(
+        "SELECT origin, skill_id, skill_uuid, tree_hash, hash_version \
+         FROM managed_path_markers WHERE path = ?1",
+        [path],
+        |row| {
+            Ok(Provenance {
+                origin: row.get(0)?,
+                skill_id: row.get(1)?,
+                skill_uuid: row.get(2)?,
+                tree_hash: row.get(3)?,
+                hash_version: row.get::<_, Option<i64>>(4)?.map(|v| v as u32),
+            })
+        },
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .unwrap_or_default()
+}
+
+/// Write the provenance columns of the marker row at `path` (the row must
+/// exist; insert it first).
+pub fn set_marker_provenance(conn: &Connection, path: &str, prov: &Provenance) -> Result<()> {
+    conn.execute(
+        "UPDATE managed_path_markers \
+         SET origin = ?1, skill_id = ?2, skill_uuid = ?3, tree_hash = ?4, hash_version = ?5 \
+         WHERE path = ?6",
+        rusqlite::params![
+            prov.origin,
+            prov.skill_id,
+            prov.skill_uuid,
+            prov.tree_hash,
+            prov.hash_version.map(i64::from),
+            path
+        ],
+    )
+    .context("failed to write managed_path_markers provenance")?;
+    Ok(())
+}
+
+/// Is the skill directory `dir` an auto-managed one according to the
+/// authoritative DB row (never the marker file)? Compares canonicalised
+/// paths like [`tracked_marker_for_path`].
+pub fn is_auto_managed_path(conn: &Connection, dir: &Path) -> bool {
+    match tracked_marker_for_path(conn, "skill", dir) {
+        Ok(Some(row)) => marker_provenance(conn, &row.path).is_auto_managed(),
+        _ => false,
+    }
+}
+
 /// Update `installation_id` for an existing marker row.
 pub fn update_db_marker_installation_id(
     conn: &Connection,
@@ -160,6 +271,11 @@ pub enum DbOwnership {
     /// A row exists at this canonical path but the content no longer matches
     /// its hash (edited, replaced, or half-written).
     HashMismatch,
+    /// A row with `origin = 'auto_managed'` whose content differs from what
+    /// Scenery wrote: the user kept editing their own skill. A normal edit,
+    /// never `managed_hash_mismatch` and never held (plan 4.5.4); drift
+    /// reports it.
+    EditedOwn,
     /// No row at this path — not ours, whatever marker file it carries.
     Untracked,
 }
@@ -222,6 +338,7 @@ pub fn db_ownership(conn: &Connection, kind: &str, dir: &Path) -> DbOwnership {
     };
     match super::drift::current_hash_for(&row) {
         Ok(Some(h)) if h == row.source_sha256 => DbOwnership::Verified,
+        _ if marker_provenance(conn, &row.path).is_auto_managed() => DbOwnership::EditedOwn,
         _ => DbOwnership::HashMismatch,
     }
 }

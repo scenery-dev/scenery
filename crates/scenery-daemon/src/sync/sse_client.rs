@@ -371,6 +371,8 @@ pub(crate) async fn run_with_policy(
                 if let Err(e) = state.mark_device_revoked() {
                     warn!(error = %e, "SSE: failed to persist device-revoked state locally");
                 }
+                // Kill switch for skills tracked in place (never deleted).
+                crate::managed_paths::tracked::reconcile(&state);
                 info!(
                     "SSE: device revoked by admin — stopping sync. \
                      Run `scenery auth pair` to re-pair as a new device."
@@ -390,6 +392,7 @@ pub(crate) async fn run_with_policy(
                 {
                     warn!(error = %e, "SSE: failed to clear the revoked session");
                 }
+                crate::managed_paths::tracked::reconcile(&state);
                 info!(
                     "SSE: your Scenery account was revoked by an admin — stopping sync. \
                      After an admin reinstates it, run `scenery auth login` then \
@@ -1756,6 +1759,7 @@ async fn try_refresh_token(
             Err(err) if err.is_user_revoked() => {
                 scenery_core::auth::handle_user_revoked(&state_clone, &reg_url)
                     .context("failed to clear the revoked session")?;
+                crate::managed_paths::tracked::reconcile(&state_clone);
                 Err(anyhow::Error::new(scenery_core::auth::UserRevokedError))
             }
             Err(err) => {

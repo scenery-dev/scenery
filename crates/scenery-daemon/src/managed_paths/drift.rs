@@ -226,6 +226,35 @@ impl DriftScanner {
                         }
                     }
                 }
+                DriftStatus::Drifted
+                    if outcome.kind == "skill" && self.is_auto_managed(&outcome.path) =>
+                {
+                    // Plan 4.5.4: the user's OWN skill (converted by auto-manage)
+                    // is never quarantined or moved aside, in any mode, strict
+                    // included. An edit is the user working; it is reported once
+                    // (the marker is re-baselined to what is on disk now, so
+                    // the next cycle does not repeat it) and keeps running.
+                    stats.drifted += 1;
+                    let current_hash = outcome.current_hash.clone().unwrap_or_default();
+                    if let Err(e) = rebaseline_marker(&self.state, &outcome.path, &current_hash) {
+                        warn!(slug = %outcome.slug, error = %e, "drift: could not re-baseline an edited own skill");
+                    }
+                    info!(
+                        slug = %outcome.slug,
+                        "drift: own (auto-managed) skill edited — reported, never quarantined"
+                    );
+                    to_report.push(DriftReportItem {
+                        slug: outcome.slug,
+                        kind: outcome.kind,
+                        current_hash,
+                        expected_hash: outcome.expected_hash,
+                        action: "reported".to_string(),
+                        detail: Some(serde_json::json!({
+                            "path": outcome.path,
+                            "reason": "own_skill_edited",
+                        })),
+                    });
+                }
                 DriftStatus::Drifted => {
                     stats.drifted += 1;
                     let current_hash = outcome.current_hash.clone().unwrap_or_default();
@@ -302,6 +331,14 @@ impl DriftScanner {
             out.push(classify(&marker));
         }
         Ok(out)
+    }
+
+    /// Is the marker row at `path` an auto-managed (the user's own) skill?
+    /// Read from the DB row, never from the marker file.
+    fn is_auto_managed(&self, path: &str) -> bool {
+        Connection::open(self.state.db_path.as_std_path())
+            .map(|conn| super::marker::marker_provenance(&conn, path).is_auto_managed())
+            .unwrap_or(false)
     }
 
     async fn report(&self, events: Vec<DriftReportItem>) -> Result<()> {
@@ -447,9 +484,31 @@ fn accept_local(state: &AppState, slug: &str, kind: &str) -> Result<()> {
     Ok(())
 }
 
+/// Accept the on-disk hash as the marker baseline (an own skill was edited).
+fn rebaseline_marker(state: &AppState, path: &str, hash: &str) -> Result<()> {
+    let conn = Connection::open(state.db_path.as_std_path())?;
+    conn.execute(
+        "UPDATE managed_path_markers SET source_sha256 = ?1 WHERE path = ?2",
+        rusqlite::params![hash, path],
+    )?;
+    Ok(())
+}
+
 fn restore_canonical(state: &AppState, slug: &str, kind: &str) -> Result<()> {
     let marker = find_marker_by_slug_kind(state, slug, kind)?
         .ok_or_else(|| anyhow::anyhow!("drift: no marker for slug={slug} kind={kind}"))?;
+    // The user's own skill is never discarded on an admin's say-so: its
+    // "canonical" version is whatever the owner last wrote, and replacing it
+    // with the registry copy would throw their work away.
+    if kind == "skill" {
+        let conn = Connection::open(state.db_path.as_std_path())?;
+        if super::marker::marker_provenance(&conn, &marker.path).is_auto_managed() {
+            anyhow::bail!(
+                "drift: refusing restore_canonical for {slug}: it is the user's own \
+                 (auto-managed) skill; their edits are not discarded"
+            );
+        }
+    }
     // The directory being discarded may hold the user's edits (that is what
     // "drifted" means). Back it up through the restore journal first; if the
     // backup fails, nothing is removed.

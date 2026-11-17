@@ -36,9 +36,11 @@
 //! even opening the DB.  Migration failure must NOT crash the daemon.
 
 pub mod adopt_publish;
+pub mod auto_manage;
 pub mod conversion;
 pub mod discoveries;
 pub mod drift;
+pub mod foreign;
 pub mod links;
 pub mod marker;
 pub mod mcp_discovery;
@@ -52,6 +54,7 @@ pub mod pusher;
 pub mod rollback;
 pub mod scanner;
 pub mod takeover;
+pub mod tracked;
 
 /// Serializes every test that mutates process-global state (`$HOME`,
 /// `SCENERY_DISABLE_FILESYSTEM_RECONCILER`).
