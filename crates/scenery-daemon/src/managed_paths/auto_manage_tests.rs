@@ -962,3 +962,22 @@ async fn a_revoked_catalog_skill_with_the_same_bare_slug_does_not_block_a_privat
     assert_eq!(s.managed, 1, "{s:?}");
     assert_eq!(marker_file(&dir)["skill_id"], "adam~pdf");
 }
+
+#[tokio::test]
+async fn local_holds_are_surfaced_without_any_directive_and_pruned_when_the_skill_is_gone() {
+    let env = Env::new().await;
+    let dir = env.user_skill(&env.agents(), "silent");
+    fs::write(dir.join("id_ed25519"), "key").unwrap();
+    let items = env.scan();
+
+    // An older backend (no directives at all) must not make the hold silent.
+    note_local_holds(&env.state, &items);
+    let att = attention_list(&env.state);
+    assert_eq!(att.len(), 1);
+    assert_eq!(att[0].reason.as_deref(), Some("secrets_detected"));
+
+    // The user removes the skill: the stale row goes away.
+    fs::remove_dir_all(&dir).unwrap();
+    note_local_holds(&env.state, &[]);
+    assert!(attention_list(&env.state).is_empty());
+}

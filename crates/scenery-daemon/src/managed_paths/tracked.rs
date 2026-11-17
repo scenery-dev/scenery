@@ -85,6 +85,7 @@ const COLS: &str = "path, slug, reason, skill_id, skill_uuid, version, last_tree
                     last_upload_at, neutralized, neutralized_reason";
 
 /// Insert or refresh a tracked skill after a successful `mode=track` upload.
+#[allow(clippy::too_many_arguments)]
 pub fn upsert(
     state: &AppState,
     path: &str,
@@ -387,7 +388,8 @@ pub fn restore(state: &AppState, row: &TrackedRow) -> Result<Vec<PathBuf>> {
              FROM tracked_neutralizations WHERE tracked_path = ?1 ORDER BY id DESC",
         )
         .context("tracked: prepare restore")?;
-    let recs: Vec<(i64, String, String, Option<String>, Option<String>)> = stmt
+    type Rec = (i64, String, String, Option<String>, Option<String>);
+    let recs: Vec<Rec> = stmt
         .query_map([&row.path], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
         })

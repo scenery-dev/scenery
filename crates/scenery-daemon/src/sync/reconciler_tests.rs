@@ -1345,3 +1345,73 @@ fn adopted_skill_with_bundled_files_round_trips_byte_for_byte() {
 
     cleanup(&root);
 }
+
+// ── Tracked skills are never overwritten by a registry install ────────────────
+
+#[tokio::test]
+async fn a_registry_install_is_skipped_while_the_owner_tracks_that_folder() {
+    use super::{handle_install, ReconcilerStats};
+    let root = temp_root("tracked-skip");
+    let state = std::sync::Arc::new(AppState::bootstrap_in(root.clone()).unwrap());
+    crate::managed_paths::tracked::upsert(
+        &state,
+        "/h/.agents/skills/pdf",
+        "pdf",
+        "git_tracked",
+        Some("adam~pdf"),
+        None,
+        Some("0.1.0"),
+        "h",
+    )
+    .unwrap();
+    let stats = std::sync::Arc::new(std::sync::Mutex::new(ReconcilerStats {
+        pending: 1,
+        ..Default::default()
+    }));
+
+    let ok = handle_install(
+        install_id(),
+        "pdf",
+        "9.9.9",
+        None,
+        &state,
+        "http://127.0.0.1:1",
+        &stats,
+        None,
+    )
+    .await;
+
+    assert!(!ok);
+    assert_eq!(stats.lock().unwrap().errors, 1);
+    // Nothing was fetched or written: no install dir for the registry copy.
+    assert!(!root.join("skills/pdf").exists());
+    cleanup(&root);
+}
+
+#[test]
+fn a_private_skill_is_fetched_by_its_registry_id_not_the_bare_folder_name() {
+    let root = temp_root("registry-id-fetch");
+    let state = AppState::bootstrap_in(root.clone()).unwrap();
+    state.record_skill_local_name("adam~pdf", "pdf").unwrap();
+    let mut server = mockito::Server::new();
+    let private = server
+        .mock("GET", "/skills/adam~pdf/versions/0.1.0")
+        .with_status(404)
+        .expect(1)
+        .create();
+    let catalog = server
+        .mock("GET", "/skills/pdf/versions/0.1.0")
+        .with_status(404)
+        .expect(0)
+        .create();
+
+    // Local folder `pdf`; the install fails (404), but only after asking for
+    // the PRIVATE id: the org catalog's `pdf` must never be fetched instead.
+    let err =
+        super::install_from_registry_blocking(&state, &server.url(), "pdf", "0.1.0", install_id())
+            .unwrap_err();
+    assert!(format!("{err:#}").contains("adam~pdf"), "{err:#}");
+    private.assert();
+    catalog.assert();
+    cleanup(&root);
+}

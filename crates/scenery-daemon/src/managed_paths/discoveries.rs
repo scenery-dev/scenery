@@ -256,6 +256,8 @@ pub async fn run_once(state: Arc<AppState>, registry_url: String) -> Result<usiz
     }
 
     let count = items.len();
+    // Held skills are surfaced to the user whatever the backend says.
+    super::auto_manage::note_local_holds(&state, &items);
     let http_client = match scenery_core::http::async_client_builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
@@ -1172,13 +1174,14 @@ mod tests {
         assert_eq!(detail["client_name"], "Cursor");
         assert_eq!(detail["server_key"], "linear-mcp");
         assert_eq!(detail["package_identifier"], "linear-mcp");
-        // The allowlist contract (mcp_discovery.rs) must survive the mapping
-        // into DiscoveryItem unchanged: no raw args/command/env value ever
-        // appears in the serialized batch.
+        // The privacy contract (mcp_discovery.rs) must survive the mapping
+        // into DiscoveryItem unchanged: the backend has not yet said
+        // `auto_submit_mcp = true`, so the first batch carries NO args; the
+        // command is its basename only; env values are never present.
+        assert_eq!(detail["command"], "npx");
         let serialized = serde_json::to_string(&items).unwrap();
         assert!(!serialized.contains("\"args\""));
-        assert!(!serialized.contains("\"command\""));
-        assert!(!serialized.contains("\"env\""));
+        assert!(!serialized.contains("\"env\":"));
     }
 
     // ── 10. R2: full batch payload never leaks secrets from an MCP fixture ────

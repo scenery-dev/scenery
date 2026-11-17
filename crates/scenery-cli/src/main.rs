@@ -833,6 +833,84 @@ async fn run(cli: Cli) -> Result<()> {
 
 // ── doctor ────────────────────────────────────────────────────────────────────
 
+/// Total size in bytes of everything under `dir` (links not followed).
+fn dir_size_bytes(dir: &std::path::Path) -> u64 {
+    let mut total = 0u64;
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    for e in rd.flatten() {
+        let Ok(m) = std::fs::symlink_metadata(e.path()) else {
+            continue;
+        };
+        if m.is_dir() {
+            total += dir_size_bytes(&e.path());
+        } else {
+            total += m.len();
+        }
+    }
+    total
+}
+
+/// The "Skills" block of `scenery doctor`: auto-managed and tracked counts,
+/// every skill held back or blocked (and why), and the size of
+/// `restore-backups/` (which is never pruned automatically).
+fn auto_manage_status_lines(state: &scenery_core::state::AppState) -> Vec<String> {
+    use scenery_daemon::managed_paths::{auto_manage, tracked};
+    let mut out = Vec::new();
+    let tracked_rows = tracked::list(state).unwrap_or_default();
+    let managed: i64 = rusqlite::Connection::open(&state.db_path)
+        .ok()
+        .and_then(|c| {
+            c.query_row(
+                "SELECT COUNT(*) FROM managed_path_markers WHERE kind = 'skill' \
+                 AND origin = 'auto_managed'",
+                [],
+                |r| r.get(0),
+            )
+            .ok()
+        })
+        .unwrap_or(0);
+    let policy = match state.cached_auto_manage_policy() {
+        Some(p) if p.auto_manage_skills => "on",
+        Some(_) => "off (set by your organization)",
+        None => "waiting for the backend",
+    };
+    out.push(format!(
+        "Auto-manage:     {policy}; {managed} skill(s) converted, {} tracked in place",
+        tracked_rows.len()
+    ));
+    for t in tracked_rows.iter().filter(|t| t.neutralized) {
+        out.push(format!(
+            "  disabled:      {} ({})",
+            t.slug,
+            t.neutralized_reason.as_deref().unwrap_or("revoked")
+        ));
+    }
+    for a in auto_manage::attention_list(state) {
+        let what = match a.status.as_str() {
+            "held" => "HELD (not uploaded, not changed)",
+            "blocked" => "BLOCKED by the backend (not changed)",
+            _ => "will retry",
+        };
+        out.push(format!(
+            "  {what}: {} at {} — {}",
+            a.slug,
+            a.source_path,
+            a.reason.as_deref().unwrap_or("unknown reason")
+        ));
+    }
+    let backups = state.root_dir.join("restore-backups");
+    let bytes = dir_size_bytes(backups.as_std_path());
+    if bytes > 0 {
+        out.push(format!(
+            "Restore backups: {:.1} MB in {backups} (originals of converted skills; not pruned automatically)",
+            bytes as f64 / 1_048_576.0
+        ));
+    }
+    out
+}
+
 async fn cmd_doctor(registry_url: Option<&str>) -> Result<()> {
     use scenery_core::app::SceneryApp;
 
@@ -903,6 +981,12 @@ async fn cmd_doctor(registry_url: Option<&str>) -> Result<()> {
 
             let reconcile_status = query_reconcile_status(&app.state.db_path);
             println!("Reconcile:       {reconcile_status}");
+
+            // Auto-management: what Scenery converted or tracks, and every
+            // skill it held back (so nothing is skipped silently).
+            for line in auto_manage_status_lines(&app.state) {
+                println!("{line}");
+            }
 
             // M8/H3: Claude Code's HTTP+OAuth entry, if it has one — the
             // configured callback port's current availability, and whether

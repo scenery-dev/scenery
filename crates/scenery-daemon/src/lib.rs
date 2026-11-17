@@ -1643,7 +1643,7 @@ pub(crate) fn refresh_tick(state: &AppState, registry_url: &str) -> Result<Optio
                 // so the refresh loop is effectively stopped until a re-pair
                 // stores new tokens.
                 let cleared = scenery_core::auth::handle_user_revoked(state, &row.registry_url);
-                managed_paths::tracked::reconcile(&state);
+                managed_paths::tracked::reconcile(state);
                 match cleared {
                     Ok(true) => warn!(
                         registry_url = %row.registry_url,

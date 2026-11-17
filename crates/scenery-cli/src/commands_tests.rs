@@ -1003,3 +1003,70 @@ fn parse_lsof_output_command_name_none_for_header_only_output() {
 fn parse_lsof_output_command_name_none_for_empty_output() {
     assert_eq!(super::parse_lsof_output_command_name(""), None);
 }
+
+// ── doctor: auto-manage block ─────────────────────────────────────────────────
+
+#[test]
+fn doctor_lists_held_and_blocked_skills_tracked_counts_and_backup_size() {
+    use scenery_core::state::{AppState, AutoManagePolicy};
+    use scenery_daemon::managed_paths::auto_manage::{record_attempt, AttemptStatus};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = camino::Utf8PathBuf::from_path_buf(tmp.path().join("data")).unwrap();
+    let state = AppState::bootstrap_in(root).unwrap();
+
+    let lines = super::auto_manage_status_lines(&state);
+    assert!(lines[0].contains("waiting for the backend"), "{lines:?}");
+
+    state
+        .cache_auto_manage_policy(&AutoManagePolicy {
+            auto_manage_skills: true,
+            auto_submit_mcp: true,
+        })
+        .unwrap();
+    record_attempt(
+        &state,
+        "leaky",
+        "/h/.agents/skills/leaky",
+        "h",
+        AttemptStatus::Held,
+        Some("secrets_detected"),
+    );
+    record_attempt(
+        &state,
+        "bad",
+        "/h/.agents/skills/bad",
+        "h",
+        AttemptStatus::Blocked,
+        Some("scan_rejected"),
+    );
+    record_attempt(
+        &state,
+        "fine",
+        "/h/.agents/skills/fine",
+        "h",
+        AttemptStatus::Managed,
+        None,
+    );
+    let backups = state.root_dir.join("restore-backups/t1/adopted/x");
+    std::fs::create_dir_all(backups.as_std_path()).unwrap();
+    std::fs::write(backups.join("SKILL.md").as_std_path(), vec![b'x'; 2048]).unwrap();
+
+    let text = super::auto_manage_status_lines(&state).join("\n");
+    assert!(text.contains("Auto-manage:     on"), "{text}");
+    assert!(
+        text.contains("HELD (not uploaded, not changed): leaky"),
+        "{text}"
+    );
+    assert!(text.contains("secrets_detected"), "{text}");
+    assert!(
+        text.contains("BLOCKED by the backend (not changed): bad"),
+        "{text}"
+    );
+    assert!(text.contains("scan_rejected"), "{text}");
+    assert!(
+        !text.contains("fine at"),
+        "managed skills are not listed as problems: {text}"
+    );
+    assert!(text.contains("Restore backups:"), "{text}");
+}

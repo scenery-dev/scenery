@@ -252,6 +252,7 @@ pub struct AutoManageRefusal {
 
 /// Result of [`RegistryClient::auto_manage`].
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum AutoManageReply {
     Done(AutoManageResponse),
     Refused(AutoManageRefusal),

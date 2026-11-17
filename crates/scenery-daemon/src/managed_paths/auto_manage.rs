@@ -432,6 +432,30 @@ fn record_skip(state: &AppState, item: &DiscoveryItem, hash: &str, reason: Optio
     }
 }
 
+/// Tell the user about every skill the LOCAL classifier holds, whatever the
+/// backend answers (an older backend sends no directives at all), and forget
+/// held/blocked/failed rows whose skill is gone from disk. A held skill must
+/// never be silent.
+pub fn note_local_holds(state: &AppState, items: &[DiscoveryItem]) {
+    for item in items.iter().filter(|i| i.kind == "skill") {
+        if let Some(local) = &item.local {
+            if let Treatment::Hold(reason) = &local.treatment {
+                note_held(state, item, &local.tree_hash, reason);
+            }
+        }
+    }
+    for a in attention_list(state) {
+        if !Path::new(&a.source_path).exists() {
+            if let Ok(conn) = open(state) {
+                let _ = conn.execute(
+                    "DELETE FROM auto_manage_attempts WHERE slug = ?1 AND source_path = ?2",
+                    [&a.slug, &a.source_path],
+                );
+            }
+        }
+    }
+}
+
 /// Remember a held skill (once per tree hash) so the user is told: a warning in
 /// the log, an audit event for IT, and a row `scenery status` lists.
 pub fn note_held(state: &AppState, item: &DiscoveryItem, hash: &str, reason: &str) {

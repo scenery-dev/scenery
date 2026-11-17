@@ -863,6 +863,9 @@ impl AppState {
     }
 }
 
+/// `(origin, skill_id, skill_uuid)` recorded with a pending takeover.
+pub type PendingProvenance = (String, Option<String>, Option<String>);
+
 // ── Auto-manage policy cache ─────────────────────────────────────────────────
 
 /// `sync_state` key holding the last policy a discovery upload returned.
@@ -954,10 +957,7 @@ impl AppState {
     /// The auto-manage provenance recorded with `slug`'s pending takeover:
     /// `(origin, skill_id, skill_uuid)`. `None` when nothing is pending or the
     /// takeover came from the legacy adopt flow (no `origin`).
-    pub fn pending_takeover_provenance(
-        &self,
-        slug: &str,
-    ) -> Result<Option<(String, Option<String>, Option<String>)>> {
+    pub fn pending_takeover_provenance(&self, slug: &str) -> Result<Option<PendingProvenance>> {
         use rusqlite::OptionalExtension;
         let conn = Connection::open(&self.db_path)
             .context("failed to open state DB for pending-takeover lookup")?;
