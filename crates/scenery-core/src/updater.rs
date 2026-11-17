@@ -267,6 +267,28 @@ pub fn check_for_update(
     }
 }
 
+/// The registry id of the skill kept in local folder `folder`: the recorded
+/// mapping (an auto-managed private skill `<owner>~<slug>` lives in folder
+/// `<slug>`), else the folder name itself.
+///
+/// Every call that talks to the registry about an installed skill must use
+/// this, never the folder name: the folder name addresses the ORG CATALOG's
+/// skill of the same name, or nothing at all.
+pub fn registry_id_of(state: &AppState, folder: &str) -> String {
+    state
+        .registry_name_for_local(folder)
+        .unwrap_or_else(|| folder.to_string())
+}
+
+/// Private (owner-namespaced) registry ids contain `~`. Neither the anonymous
+/// lifecycle endpoint nor the catalog knows them, so the periodic lifecycle
+/// and version phases leave such skills alone: their lifecycle is driven by
+/// the sync stream (install, deactivate, purge, revoke), and a private skill
+/// is never auto-upgraded.
+pub fn is_private_registry_id(id: &str) -> bool {
+    id.contains('~')
+}
+
 /// Check all installed skills for lifecycle changes and available updates from the registry.
 ///
 /// **Lifecycle phase** (runs first, requires `POST /skills/status`):
@@ -305,7 +327,25 @@ pub fn check_skill_updates(
     drop(all_stmt);
     drop(conn);
 
-    let all_skill_ids: Vec<String> = all_installed.iter().map(|(id, _)| id.clone()).collect();
+    // Folder name -> registry id. The status check, the policy fetch and the
+    // detail fetch speak REGISTRY ids; local removal speaks folder names.
+    let registry_ids: std::collections::HashMap<String, String> = all_installed
+        .iter()
+        .map(|(id, _)| (id.clone(), registry_id_of(state, id)))
+        .collect();
+    let rid = |folder: &str| -> String {
+        registry_ids
+            .get(folder)
+            .cloned()
+            .unwrap_or_else(|| folder.to_string())
+    };
+    // Private skills are never sent: the endpoint cannot know them and would
+    // answer "unknown", which means "uninstall".
+    let all_skill_ids: Vec<String> = all_installed
+        .iter()
+        .map(|(id, _)| rid(id))
+        .filter(|r| !is_private_registry_id(r))
+        .collect();
     let mut changes = 0usize;
 
     // ── Phase 2: lifecycle check ──────────────────────────────────────────────
@@ -317,7 +357,23 @@ pub fn check_skill_updates(
         Ok(status_resp) => {
             let mut published = std::collections::HashSet::new();
             for (skill_id, local_status) in &all_installed {
-                if status_resp.unknown.contains(skill_id) {
+                let registry_id = rid(skill_id);
+                if is_private_registry_id(&registry_id) {
+                    // Never touched here: see `is_private_registry_id`.
+                    continue;
+                }
+                let mapped = registry_id != *skill_id;
+                if status_resp.unknown.contains(&registry_id) {
+                    if mapped {
+                        // Registered under a different name than its folder:
+                        // an "unknown" here is not proof it was deleted.
+                        tracing::warn!(
+                            skill_id,
+                            registry_id,
+                            "sync: registry does not know a mapped skill; leaving it installed"
+                        );
+                        continue;
+                    }
                     // Skill was deleted from registry — full cleanup.
                     match uninstall_skill(state, skill_id) {
                         Ok(Some(_)) => {
@@ -329,7 +385,7 @@ pub fn check_skill_updates(
                             tracing::warn!(skill_id, error = %e, "sync: failed to uninstall unknown skill");
                         }
                     }
-                } else if let Some(entry) = status_resp.statuses.get(skill_id) {
+                } else if let Some(entry) = status_resp.statuses.get(&registry_id) {
                     match entry.status.as_str() {
                         "unpublished" => {
                             if local_status == "active" {
@@ -409,6 +465,12 @@ pub fn check_skill_updates(
     drop(conn);
 
     for (skill_id, active_version, install_root) in active_rows {
+        // A skill kept under a different registry id (every auto-managed
+        // private skill) is not version-updated from here: asking the catalog
+        // about its folder name would update it to a DIFFERENT skill.
+        if state.registry_name_for_local(&skill_id).is_some() {
+            continue;
+        }
         // When lifecycle check succeeded, only update skills that are published.
         if let Some(ref published) = published_ids {
             if !published.contains(&skill_id) {

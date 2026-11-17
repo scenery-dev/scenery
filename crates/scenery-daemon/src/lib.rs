@@ -2720,6 +2720,11 @@ fn populate_update_check_cache(
     let now = std::time::Instant::now();
 
     for (skill_id, active_version) in rows {
+        // Skills kept under a different registry id are not asked about by
+        // folder name (that would query the catalog's skill of the same name).
+        if state.registry_name_for_local(&skill_id).is_some() {
+            continue;
+        }
         let installed = match Version::parse(&active_version) {
             Ok(v) => v,
             Err(_) => continue,
@@ -2766,7 +2771,17 @@ fn flush_ratings_and_scan(
         Ok(conn) => {
             match get_unsynced_ratings(&conn) {
                 Ok(ratings) if !ratings.is_empty() => {
-                    match registry.upload_skill_ratings(&ratings) {
+                    // Rows are keyed by LOCAL folder; the registry knows the
+                    // REGISTRY id (`<owner>~<slug>` for a private skill).
+                    let wire: Vec<_> = ratings
+                        .iter()
+                        .cloned()
+                        .map(|mut r| {
+                            r.skill_id = scenery_core::updater::registry_id_of(state, &r.skill_id);
+                            r
+                        })
+                        .collect();
+                    match registry.upload_skill_ratings(&wire) {
                         Ok(()) => {
                             let ids: Vec<i64> = ratings.iter().map(|r| r.id).collect();
                             match mark_ratings_synced(&conn, &ids) {
@@ -2785,10 +2800,15 @@ fn flush_ratings_and_scan(
 
             // ── 6. Execution stats flush ──────────────────────────────────────
             match get_execution_stats(&conn) {
-                Ok(stats) if !stats.is_empty() => match registry.upload_execution_stats(&stats) {
-                    Ok(()) => info!(count = stats.len(), "sync: execution stats flushed"),
-                    Err(e) => warn!(error = %e, "sync: execution stats upload failed"),
-                },
+                Ok(mut stats) if !stats.is_empty() => {
+                    for s in &mut stats {
+                        s.skill_id = scenery_core::updater::registry_id_of(state, &s.skill_id);
+                    }
+                    match registry.upload_execution_stats(&stats) {
+                        Ok(()) => info!(count = stats.len(), "sync: execution stats flushed"),
+                        Err(e) => warn!(error = %e, "sync: execution stats upload failed"),
+                    }
+                }
                 Ok(_) => {}
                 Err(e) => warn!(error = %e, "sync: failed to read execution stats"),
             }
