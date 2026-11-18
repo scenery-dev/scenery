@@ -172,6 +172,45 @@ fn build_tool_list_inner(
     // them would leave that skill pointing at tools that do not exist.
     tools.extend(crate::authoring_tools::tool_definitions());
 
+    // MCP server setup (plan 4.7): the built-in authoring skill steers the AI to
+    // the catalog, then the request tool, so both are exposed by default once the
+    // user is logged in (the rest of the MCP governance tools stay opt-in).
+    if logged_in {
+        tools.push(ToolDefinition {
+            name: "scenery_mcp_catalog".to_string(),
+            description: "Browse approved MCP servers in your organisation's catalog. Shows \
+                available servers with their status, version pins, and credential notes."
+                .to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+        });
+
+        tools.push(ToolDefinition {
+            name: "scenery_mcp_request".to_string(),
+            description: "Request access to a new MCP server. In trust mode the request is \
+                auto-approved. In catalog-only mode, known servers are auto-approved. In strict \
+                mode the request goes to IT for review."
+                .to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "server_name": {
+                        "type": "string",
+                        "description": "Name of the MCP server to request (e.g., 'Slack MCP')"
+                    },
+                    "package_source": {
+                        "type": "string",
+                        "description": "Optional package source (e.g., '@modelcontextprotocol/server-slack')"
+                    }
+                },
+                "required": ["server_name"]
+            }),
+        });
+    }
+
     if !expose_builtins {
         return tools;
     }
@@ -319,40 +358,6 @@ fn build_tool_list_inner(
 
     // MCP Governance tools — only shown when logged in
     if logged_in {
-        tools.push(ToolDefinition {
-            name: "scenery_mcp_catalog".to_string(),
-            description: "Browse approved MCP servers in your organisation's catalog. Shows \
-                available servers with their status, version pins, and credential notes."
-                .to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {},
-                "required": []
-            }),
-        });
-
-        tools.push(ToolDefinition {
-            name: "scenery_mcp_request".to_string(),
-            description: "Request access to a new MCP server. In trust mode the request is \
-                auto-approved. In catalog-only mode, known servers are auto-approved. In strict \
-                mode the request goes to IT for review."
-                .to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "server_name": {
-                        "type": "string",
-                        "description": "Name of the MCP server to request (e.g., 'Slack MCP')"
-                    },
-                    "package_source": {
-                        "type": "string",
-                        "description": "Optional package source (e.g., '@modelcontextprotocol/server-slack')"
-                    }
-                },
-                "required": ["server_name"]
-            }),
-        });
-
         tools.push(ToolDefinition {
             name: "scenery_mcp_status".to_string(),
             description: "Check the status of your MCP server access requests.".to_string(),
@@ -3188,6 +3193,35 @@ mod tests {
         assert!(
             !names.contains(&"scenery_list"),
             "other management tools stay hidden"
+        );
+        let _ = fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn mcp_catalog_and_request_are_on_the_default_surface_when_logged_in() {
+        let state_root = temp_root("mcp-default");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+        let url = Some("https://registry.test".to_string());
+        let names = |s: &AppState| -> Vec<String> {
+            build_tool_list_inner(s, &url, false, None)
+                .into_iter()
+                .map(|t| t.name)
+                .collect()
+        };
+        let before = names(&state);
+        assert!(
+            !before.iter().any(|n| n == "scenery_mcp_catalog"),
+            "{before:?}"
+        );
+        auth::save_tokens(&state, "https://registry.test", "a", "r").unwrap();
+        let after = names(&state);
+        for n in ["scenery_mcp_catalog", "scenery_mcp_request"] {
+            assert!(after.iter().any(|x| x == n), "{n} missing: {after:?}");
+        }
+        // the rest of MCP governance stays opt-in
+        assert!(
+            !after.iter().any(|n| n == "scenery_mcp_install"),
+            "{after:?}"
         );
         let _ = fs::remove_dir_all(&state_root);
     }

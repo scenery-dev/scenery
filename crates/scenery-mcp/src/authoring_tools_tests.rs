@@ -343,9 +343,9 @@ fn share_is_two_steps_and_the_token_is_single_use() {
     let _u = ok_upload(&mut server);
     let publish = server
         .mock("POST", publish_path())
-        .match_body(Matcher::PartialJson(serde_json::json!({"catalog_name": "notes", "version": "0.1.0+abc"})))
+        .match_body(Matcher::PartialJson(serde_json::json!({"catalog_name": "notes", "version": "0.1.0+abc", "force_review": true})))
         .with_status(200)
-        .with_body(r#"{"kind":"skill","id":"x","adoption_status":"approved_published","visibility":"org_published","shared_skill_id":"notes"}"#)
+        .with_body(r#"{"kind":"skill","id":"x","adoption_status":"pending_review","visibility":"private","shared_skill_id":"notes"}"#)
         .expect(1)
         .create();
     let url = Some(server.url());
@@ -353,7 +353,8 @@ fn share_is_two_steps_and_the_token_is_single_use() {
     let v = step_one(&env, &server.url(), serde_json::json!({}));
     assert_eq!(v["status"], "awaiting_confirmation", "{v}");
     assert_eq!(v["preview"]["catalog_name"], "notes");
-    assert_eq!(v["preview"]["it_review_required"], false);
+    // An AI-client share always goes to IT review, whatever the scan gate says.
+    assert_eq!(v["preview"]["it_review_required"], true);
     let tok = v["confirm_token"].as_str().unwrap().to_string();
     // nothing was published by step one
     assert!(!publish.matched());
@@ -365,7 +366,7 @@ fn share_is_two_steps_and_the_token_is_single_use() {
         &url,
     );
     assert_ne!(done.is_error, Some(true), "{}", text(&done));
-    assert_eq!(json(&done)["status"], "shared");
+    assert_eq!(json(&done)["status"], "pending_review");
     publish.assert();
 
     // reuse is refused, and so is a made-up token
@@ -673,4 +674,57 @@ fn a_successful_upload_moves_the_recorded_tree_hash_forward() {
         )
         .unwrap();
     assert_eq!(hash.unwrap(), authoring::check_tree(&dir).tree_hash);
+}
+
+#[test]
+fn path_must_be_a_skill_folder_under_the_skill_roots() {
+    let env = Env::new();
+    env.own_skill("notes", "body");
+    // inside the root: fine
+    let inside = env.skills().join("notes");
+    let r = call(
+        "scenery_check_skill",
+        serde_json::json!({"path": inside.to_string_lossy()}),
+        &env,
+        &None,
+    );
+    assert_ne!(r.is_error, Some(true), "{}", text(&r));
+
+    // an arbitrary folder, the root itself, and a `..` escape are refused
+    let outside = env.home.path().join("elsewhere");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("SKILL.md"), "x").unwrap();
+    let dotdot = inside.join("..").join("..").join("..").join("elsewhere");
+    for p in [outside.clone(), env.skills(), dotdot] {
+        for tool in ["scenery_check_skill", "scenery_share_skill"] {
+            let r = call(
+                tool,
+                serde_json::json!({"path": p.to_string_lossy()}),
+                &env,
+                &None,
+            );
+            assert_eq!(r.is_error, Some(true), "{tool} {}", p.display());
+            assert!(text(&r).contains("not a skill folder"), "{}", text(&r));
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_inside_the_root_pointing_outside_is_refused() {
+    let env = Env::new();
+    let outside = env.home.path().join("secrets-dir");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("SKILL.md"), "x").unwrap();
+    std::fs::create_dir_all(env.skills()).unwrap();
+    let link = env.skills().join("sneaky");
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+    let r = call(
+        "scenery_share_skill",
+        serde_json::json!({"path": link.to_string_lossy()}),
+        &env,
+        &None,
+    );
+    assert_eq!(r.is_error, Some(true));
+    assert!(text(&r).contains("not a skill folder"), "{}", text(&r));
 }

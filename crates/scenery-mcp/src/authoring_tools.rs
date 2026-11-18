@@ -10,9 +10,13 @@
 //! * **share**: two steps. Step one checks, previews, uploads the current tree
 //!   as a new private version and returns a preview plus a single-use
 //!   confirmation token bound to the tree hash. Step two, with the token,
-//!   publishes through the existing share path. The token and the preview keep
-//!   an injected prompt from silently publishing a skill: the AI client is told
-//!   to show the preview to the user and only then confirm.
+//!   publishes through the existing share path. The token is handed to the AI
+//!   client, so it cannot prove a human agreed: an injected agent could call step
+//!   two itself. The server has no way to ask the human directly (it is a
+//!   hand-rolled JSON-RPC server; the daemon relay and the HTTP transport carry
+//!   no server-to-client requests, so MCP elicitation is not available), so
+//!   step two ALWAYS submits with `force_review`: the share goes to IT's review
+//!   queue whatever the org's approval mode, never straight to the catalog.
 //!
 //! Guidance, not enforcement: nothing here blocks a manual path.
 
@@ -303,13 +307,43 @@ fn write_new_skill(root: &Path, dir: &Path, skill_md: &str) -> anyhow::Result<()
 
 // ── resolving a skill folder ────────────────────────────────────────────────
 
+/// Canonicalize `p` and accept it only when it is a skill folder directly
+/// under one of the skill roots (`~/.agents/skills`, `~/.claude/skills`).
+/// `canonicalize` resolves `..` and symlinks first, so a link inside a root that
+/// points elsewhere (or a path outside the roots) is refused: an injected agent
+/// cannot make check/share pack and upload an arbitrary directory.
+fn confine_to_skill_roots(p: &Path) -> Result<PathBuf, String> {
+    let not_allowed = || {
+        format!(
+            "'{}' is not a skill folder under ~/.agents/skills. Give the skill's `name` instead.",
+            p.display()
+        )
+    };
+    let canon =
+        std::fs::canonicalize(p).map_err(|_| format!("'{}' is not a folder.", p.display()))?;
+    if !canon.is_dir() {
+        return Err(format!("'{}' is not a folder.", p.display()));
+    }
+    let roots = [agents_skills_dir(), claude_skills_dir()];
+    for root in roots.into_iter().flatten() {
+        let Ok(root_canon) = std::fs::canonicalize(&root) else {
+            continue;
+        };
+        if canon.parent() == Some(root_canon.as_path()) {
+            // Hand back the logical `<root>/<slug>`: the marker rows are keyed
+            // by that spelling, not by the canonical one.
+            if let Some(name) = canon.file_name() {
+                return Ok(root.join(name));
+            }
+        }
+    }
+    Err(not_allowed())
+}
+
 /// `(slug, dir)` from `name` (under `~/.agents/skills`) or `path`.
 fn resolve_skill_dir(args: &serde_json::Value) -> Result<(String, PathBuf), String> {
     if let Some(p) = str_arg(args, "path") {
-        let dir = PathBuf::from(p);
-        if !dir.is_dir() {
-            return Err(format!("'{p}' is not a folder."));
-        }
+        let dir = confine_to_skill_roots(Path::new(p))?;
         let slug = dir
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -707,23 +741,22 @@ fn handle_share(
             "version": version,
             "scan_verdict": preview.verdict,
             "scan_findings": preview.findings,
-            "it_review_required": preview.requires_review,
-            "what_happens": if preview.requires_review {
-                "It goes to IT for review first and stays private to you until they approve it."
-            } else {
-                "It is published to the catalog right away."
-            },
+            "it_review_required": true,
+            "what_happens": "It goes to IT for review first and stays private to you until they \
+                             approve it. A share made from an AI client is never published \
+                             straight to the catalog.",
             "your_copy": "Your own private copy stays yours and is not changed.",
         },
         "confirm_token": confirm,
-        "next": "Show this preview to the user in plain words and ask if they want to share. \
-                 ONLY if they say yes, call scenery_share_skill again with the same name \
+        "next": "Show this preview to the user in plain words (it will go to IT for review) \
+                 and ask if they want to share. ONLY if they say yes, call scenery_share_skill again with the same name \
                  and this confirm_token. The token works once and only for this exact content.",
     }))
 }
 
 fn finish_share(client: &RegistryClient, p: &PendingShare) -> ToolCallResult {
-    match client.share_private_skill(&p.skill_uuid, &p.catalog_name, &p.version, &p.groups) {
+    // `force_review` always: see the module docs.
+    match client.share_private_skill(&p.skill_uuid, &p.catalog_name, &p.version, &p.groups, true) {
         Ok(AuthoringReply::Done(s)) => {
             let live = s.visibility == "org_published";
             json_result(serde_json::json!({

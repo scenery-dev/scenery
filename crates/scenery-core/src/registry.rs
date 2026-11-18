@@ -1442,6 +1442,7 @@ impl RegistryClient {
         catalog_name: &str,
         version: &str,
         group_ids: &[String],
+        force_review: bool,
     ) -> Result<AuthoringReply<SharedSkill>> {
         let token = self
             .get_auth_token()
@@ -1453,6 +1454,9 @@ impl RegistryClient {
         let mut body = serde_json::json!({ "catalog_name": catalog_name, "version": version });
         if !group_ids.is_empty() {
             body["group_ids"] = serde_json::json!(group_ids);
+        }
+        if force_review {
+            body["force_review"] = serde_json::json!(true);
         }
         let http = crate::http::blocking_client_builder()
             .connect_timeout(std::time::Duration::from_secs(5))
@@ -3544,14 +3548,14 @@ mod tests {
             .mock("POST", "/portal/custom-tools/skill/u-1/publish")
             .match_header("authorization", "Bearer tok")
             .match_body(Matcher::Json(serde_json::json!({
-                "catalog_name": "notes", "version": "0.1.0", "group_ids": ["g1"]
+                "catalog_name": "notes", "version": "0.1.0", "group_ids": ["g1"], "force_review": true
             })))
             .with_status(200)
             .with_body(r#"{"kind":"skill","id":"u-1","adoption_status":"approved_published","visibility":"org_published","shared_skill_id":"notes"}"#)
             .create();
         let client = RegistryClient::new(server.url()).with_auth("tok");
         match client
-            .share_private_skill("u-1", "notes", "0.1.0", &["g1".to_string()])
+            .share_private_skill("u-1", "notes", "0.1.0", &["g1".to_string()], true)
             .unwrap()
         {
             AuthoringReply::Done(s) => {

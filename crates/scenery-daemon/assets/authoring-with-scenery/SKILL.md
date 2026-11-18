@@ -33,8 +33,9 @@ Sharing is the user's choice, never yours. Only when they ask:
 
 1. Call `scenery_share_skill` with the skill name. It checks the skill,
    uploads the current version privately and returns a preview: the catalog
-   name, who will see it, the scan result and whether IT review applies. It
-   also returns a one-time confirmation token.
+   name, who will see it and the scan result. It also returns a one-time
+   confirmation token. A share made from an AI client always goes to IT for
+   review first and stays private to the user until IT approves it; say so.
 2. Show the preview to the user in plain words and ask whether to go ahead.
    Do not call the second step on your own.
 3. Only after the user says yes, call `scenery_share_skill` again with the
@@ -48,12 +49,12 @@ Sharing is the user's choice, never yours. Only when they ask:
 Do not edit `~/.claude.json` or any client config by hand, and do not run
 `claude mcp add` for a new server.
 
-1. If `scenery_mcp_catalog` is available, call it to see whether the
-   organization already offers the server. If it does, use
-   `scenery_mcp_install`.
-2. If it is not in the catalog, call `scenery_mcp_request` with what the user
-   gave you (a package name, a command, a URL or a JSON snippet). The request
-   goes to IT for review. Tell the user it is waiting for approval.
-3. If those tools are not available, tell the user to request the server in
-   the Scenery portal instead of configuring it by hand.
+1. Call `scenery_mcp_catalog` to see whether the organization already offers
+   the server.
+2. Call `scenery_mcp_request` with what the user gave you (a package name, a
+   command, a URL or a JSON snippet). If the server is already approved it
+   becomes available through Scenery; otherwise the request goes to IT for
+   review. Tell the user which one happened and, if it is waiting, that it
+   needs approval.
+3. If the user is not signed in, call `scenery_login` first.
 4. Never ask the user to paste secrets into the chat.

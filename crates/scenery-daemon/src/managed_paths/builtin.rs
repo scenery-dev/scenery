@@ -67,6 +67,16 @@ fn is_current(state: &AppState, dir: &Path) -> bool {
         Ok(b) if hex::encode(Sha256::digest(&b)) == embedded_hash() => {}
         _ => return false,
     }
+    // Exactly the skill file and Scenery's marker: anything else was planted.
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name != "SKILL.md" && name != scenery_mcp::ownership::MANAGED_MARKER_FILENAME {
+            return false;
+        }
+    }
     matches!(
         super::pusher::projection_state(BUILTIN_SLUG),
         Ok(super::pusher::ProjectionState::Intact)
@@ -90,12 +100,69 @@ pub fn ensure_builtin_skill(state: &AppState) -> Result<BuiltinOutcome> {
         warn!(path = %dir.display(), "builtin skill: an unmanaged directory holds the reserved slug; not writing");
         return Ok(BuiltinOutcome::Conflict(dir));
     }
+    clear_for_rewrite(state, &dir)?;
     ManagedPathsPusher::new(state)
         .push_skill(BUILTIN_SLUG, None, BUILTIN_SKILL_MD.as_bytes(), &[])
         .context("builtin skill: push failed")?;
     stamp_builtin(state, &dir)?;
     info!(path = %dir.display(), "builtin skill: written");
     Ok(BuiltinOutcome::Written)
+}
+
+/// Empty the slot before the built-in is written, so the result is exactly the
+/// embedded `SKILL.md` and nothing else.
+///
+/// * A directory the row says is NOT builtin (for example the user's own
+///   auto-managed skill that holds the reserved slug) is copied into
+///   `restore-backups/<ts>/builtin/<slug>` and journaled first; if the backup
+///   fails nothing is removed and the write is abandoned.
+/// * A modified builtin is replaced whole, so a planted extra file (a script
+///   next to `SKILL.md`) never survives a rewrite.
+///
+/// A symlink is unlinked, never followed: its target is not ours to delete.
+fn clear_for_rewrite(state: &AppState, dir: &Path) -> Result<()> {
+    let Ok(meta) = std::fs::symlink_metadata(dir) else {
+        return Ok(()); // nothing there
+    };
+    let is_builtin = Connection::open(&state.db_path)
+        .map(|c| marker_provenance(&c, &dir.to_string_lossy()).is_builtin())
+        .unwrap_or(false);
+    if !is_builtin {
+        back_up_displaced(state, dir)?;
+    }
+    if meta.file_type().is_symlink() {
+        std::fs::remove_file(dir).context("builtin skill: could not unlink the old link")?;
+    } else {
+        std::fs::remove_dir_all(dir).context("builtin skill: could not clear the old copy")?;
+    }
+    Ok(())
+}
+
+/// Copy what is about to be displaced into the restore-backups area and journal
+/// it (`source = managed`: uninstall does not put it back, but it is on disk).
+fn back_up_displaced(state: &AppState, dir: &Path) -> Result<()> {
+    use scenery_core::restore_journal::{JournalEntry, JournalOp, JournalSource, RestoreJournal};
+
+    let src = camino::Utf8Path::from_path(dir)
+        .ok_or_else(|| anyhow::anyhow!("builtin skill: path is not valid UTF-8"))?;
+    let journal = RestoreJournal::for_state(state);
+    let backup = journal
+        .backup_tree_unique("builtin", BUILTIN_SLUG, src)
+        .context("builtin skill: could not back up the skill that holds the reserved slug")?;
+    journal
+        .append(
+            JournalEntry::new(
+                JournalOp::FileDelete,
+                JournalSource::Managed,
+                dir.to_string_lossy().to_string(),
+            )
+            .with_slug(BUILTIN_SLUG)
+            .with_backup_path(backup.to_string())
+            .with_detail(serde_json::json!({"reason": "builtin_reserved_slug"})),
+        )
+        .context("builtin skill: failed to journal the backup")?;
+    warn!(path = %dir.display(), backup = %backup, "builtin skill: moved a non-builtin skill aside");
+    Ok(())
 }
 
 /// Mark the row (and the file marker) `origin = builtin`.
@@ -106,6 +173,8 @@ fn stamp_builtin(state: &AppState, dir: &Path) -> Result<()> {
     prov.origin = Some(ORIGIN_BUILTIN.to_string());
     prov.skill_id = None;
     prov.skill_uuid = None;
+    prov.tree_hash = None;
+    prov.hash_version = None;
     set_marker_provenance(&conn, &key, &prov)?;
     // The file marker mirrors it for humans; ownership is the row.
     if let Ok(Some(m)) = super::marker::read_file_marker(dir) {
