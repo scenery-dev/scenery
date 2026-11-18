@@ -43,6 +43,12 @@ pub struct ManagedMarkerFile {
 /// Origin value for a skill Scenery converted from the user's own copy.
 pub const ORIGIN_AUTO_MANAGED: &str = "auto_managed";
 
+/// Origin value for a skill Scenery itself ships inside the runner binary
+/// (`authoring-with-scenery`). Scenery-owned, never uploaded, shared, drifted
+/// or branched, and it has no registry row. Ownership is this DB value, never
+/// the file marker (F13).
+pub const ORIGIN_BUILTIN: &str = "builtin";
+
 /// Provenance carried beside a marker: where the skill came from and what
 /// Scenery last wrote. All-`None` is a legacy/catalog marker.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -57,6 +63,10 @@ pub struct Provenance {
 impl Provenance {
     pub fn is_auto_managed(&self) -> bool {
         self.origin.as_deref() == Some(ORIGIN_AUTO_MANAGED)
+    }
+
+    pub fn is_builtin(&self) -> bool {
+        self.origin.as_deref() == Some(ORIGIN_BUILTIN)
     }
 }
 
@@ -223,6 +233,15 @@ pub fn set_marker_provenance(conn: &Connection, path: &str, prov: &Provenance) -
 pub fn is_auto_managed_path(conn: &Connection, dir: &Path) -> bool {
     match tracked_marker_for_path(conn, "skill", dir) {
         Ok(Some(row)) => marker_provenance(conn, &row.path).is_auto_managed(),
+        _ => false,
+    }
+}
+
+/// Is the skill directory `dir` the Scenery-owned built-in skill according to
+/// the authoritative DB row (`origin = 'builtin'`, never the marker file)?
+pub fn is_builtin_path(conn: &Connection, dir: &Path) -> bool {
+    match tracked_marker_for_path(conn, "skill", dir) {
+        Ok(Some(row)) => marker_provenance(conn, &row.path).is_builtin(),
         _ => false,
     }
 }

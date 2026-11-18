@@ -173,6 +173,7 @@ impl DriftScanner {
 
     /// Run one drift-scan cycle: scan, apply policy, report to backend.
     pub async fn run_cycle(&self) -> Result<CycleStats> {
+        super::builtin::refresh_if_modified(&self.state);
         let outcomes = self.scan_once()?;
         let mode = read_policy_mode(&self.state);
         let mut stats = CycleStats {
@@ -325,6 +326,14 @@ impl DriftScanner {
             // cleanup removes it).
             if matches!(marker.kind.as_str(), "skill" | "plugin")
                 && ownership::is_anthropic_native_path(std::path::Path::new(&marker.path))
+            {
+                continue;
+            }
+            // The built-in `authoring-with-scenery` skill is Scenery-owned: it is
+            // never drift-reported or quarantined. A modified copy is simply
+            // re-written from the embedded content ([`super::builtin`]).
+            if marker.kind == "skill"
+                && super::marker::marker_provenance(&conn, &marker.path).is_builtin()
             {
                 continue;
             }

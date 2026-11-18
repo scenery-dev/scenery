@@ -86,7 +86,9 @@ const GOVERNANCE_FOOTER: &str = "\n\n---\nTo add new MCP servers, use /mcp-reque
 /// hidden by default because users now manage skills + MCP servers via the
 /// portal — the management tools clutter the AI client's tool list. Set
 /// `SCENERY_EXPOSE_BUILTIN_TOOLS=1` to surface them for CLI-style
-/// workflows.
+/// workflows. The three authoring tools (`scenery_create_skill`,
+/// `scenery_check_skill`, `scenery_share_skill`) are the exception: always
+/// exposed.
 ///
 /// `native_skills_dir` is the skills folder the connected client loads
 /// natively (see [`native_skills_dir`]); skills with a Scenery copy there
@@ -163,6 +165,12 @@ fn build_tool_list_inner(
             }),
         });
     }
+
+    // Authoring with Scenery (plan 4.7): create / check / share a skill. Exposed
+    // by default (unlike the other management tools below): the built-in
+    // `authoring-with-scenery` skill steers the AI client to them, so hiding
+    // them would leave that skill pointing at tools that do not exist.
+    tools.extend(crate::authoring_tools::tool_definitions());
 
     if !expose_builtins {
         return tools;
@@ -835,6 +843,9 @@ fn handle_tool_call_inner(
         "scenery_author" => handle_author(arguments, state, registry_url.as_deref()),
         "scenery_author_confirm" => {
             handle_author_confirm(arguments, state, registry_url.as_deref())
+        }
+        n if crate::authoring_tools::is_authoring_tool(n) => {
+            crate::authoring_tools::handle(n, arguments, state, registry_url)
         }
         _ => handle_skill_run(
             name,
@@ -3159,6 +3170,26 @@ mod tests {
 
     fn empty_cache() -> UpdateCheckCache {
         Arc::new(Mutex::new(HashMap::new()))
+    }
+
+    #[test]
+    fn the_authoring_tools_are_exposed_even_with_builtins_hidden() {
+        let state_root = temp_root("authoring-default");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+        // `build_tool_list_inner(.., expose_builtins = false, ..)` is the default surface.
+        let tools = build_tool_list_inner(&state, &None, false, None);
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        for n in crate::authoring_tools::TOOL_NAMES {
+            assert!(
+                names.contains(&n),
+                "{n} must be on the default surface: {names:?}"
+            );
+        }
+        assert!(
+            !names.contains(&"scenery_list"),
+            "other management tools stay hidden"
+        );
+        let _ = fs::remove_dir_all(&state_root);
     }
 
     #[test]

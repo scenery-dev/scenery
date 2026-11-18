@@ -90,6 +90,10 @@ dev CLI. The override survives `brew services restart` until `--revert`. On macO
 `brew services stop scenery`, `cargo build --release`, then run
 `target/release/scenery daemon run --foreground`.
 
+## Authoring with Scenery (2.4.0)
+
+MCP tools `scenery_create_skill`, `scenery_check_skill`, `scenery_share_skill` (exposed by default, unlike the other management tools, which need `SCENERY_EXPOSE_BUILTIN_TOOLS=1`) live in `crates/scenery-mcp/src/authoring_tools.rs`; the daemon registers the create hook (`managed_paths/authoring.rs`: register, then the same transactional conversion as auto-manage). The built-in skill `authoring-with-scenery` is `crates/scenery-daemon/assets/authoring-with-scenery/SKILL.md`, written by `managed_paths/builtin.rs` at start (marker row `origin='builtin'`); discovery, auto-manage, drift, upload and Share skip it and `scenery uninstall` removes it. Backend gate: the new endpoints answer 426 below runner 2.4.0.
+
 ## Releasing
 
 After bumping the workspace `Cargo.toml` version, tag `vX.Y.Z` and push the tag

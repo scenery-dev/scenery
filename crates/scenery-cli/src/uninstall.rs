@@ -592,7 +592,9 @@ fn remove_marked_dirs(
                     ));
                 }
             }
-            Ok(Some(_marker)) => {
+            Ok(Some(marker)) => {
+                let builtin = marker.origin.as_deref()
+                    == Some(scenery_daemon::managed_paths::marker::ORIGIN_BUILTIN);
                 if let Err(e) = std::fs::remove_dir_all(&path) {
                     report.warnings.push(format!(
                         "failed to remove managed {location} entry '{name}': {e:#}"
@@ -602,10 +604,15 @@ fn remove_marked_dirs(
                 report.removed.push(RemovedItem {
                     name,
                     kind,
-                    reinstall_hint:
+                    reinstall_hint: if builtin {
+                        "Built into Scenery (it only teaches your AI client to use Scenery's \
+                         authoring tools) — nothing to re-add."
+                            .into()
+                    } else {
                         "Pushed by your organization's Scenery policy — nothing to re-add; \
                          ask IT if you still need it."
-                            .into(),
+                            .into()
+                    },
                     stripped_from: stripped_from.iter().map(|s| (*s).to_string()).collect(),
                 });
             }
@@ -2648,6 +2655,56 @@ mod tests {
                 .removed
                 .iter()
                 .any(|r| r.name == "marked-skill" && matches!(r.kind, RemovedKind::ManagedSkill)));
+        });
+        let _ = fs::remove_dir_all(&fake_home);
+    }
+
+    #[test]
+    fn whole_product_uninstall_removes_the_builtin_authoring_skill() {
+        use scenery_daemon::managed_paths::marker::{
+            write_file_marker_with, Provenance, ORIGIN_BUILTIN,
+        };
+        let fake_home = temp_dir("builtin-sweep");
+        with_fake_home(&fake_home, || {
+            let canonical = fake_home.join(".agents/skills/authoring-with-scenery");
+            fs::create_dir_all(&canonical).unwrap();
+            fs::write(canonical.join("SKILL.md"), b"builtin body").unwrap();
+            write_file_marker_with(
+                &canonical,
+                None,
+                "abc",
+                "2026-11-18T00:00:00Z",
+                &Provenance {
+                    origin: Some(ORIGIN_BUILTIN.into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let links = fake_home.join(".claude/skills");
+            fs::create_dir_all(&links).unwrap();
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&canonical, links.join("authoring-with-scenery")).unwrap();
+
+            let plan = Plan {
+                brokered: vec![],
+                clients: vec![],
+            };
+            let mut report = RestoreReport::default();
+            remove_managed_artifacts(&plan, &mut report);
+
+            assert!(!canonical.exists(), "the built-in skill is removed");
+            assert!(links
+                .join("authoring-with-scenery")
+                .symlink_metadata()
+                .is_err());
+            let item = report
+                .removed
+                .iter()
+                .find(|r| r.name == "authoring-with-scenery")
+                .expect("reported as removed");
+            assert!(item.reinstall_hint.contains("Built into Scenery"));
+            // Nothing of the user's own to keep or restore.
+            assert!(report.kept_own.is_empty());
         });
         let _ = fs::remove_dir_all(&fake_home);
     }

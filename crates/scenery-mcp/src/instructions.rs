@@ -58,7 +58,11 @@ pub fn build_instructions(
         ""
     };
 
-    let discovery_hint = build_discovery_hint(exposed_tool_names);
+    let discovery_hint = format!(
+        "{}{}",
+        build_discovery_hint(exposed_tool_names),
+        build_authoring_hint(exposed_tool_names)
+    );
 
     let Some(managed) = managed else {
         return format!(
@@ -123,6 +127,23 @@ fn build_discovery_hint(exposed_tool_names: &[String]) -> String {
     format!(" Use {}.", clauses.join(", "))
 }
 
+/// Point the AI client at the authoring tools and the built-in
+/// `authoring-with-scenery` skill. Only when the tools are exposed (see this
+/// module's doc comment).
+fn build_authoring_hint(exposed_tool_names: &[String]) -> String {
+    if exposed_tool_names
+        .iter()
+        .any(|n| n == "scenery_create_skill")
+    {
+        " To make a new skill, use scenery_create_skill (then scenery_check_skill; \
+         scenery_share_skill only when the user asks to share) and follow the \
+         authoring-with-scenery skill; do not hand-write skill files or edit MCP client configs."
+            .to_string()
+    } else {
+        String::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,6 +185,22 @@ mod tests {
     /// possibly `scenery_login`.
     fn no_builtins() -> Vec<String> {
         Vec::new()
+    }
+
+    #[test]
+    fn authoring_tools_are_mentioned_only_when_exposed() {
+        let with = names(&[
+            "scenery_create_skill",
+            "scenery_check_skill",
+            "scenery_share_skill",
+        ]);
+        for managed in [None, Some(cfg(Some("Acme"), None, true))] {
+            let s = build_instructions(managed.as_ref(), "daemon", true, &with);
+            assert!(s.contains("scenery_create_skill"), "got: {s}");
+            assert!(s.contains("authoring-with-scenery"), "got: {s}");
+            let s = build_instructions(managed.as_ref(), "daemon", true, &no_builtins());
+            assert!(!s.contains("scenery_create_skill"), "got: {s}");
+        }
     }
 
     #[test]

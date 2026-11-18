@@ -444,6 +444,16 @@ async fn process_directives(
     }
 }
 
+/// Is `source_path` the Scenery-owned built-in skill (DB row, never the file
+/// marker)? Also true for the reserved slug on an unmarked directory: the
+/// backend would refuse that name anyway, so it is not offered at all.
+fn is_builtin_source(state: &AppState, source_path: &str) -> bool {
+    let Ok(conn) = open(state) else {
+        return false;
+    };
+    super::marker::is_builtin_path(&conn, Path::new(source_path))
+}
+
 /// The hold reason the LOCAL classifier gave this item, if it holds it.
 fn local_hold(item: &DiscoveryItem) -> Option<String> {
     match item.local.as_ref().map(|l| &l.treatment) {
@@ -567,6 +577,13 @@ async fn act_on(ctx: &TickCtx, item: &DiscoveryItem, d: &Directive, wants_track:
     if let Err(e) = scenery_core::safe_path::validate_single_component("skill slug", &slug) {
         warn!(slug, error = %e, "auto-manage: refusing a slug that is not one path component");
         return Acted::Failed;
+    }
+
+    // The built-in skill is Scenery's own: never classified, uploaded or
+    // converted, whatever directive names it.
+    if is_builtin_source(state, &source_path) {
+        debug!(slug, "auto-manage: built-in skill — never uploaded");
+        return Acted::Skipped;
     }
 
     // ── 1. Re-check locally, right now (blocking I/O off the executor). ──

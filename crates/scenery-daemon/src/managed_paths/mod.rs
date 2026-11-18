@@ -36,7 +36,9 @@
 //! even opening the DB.  Migration failure must NOT crash the daemon.
 
 pub mod adopt_publish;
+pub mod authoring;
 pub mod auto_manage;
+pub mod builtin;
 pub mod conversion;
 pub mod discoveries;
 pub mod drift;

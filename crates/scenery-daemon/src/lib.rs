@@ -396,6 +396,21 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
         );
     }
 
+    // ── Authoring with Scenery ────────────────────────────────────────────────
+    //
+    // The create hook lets `scenery_create_skill` register + convert a new
+    // skill at once; the built-in skill that teaches the AI client to use it
+    // is written (or refreshed after an upgrade) before anything is scanned.
+    managed_paths::authoring::init(Arc::new(state.clone()));
+    if std::env::var("SCENERY_DISABLE_FILESYSTEM_RECONCILER").is_err() {
+        match managed_paths::builtin::ensure_builtin_skill(&state) {
+            Ok(outcome) => info!(?outcome, "startup: built-in authoring skill"),
+            Err(e) => {
+                warn!(error = %e, "startup: could not write the built-in authoring skill (non-fatal)")
+            }
+        }
+    }
+
     // ── Active-skill self-heal ────────────────────────────────────────────────
     //
     // The pre-v1.0.51 `reclaim_active_skills` pass that used to run here was

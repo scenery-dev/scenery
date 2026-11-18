@@ -369,6 +369,13 @@ pub fn collect_discoveries(roots: &[PathBuf], state: &AppState) -> Vec<Discovery
             Ok(found) => {
                 for mut item in found {
                     let path = Path::new(&item.source_path);
+                    // Scenery's own built-in skill is never discovered, whatever
+                    // its content hash says (a modified copy is rewritten, not
+                    // reported as suspicious).
+                    if super::marker::is_builtin_path(&conn, path) {
+                        debug!(slug = %item.slug, "discoveries: built-in skill — skipping");
+                        continue;
+                    }
                     let reason = match db_ownership(&conn, "skill", path) {
                         DbOwnership::Verified => {
                             debug!(slug = %item.slug, "discoveries: verified managed — skipping");

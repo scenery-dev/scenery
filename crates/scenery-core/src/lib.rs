@@ -24,6 +24,7 @@ pub mod app;
 pub mod approvals;
 pub mod atomic_file;
 pub mod audit;
+pub mod authoring;
 pub mod binary_path;
 pub mod crash;
 mod crash_redact;

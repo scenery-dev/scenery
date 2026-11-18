@@ -271,6 +271,111 @@ pub struct AutoManageRequest<'a> {
     pub discovery_id: Option<&'a str>,
 }
 
+/// Fields of one `POST /runner/skills/register` upload (Authoring with
+/// Scenery). `mode` is `"manage"` (also creates this device's install row) or
+/// `"track"` (a new private version only, used by Share).
+#[derive(Debug, Clone)]
+pub struct RegisterSkillRequest<'a> {
+    pub tar_gz: Vec<u8>,
+    pub slug: &'a str,
+    pub tree_hash: &'a str,
+    pub device_id: &'a str,
+    pub mode: &'a str,
+}
+
+/// Body of a 200 from `POST /runner/skills/preview-scan`: what the scan and the
+/// org's gate would say about a tree. Nothing is stored as a skill or version.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct PreviewScan {
+    #[serde(default)]
+    pub verdict: String,
+    #[serde(default)]
+    pub decision: Option<String>,
+    #[serde(default)]
+    pub requires_review: bool,
+    #[serde(default)]
+    pub findings: serde_json::Value,
+    /// File NAMES only.
+    #[serde(default)]
+    pub secrets: Vec<String>,
+    #[serde(default)]
+    pub name_clash: bool,
+    #[serde(default)]
+    pub suggestions: Vec<String>,
+}
+
+/// A protocol-level refusal from one of the authoring endpoints (401, 403,
+/// 404, 409, 422, 426, 503). Anything else non-2xx is an `Err`.
+#[derive(Debug, Clone, Default)]
+pub struct AuthoringRefusal {
+    pub status: u16,
+    pub code: String,
+    pub message: String,
+    pub suggestions: Vec<String>,
+    pub files: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
+pub enum AuthoringReply<T> {
+    Done(T),
+    Refused(AuthoringRefusal),
+}
+
+/// Body of a 200 from `POST /portal/custom-tools/skill/{id}/publish`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SharedSkill {
+    #[serde(default)]
+    pub adoption_status: String,
+    #[serde(default)]
+    pub visibility: String,
+    #[serde(default)]
+    pub shared_skill_id: Option<String>,
+    #[serde(default)]
+    pub shared_skill_uuid: Option<String>,
+}
+
+/// Like [`error_code_and_message`], plus the `suggestions` and `files` lists
+/// some refusals carry.
+fn authoring_refusal(status: u16, body: &str) -> AuthoringRefusal {
+    let (code, message) = error_code_and_message(body);
+    let v: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+    let detail = v.get("detail").unwrap_or(&v);
+    let list = |key: &str| -> Vec<String> {
+        detail
+            .get(key)
+            .and_then(|x| x.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|e| e.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    // The 426 body is top-level `{code, min}` rather than under `detail`.
+    let code = if code.is_empty() {
+        v.get("code")
+            .and_then(|c| c.as_str())
+            .unwrap_or_default()
+            .to_string()
+    } else {
+        code
+    };
+    // The authoring endpoints put the text under `detail.detail`.
+    let message = detail
+        .get("detail")
+        .and_then(|m| m.as_str())
+        .map(str::to_string)
+        .unwrap_or(message);
+    AuthoringRefusal {
+        status,
+        code,
+        message,
+        suggestions: list("suggestions"),
+        files: list("files"),
+    }
+}
+
 /// Pull `(code, message)` out of a FastAPI error body: `detail` is either an
 /// object with `code`/`message`, or a bare string.
 fn error_code_and_message(body: &str) -> (String, String) {
@@ -1249,6 +1354,130 @@ impl RegistryClient {
             }));
         }
         anyhow::bail!("auto-manage failed (HTTP {status}): {body}")
+    }
+
+    /// Register a freshly scaffolded skill (`POST /runner/skills/register`,
+    /// user bearer): same private ingest as [`Self::auto_manage`] but needs no
+    /// discovery row. Idempotent per (owner, slug, tree hash).
+    pub fn register_skill(
+        &self,
+        req: RegisterSkillRequest<'_>,
+    ) -> Result<AuthoringReply<AutoManageResponse>> {
+        let file_part = reqwest::blocking::multipart::Part::bytes(req.tar_gz)
+            .file_name("skill-source.tar.gz")
+            .mime_str("application/gzip")
+            .context("invalid MIME type for register upload")?;
+        let form = reqwest::blocking::multipart::Form::new()
+            .part("file", file_part)
+            .text("slug", req.slug.to_string())
+            .text("tree_hash", req.tree_hash.to_string())
+            .text("device_id", req.device_id.to_string())
+            .text("mode", req.mode.to_string());
+        self.authoring_post("/runner/skills/register", form)
+    }
+
+    /// Scan preview of a tree (`POST /runner/skills/preview-scan`): verdict,
+    /// gate decision and redacted findings. Stores nothing.
+    pub fn preview_scan(
+        &self,
+        tar_gz: Vec<u8>,
+        slug: &str,
+        catalog_name: Option<&str>,
+    ) -> Result<AuthoringReply<PreviewScan>> {
+        let file_part = reqwest::blocking::multipart::Part::bytes(tar_gz)
+            .file_name("skill-source.tar.gz")
+            .mime_str("application/gzip")
+            .context("invalid MIME type for preview-scan upload")?;
+        let mut form = reqwest::blocking::multipart::Form::new()
+            .part("file", file_part)
+            .text("slug", slug.to_string());
+        if let Some(n) = catalog_name {
+            form = form.text("catalog_name", n.to_string());
+        }
+        self.authoring_post("/runner/skills/preview-scan", form)
+    }
+
+    fn authoring_post<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        form: reqwest::blocking::multipart::Form,
+    ) -> Result<AuthoringReply<T>> {
+        let token = self
+            .get_auth_token()
+            .ok_or_else(|| anyhow::anyhow!("not authenticated; run `scenery auth login` first"))?;
+        let url = format!("{}{path}", self.base_url.trim_end_matches('/'));
+        let http = crate::http::blocking_client_builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(AUTO_MANAGE_TIMEOUT)
+            .build()
+            .context("failed to build the authoring HTTP client")?;
+        let resp = http
+            .post(&url)
+            .bearer_auth(token)
+            .multipart(form)
+            .send_tracked()
+            .with_context(|| format!("failed to reach registry at {url}"))?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(AuthoringReply::Done(resp.json().with_context(|| {
+                format!("failed to deserialize the response of {path}")
+            })?));
+        }
+        let code = status.as_u16();
+        let body = resp.text().unwrap_or_default();
+        if matches!(code, 401 | 403 | 404 | 409 | 422 | 426 | 503) {
+            return Ok(AuthoringReply::Refused(authoring_refusal(code, &body)));
+        }
+        anyhow::bail!("{path} failed (HTTP {status}): {body}")
+    }
+
+    /// Share the user's own private skill to the org catalog
+    /// (`POST /portal/custom-tools/skill/{uuid}/publish`, user bearer). The
+    /// backend publishes a derived catalog copy through the normal scan gate;
+    /// `catalog_name` is the name to publish under, `version` the private
+    /// version the user previewed.
+    pub fn share_private_skill(
+        &self,
+        skill_uuid: &str,
+        catalog_name: &str,
+        version: &str,
+        group_ids: &[String],
+    ) -> Result<AuthoringReply<SharedSkill>> {
+        let token = self
+            .get_auth_token()
+            .ok_or_else(|| anyhow::anyhow!("not authenticated; run `scenery auth login` first"))?;
+        let url = format!(
+            "{}/portal/custom-tools/skill/{skill_uuid}/publish",
+            self.base_url.trim_end_matches('/')
+        );
+        let mut body = serde_json::json!({ "catalog_name": catalog_name, "version": version });
+        if !group_ids.is_empty() {
+            body["group_ids"] = serde_json::json!(group_ids);
+        }
+        let http = crate::http::blocking_client_builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(AUTO_MANAGE_TIMEOUT)
+            .build()
+            .context("failed to build the share HTTP client")?;
+        let resp = http
+            .post(&url)
+            .bearer_auth(token)
+            .json(&body)
+            .send_tracked()
+            .with_context(|| format!("failed to reach registry at {url}"))?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(AuthoringReply::Done(
+                resp.json()
+                    .context("failed to deserialize the share response")?,
+            ));
+        }
+        let code = status.as_u16();
+        let text = resp.text().unwrap_or_default();
+        if matches!(code, 401 | 403 | 404 | 409 | 422 | 503) {
+            return Ok(AuthoringReply::Refused(authoring_refusal(code, &text)));
+        }
+        anyhow::bail!("share failed (HTTP {status}): {text}")
     }
 
     /// Tell the registry the user uninstalled their OWN auto-managed skill
@@ -3183,5 +3412,154 @@ mod tests {
             "error should mention the failure; got: {msg}"
         );
         mock.assert();
+    }
+
+    // ── Authoring with Scenery (register / preview-scan / share) ──────────────
+
+    #[test]
+    fn register_sends_the_fields_with_the_user_bearer_and_parses_the_answer() {
+        use mockito::{Matcher, Server};
+        let mut server = Server::new();
+        let m = server
+            .mock("POST", "/runner/skills/register")
+            .match_header("authorization", "Bearer tok")
+            .match_body(Matcher::AllOf(vec![
+                Matcher::Regex("name=\"slug\"\r\n\r\nnotes".into()),
+                Matcher::Regex("name=\"tree_hash\"\r\n\r\nh1".into()),
+                Matcher::Regex("name=\"device_id\"\r\n\r\ndev-1".into()),
+                Matcher::Regex("name=\"mode\"\r\n\r\ntrack".into()),
+            ]))
+            .with_status(200)
+            .with_body(r#"{"outcome":"managed","mode":"track","skill_id":"adam~notes","skill_uuid":"u","version":"0.1.0","owner_namespace":"adam"}"#)
+            .create();
+        let client = RegistryClient::new(server.url()).with_auth("tok");
+        match client
+            .register_skill(RegisterSkillRequest {
+                tar_gz: minimal_gz_bytes(),
+                slug: "notes",
+                tree_hash: "h1",
+                device_id: "dev-1",
+                mode: "track",
+            })
+            .unwrap()
+        {
+            AuthoringReply::Done(r) => {
+                assert_eq!(r.outcome, AutoManageOutcomeKind::Managed);
+                assert_eq!(r.skill_id.as_deref(), Some("adam~notes"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        m.assert();
+    }
+
+    #[test]
+    fn authoring_refusals_carry_code_message_suggestions_and_files() {
+        use mockito::Server;
+        for (status, body, code, msg) in [
+            (
+                426,
+                r#"{"code":"runner_upgrade_required","min":"2.4.0"}"#,
+                "runner_upgrade_required",
+                "",
+            ),
+            (
+                422,
+                r#"{"detail":{"code":"reserved_slug","detail":"That name is reserved by Scenery"}}"#,
+                "reserved_slug",
+                "reserved",
+            ),
+            (
+                409,
+                r#"{"detail":{"code":"name_clash","detail":"taken","suggestions":["a-2","b-a"]}}"#,
+                "name_clash",
+                "taken",
+            ),
+            (
+                422,
+                r#"{"detail":{"code":"secrets_detected","files":[".env"]}}"#,
+                "secrets_detected",
+                "",
+            ),
+        ] {
+            let mut server = Server::new();
+            let _m = server
+                .mock("POST", "/runner/skills/preview-scan")
+                .with_status(status)
+                .with_body(body)
+                .create();
+            let client = RegistryClient::new(server.url()).with_auth("tok");
+            match client
+                .preview_scan(minimal_gz_bytes(), "x", Some("y"))
+                .unwrap()
+            {
+                AuthoringReply::Refused(r) => {
+                    assert_eq!(r.status, status as u16);
+                    assert_eq!(r.code, code);
+                    assert!(r.message.contains(msg), "{r:?}");
+                    if code == "name_clash" {
+                        assert_eq!(r.suggestions, vec!["a-2", "b-a"]);
+                    }
+                    if code == "secrets_detected" {
+                        assert_eq!(r.files, vec![".env"]);
+                    }
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        // a server error is an Err so the caller reports it as unreachable
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/runner/skills/preview-scan")
+            .with_status(500)
+            .create();
+        let client = RegistryClient::new(server.url()).with_auth("tok");
+        assert!(client.preview_scan(minimal_gz_bytes(), "x", None).is_err());
+    }
+
+    #[test]
+    fn preview_scan_parses_the_verdict_and_never_needs_a_catalog_name() {
+        use mockito::Server;
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/runner/skills/preview-scan")
+            .with_status(200)
+            .with_body(r#"{"verdict":"clean","decision":"queue-for-review","requires_review":true,"findings":[{"rule_id":"r"}],"secrets":[],"name_clash":false,"suggestions":[]}"#)
+            .create();
+        let client = RegistryClient::new(server.url()).with_auth("tok");
+        match client.preview_scan(minimal_gz_bytes(), "x", None).unwrap() {
+            AuthoringReply::Done(p) => {
+                assert_eq!(p.verdict, "clean");
+                assert!(p.requires_review);
+                assert_eq!(p.decision.as_deref(), Some("queue-for-review"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn share_posts_the_catalog_name_version_and_groups() {
+        use mockito::{Matcher, Server};
+        let mut server = Server::new();
+        let m = server
+            .mock("POST", "/portal/custom-tools/skill/u-1/publish")
+            .match_header("authorization", "Bearer tok")
+            .match_body(Matcher::Json(serde_json::json!({
+                "catalog_name": "notes", "version": "0.1.0", "group_ids": ["g1"]
+            })))
+            .with_status(200)
+            .with_body(r#"{"kind":"skill","id":"u-1","adoption_status":"approved_published","visibility":"org_published","shared_skill_id":"notes"}"#)
+            .create();
+        let client = RegistryClient::new(server.url()).with_auth("tok");
+        match client
+            .share_private_skill("u-1", "notes", "0.1.0", &["g1".to_string()])
+            .unwrap()
+        {
+            AuthoringReply::Done(s) => {
+                assert_eq!(s.visibility, "org_published");
+                assert_eq!(s.shared_skill_id.as_deref(), Some("notes"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        m.assert();
     }
 }
