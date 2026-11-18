@@ -918,18 +918,6 @@ mod own_skill_guard {
 
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
-    async fn a_catalog_skill_is_still_quarantined_in_strict_mode() {
-        let f = Fixture::new();
-        f.set_mode("quarantine");
-        let dir = f.push("catalog", false);
-        fs::write(dir.join("SKILL.md"), "someone edited the catalog copy").unwrap();
-        f.cycle().await;
-        assert!(!dir.exists(), "catalog behaviour is unchanged: moved aside");
-        assert!(f.home.join(".claude/.scenery-quarantine").exists());
-    }
-
-    #[allow(clippy::await_holding_lock)]
-    #[tokio::test]
     async fn restore_canonical_is_refused_for_an_own_skill_but_not_a_catalog_one() {
         let f = Fixture::new();
         let own = f.push("own", true);

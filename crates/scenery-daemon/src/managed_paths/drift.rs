@@ -278,16 +278,34 @@ impl DriftScanner {
                     stats.drifted += 1;
                     let current_hash = outcome.current_hash.clone().unwrap_or_default();
                     let marker = marker_of(&outcome);
-                    let uploaded = super::local_edits::upload_edit(
+                    // The baseline is NOT moved (keep_baseline): the tree stays
+                    // drifted until IT resolves it or the edit is restored, so
+                    // the next scan does not see the edit as Clean and run it.
+                    let uploaded = super::local_edits::upload_edit_keep_baseline(
                         &self.state,
                         &self.registry_url,
                         &marker,
-                        true,
                     )
                     .await;
-                    let branch_uploaded =
-                        matches!(uploaded, super::local_edits::EditOutcome::Stored { .. });
+                    use super::local_edits::EditOutcome;
+                    // Quarantine only once the work is saved (Stored/AlreadyUploaded)
+                    // or will never be (Held). On Retry/Settling leave the tree and
+                    // marker in place so the next scan retries the upload.
+                    let upload_settled = matches!(
+                        uploaded,
+                        EditOutcome::Stored { .. }
+                            | EditOutcome::Held { .. }
+                            | EditOutcome::AlreadyUploaded
+                    );
+                    let branch_uploaded = matches!(
+                        uploaded,
+                        EditOutcome::Stored { .. } | EditOutcome::AlreadyUploaded
+                    );
                     let action = match mode {
+                        PolicyMode::Quarantine if !upload_settled => {
+                            debug!(slug = %outcome.slug, "drift: edit not uploaded yet; quarantine waits for the next scan");
+                            continue;
+                        }
                         PolicyMode::Quarantine => match quarantine_item(&outcome) {
                             Ok(quarantined_to) => {
                                 drop_marker(&self.state, &outcome.path).ok();
@@ -521,6 +539,13 @@ fn edit_report_item(
         EditOutcome::Settling => {
             debug!(slug = %o.slug, "drift: skill edit still being typed; uploading on a later scan");
             return None;
+        }
+        EditOutcome::AlreadyUploaded => return None,
+        EditOutcome::Retry { reason: why } if why.starts_with("could not hash the tree") => {
+            // A tree that cannot be hashed (size cap) can never be uploaded or
+            // compared: say so instead of looking clean.
+            warn!(slug = %o.slug, why, "drift: skill tree cannot be hashed; edit not tracked");
+            serde_json::json!({ "path": o.path, "reason": reason, "not_uploaded": why })
         }
         EditOutcome::Retry { reason: why } => {
             debug!(slug = %o.slug, why, "drift: skill edit not uploaded yet; will retry");
@@ -794,8 +819,11 @@ fn classify_skill(state: &AppState, conn: &Connection, marker: &ManagedPathMarke
     let survey = match scenery_core::skill_tree::survey(&dir) {
         Ok(s) => s,
         Err(e) => {
-            warn!(slug = %marker.slug, error = %e, "drift: could not hash the skill tree; treating as clean");
-            return mk(DriftStatus::Clean, None);
+            // Not clean: a tree that cannot be hashed (size cap) cannot be
+            // verified. It goes through the edit path, which reports it as not
+            // tracked instead of showing it as Clean.
+            warn!(slug = %marker.slug, error = %e, "drift: could not hash the skill tree; reporting it as edited");
+            return edited(None);
         }
     };
     let tree = survey.tree_hash;

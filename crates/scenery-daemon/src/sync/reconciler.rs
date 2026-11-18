@@ -3075,6 +3075,18 @@ pub(crate) async fn install_verified_version(
         }
     }
 
+    // Never overwrite an edit that is not uploaded yet (still settling, offline
+    // or held): the live tree differs from the marker baseline. Skip this
+    // cycle; the drift scan uploads the edit (own: it becomes the version,
+    // catalog: a branch), after which the snapshot no longer asks for this.
+    if live_edit_pending(state, skill_id).await {
+        info!(
+            skill_id,
+            version, "reconciler: install skipped, the local copy has edits not uploaded yet"
+        );
+        return Ok(());
+    }
+
     let skill_id = skill_id.to_string();
     let version = version.to_string();
     let state_clone = Arc::clone(state);
@@ -3126,6 +3138,27 @@ pub(crate) async fn install_verified_version(
     push_skill_to_claude(pusher, &skill_id, Some(&installation_id.to_string()), state);
 
     Ok(())
+}
+
+/// Does the managed skill dir for `slug` hold edits that differ from its marker
+/// baseline (plan 4.5.1)?
+async fn live_edit_pending(state: &Arc<AppState>, slug: &str) -> bool {
+    let (st, slug) = (Arc::clone(state), slug.to_string());
+    tokio::task::spawn_blocking(move || {
+        let Ok(conn) = rusqlite::Connection::open(&st.db_path) else {
+            return false;
+        };
+        match crate::managed_paths::local_edits::marker_path_for_slug(&conn, &slug) {
+            Some(path) => crate::managed_paths::local_edits::tree_is_dirty(
+                &conn,
+                &path,
+                std::path::Path::new(&path),
+            ),
+            None => false,
+        }
+    })
+    .await
+    .unwrap_or(true)
 }
 
 /// A registry version was just installed: the device runs a plain version

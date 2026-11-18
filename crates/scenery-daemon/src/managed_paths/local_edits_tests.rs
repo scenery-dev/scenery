@@ -431,6 +431,137 @@ async fn a_catalog_edit_in_strict_mode_is_uploaded_as_a_branch_then_quarantined_
     }
 }
 
+const STORED_BRANCH_MOCK_PATH: &str = "/runner/skills/cat/versions/local";
+
+#[tokio::test]
+async fn approve_required_stays_strict_across_cycles_and_uploads_only_once() {
+    let mut f = Fx::new().await;
+    f.set_mode("approve_required");
+    f.drift_sink().await;
+    let dir = f.push("cat", false);
+    let before = marker_provenance(&f.conn(), &dir.to_string_lossy()).tree_hash;
+    let up = f
+        .server
+        .mock("POST", STORED_BRANCH_MOCK_PATH)
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(STORED_BRANCH)
+        .expect(1)
+        .create_async()
+        .await;
+    let _patch = f
+        .server
+        .mock("PATCH", "/api/installations/inst-1")
+        .with_status(200)
+        .with_body("{}")
+        .create_async()
+        .await;
+    fs::write(dir.join("prompts/p.md"), "unapproved change").unwrap();
+    for cycle in 1..=3 {
+        assert_eq!(f.cycle().await.drifted, 1, "cycle {cycle}: still drifted");
+        assert_eq!(
+            marker_provenance(&f.conn(), &dir.to_string_lossy()).tree_hash,
+            before,
+            "cycle {cycle}: the baseline is never moved in a strict mode"
+        );
+    }
+    up.assert_async().await; // exactly one upload across three cycles
+    assert!(f
+        .scan()
+        .iter()
+        .any(|o| o.status == DriftStatus::EditedCatalog));
+    assert!(dir.exists());
+    // restoring the edit clears the drift
+    fs::write(dir.join("prompts/p.md"), "my prompt").unwrap();
+    assert_eq!(f.cycle().await.drifted, 0);
+}
+
+#[tokio::test]
+async fn strict_quarantine_waits_for_the_upload_and_never_loses_an_unuploaded_edit() {
+    let mut f = Fx::new().await;
+    f.set_mode("quarantine");
+    f.drift_sink().await;
+    let dir = f.push("cat", false);
+    let fail = f
+        .server
+        .mock("POST", STORED_BRANCH_MOCK_PATH)
+        .with_status(503)
+        .expect(2)
+        .create_async()
+        .await;
+    fs::write(dir.join("prompts/p.md"), "offline strict edit").unwrap();
+    f.cycle().await;
+    f.cycle().await;
+    fail.assert_async().await;
+    assert!(dir.exists(), "offline: the tree is not moved aside");
+    assert!(!f.home.join(".claude/.scenery-quarantine").exists());
+    let n: i64 = f
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM managed_path_markers WHERE path = ?1",
+            [dir.to_string_lossy().to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 1, "the marker stays so the next scan retries");
+    // back online: uploaded, then quarantined
+    fail.remove_async().await;
+    let ok = f
+        .server
+        .mock("POST", STORED_BRANCH_MOCK_PATH)
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(STORED_BRANCH)
+        .expect(1)
+        .create_async()
+        .await;
+    let _patch = f
+        .server
+        .mock("PATCH", "/api/installations/inst-1")
+        .with_status(200)
+        .with_body("{}")
+        .create_async()
+        .await;
+    f.cycle().await;
+    ok.assert_async().await;
+    assert!(!dir.exists());
+    assert!(f.home.join(".claude/.scenery-quarantine").exists());
+}
+
+#[tokio::test]
+async fn a_catalog_update_never_overwrites_an_edit_that_is_not_uploaded_yet() {
+    let f = Fx::new().await;
+    let dir = f.push("cat", false);
+    fs::write(dir.join("prompts/p.md"), "offline edit, not uploaded").unwrap();
+    // The reconciler guard: nothing is downloaded or written (the registry is
+    // not even mocked, so touching it would be an error).
+    crate::sync::reconciler::install_verified_version(
+        uuid::Uuid::new_v4(),
+        "cat",
+        "1.1.0",
+        &f.state,
+        &f.server.url(),
+        Some(&ManagedPathsPusher::new(&f.state)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        fs::read_to_string(dir.join("prompts/p.md")).unwrap(),
+        "offline edit, not uploaded"
+    );
+    // And the pusher itself refuses as a backstop.
+    let err = ManagedPathsPusher::new(&f.state)
+        .push_skill("cat", None, b"---\nname: x\n---\nv2", &[])
+        .unwrap_err();
+    assert!(err
+        .downcast_ref::<crate::managed_paths::pusher::DirtyLocalEdit>()
+        .is_some());
+    assert_eq!(
+        fs::read_to_string(dir.join("prompts/p.md")).unwrap(),
+        "offline edit, not uploaded"
+    );
+}
+
 // ── debounce, secrets, retry ─────────────────────────────────────────────────
 
 #[tokio::test]

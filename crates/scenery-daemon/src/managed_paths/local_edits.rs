@@ -163,6 +163,41 @@ pub fn reset_branch(conn: &Connection, skill_id: &str) {
     );
 }
 
+/// Is the live tree at `dir` different from the marker baseline at `path`?
+/// Used before any install or push over an existing managed skill dir, so an
+/// edit that is still settling, offline or held is never overwritten (plan
+/// 4.5.1). A tree that cannot be hashed counts as dirty: refusing to overwrite
+/// what cannot be verified is the safe side. Markers without a v2 tree baseline
+/// are not judged here (the drift scan re-baselines them).
+pub fn tree_is_dirty(conn: &Connection, path: &str, dir: &Path) -> bool {
+    let prov = marker::marker_provenance(conn, path);
+    let (Some(v), Some(baseline)) = (prov.hash_version, prov.tree_hash.as_deref()) else {
+        return false;
+    };
+    if v < marker::HASH_VERSION_TREE || !dir.is_dir() {
+        return false;
+    }
+    match skill_tree::survey(dir) {
+        Ok(s) => s.tree_hash != baseline,
+        Err(e) => {
+            warn!(path, error = %e, "local-edits: cannot hash the tree; treating it as edited");
+            true
+        }
+    }
+}
+
+/// The marker path of the managed skill with this local slug, if any.
+pub fn marker_path_for_slug(conn: &Connection, slug: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT path FROM managed_path_markers WHERE kind = 'skill' AND slug = ?1 LIMIT 1",
+        [slug],
+        |r| r.get::<_, String>(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+}
+
 fn settle_window() -> Duration {
     Duration::from_secs(
         std::env::var(ENV_SETTLE)
@@ -191,6 +226,9 @@ pub enum EditOutcome {
     Held { reason: String },
     /// Could not reach the registry or not signed in: retried next scan.
     Retry { reason: String },
+    /// This exact tree was already uploaded (strict mode keeps the old
+    /// baseline, so the same edit is seen again): nothing to send.
+    AlreadyUploaded,
 }
 
 /// Upload the current tree of `marker`'s skill as a local version.
@@ -204,9 +242,30 @@ pub async fn upload_edit(
     marker: &ManagedPathMarker,
     force: bool,
 ) -> EditOutcome {
-    let dir = PathBuf::from(&marker.path);
+    upload_edit_with(state, registry_url, marker, force, true).await
+}
+
+/// Strict-mode variant (plan 4.5.1): saves the edit privately but does NOT move
+/// the marker baseline, so the tree stays drifted until IT resolves it or the
+/// edit is restored. `uploaded_tree` records what was sent, so the same tree is
+/// not uploaded again ([`EditOutcome::AlreadyUploaded`]).
+pub async fn upload_edit_keep_baseline(
+    state: &Arc<AppState>,
+    registry_url: &str,
+    marker: &ManagedPathMarker,
+) -> EditOutcome {
+    upload_edit_with(state, registry_url, marker, true, false).await
+}
+
+async fn upload_edit_with(
+    state: &Arc<AppState>,
+    registry_url: &str,
+    marker: &ManagedPathMarker,
+    force: bool,
+    rebaseline: bool,
+) -> EditOutcome {
     let (st, mk) = (Arc::clone(state), marker.clone());
-    let prep = tokio::task::spawn_blocking(move || prepare(&st, &mk, force)).await;
+    let prep = tokio::task::spawn_blocking(move || prepare(&st, &mk, force, rebaseline)).await;
     let prep = match prep {
         Ok(p) => p,
         Err(e) => {
@@ -284,10 +343,10 @@ pub async fn upload_edit(
                 state,
                 registry_url,
                 marker,
-                &dir,
                 &prep.skill_id,
                 &prep.tree_hash,
                 resp,
+                rebaseline,
             )
             .await
         }
@@ -327,6 +386,7 @@ fn prepare(
     state: &AppState,
     marker: &ManagedPathMarker,
     force: bool,
+    rebaseline: bool,
 ) -> Result<Prepared, EditOutcome> {
     let dir = Path::new(&marker.path);
     let conn = Connection::open(&state.db_path).map_err(|e| EditOutcome::Retry {
@@ -344,6 +404,9 @@ fn prepare(
         return Err(EditOutcome::Held {
             reason: "unchanged since it was held".into(),
         });
+    }
+    if !rebaseline && local.uploaded_tree.as_deref() == Some(tree_hash.as_str()) {
+        return Err(EditOutcome::AlreadyUploaded);
     }
     if !force && survey.modified_within(SystemTime::now(), settle_window()) {
         return Err(EditOutcome::Settling);
@@ -384,10 +447,10 @@ async fn finish_stored(
     state: &Arc<AppState>,
     registry_url: &str,
     marker: &ManagedPathMarker,
-    dir: &Path,
     skill_id: &str,
     tree_hash: &str,
     resp: LocalVersionResponse,
+    rebaseline: bool,
 ) -> EditOutcome {
     let auth = if resp.authorship == AUTHORSHIP_OWN {
         Authorship::Own
@@ -407,7 +470,7 @@ async fn finish_stored(
     let (st, mk, d, sid, th, bs, rv) = (
         Arc::clone(state),
         marker.clone(),
-        dir.to_path_buf(),
+        PathBuf::from(&marker.path),
         skill_id.to_string(),
         tree_hash.to_string(),
         branch_state.clone(),
@@ -422,8 +485,10 @@ async fn finish_stored(
             .unwrap_or_else(|_| mk.source_sha256.clone());
         // The tree may have changed again while uploading: baseline what was
         // actually uploaded, so the newer edit is seen next scan.
-        if let Err(e) = marker::set_tree_baseline(&conn, &mk.path, &th, &md) {
-            warn!(skill_id = %sid, error = %e, "local-edits: could not re-baseline the marker");
+        if rebaseline {
+            if let Err(e) = marker::set_tree_baseline(&conn, &mk.path, &th, &md) {
+                warn!(skill_id = %sid, error = %e, "local-edits: could not re-baseline the marker");
+            }
         }
         let base = match rv.authorship.as_str() {
             AUTHORSHIP_OWN => rv.version.clone(),
@@ -460,7 +525,7 @@ async fn finish_stored(
         );
         // An own skill's pin moved server-side to the uploaded version; follow it
         // locally so the snapshot is satisfied and nothing is re-downloaded.
-        if rv.authorship == AUTHORSHIP_OWN {
+        if rebaseline && rv.authorship == AUTHORSHIP_OWN {
             if let Some(v) = rv.version.as_deref() {
                 let _ = conn.execute(
                     "UPDATE installed_skills SET active_version = ?1 WHERE skill_id = ?2",

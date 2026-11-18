@@ -92,6 +92,25 @@ impl std::fmt::Display for CollisionRefused {
 
 impl std::error::Error for CollisionRefused {}
 
+/// `push_skill` refused to overwrite a managed dir whose live tree differs from
+/// its marker baseline: the user's edit is not uploaded yet (plan 4.5.1).
+#[derive(Debug)]
+pub struct DirtyLocalEdit {
+    pub path: PathBuf,
+}
+
+impl std::fmt::Display for DirtyLocalEdit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "pusher: not overwriting {}: it has local edits that are not uploaded yet",
+            self.path.display()
+        )
+    }
+}
+
+impl std::error::Error for DirtyLocalEdit {}
+
 // ── ManagedPathsPusher ────────────────────────────────────────────────────────
 
 /// Pushes Scenery-managed items into Claude Code's native directories.
@@ -312,6 +331,17 @@ impl ManagedPathsPusher {
                     what: "directory",
                     slug: slug.to_string(),
                 }));
+            }
+        }
+
+        // Plan 4.5.1: a managed dir whose tree differs from its baseline holds an
+        // edit that may not be uploaded yet; never write over it.
+        if conversion.is_none() && skill_dir.is_dir() && ownership::is_scenery_managed(&skill_dir) {
+            if let Ok(conn) = Connection::open(&self.db_path) {
+                let key = skill_dir.to_string_lossy().to_string();
+                if super::local_edits::tree_is_dirty(&conn, &key, &skill_dir) {
+                    return Err(anyhow::Error::new(DirtyLocalEdit { path: skill_dir }));
+                }
             }
         }
 
