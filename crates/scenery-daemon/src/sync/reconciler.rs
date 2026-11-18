@@ -329,9 +329,11 @@ fn localize_skill_names(event: SyncEvent, state: &AppState) -> SyncEvent {
         SyncEvent::Deactivate {
             installation_id,
             skill_id,
+            user_uninstall,
         } => SyncEvent::Deactivate {
             installation_id,
             skill_id: local(&skill_id),
+            user_uninstall,
         },
         SyncEvent::Purge {
             installation_id,
@@ -482,10 +484,12 @@ async fn dispatch_event(
         SyncEvent::Deactivate {
             installation_id,
             skill_id,
+            user_uninstall,
         } => {
             spawn_deactivate(
                 installation_id,
                 skill_id,
+                user_uninstall,
                 state,
                 registry_url,
                 skill_locks,
@@ -763,10 +767,12 @@ async fn dispatch_event(
                     SyncEvent::Deactivate {
                         installation_id,
                         skill_id,
+                        user_uninstall,
                     } => {
                         spawn_deactivate(
                             installation_id,
                             skill_id,
+                            user_uninstall,
                             state,
                             registry_url,
                             skill_locks,
@@ -981,9 +987,11 @@ fn spawn_install(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_deactivate(
     installation_id: Uuid,
     skill_id: String,
+    user_uninstall: bool,
     state: &Arc<AppState>,
     registry_url: &str,
     skill_locks: &SkillLockMap,
@@ -996,7 +1004,15 @@ fn spawn_deactivate(
 
     install_tasks.spawn(async move {
         let _skill_guard = lock.lock_owned().await;
-        handle_deactivate(installation_id, &skill_id, &st, &reg_url, pusher.as_deref()).await
+        handle_deactivate_with(
+            installation_id,
+            &skill_id,
+            user_uninstall,
+            &st,
+            &reg_url,
+            pusher.as_deref(),
+        )
+        .await
     });
 }
 
@@ -3471,9 +3487,35 @@ use scenery_core::safe_unpack::unpack_cskill_archive;
 // ── Deactivate handler ────────────────────────────────────────────────────────
 
 /// Handle one `Deactivate` event.  Returns `true` if the tool list changed.
+#[cfg(test)]
 async fn handle_deactivate(
     installation_id: Uuid,
     skill_id: &str,
+    state: &Arc<AppState>,
+    registry_url: &str,
+    pusher: Option<&ManagedPathsPusher>,
+) -> bool {
+    handle_deactivate_with(
+        installation_id,
+        skill_id,
+        false,
+        state,
+        registry_url,
+        pusher,
+    )
+    .await
+}
+
+/// [`handle_deactivate`]. `user_uninstall` is set by the backend when the OWNER
+/// uninstalled their own private skill from the portal: an auto-managed own
+/// skill is then removed for good (own-skill teardown: files, links, markers,
+/// journal; a removed-own backup only if the tree has unuploaded edits), and
+/// the backend has already archived it. Revoke/kill and snapshot catch-up send
+/// `false` and use the plain removal, exactly as before.
+async fn handle_deactivate_with(
+    installation_id: Uuid,
+    skill_id: &str,
+    user_uninstall: bool,
     state: &Arc<AppState>,
     registry_url: &str,
     pusher: Option<&ManagedPathsPusher>,
@@ -3494,7 +3536,12 @@ async fn handle_deactivate(
             // F2: Remove the skill from ~/.claude/skills/.
             if let Some(p) = pusher {
                 let slug = state.skill_local_name(&skill_id_for_pusher);
-                if let Err(e) = p.remove_skill(&slug) {
+                let torn_down = if user_uninstall {
+                    crate::managed_paths::own_uninstall::uninstall_projection(state, &slug)
+                } else {
+                    p.remove_skill(&slug)
+                };
+                if let Err(e) = torn_down {
                     warn!(
                         skill_id = %skill_id_for_pusher,
                         error = %e,
@@ -3569,12 +3616,8 @@ async fn handle_purge(
     let state_clone = Arc::clone(state);
     let reg_url = registry_url.to_string();
 
-    let result = tokio::task::spawn_blocking(move || {
-        // A portal-driven uninstall is a user action: an own skill that
-        // Scenery converted goes back to the user's original.
-        purge_skill_blocking_with(&state_clone, &skill_id, true)
-    })
-    .await;
+    let result =
+        tokio::task::spawn_blocking(move || purge_skill_blocking(&state_clone, &skill_id)).await;
 
     match result {
         Ok(Ok(_)) => {
@@ -3607,13 +3650,6 @@ async fn handle_purge(
 /// The projection is keyed by the LOCAL slug (`skill_local_name`), which can
 /// differ from the registry `skill_id`; both are removed when they differ.
 fn purge_skill_blocking(state: &AppState, skill_id: &str) -> Result<bool> {
-    purge_skill_blocking_with(state, skill_id, false)
-}
-
-/// [`purge_skill_blocking`], optionally restoring the user's own original for
-/// an auto-managed skill (`restore_own`). Revoke/kill switch passes `false`
-/// (restoring would re-expose a revoked skill); a user/portal uninstall `true`.
-fn purge_skill_blocking_with(state: &AppState, skill_id: &str, restore_own: bool) -> Result<bool> {
     let mut removed = false;
     let mut errors: Vec<String> = Vec::new();
     // Read before anything is deleted.
@@ -3647,12 +3683,7 @@ fn purge_skill_blocking_with(state: &AppState, skill_id: &str, restore_own: bool
         slugs.push(skill_id.to_string());
     }
     for slug in &slugs {
-        let torn_down = if restore_own {
-            crate::managed_paths::own_restore::uninstall_projection(state, slug)
-        } else {
-            pusher.remove_skill(slug)
-        };
-        match torn_down {
+        match pusher.remove_skill(slug) {
             Ok(r) => removed |= r,
             Err(e) => errors.push(format!("F2 remove_skill '{slug}' failed: {e:#}")),
         }
@@ -3806,6 +3837,8 @@ fn build_derived_events_blocking(
                     events.push(SyncEvent::Deactivate {
                         installation_id: record.installation_id,
                         skill_id: record.skill_id.clone(),
+                        // A snapshot cannot tell an uninstall from a revoke.
+                        user_uninstall: false,
                     });
                 }
             }

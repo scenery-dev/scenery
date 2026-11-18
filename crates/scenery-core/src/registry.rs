@@ -1251,6 +1251,42 @@ impl RegistryClient {
         anyhow::bail!("auto-manage failed (HTTP {status}): {body}")
     }
 
+    /// Tell the registry the user uninstalled their OWN auto-managed skill
+    /// (`POST /runner/skills/user-uninstall`, user bearer) so it archives the
+    /// private copy (not revoke; the portal can reinstall it). Best effort for
+    /// callers: a shared catalog skill is never archived server-side.
+    /// `Ok(true)` = archived, `Ok(false)` = the backend left it alone (or the
+    /// backend predates the call).
+    pub fn notify_own_skill_uninstalled(&self, skill_id: &str, local_edits: bool) -> Result<bool> {
+        let token = self
+            .get_auth_token()
+            .ok_or_else(|| anyhow::anyhow!("not authenticated; cannot tell the registry"))?;
+        let url = format!(
+            "{}/runner/skills/user-uninstall",
+            self.base_url.trim_end_matches('/')
+        );
+        let mut body = serde_json::json!({ "skill_id": skill_id, "local_edits": local_edits });
+        if let Some(d) = self.get_device_id() {
+            body["device_id"] = serde_json::Value::String(d);
+        }
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(token)
+            .json(&body)
+            .send_tracked()
+            .with_context(|| format!("failed to reach registry at {url}"))?;
+        let status = resp.status();
+        if status.is_success() {
+            let v: serde_json::Value = resp.json().unwrap_or_default();
+            return Ok(v.get("archived").and_then(|a| a.as_bool()).unwrap_or(false));
+        }
+        if matches!(status.as_u16(), 404 | 405 | 426) {
+            return Ok(false);
+        }
+        anyhow::bail!("user-uninstall failed (HTTP {status})")
+    }
+
     /// Fetch aggregated pre-install governance data for a skill.
     ///
     /// Deliberately sends NO `Authorization` header. The backend guards this
@@ -2773,6 +2809,35 @@ mod tests {
                 assert_eq!(r.scan.verdict.as_deref(), Some("ALLOW"));
             }
             other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn notify_own_skill_uninstalled_posts_the_archive_call() {
+        use mockito::{Matcher, Server};
+        let mut server = Server::new();
+        let m = server
+            .mock("POST", "/runner/skills/user-uninstall")
+            .match_header("authorization", "Bearer tok")
+            .match_body(Matcher::PartialJson(
+                serde_json::json!({"skill_id": "adam~pdf", "local_edits": true, "device_id": "dev-1"}),
+            ))
+            .with_status(200)
+            .with_body(r#"{"archived":true,"skill_id":"adam~pdf","reason":null}"#)
+            .create();
+        let client = RegistryClient::new(server.url()).with_auth("tok");
+        client.set_device_id("dev-1");
+        assert!(client
+            .notify_own_skill_uninstalled("adam~pdf", true)
+            .unwrap());
+        m.assert();
+        // A backend that predates the call (404) or a runner it refuses (426) is not an error.
+        for code in [404, 426] {
+            let _m = server
+                .mock("POST", "/runner/skills/user-uninstall")
+                .with_status(code)
+                .create();
+            assert!(!client.notify_own_skill_uninstalled("x", false).unwrap());
         }
     }
 

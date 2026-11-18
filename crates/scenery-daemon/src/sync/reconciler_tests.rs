@@ -1062,6 +1062,7 @@ fn snapshot_records_folder_name_and_later_events_use_it() {
         SyncEvent::Deactivate {
             installation_id: iid,
             skill_id: "x-bob".to_string(),
+            user_uninstall: false,
         },
         &state,
     ) {

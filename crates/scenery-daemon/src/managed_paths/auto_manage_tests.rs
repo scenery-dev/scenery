@@ -1194,7 +1194,7 @@ async fn a_failed_install_clears_the_pending_takeover() {
     assert!(!dir.join(".scenery-managed.json").exists());
 }
 
-// ── Uninstall restores the user's original (own_restore) ─────────────────────
+// ── Uninstall removes an own skill (own_uninstall) ─────────────────────
 
 #[cfg(unix)]
 fn make_exec(p: &Path) {
@@ -1250,26 +1250,23 @@ async fn convert_pdf(env: &mut Env) -> PathBuf {
 }
 
 #[tokio::test]
-async fn uninstall_restores_the_original_byte_identical_and_never_reconverts() {
+async fn unedited_uninstall_removes_everything_with_no_backup_and_no_restore() {
     let mut env = Env::new().await;
-    let probe = env.user_skill(&env.home.join("probe"), "pdf");
-    #[cfg(unix)]
-    {
-        fs::write(probe.join("references/run.sh"), "#!/bin/sh\necho hi\n").unwrap();
-        make_exec(&probe.join("references/run.sh"));
-    }
-    let original = snapshot(&probe);
     let dir = convert_pdf(&mut env).await;
     assert!(fs::read_to_string(dir.join("SKILL.md"))
         .unwrap()
         .contains("COMPILED"));
 
     // `scenery skill uninstall pdf` (registry id or folder name).
-    let acted = super::super::own_restore::uninstall_projection(&env.state, "adam~pdf").unwrap();
-    assert!(acted);
+    let (removed, own) =
+        super::super::own_uninstall::uninstall_projection_detailed(&env.state, "adam~pdf").unwrap();
+    assert!(removed);
+    let own = own.expect("an auto-managed own skill");
+    assert!(!own.local_edits, "tree equals what Scenery wrote");
+    assert!(own.skill_id.contains("pdf"), "{own:?}");
 
-    assert_eq!(snapshot(&dir), original, "original bytes + exec bits");
-    assert!(!dir.join(".scenery-managed.json").exists());
+    // Gone from the device and the AI clients; the original is NOT put back.
+    assert!(!dir.exists(), "removed, not restored");
     assert!(fs::symlink_metadata(env.claude().join("pdf")).is_err());
     let conn = Connection::open(&env.state.db_path).unwrap();
     let rows: i64 = conn
@@ -1278,60 +1275,58 @@ async fn uninstall_restores_the_original_byte_identical_and_never_reconverts() {
         })
         .unwrap();
     assert_eq!(rows, 0, "no tracked marker rows left");
-    // No stale restore entries for a later whole-product uninstall.
+    // No conversion journal left to replay on a whole-product uninstall.
     assert!(
         scenery_core::restore_journal::RestoreJournal::for_state(&env.state)
             .read_all()
             .unwrap()
             .is_empty()
     );
-    // The backups stay on disk.
-    assert!(env.state.root_dir.join("restore-backups").exists());
-
-    // Next ticks: the backend still says "manage", the runner must not.
-    let _never = env.managed_response("adam~pdf", "0.1.0", "manage", 0);
-    let items = env.scan();
-    let s = process_response(
-        &env.ctx(true),
-        response(vec![directive(&dir, "manage")]),
-        &items,
-    )
-    .await;
-    assert_eq!(s.managed, 0, "{s:?}");
-    assert_eq!(snapshot(&dir), original, "still the user's original");
-
-    // Even after the user edits it, an uninstalled skill stays unmanaged.
-    fs::write(dir.join("SKILL.md"), "---\nname: pdf\n---\nedited later\n").unwrap();
-    let items = env.scan();
-    let s = process_response(
-        &env.ctx(true),
-        response(vec![directive(&dir, "manage")]),
-        &items,
-    )
-    .await;
-    assert_eq!(s.managed, 0, "{s:?}");
-    assert!(!dir.join(".scenery-managed.json").exists());
+    // An unedited own skill needs no removed-own backup (the registry has it).
+    assert!(removed_own_backups(&env).is_empty());
+    // Sticky state is gone: nothing blocks managing a recreated folder.
+    let attempts: i64 = conn
+        .query_row("SELECT COUNT(*) FROM auto_manage_attempts", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(attempts, 0);
 }
 
 #[tokio::test]
-async fn uninstall_keeps_edits_made_after_conversion() {
+async fn edited_uninstall_removes_the_files_but_keeps_a_removed_own_backup() {
     let mut env = Env::new().await;
     let dir = convert_pdf(&mut env).await;
     fs::write(dir.join("SKILL.md"), "MY NEW EDITS").unwrap();
 
-    super::super::own_restore::uninstall_projection(&env.state, "pdf").unwrap();
+    let (_, own) =
+        super::super::own_uninstall::uninstall_projection_detailed(&env.state, "pdf").unwrap();
+    assert!(own.expect("own").local_edits);
 
-    assert_eq!(fs::read(dir.join("SKILL.md")).unwrap(), b"MY NEW EDITS");
-    assert!(!dir.join(".scenery-managed.json").exists());
+    assert!(!dir.exists());
     assert!(fs::symlink_metadata(env.claude().join("pdf")).is_err());
-    // The original is still recoverable from its backup.
-    let kept = walk_files(
-        &env.state
-            .root_dir
-            .join("restore-backups")
-            .into_std_path_buf(),
+    let kept = removed_own_backups(&env);
+    assert!(
+        kept.iter()
+            .any(|p| p.ends_with("removed-own/pdf/SKILL.md")
+                && fs::read(p).unwrap() == b"MY NEW EDITS"),
+        "edits survive in removed-own: {kept:?}"
     );
-    assert!(kept.iter().any(|p| p.ends_with("adopted/pdf/SKILL.md")));
+}
+
+#[tokio::test]
+async fn uninstall_with_an_unknown_baseline_backs_up_fail_safe() {
+    let mut env = Env::new().await;
+    let dir = convert_pdf(&mut env).await;
+    Connection::open(&env.state.db_path)
+        .unwrap()
+        .execute("UPDATE managed_path_markers SET tree_hash = NULL", [])
+        .unwrap();
+    let (_, own) =
+        super::super::own_uninstall::uninstall_projection_detailed(&env.state, "pdf").unwrap();
+    assert!(own.expect("own").local_edits, "unknown counts as edited");
+    assert!(!dir.exists());
+    assert!(!removed_own_backups(&env).is_empty());
 }
 
 #[tokio::test]
@@ -1340,7 +1335,7 @@ async fn uninstall_never_deletes_a_tracked_or_unmanaged_skill() {
     let dir = env.user_skill(&env.agents(), "devrepo");
     fs::create_dir_all(dir.join(".git")).unwrap();
     let before = snapshot(&dir);
-    let acted = super::super::own_restore::uninstall_projection(&env.state, "devrepo").unwrap();
+    let acted = super::super::own_uninstall::uninstall_projection(&env.state, "devrepo").unwrap();
     assert!(!acted);
     assert_eq!(snapshot(&dir), before);
 }
@@ -1421,37 +1416,46 @@ async fn registry_deleted_teardown_of_an_edited_own_skill_backs_up_and_does_not_
 }
 
 #[tokio::test]
-async fn user_uninstall_through_the_core_hook_restores() {
+async fn user_uninstall_through_the_core_hook_removes_and_reports_the_own_skill() {
     let mut env = Env::new().await;
     crate::managed_paths::register_core_hooks();
     let dir = convert_pdf(&mut env).await;
     ensure_install_row(&env);
-    scenery_core::installer::uninstall_skill_restoring(&env.state, "pdf").unwrap();
-    assert!(fs::read_to_string(dir.join("SKILL.md"))
+    let done = scenery_core::installer::uninstall_skill_by_user(&env.state, "pdf")
         .unwrap()
-        .contains("ORIGINAL body"));
+        .expect("installed");
+    assert!(!done.own.expect("own skill reported").local_edits);
+    assert!(!dir.exists(), "no restore of the original");
+    assert!(fs::symlink_metadata(env.claude().join("pdf")).is_err());
 }
 
 #[tokio::test]
-async fn reconvert_after_revoke_restores_the_second_original_not_the_stale_first() {
+async fn user_uninstall_of_a_catalog_skill_reports_no_own_skill() {
+    let env = Env::new().await;
+    crate::managed_paths::register_core_hooks();
+    ensure_install_row(&env);
+    let done = scenery_core::installer::uninstall_skill_by_user(&env.state, "pdf")
+        .unwrap()
+        .expect("installed");
+    assert!(done.own.is_none(), "nothing for the backend to archive");
+}
+
+#[tokio::test]
+async fn recreating_the_folder_after_uninstall_is_managed_again() {
     let mut env = Env::new().await;
     crate::managed_paths::register_core_hooks();
     let dir = convert_pdf(&mut env).await;
-    // Revoke-style teardown (leaves the first cycle's Adopted entry behind).
     ensure_install_row(&env);
-    scenery_core::installer::uninstall_skill(&env.state, "pdf").unwrap();
+    scenery_core::installer::uninstall_skill_by_user(&env.state, "pdf").unwrap();
     assert!(!dir.exists());
-    // The user recreates the skill with new content and it is converted again.
+    // The user recreates the skill with new content: converted like a new one,
+    // and a later uninstall backs up nothing (no stale state from cycle one).
     fs::create_dir_all(&dir).unwrap();
     fs::write(
         dir.join("SKILL.md"),
         "---\nname: pdf\n---\nSECOND original\n",
     )
     .unwrap();
-    Connection::open(&env.state.db_path)
-        .unwrap()
-        .execute("DELETE FROM auto_manage_attempts", [])
-        .unwrap();
     env.seed_registry_version("pdf", "0.1.0");
     let m = env.managed_response("adam~pdf", "0.1.0", "manage", 1);
     let items = env.scan();
@@ -1463,10 +1467,10 @@ async fn reconvert_after_revoke_restores_the_second_original_not_the_stale_first
     .await;
     m.assert();
     assert_eq!(s.managed, 1, "{s:?}");
+    assert!(dir.join(".scenery-managed.json").exists());
 
-    super::super::own_restore::uninstall_projection(&env.state, "pdf").unwrap();
-    assert_eq!(
-        fs::read_to_string(dir.join("SKILL.md")).unwrap(),
-        "---\nname: pdf\n---\nSECOND original\n"
-    );
+    let (_, own) =
+        super::super::own_uninstall::uninstall_projection_detailed(&env.state, "pdf").unwrap();
+    assert!(!own.expect("own").local_edits);
+    assert!(!dir.exists());
 }

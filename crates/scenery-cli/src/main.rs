@@ -6174,7 +6174,7 @@ async fn cmd_skill_uninstall(id: &str, registry_url: Option<&str>) -> Result<()>
     use rusqlite::{Connection, OptionalExtension};
     use scenery_core::{
         audit::{write_audit_event_direct, AuditEvent},
-        installer::uninstall_skill_restoring,
+        installer::uninstall_skill_by_user,
         state::AppState,
     };
 
@@ -6220,9 +6220,26 @@ async fn cmd_skill_uninstall(id: &str, registry_url: Option<&str>) -> Result<()>
                 .context("failed to query managed_path_markers")?
                 .unwrap_or(false);
             if has_leftover {
-                scenery_daemon::managed_paths::own_restore::uninstall_projection(&state, id)
+                let (_, own) =
+                    scenery_daemon::managed_paths::own_uninstall::uninstall_projection_detailed(
+                        &state, id,
+                    )
                     .with_context(|| format!("failed to remove leftover files for '{id}'"))?;
                 println!("Removed leftover managed files for skill '{id}'.");
+                if let Some(own) = own {
+                    archive_own_skill_on_backend(&state, registry_url, &own).await;
+                }
+                return Ok(());
+            }
+            if scenery_daemon::managed_paths::tracked::is_slug_tracked(&state, id) {
+                // Tracked (dev / git / foreign-installer) skills are governed in
+                // place and never converted: uninstall must not delete or edit
+                // the user's files, so there is nothing for it to do.
+                println!(
+                    "Skill '{id}' is tracked in place (a development or foreign-installer \
+                     skill). Scenery never deletes it; its files were left untouched. \
+                     Remove the folder yourself if you no longer want it."
+                );
                 return Ok(());
             }
             anyhow::bail!("skill '{id}' is not installed");
@@ -6230,8 +6247,18 @@ async fn cmd_skill_uninstall(id: &str, registry_url: Option<&str>) -> Result<()>
     };
 
     // Perform the local removal (files + DB rows).
-    uninstall_skill_restoring(&state, id)
-        .with_context(|| format!("failed to remove skill '{id}'"))?;
+    let own = uninstall_skill_by_user(&state, id)
+        .with_context(|| format!("failed to remove skill '{id}'"))?
+        .and_then(|u| u.own);
+    if let Some(own) = &own {
+        if own.local_edits {
+            eprintln!(
+                "note: '{id}' had edits that were never uploaded; a copy was kept under \
+                 restore-backups/*/removed-own/."
+            );
+        }
+        archive_own_skill_on_backend(&state, registry_url, own).await;
+    }
 
     // Emit audit event.
     let ts = scenery_core::timefmt::now_rfc3339();
@@ -6288,6 +6315,38 @@ async fn cmd_skill_uninstall(id: &str, registry_url: Option<&str>) -> Result<()>
     }
 
     Ok(())
+}
+
+/// Tell the registry to archive the user's private copy of an own skill that
+/// was just uninstalled (`POST /runner/skills/user-uninstall`). Best effort: the
+/// local removal already succeeded and the owner can archive/reinstall from the
+/// portal either way.
+async fn archive_own_skill_on_backend(
+    state: &scenery_core::state::AppState,
+    registry_url: Option<&str>,
+    own: &scenery_core::installer::OwnSkillUninstall,
+) {
+    let url = registry_url.unwrap_or(DEFAULT_REGISTRY_URL).to_string();
+    let st = state.clone();
+    let own = own.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        let client = scenery_core::registry::RegistryClient::new(&url).with_stored_auth(&st);
+        if let Ok(Some(d)) = st.get_sync_state("device_id") {
+            client.set_device_id(d);
+        }
+        client.notify_own_skill_uninstalled(&own.skill_id, own.local_edits)
+    })
+    .await;
+    match res {
+        Ok(Ok(true)) => println!(
+            "Your private copy was archived in the registry; reinstall it from the portal."
+        ),
+        Ok(Ok(false)) => {}
+        Ok(Err(e)) => eprintln!(
+            "warning: removed locally, but could not tell the registry to archive the skill: {e:#}"
+        ),
+        Err(e) => eprintln!("warning: archive call did not complete: {e}"),
+    }
 }
 
 /// PATCH `state: "deactivated"` to `PATCH /api/installations/{id}`.

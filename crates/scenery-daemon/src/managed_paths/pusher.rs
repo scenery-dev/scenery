@@ -102,6 +102,20 @@ pub struct ManagedPathsPusher {
     root_dir: camino::Utf8PathBuf,
 }
 
+/// Does the live tree of an auto-managed own skill differ from what Scenery
+/// last wrote (the registry-installed copy of the version the user uploaded)?
+/// Fail-safe: an unreadable tree or a missing conversion-time hash counts as
+/// edited, so the caller backs up rather than deleting.
+pub(crate) fn own_tree_has_unuploaded_edits(skill_dir: &Path, prov: &Provenance) -> bool {
+    match (
+        scenery_core::skill_tree::survey(skill_dir).map(|s| s.tree_hash),
+        &prov.tree_hash,
+    ) {
+        (Ok(cur), Some(written)) => &cur != written,
+        _ => true,
+    }
+}
+
 impl ManagedPathsPusher {
     /// Construct a pusher from the daemon's `AppState`.
     pub fn new(state: &AppState) -> Self {
@@ -606,11 +620,8 @@ impl ManagedPathsPusher {
         if !prov.is_auto_managed() {
             return Ok(());
         }
-        let current = scenery_core::skill_tree::survey(skill_dir).map(|s| s.tree_hash);
-        if let (Ok(cur), Some(written)) = (&current, &prov.tree_hash) {
-            if cur == written {
-                return Ok(()); // exactly what Scenery wrote
-            }
+        if !own_tree_has_unuploaded_edits(skill_dir, &prov) {
+            return Ok(()); // exactly what Scenery wrote
         }
         let journal = self.journal();
         let src = camino::Utf8Path::from_path(skill_dir).ok_or_else(|| {

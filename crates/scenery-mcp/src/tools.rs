@@ -33,7 +33,7 @@ use rusqlite::Connection;
 use scenery_core::{
     auth::{self, AuthClient},
     executor::{run_skill, RunResult},
-    installer::{install_unpacked_skill, uninstall_skill_restoring, InstallMode},
+    installer::{install_unpacked_skill, uninstall_skill_by_user, InstallMode},
     mcp_governance,
     model::{ModelClient, ModelSource},
     policy::PolicyClient,
@@ -828,7 +828,7 @@ fn handle_tool_call_inner(
         "scenery_mcp_status" => handle_mcp_status(state, registry_url),
         "scenery_mcp_install" => handle_mcp_install(arguments, state, registry_url, aggregator),
         "scenery_mcp_uninstall" => handle_mcp_uninstall(arguments, registry_url, aggregator),
-        "scenery_uninstall" => handle_uninstall(arguments, state),
+        "scenery_uninstall" => handle_uninstall(arguments, state, registry_url),
         "scenery_update" => handle_update(arguments, state, registry_url),
         "scenery_plugin_export" => handle_plugin_export(arguments),
         "scenery_plugin_import" => handle_plugin_import(arguments),
@@ -2104,15 +2104,46 @@ pub fn handle_mcp_uninstall(
 
 // ── Skill lifecycle handlers (GAP-07, GAP-08) ─────────────────────────────────
 
-fn handle_uninstall(arguments: &serde_json::Value, state: &AppState) -> ToolCallResult {
+fn handle_uninstall(
+    arguments: &serde_json::Value,
+    state: &AppState,
+    registry_url: &Option<String>,
+) -> ToolCallResult {
     let skill_id = match arguments.get("skill_id").and_then(|v| v.as_str()) {
         Some(id) => id,
         None => return ToolCallResult::error_result("Missing required parameter: skill_id"),
     };
 
-    match uninstall_skill_restoring(state, skill_id) {
-        Ok(Some(version)) => {
-            ToolCallResult::success(format!("Successfully uninstalled {skill_id}@{version}."))
+    match uninstall_skill_by_user(state, skill_id) {
+        Ok(Some(done)) => {
+            let mut msg = format!("Successfully uninstalled {skill_id}@{}.", done.version);
+            if let Some(own) = done.own {
+                if own.local_edits {
+                    msg.push_str(
+                        " It had edits that were never uploaded; a copy was kept under \
+                         restore-backups/*/removed-own/.",
+                    );
+                }
+                // Tell the registry to archive the private copy (best effort).
+                if let Some(url) = registry_url {
+                    let registry = RegistryClient::new(url).with_stored_auth(state);
+                    if let Ok(Some(d)) = state.get_sync_state("device_id") {
+                        registry.set_device_id(d);
+                    }
+                    match registry.notify_own_skill_uninstalled(&own.skill_id, own.local_edits) {
+                        Ok(true) => msg.push_str(
+                            " Your private copy was archived in the registry; reinstall it from the portal.",
+                        ),
+                        Ok(false) => {}
+                        Err(e) => tracing::warn!(
+                            skill_id,
+                            error = %e,
+                            "uninstall: could not tell the registry to archive the skill"
+                        ),
+                    }
+                }
+            }
+            ToolCallResult::success(msg)
         }
         Ok(None) => ToolCallResult::error_result(format!("Skill '{skill_id}' is not installed.")),
         Err(e) => ToolCallResult::error_result(format!("Failed to uninstall '{skill_id}': {e}")),

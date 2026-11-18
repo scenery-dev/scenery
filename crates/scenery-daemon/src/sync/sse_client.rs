@@ -1062,6 +1062,9 @@ pub enum SyncEvent {
     Deactivate {
         installation_id: Uuid,
         skill_id: String,
+        /// The owner uninstalled their own private skill from the portal
+        /// (`reason: "user_uninstall"`): remove it for good. Absent = false.
+        user_uninstall: bool,
     },
     /// Purge a skill (delete files and SQLite row).
     Purge {
@@ -1296,6 +1299,8 @@ struct WireInstall {
 struct WireDeactivate {
     installation_id: Uuid,
     skill_id: String,
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1462,6 +1467,7 @@ pub(crate) fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent
             Ok(SyncEvent::Deactivate {
                 installation_id: wire.installation_id,
                 skill_id: wire.skill_id,
+                user_uninstall: wire.reason.as_deref() == Some("user_uninstall"),
             })
         }
         "purge" => {

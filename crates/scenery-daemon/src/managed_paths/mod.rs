@@ -47,7 +47,7 @@ pub mod mcp_args;
 pub mod mcp_discovery;
 pub mod migrator;
 pub mod native_cleanup;
-pub mod own_restore;
+pub mod own_uninstall;
 pub mod paths;
 pub mod plugin_marketplace;
 pub mod projection_outcome;
@@ -94,8 +94,8 @@ pub fn register_core_hooks() {
             .remove_skill(slug)
             .map(|_| ())
     });
-    scenery_core::installer::register_skill_restoring_remover(|state, slug| {
-        own_restore::uninstall_projection(state, slug).map(|_| ())
+    scenery_core::installer::register_skill_user_remover(|state, slug| {
+        own_uninstall::uninstall_projection_detailed(state, slug).map(|(_, own)| own)
     });
 }
 pub use rollback::{list_backups, rollback, BackupSummary, RollbackReport};

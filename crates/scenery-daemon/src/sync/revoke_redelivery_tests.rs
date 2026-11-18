@@ -866,6 +866,7 @@ async fn catalog_install_deactivate_and_purge_for_a_held_folder_are_refused() {
         SyncEvent::Deactivate {
             installation_id: iid,
             skill_id: "pdf".into(),
+            user_uninstall: false,
         },
         &state,
     )
@@ -976,12 +977,9 @@ async fn revoking_an_unedited_own_skill_takes_no_backup() {
     assert!(walk(state.root_dir.join("restore-backups").as_std_path()).is_empty());
 }
 
-// ── A portal-driven uninstall restores; a revoke does not ─────────────────────
+// ── A portal uninstall of an own skill removes it for good ────────────────────
 
-#[tokio::test]
-async fn portal_uninstall_restores_the_users_original_own_skill() {
-    let home = FakeHome::new();
-    let (_t, state) = new_state();
+async fn converted_own_pdf(home: &FakeHome, state: &AppState) -> PathBuf {
     state.record_skill_local_name("adam~pdf", "pdf").unwrap();
     let dir = home.agents("pdf");
     std::fs::create_dir_all(&dir).unwrap();
@@ -989,31 +987,89 @@ async fn portal_uninstall_restores_the_users_original_own_skill() {
     state
         .record_pending_auto_managed_takeover("pdf", &dir.to_string_lossy(), "adam~pdf", "u")
         .unwrap();
-    seed_skill(&state, "adam~pdf", "0.1.0", true);
-    ManagedPathsPusher::new(&state)
+    seed_skill(state, "adam~pdf", "0.1.0", true);
+    ManagedPathsPusher::new(state)
         .push_skill_adopting_in_place("pdf", None, b"---\nname: pdf\n---\nCOMPILED\n", &[])
         .unwrap();
-    assert_eq!(
-        std::fs::read(dir.join("SKILL.md")).unwrap(),
-        b"---\nname: pdf\n---\nCOMPILED\n"
-    );
+    dir
+}
+
+#[tokio::test]
+async fn portal_uninstall_removes_the_own_skill_without_restoring_the_original() {
+    let home = FakeHome::new();
+    let (_t, state) = new_state();
+    let dir = converted_own_pdf(&home, &state).await;
 
     run(
-        SyncEvent::Purge {
+        SyncEvent::Deactivate {
             installation_id: uuid::Uuid::new_v4(),
             skill_id: "adam~pdf".into(),
+            user_uninstall: true,
         },
         &state,
     )
     .await;
 
-    assert_eq!(
-        std::fs::read(dir.join("SKILL.md")).unwrap(),
-        b"---\nname: pdf\n---\nMINE\n",
-        "the user's original is back"
+    assert!(
+        !dir.exists(),
+        "removed from the device, original not restored"
     );
-    assert!(!dir.join(".scenery-managed.json").exists());
     assert!(home.link("pdf").symlink_metadata().is_err());
+    assert!(
+        scenery_core::restore_journal::RestoreJournal::for_state(&state)
+            .read_all()
+            .unwrap()
+            .is_empty(),
+        "no conversion journal left to replay"
+    );
+    assert!(
+        !walk(state.root_dir.join("restore-backups").as_std_path())
+            .iter()
+            .any(|p| p.to_string_lossy().contains("removed-own")),
+        "unedited: no removed-own backup"
+    );
+}
+
+#[tokio::test]
+async fn portal_uninstall_of_an_edited_own_skill_keeps_a_removed_own_backup() {
+    let home = FakeHome::new();
+    let (_t, state) = new_state();
+    let dir = converted_own_pdf(&home, &state).await;
+    std::fs::write(dir.join("SKILL.md"), "EDITED").unwrap();
+
+    run(
+        SyncEvent::Deactivate {
+            installation_id: uuid::Uuid::new_v4(),
+            skill_id: "adam~pdf".into(),
+            user_uninstall: true,
+        },
+        &state,
+    )
+    .await;
+
+    assert!(!dir.exists());
+    assert!(walk(state.root_dir.join("restore-backups").as_std_path())
+        .iter()
+        .any(|p| p.ends_with("removed-own/pdf/SKILL.md")));
+}
+
+#[tokio::test]
+async fn a_revoke_style_deactivate_never_restores_and_leaves_the_journal() {
+    let home = FakeHome::new();
+    let (_t, state) = new_state();
+    let dir = converted_own_pdf(&home, &state).await;
+
+    run(
+        SyncEvent::Deactivate {
+            installation_id: uuid::Uuid::new_v4(),
+            skill_id: "adam~pdf".into(),
+            user_uninstall: false,
+        },
+        &state,
+    )
+    .await;
+
+    assert!(!dir.exists(), "kill switch removes, never restores");
 }
 
 fn walk(dir: &Path) -> Vec<PathBuf> {

@@ -210,9 +210,19 @@ fn parses_deactivate_event() {
         r#"{"installation_id":"550e8400-e29b-41d4-a716-446655440002","skill_id":"old-skill"}"#;
     let event = parse_sync_event("deactivate", data).unwrap();
     match event {
-        super::SyncEvent::Deactivate { skill_id, .. } => {
+        super::SyncEvent::Deactivate {
+            skill_id,
+            user_uninstall,
+            ..
+        } => {
             assert_eq!(skill_id, "old-skill");
+            assert!(!user_uninstall, "no reason = revoke-style deactivate");
         }
+        other => panic!("expected Deactivate, got {other:?}"),
+    }
+    let data = r#"{"installation_id":"550e8400-e29b-41d4-a716-446655440002","skill_id":"adam~pdf","reason":"user_uninstall"}"#;
+    match parse_sync_event("deactivate", data).unwrap() {
+        super::SyncEvent::Deactivate { user_uninstall, .. } => assert!(user_uninstall),
         other => panic!("expected Deactivate, got {other:?}"),
     }
 }

@@ -157,25 +157,50 @@ fn symlink_version_dir(source: &Utf8Path, version_dir: &Utf8Path) -> Result<()> 
 /// Returns `Ok(Some(version))` with the previously active version string, or
 /// `Ok(None)` if the skill was not installed.
 ///
-/// Teardown only: an auto-managed own skill is removed, never restored (the
-/// registry-sync "deleted upstream" path uses this). A user-initiated
-/// uninstall calls [`uninstall_skill_restoring`] instead.
+/// Plain teardown (the registry-sync "deleted upstream" path uses this): the
+/// native projection is removed by the registered projection remover, which
+/// backs up unuploaded edits of an own skill and otherwise deletes. A
+/// user-initiated uninstall calls [`uninstall_skill_by_user`] instead.
 pub fn uninstall_skill(state: &AppState, skill_id: &str) -> Result<Option<String>> {
-    uninstall_skill_inner(state, skill_id, false)
+    Ok(uninstall_skill_inner(state, skill_id, false)?.map(|(v, _)| v))
+}
+
+/// What a user uninstall removed when the skill was the user's OWN
+/// auto-managed skill (the backend is told so it can archive the private copy).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnSkillUninstall {
+    /// Registry id of the private skill (`adam~pdf`, or its UUID).
+    pub skill_id: String,
+    /// The tree held edits that were never uploaded, so a `removed-own` backup
+    /// was kept.
+    pub local_edits: bool,
+}
+
+/// Result of [`uninstall_skill_by_user`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserUninstall {
+    pub version: String,
+    /// `Some` when an auto-managed own skill was torn down.
+    pub own: Option<OwnSkillUninstall>,
 }
 
 /// [`uninstall_skill`] for a USER-initiated uninstall (`scenery skill
-/// uninstall`, the MCP `scenery_uninstall` tool): the user's own original of an
-/// auto-managed skill is put back instead of deleted.
-pub fn uninstall_skill_restoring(state: &AppState, skill_id: &str) -> Result<Option<String>> {
-    uninstall_skill_inner(state, skill_id, true)
+/// uninstall`, the MCP `scenery_uninstall` tool). An auto-managed own skill is
+/// REMOVED from the device and every AI client with no restore of the original
+/// (the registry holds the uploaded bytes and the backend archives the private
+/// copy, reinstallable from the portal); only unuploaded edits are kept, in a
+/// `removed-own` backup. The result says which case it was so the caller can
+/// tell the backend.
+pub fn uninstall_skill_by_user(state: &AppState, skill_id: &str) -> Result<Option<UserUninstall>> {
+    Ok(uninstall_skill_inner(state, skill_id, true)?
+        .map(|(version, own)| UserUninstall { version, own }))
 }
 
 fn uninstall_skill_inner(
     state: &AppState,
     skill_id: &str,
-    restore_own: bool,
-) -> Result<Option<String>> {
+    by_user: bool,
+) -> Result<Option<(String, Option<OwnSkillUninstall>)>> {
     let conn = Connection::open(&state.db_path)?;
 
     let row: Option<(String, String)> = conn
@@ -212,47 +237,57 @@ fn uninstall_skill_inner(
     // `~/.agents/skills/<id>` (+ its `.scenery-managed.json` marker, the
     // `managed_path_markers` row) and the `~/.claude/skills/<id>` link are the
     // F2 pusher's projection of this install. The pusher lives in the daemon
-    // crate (which depends on this one), so it registers its remover via
-    // [`register_skill_projection_remover`]. Leaving the projection behind
-    // keeps the skill visible to Claude Code and lets the reconciler's phantom
-    // check resurrect it as an "adopted from local path" install.
+    // crate (which depends on this one), so it registers its removers via
+    // [`register_skill_projection_remover`] / [`register_skill_user_remover`].
+    // Leaving the projection behind keeps the skill visible to Claude Code and
+    // lets the reconciler's phantom check resurrect it as an "adopted from
+    // local path" install.
     //
     // Non-fatal: the pusher refuses to touch anything lacking our marker
     // (user content at the same slug), and that must not fail the uninstall.
-    let hook = if restore_own {
-        SKILL_RESTORING_REMOVER
-            .get()
-            .or(SKILL_PROJECTION_REMOVER.get())
-    } else {
-        SKILL_PROJECTION_REMOVER.get()
-    };
-    if let Some(remover) = hook {
-        if let Err(e) = remover(state, skill_id) {
-            tracing::warn!(
+    let mut own = None;
+    match (by_user, SKILL_USER_REMOVER.get()) {
+        (true, Some(user_remover)) => match user_remover(state, skill_id) {
+            Ok(o) => own = o,
+            Err(e) => tracing::warn!(
                 skill_id,
                 error = %e,
                 "uninstall: could not remove the native skill projection (non-fatal)"
-            );
+            ),
+        },
+        _ => {
+            if let Some(remover) = SKILL_PROJECTION_REMOVER.get() {
+                if let Err(e) = remover(state, skill_id) {
+                    tracing::warn!(
+                        skill_id,
+                        error = %e,
+                        "uninstall: could not remove the native skill projection (non-fatal)"
+                    );
+                }
+            }
         }
     }
 
-    Ok(Some(active_version))
+    Ok(Some((active_version, own)))
 }
 
 /// Signature of the callback that removes a skill's native-directory
 /// projection (`~/.agents/skills/<slug>` + `~/.claude/skills/<slug>`).
 pub type SkillProjectionRemover = fn(&AppState, &str) -> Result<()>;
 
+/// [`SkillProjectionRemover`] for a user-initiated uninstall: also reports the
+/// own auto-managed skill it tore down, if any.
+pub type SkillUserRemover = fn(&AppState, &str) -> Result<Option<OwnSkillUninstall>>;
+
 static SKILL_PROJECTION_REMOVER: std::sync::OnceLock<SkillProjectionRemover> =
     std::sync::OnceLock::new();
 
-static SKILL_RESTORING_REMOVER: std::sync::OnceLock<SkillProjectionRemover> =
-    std::sync::OnceLock::new();
+static SKILL_USER_REMOVER: std::sync::OnceLock<SkillUserRemover> = std::sync::OnceLock::new();
 
-/// Register the remover used by [`uninstall_skill_restoring`] (restores the
-/// user's original for an auto-managed own skill). First registration wins.
-pub fn register_skill_restoring_remover(remover: SkillProjectionRemover) {
-    let _ = SKILL_RESTORING_REMOVER.set(remover);
+/// Register the remover used by [`uninstall_skill_by_user`]. First
+/// registration wins.
+pub fn register_skill_user_remover(remover: SkillUserRemover) {
+    let _ = SKILL_USER_REMOVER.set(remover);
 }
 
 /// Register the projection remover invoked by [`uninstall_skill`]. First
