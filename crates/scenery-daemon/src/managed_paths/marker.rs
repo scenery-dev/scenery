@@ -276,8 +276,44 @@ pub enum DbOwnership {
     /// never `managed_hash_mismatch` and never held (plan 4.5.4); drift
     /// reports it.
     EditedOwn,
+    /// A row with no provenance at all (`origin`, `skill_id`, `tree_hash` all
+    /// empty): written by an older runner's adopt/migrate pass for a skill
+    /// another installer owns. It proves neither that Scenery manages the
+    /// skill nor that anyone tampered with it, so it is ignored (and cleaned
+    /// up by [`drop_legacy_row`]). Scenery's own writes always carry a tree
+    /// hash.
+    Legacy { row_path: String },
     /// No row at this path — not ours, whatever marker file it carries.
     Untracked,
+}
+
+fn is_blank(v: &Option<String>) -> bool {
+    v.as_deref().map_or(true, |s| s.trim().is_empty())
+}
+
+/// True for a pre-provenance row: no origin, no skill id, no tree hash.
+pub fn is_legacy_provenance(prov: &Provenance) -> bool {
+    is_blank(&prov.origin) && is_blank(&prov.skill_id) && is_blank(&prov.tree_hash)
+}
+
+/// Delete a legacy marker row, and the `.scenery-managed.json` sidecar beside
+/// the skill only if it too carries no provenance. Best effort.
+pub fn drop_legacy_row(conn: &Connection, row_path: &str, skill_dir: &Path) {
+    if !is_legacy_provenance(&marker_provenance(conn, row_path)) {
+        return;
+    }
+    if let Err(e) = conn.execute(
+        "DELETE FROM managed_path_markers WHERE path = ?1 AND kind = 'skill'",
+        [row_path],
+    ) {
+        warn!(path = row_path, error = %e, "managed_paths/marker: could not drop legacy row");
+        return;
+    }
+    if let Ok(Some(f)) = read_file_marker(skill_dir) {
+        if is_blank(&f.origin) && is_blank(&f.skill_id) && is_blank(&f.tree_hash) {
+            let _ = std::fs::remove_file(skill_dir.join(MANAGED_MARKER_FILENAME));
+        }
+    }
 }
 
 /// Return the `kind` row whose path is `dir`, comparing canonicalised paths so
@@ -336,6 +372,9 @@ pub fn db_ownership(conn: &Connection, kind: &str, dir: &Path) -> DbOwnership {
             return DbOwnership::Untracked;
         }
     };
+    if is_legacy_provenance(&marker_provenance(conn, &row.path)) {
+        return DbOwnership::Legacy { row_path: row.path };
+    }
     match super::drift::current_hash_for(&row) {
         Ok(Some(h)) if h == row.source_sha256 => DbOwnership::Verified,
         _ if marker_provenance(conn, &row.path).is_auto_managed() => DbOwnership::EditedOwn,

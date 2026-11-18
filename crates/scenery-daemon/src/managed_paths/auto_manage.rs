@@ -171,7 +171,7 @@ pub fn get_attempt(state: &AppState, slug: &str, source_path: &str) -> Option<At
 }
 
 /// Skills the runner has held back or that the backend refused, for the user
-/// (`scenery status`). Newest first.
+/// (`scenery doctor`). Newest first.
 pub fn attention_list(state: &AppState) -> Vec<Attempt> {
     let Ok(conn) = open(state) else {
         return Vec::new();
@@ -496,7 +496,7 @@ pub fn note_local_holds(state: &AppState, items: &[DiscoveryItem]) {
 }
 
 /// Remember a held skill (once per tree hash) so the user is told: a warning in
-/// the log, an audit event for IT, and a row `scenery status` lists.
+/// the log, an audit event for IT, and a row `scenery doctor` lists.
 pub fn note_held(state: &AppState, item: &DiscoveryItem, hash: &str, reason: &str) {
     let already = get_attempt(state, &item.slug, &item.source_path).is_some_and(|a| {
         a.status == "held"
@@ -510,7 +510,7 @@ pub fn note_held(state: &AppState, item: &DiscoveryItem, hash: &str, reason: &st
         slug = %item.slug,
         path = %item.source_path,
         reason,
-        "auto-manage: skill HELD — not uploaded and not converted; run `scenery status` for details"
+        "auto-manage: skill HELD — not uploaded and not converted; run `scenery doctor` for details"
     );
     record_attempt(
         state,

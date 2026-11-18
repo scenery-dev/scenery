@@ -66,7 +66,7 @@ use tokio::{sync::Notify, time::interval};
 use tracing::{debug, info, warn};
 
 use super::foreign::{self, ClassifyContext, Treatment};
-use super::marker::{db_ownership, DbOwnership};
+use super::marker::{db_ownership, drop_legacy_row, DbOwnership};
 use super::mcp_discovery;
 
 const ENV_DISABLE: &str = "SCENERY_DISABLE_FILESYSTEM_RECONCILER";
@@ -377,6 +377,11 @@ pub fn collect_discoveries(roots: &[PathBuf], state: &AppState) -> Vec<Discovery
                         DbOwnership::EditedOwn => {
                             debug!(slug = %item.slug, "discoveries: auto-managed skill edited by its owner — not suspicious");
                             continue;
+                        }
+                        DbOwnership::Legacy { row_path } => {
+                            debug!(slug = %item.slug, "discoveries: legacy marker row proves nothing — dropping it and classifying normally");
+                            drop_legacy_row(&conn, &row_path, path);
+                            None
                         }
                         DbOwnership::HashMismatch => Some("managed_hash_mismatch"),
                         DbOwnership::Untracked => scenery_mcp::ownership::is_scenery_managed(path)
@@ -800,6 +805,11 @@ mod tests {
                 ],
             )
             .unwrap();
+            conn.execute(
+                "UPDATE managed_path_markers SET tree_hash = 'deadbeef', hash_version = 2",
+                [],
+            )
+            .unwrap();
         }
 
         let items = collect_discoveries(&[root], &state);
@@ -992,6 +1002,33 @@ mod tests {
             rusqlite::params![path.to_string_lossy().to_string(), slug, sha],
         )
         .unwrap();
+        // Scenery's own writes always carry provenance (origin/tree hash).
+        conn.execute(
+            "UPDATE managed_path_markers SET tree_hash = 'deadbeef', hash_version = 2 WHERE path = ?1",
+            rusqlite::params![path.to_string_lossy().to_string()],
+        )
+        .unwrap();
+    }
+
+    /// A row as an older runner's adopt/migrate pass wrote it: no provenance.
+    fn insert_legacy_row(state: &AppState, path: &Path, slug: &str, sha: &str) {
+        let conn = Connection::open(&state.db_path).unwrap();
+        conn.execute(
+            "INSERT INTO managed_path_markers \
+             (path, kind, slug, installation_id, source_sha256, migrated_at, origin, skill_id, tree_hash) \
+             VALUES (?1, 'skill', ?2, NULL, ?3, '2026-01-01T00:00:00Z', '', NULL, NULL)",
+            rusqlite::params![path.to_string_lossy().to_string(), slug, sha],
+        )
+        .unwrap();
+    }
+
+    fn row_count(state: &AppState) -> i64 {
+        Connection::open(&state.db_path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM managed_path_markers", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
     }
 
     fn forge_marker(dir: &Path) {
@@ -1109,6 +1146,64 @@ mod tests {
             suspicious_reason(&items[0]).as_deref(),
             Some("managed_hash_mismatch")
         );
+    }
+
+    #[test]
+    fn legacy_row_with_matching_hash_is_reported_and_cleaned_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("skills");
+        let foreign = write_skill(&root, "aws-thing");
+        forge_marker(&foreign); // the legacy pass also wrote a bare sidecar
+        let (state, _guard) = temp_state();
+        insert_legacy_row(
+            &state,
+            &foreign,
+            "aws-thing",
+            &hex_sha256(b"---\nname: aws-thing\n---\n"),
+        );
+
+        let items = collect_discoveries(&[root], &state);
+        assert_eq!(items.len(), 1, "legacy row must not hide the skill");
+        assert!(suspicious_reason(&items[0]).is_none());
+        assert!(items[0].local.is_some(), "must flow through classify_skill");
+        assert_eq!(row_count(&state), 0, "legacy row is dropped");
+        assert!(!foreign.join(".scenery-managed.json").exists());
+    }
+
+    #[test]
+    fn legacy_row_with_wrong_hash_is_not_held() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("skills");
+        let foreign = write_skill(&root, "aws-other");
+        forge_marker(&foreign);
+        let (state, _guard) = temp_state();
+        insert_legacy_row(&state, &foreign, "aws-other", "0000");
+
+        let items = collect_discoveries(&[root], &state);
+        assert_eq!(items.len(), 1);
+        assert!(suspicious_reason(&items[0]).is_none(), "not tampering");
+        assert!(!matches!(
+            items[0].local.as_ref().unwrap().treatment,
+            Treatment::Hold(ref r) if r == "suspicious"
+        ));
+        assert_eq!(row_count(&state), 0);
+    }
+
+    #[test]
+    fn row_with_provenance_and_wrong_hash_is_still_held() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("skills");
+        let ours = write_skill(&root, "ours");
+        let (state, _guard) = temp_state();
+        insert_skill_row(&state, &ours, "ours", "0000");
+
+        let items = collect_discoveries(&[root], &state);
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            suspicious_reason(&items[0]).as_deref(),
+            Some("managed_hash_mismatch")
+        );
+        assert_eq!(row_count(&state), 1, "real rows are never dropped");
     }
 
     // ── 9. R2: merged batch contains both a skill and an MCP item ─────────────
