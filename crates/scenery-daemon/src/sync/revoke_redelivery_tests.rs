@@ -750,7 +750,7 @@ fn snapshot_noop_for_an_installed_skill_writes_no_projection_outcome() {
     let (_t, state) = new_state();
     seed_skill(&state, "same", "1.0.0", true);
     project(&state, "same");
-    let since = chrono::Utc::now() - chrono::Duration::seconds(1);
+    let since = scenery_core::timefmt::now() - time::Duration::seconds(1);
 
     let events = super::build_derived_events_blocking(
         vec![InstallationRecord {

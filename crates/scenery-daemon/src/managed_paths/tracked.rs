@@ -115,7 +115,7 @@ pub fn upsert(
             skill_uuid,
             version,
             tree_hash,
-            chrono::Utc::now().to_rfc3339()
+            scenery_core::timefmt::now_rfc3339()
         ],
     )
     .context("tracked: failed to upsert tracked_skills")?;
@@ -315,7 +315,7 @@ pub fn neutralize(state: &AppState, row: &TrackedRow, reason: &str) -> Result<Ne
     conn.execute(
         "UPDATE tracked_skills SET neutralized = 1, neutralized_reason = ?1, \
              neutralized_at = COALESCE(neutralized_at, ?2) WHERE path = ?3",
-        rusqlite::params![reason, chrono::Utc::now().to_rfc3339(), row.path],
+        rusqlite::params![reason, scenery_core::timefmt::now_rfc3339(), row.path],
     )
     .context("tracked: marking neutralized")?;
 

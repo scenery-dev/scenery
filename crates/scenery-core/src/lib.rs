@@ -42,6 +42,7 @@ pub mod secret_file;
 pub mod signed;
 pub mod skill_tree;
 pub mod state;
+pub mod timefmt;
 pub mod trust;
 pub mod verifier;
 

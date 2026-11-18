@@ -8,9 +8,10 @@
 //! the CLI needs an explicit outcome rather than a poll on the files.
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
 use scenery_core::state::AppState;
+use scenery_core::timefmt;
 use std::path::{Path, PathBuf};
+use time::OffsetDateTime;
 
 /// What the daemon did for one install's native projection.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,22 +31,20 @@ fn key(skill_id: &str) -> String {
     format!("native_projection:{skill_id}")
 }
 
-fn encode(outcome: &ProjectionOutcome, at: DateTime<Utc>) -> String {
+fn encode(outcome: &ProjectionOutcome, at: OffsetDateTime) -> String {
     let (kind, payload) = match outcome {
         ProjectionOutcome::Ok => ("ok", String::new()),
         ProjectionOutcome::LinkRefused { path } => ("link_refused", path.display().to_string()),
         ProjectionOutcome::PushRefused { path } => ("push_refused", path.display().to_string()),
         ProjectionOutcome::PushFailed { detail } => ("push_failed", detail.replace('\t', " ")),
     };
-    format!("{kind}\t{}\t{payload}", at.to_rfc3339())
+    format!("{kind}\t{}\t{payload}", timefmt::to_rfc3339(at))
 }
 
-fn decode(raw: &str) -> Option<(DateTime<Utc>, ProjectionOutcome)> {
+fn decode(raw: &str) -> Option<(OffsetDateTime, ProjectionOutcome)> {
     let mut parts = raw.splitn(3, '\t');
     let kind = parts.next()?;
-    let at = DateTime::parse_from_rfc3339(parts.next()?)
-        .ok()?
-        .with_timezone(&Utc);
+    let at = timefmt::parse_rfc3339(parts.next()?)?;
     let payload = parts.next().unwrap_or("");
     let outcome = match kind {
         "ok" => ProjectionOutcome::Ok,
@@ -66,7 +65,7 @@ fn decode(raw: &str) -> Option<(DateTime<Utc>, ProjectionOutcome)> {
 /// Record the outcome for `skill_id` (registry id), stamped now.
 pub fn record(state: &AppState, skill_id: &str, outcome: &ProjectionOutcome) -> Result<()> {
     state
-        .set_sync_state(&key(skill_id), &encode(outcome, Utc::now()))
+        .set_sync_state(&key(skill_id), &encode(outcome, timefmt::now()))
         .context("failed to record native projection outcome")
 }
 
@@ -75,7 +74,7 @@ pub fn record(state: &AppState, skill_id: &str, outcome: &ProjectionOutcome) -> 
 pub fn read_since(
     state: &AppState,
     skill_id: &str,
-    since: DateTime<Utc>,
+    since: OffsetDateTime,
 ) -> Result<Option<ProjectionOutcome>> {
     let raw = state
         .get_sync_state(&key(skill_id))

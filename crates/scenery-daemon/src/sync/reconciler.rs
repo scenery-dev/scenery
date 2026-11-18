@@ -3537,7 +3537,7 @@ fn deactivate_skill_blocking(state: &AppState, skill_id: &str) -> Result<()> {
             .with_context(|| format!("failed to remove active symlink for {skill_id}"))?;
     }
 
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = scenery_core::timefmt::now_rfc3339();
     let conn = rusqlite::Connection::open(&state.db_path)
         .context("failed to open state DB for deactivate")?;
     conn.execute(

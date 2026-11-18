@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used)]
 
 use super::*;
-use chrono::Duration;
+use time::Duration;
 
 fn state() -> (tempfile::TempDir, AppState) {
     let tmp = tempfile::tempdir().unwrap();
@@ -13,7 +13,7 @@ fn state() -> (tempfile::TempDir, AppState) {
 #[test]
 fn round_trips_every_outcome() {
     let (_t, state) = state();
-    let past = Utc::now() - Duration::seconds(5);
+    let past = timefmt::now() - Duration::seconds(5);
     for o in [
         ProjectionOutcome::Ok,
         ProjectionOutcome::LinkRefused {
@@ -35,10 +35,18 @@ fn round_trips_every_outcome() {
 fn ignores_a_record_older_than_the_install() {
     let (_t, state) = state();
     record(&state, "x", &ProjectionOutcome::Ok).unwrap();
-    let later = Utc::now() + Duration::seconds(5);
+    let later = timefmt::now() + Duration::seconds(5);
     assert_eq!(read_since(&state, "x", later).unwrap(), None);
     assert_eq!(
-        read_since(&state, "other", Utc::now() - Duration::seconds(5)).unwrap(),
+        read_since(&state, "other", timefmt::now() - Duration::seconds(5)).unwrap(),
         None
     );
+}
+
+#[test]
+fn decodes_values_stored_by_the_chrono_era_runner() {
+    // Exact shape chrono's `to_rfc3339()` wrote: `+00:00` suffix, micro digits.
+    let (at, o) = decode("ok\t2026-11-16T06:00:00.123456+00:00\t").unwrap();
+    assert_eq!(o, ProjectionOutcome::Ok);
+    assert_eq!(timefmt::to_rfc3339(at), "2026-11-16T06:00:00.123456+00:00");
 }

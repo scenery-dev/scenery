@@ -23,13 +23,12 @@
 //!
 //! `LOG_SEGMENT_BYTES` * (`LOG_MAX_BACKUPS` + 1 active segment) caps the
 //! daemon's durable log footprint at ~50 MB total. Oldest segments are
-//! deleted by the `rolling-file` crate as new ones roll in — see
-//! `rotates_and_bounds_total_log_size` below for a direct test of that
-//! behavior with the same condition/cap shape this module configures.
+//! deleted by [`crate::rotating_file::RotatingFile`] as new ones roll in — see
+//! its tests for the rotation/bound behavior.
 
 use std::path::Path;
 
-use rolling_file::{BasicRollingFileAppender, RollingConditionBasic};
+use crate::rotating_file::RotatingFile;
 use tracing_subscriber::EnvFilter;
 
 /// Size of each rotated log segment.
@@ -71,10 +70,9 @@ pub fn init_daemon(log_dir: &Path) -> LoggingGuard {
         return init_daemon_stderr_fallback();
     }
 
-    let condition = RollingConditionBasic::new().max_size(LOG_SEGMENT_BYTES);
-    let appender = match BasicRollingFileAppender::new(
+    let appender = match RotatingFile::new(
         log_dir.join(LOG_FILE_BASENAME),
-        condition,
+        LOG_SEGMENT_BYTES,
         LOG_MAX_BACKUPS,
     ) {
         Ok(a) => a,
@@ -115,60 +113,4 @@ fn init_daemon_stderr_fallback() -> LoggingGuard {
 
 fn env_filter_or(default_level: &str) -> EnvFilter {
     EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::Write;
-
-    /// Direct test of the exact condition/cap shape `init_daemon` configures
-    /// (scaled down so the test runs fast): writes far more data than an
-    /// unrotated file would ever be allowed to hold, then asserts the
-    /// on-disk footprint stayed bounded and old segments were deleted.
-    ///
-    /// This is the D1 acceptance check ("generate volume, confirm rotation
-    /// kicks in and old segments are deleted, size stays under cap") applied
-    /// directly to the appender construction this module uses.
-    #[test]
-    fn rotates_and_bounds_total_log_size() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let log_path = tmp.path().join(LOG_FILE_BASENAME);
-        // 1 KiB segments, 3 rotated backups => 4 segments total, ~4 KiB cap.
-        let condition = RollingConditionBasic::new().max_size(1024);
-        let mut appender = BasicRollingFileAppender::new(&log_path, condition, 3)
-            .expect("failed to construct rolling appender");
-
-        // 200 lines * ~191 bytes =~ 38 KB if nothing ever rotated — about
-        // 10x the ~4 KB total cap this configuration allows.
-        let line = vec![b'x'; 190];
-        for _ in 0..200 {
-            appender.write_all(&line).expect("write");
-            appender.write_all(b"\n").expect("write newline");
-        }
-        appender.flush().expect("flush");
-        drop(appender);
-
-        let entries: Vec<_> = std::fs::read_dir(tmp.path())
-            .expect("read_dir")
-            .filter_map(|e| e.ok())
-            .collect();
-
-        let total_bytes: u64 = entries
-            .iter()
-            .map(|e| e.metadata().expect("metadata").len())
-            .sum();
-
-        assert!(
-            entries.len() <= 4,
-            "expected at most 4 log segments (1 active + 3 backups), found {} ({:?})",
-            entries.len(),
-            entries.iter().map(|e| e.file_name()).collect::<Vec<_>>()
-        );
-        assert!(
-            total_bytes < 8 * 1024,
-            "expected bounded total log size well under the ~38 KB an \
-             unrotated file would reach, got {total_bytes} bytes"
-        );
-    }
 }

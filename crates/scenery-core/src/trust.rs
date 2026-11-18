@@ -136,7 +136,7 @@ pub fn pin_key(state: &AppState, origin: &str, kid: &str, pubkey: &[u8; 32]) -> 
     conn.execute(
         "INSERT INTO trusted_keys (origin, kid, pubkey, pinned_at) VALUES (?1, ?2, ?3, ?4)
          ON CONFLICT(origin, kid) DO UPDATE SET pubkey = excluded.pubkey, pinned_at = excluded.pinned_at",
-        params![origin, kid, pubkey.as_slice(), chrono::Utc::now().to_rfc3339()],
+        params![origin, kid, pubkey.as_slice(), crate::timefmt::now_rfc3339()],
     )
     .context("failed to pin key")?;
     Ok(())

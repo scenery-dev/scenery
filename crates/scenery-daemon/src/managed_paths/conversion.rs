@@ -138,7 +138,7 @@ impl Conversion {
             old: old.to_string_lossy().to_string(),
             backup_path: None,
             phase: Phase::Staging,
-            started: chrono::Utc::now().to_rfc3339(),
+            started: scenery_core::timefmt::now_rfc3339(),
         };
         // Intent first, so a crash at any later point is recoverable.
         write_intent(&ipath, &intent)?;

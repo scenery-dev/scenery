@@ -81,7 +81,7 @@ fn new_record(kind: CrashKind, runner_version: &str, occurred_at: String) -> Cra
 }
 
 fn now_rfc3339() -> String {
-    chrono::Utc::now().to_rfc3339()
+    crate::timefmt::now_rfc3339()
 }
 
 /// Cut `s` to at most `max` bytes on a char boundary.

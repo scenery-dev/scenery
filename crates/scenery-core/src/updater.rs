@@ -1217,7 +1217,7 @@ mod tests {
             "UPDATE installed_skills \
              SET deactivated = 1, deactivated_at = ?1, current_status = 'deactivated' \
              WHERE skill_id = 'test-skill'",
-            rusqlite::params![chrono::Utc::now().to_rfc3339()],
+            rusqlite::params![crate::timefmt::now_rfc3339()],
         )
         .unwrap();
         drop(conn);

@@ -181,7 +181,7 @@ pub fn install_plugin_bundle(bundle: &PluginBundle) -> Result<()> {
         .with_context(|| format!("plugin_marketplace: failed to populate cache {cache:?}"))?;
 
     // 4. Register the marketplace + record the install + enable the plugin.
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = scenery_core::timefmt::now_rfc3339();
     upsert_known_marketplaces(&home, &mp, &now)?;
     upsert_installed_plugins(&home, &bundle.slug, &bundle.version, &cache, &now)?;
     upsert_settings(&home, &mp, &bundle.slug)?;

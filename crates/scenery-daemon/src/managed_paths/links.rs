@@ -364,7 +364,7 @@ fn backup_and_remove(dir: &Path) -> Result<()> {
     // merge into the same directory.
     let ts = format!(
         "{}-{}",
-        chrono::Utc::now().format("%Y-%m-%dT%H%M%SZ"),
+        scenery_core::timefmt::stamp_compact(scenery_core::timefmt::now()),
         scenery_core::safe_copy::unique_token()
     );
     let backup_root = home

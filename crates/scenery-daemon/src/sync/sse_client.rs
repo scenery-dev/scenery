@@ -300,7 +300,7 @@ pub(crate) async fn run_with_policy(
                         policy.degraded_init.as_secs(),
                         policy.degraded_max.as_secs()
                     );
-                    let since = chrono::Utc::now().to_rfc3339();
+                    let since = scenery_core::timefmt::now_rfc3339();
                     if let Err(e) = state.set_sync_state(SSE_DEGRADED_KEY, &since) {
                         warn!(error = %e, "SSE: failed to persist degraded marker");
                     }

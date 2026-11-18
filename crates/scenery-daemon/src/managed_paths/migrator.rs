@@ -260,7 +260,7 @@ pub async fn migrate_item(
     // aggregator until the approved-servers/gateway pipeline lands
     // (`/runner/approved-servers` is currently a stub). Removing the user's
     // direct entry before then would break the tool. See the board card.
-    let now_ts = chrono::Utc::now().to_rfc3339();
+    let now_ts = scenery_core::timefmt::now_rfc3339();
     let conn = Connection::open(&state.db_path)
         .context("migrator: failed to open state DB for marker write")?;
 

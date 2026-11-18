@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "2.3.0"
+version = "2.3.1"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Scenery"]
@@ -34,7 +34,7 @@ futures = "0.3"
 bytes = "1"
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
-chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+time = { version = "0.3", default-features = false, features = ["std", "parsing"] }
 dirs = "5"
 camino = "1"
 libc = "0.2"
@@ -46,7 +46,6 @@ tar = "0.4"
 base64 = "0.22"
 getrandom = "0.2"
 tracing-appender = "0.2"
-rolling-file = "0.2"
 
 [profile.release]
 lto = "thin"

@@ -585,7 +585,7 @@ impl AppState {
     /// that a subsequent re-pair as a *different* user could collide with.
     pub fn mark_device_revoked(&self) -> Result<()> {
         self.clear_device_session()?;
-        self.set_sync_state("device_revoked_at", &chrono::Utc::now().to_rfc3339())?;
+        self.set_sync_state("device_revoked_at", &crate::timefmt::now_rfc3339())?;
         Ok(())
     }
 

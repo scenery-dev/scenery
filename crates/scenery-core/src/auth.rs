@@ -101,7 +101,7 @@ pub fn handle_user_revoked(state: &AppState, registry_url: &str) -> Result<bool>
     clear_tokens(state, registry_url)?;
     state.clear_device_session()?;
     if first {
-        state.set_sync_state(USER_REVOKED_KEY, &chrono::Utc::now().to_rfc3339())?;
+        state.set_sync_state(USER_REVOKED_KEY, &crate::timefmt::now_rfc3339())?;
     }
     Ok(first)
 }

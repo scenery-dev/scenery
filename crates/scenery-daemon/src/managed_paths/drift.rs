@@ -784,7 +784,7 @@ pub fn check_link_integrity(slug: &str, expected_hash: &str) -> Result<bool> {
 
 fn quarantine_item(outcome: &DriftOutcome) -> Result<PathBuf> {
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("drift: HOME not resolvable"))?;
-    let ts = chrono::Utc::now().format("%Y-%m-%dT%H%M%SZ").to_string();
+    let ts = scenery_core::timefmt::stamp_compact(scenery_core::timefmt::now());
     let dest_root = home
         .join(".claude")
         .join(".scenery-quarantine")

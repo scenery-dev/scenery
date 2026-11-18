@@ -202,7 +202,7 @@ pub fn attention_list(state: &AppState) -> Vec<Attempt> {
 }
 
 fn now_unix() -> i64 {
-    chrono::Utc::now().timestamp()
+    scenery_core::timefmt::now_unix()
 }
 
 /// Record the outcome of acting on a skill. A `Failed` status bumps the
@@ -242,7 +242,7 @@ pub fn record_attempt(
             status.as_str(),
             reason,
             fails,
-            chrono::Utc::now().to_rfc3339(),
+            scenery_core::timefmt::now_rfc3339(),
             next
         ],
     ) {
@@ -264,8 +264,8 @@ pub fn should_attempt(state: &AppState, slug: &str, source_path: &str, tree_hash
         return now_unix() >= a.next_try_at;
     }
     // Terminal for this tree: retry only after it has gone stale.
-    let age = chrono::DateTime::parse_from_rfc3339(&a.last_try)
-        .map(|t| chrono::Utc::now().signed_duration_since(t).num_seconds())
+    let age = scenery_core::timefmt::parse_rfc3339(&a.last_try)
+        .map(|t| (scenery_core::timefmt::now() - t).whole_seconds())
         .unwrap_or(i64::MAX);
     age >= TERMINAL_RETRY_AFTER_SECS
 }
@@ -774,11 +774,9 @@ fn track_upload_due(state: &AppState, path: &str, reason: &str, hash: &str) -> b
     match row
         .last_upload_at
         .as_deref()
-        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+        .and_then(scenery_core::timefmt::parse_rfc3339)
     {
-        Some(t) => {
-            chrono::Utc::now().signed_duration_since(t).num_seconds() >= FOREIGN_REUPLOAD_MIN_SECS
-        }
+        Some(t) => (scenery_core::timefmt::now() - t).whole_seconds() >= FOREIGN_REUPLOAD_MIN_SECS,
         None => true,
     }
 }

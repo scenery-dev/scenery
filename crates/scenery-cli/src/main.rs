@@ -41,6 +41,7 @@ mod device_trust;
 mod install;
 mod logging;
 mod pair;
+mod rotating_file;
 mod token_input;
 mod uninstall;
 
@@ -1578,17 +1579,7 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
 
 /// Convert a Unix timestamp (seconds) to a human-readable UTC string.
 fn format_unix_timestamp(ts: i64) -> String {
-    use std::time::{Duration, UNIX_EPOCH};
-    let d = UNIX_EPOCH + Duration::from_secs(ts as u64);
-    match d.duration_since(UNIX_EPOCH) {
-        Ok(_) => {
-            // chrono is in workspace deps
-            use chrono::{DateTime, Utc};
-            let dt = DateTime::<Utc>::from(d);
-            dt.format("%Y-%m-%d %H:%M:%S UTC").to_string()
-        }
-        Err(_) => ts.to_string(),
-    }
+    scenery_core::timefmt::format_unix_utc(ts).unwrap_or_else(|| ts.to_string())
 }
 
 // ── skill list ────────────────────────────────────────────────────────────────
@@ -1855,7 +1846,7 @@ async fn cmd_skill_install(
 
         // Audit: skill installed from a local directory (fail-open: never block install).
         let mode_str = if link { "symlink" } else { "copy" };
-        let ts = chrono::Utc::now().to_rfc3339();
+        let ts = scenery_core::timefmt::now_rfc3339();
         write_audit_event_direct(
             &state.db_path,
             &AuditEvent {
@@ -1959,7 +1950,7 @@ async fn install_via_desired_state(
 
     // Outcomes the daemon recorded before this moment belong to an earlier
     // install of the same skill.
-    let install_requested_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+    let install_requested_at = scenery_core::timefmt::now() - time::Duration::seconds(1);
 
     // The version active BEFORE the request (the daemon may upgrade it the
     // moment the backend queues the install). Compared against the version
@@ -2121,7 +2112,7 @@ async fn install_via_desired_state(
                 println!("Installed skill '{skill_id}' from registry.");
                 // Audit: daemon confirmed the desired-state install succeeded.
                 // Fail-open: never block on audit write failure.
-                let ts = chrono::Utc::now().to_rfc3339();
+                let ts = scenery_core::timefmt::now_rfc3339();
                 scenery_core::audit::write_audit_event_direct(
                     &state.db_path,
                     &scenery_core::audit::AuditEvent {
@@ -2346,7 +2337,7 @@ async fn direct_registry_install(
     .with_context(|| format!("failed to install '{skill_ref}' from registry"))?;
 
     // Audit: successful direct-registry install (fail-open).
-    let ts = chrono::Utc::now().to_rfc3339();
+    let ts = scenery_core::timefmt::now_rfc3339();
     write_audit_event_direct(
         &db_path,
         &AuditEvent {
@@ -2665,7 +2656,7 @@ async fn cmd_skill_run(
         Err(_) => None,
     };
 
-    let ts = chrono::Utc::now().to_rfc3339();
+    let ts = scenery_core::timefmt::now_rfc3339();
     write_audit_event_direct(
         &state.db_path,
         &AuditEvent {
@@ -6243,7 +6234,7 @@ async fn cmd_skill_uninstall(id: &str, registry_url: Option<&str>) -> Result<()>
     uninstall_skill(&state, id).with_context(|| format!("failed to remove skill '{id}'"))?;
 
     // Emit audit event.
-    let ts = chrono::Utc::now().to_rfc3339();
+    let ts = scenery_core::timefmt::now_rfc3339();
     write_audit_event_direct(
         &state.db_path,
         &AuditEvent {
@@ -6490,7 +6481,7 @@ async fn cmd_plugin_uninstall(slug: &str, registry_url: Option<&str>) -> Result<
     .with_context(|| format!("failed to remove plugin '{slug}' from local marketplace"))?;
 
     // Emit audit event.
-    let ts = chrono::Utc::now().to_rfc3339();
+    let ts = scenery_core::timefmt::now_rfc3339();
     write_audit_event_direct(
         &state.db_path,
         &AuditEvent {

@@ -318,7 +318,7 @@ impl ManagedPathsPusher {
 
         // Compute source hash from SKILL.md content.
         let sha256 = hex_sha256(skill_md_bytes);
-        let now_ts = chrono::Utc::now().to_rfc3339();
+        let now_ts = scenery_core::timefmt::now_rfc3339();
 
         // Provenance: a pending auto-manage takeover for this slug stamps the
         // marker (`origin = auto_managed`, registry ids); otherwise whatever
@@ -690,7 +690,7 @@ impl ManagedPathsPusher {
         // Upsert SQLite marker (virtual key: path:<slug>).
         let path_key = format!("{}:{}", claude_json.display(), slug);
         let sha256 = hex_sha256(entry_value.to_string().as_bytes());
-        let now_ts = chrono::Utc::now().to_rfc3339();
+        let now_ts = scenery_core::timefmt::now_rfc3339();
         self.upsert_db_marker(&path_key, "mcp", slug, installation_id, &sha256, &now_ts)
             .context("pusher: failed to upsert managed_path_markers for mcp")?;
 

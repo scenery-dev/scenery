@@ -166,7 +166,7 @@ impl JournalEntry {
 /// RFC 3339 timestamp, `Z`-suffixed, second precision — matches the schema
 /// example in the restore-journal contract.
 pub fn now_iso() -> String {
-    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
+    crate::timefmt::stamp_colon(crate::timefmt::now())
 }
 
 /// Filesystem-safe, **unique** name (no colons) for `restore-backups/<ts>/`
@@ -177,7 +177,7 @@ pub fn now_iso() -> String {
 pub fn new_backup_ts() -> String {
     format!(
         "{}-{}",
-        chrono::Utc::now().format("%Y-%m-%dT%H%M%SZ"),
+        crate::timefmt::stamp_compact(crate::timefmt::now()),
         crate::safe_copy::unique_token()
     )
 }
