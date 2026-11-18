@@ -37,7 +37,7 @@ use scenery_core::{
     restore_journal::{JournalOp, JournalSource, RestoreJournal},
     state::AppState,
 };
-use tracing::info;
+use tracing::{info, warn};
 
 /// User-driven uninstall of the native projection of `id` (a registry id like
 /// `adam~pdf`, or the folder name). See the module docs.
@@ -71,6 +71,18 @@ pub fn uninstall_projection_detailed(
         return Ok((pusher.remove_skill(&slug)?, None));
     }
 
+    let installation_id: Option<String> = rusqlite::Connection::open(&state.db_path)
+        .ok()
+        .and_then(|c| {
+            c.query_row(
+                "SELECT installation_id FROM managed_path_markers WHERE path = ?1",
+                [&key],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten()
+        })
+        .filter(|i| !i.is_empty());
     // Decide before anything is deleted; `remove_skill` takes the backup.
     let local_edits = canonical
         .as_deref()
@@ -88,6 +100,8 @@ pub fn uninstall_projection_detailed(
         Some(OwnSkillUninstall {
             skill_id,
             local_edits,
+            local_slug: slug,
+            installation_id,
         }),
     ))
 }
@@ -113,4 +127,48 @@ fn finish(state: &AppState, slug: &str) {
             && e.op != JournalOp::ConfigEdit
             && !keeps_edit_backup
     });
+}
+
+/// Retry the backend archive+deactivate of user-uninstalled own skills until it
+/// is confirmed (survives restarts: the queue is in state.db). Due entries are
+/// tried every [`RETRY_TICK`]; each entry backs off on its own schedule.
+pub fn spawn_retry_loop(state: std::sync::Arc<AppState>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(RETRY_TICK);
+        loop {
+            ticker.tick().await;
+            retry_due(&state).await;
+        }
+    })
+}
+
+const RETRY_TICK: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// One pass over the due entries. Returns how many were confirmed.
+pub async fn retry_due(state: &std::sync::Arc<AppState>) -> usize {
+    let st = std::sync::Arc::clone(state);
+    let entries = tokio::task::spawn_blocking(move || scenery_core::own_uninstall_outbox::due(&st))
+        .await
+        .unwrap_or_default();
+    let mut done = 0;
+    for e in entries {
+        let st = std::sync::Arc::clone(state);
+        let skill = e.skill_id.clone();
+        match tokio::task::spawn_blocking(move || {
+            scenery_core::own_uninstall_outbox::process(&st, &e)
+        })
+        .await
+        {
+            Ok(Ok(true)) => {
+                info!(skill_id = %skill, "own-uninstall: backend confirmed the archive");
+                done += 1;
+            }
+            Ok(Ok(false)) => {}
+            Ok(Err(err)) => {
+                warn!(skill_id = %skill, error = %err, "own-uninstall: backend not reachable yet; will retry")
+            }
+            Err(err) => warn!(error = %err, "own-uninstall: retry task panicked"),
+        }
+    }
+    done
 }

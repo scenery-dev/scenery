@@ -605,6 +605,9 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
         .spawn_loop();
     }
 
+    // Backend archive of user-uninstalled own skills, retried until confirmed.
+    managed_paths::own_uninstall::spawn_retry_loop(Arc::new(state.clone()));
+
     if let Some(ref m) = managed_config {
         info!(
             org = m.org.as_deref().unwrap_or("(unspecified)"),

@@ -174,6 +174,10 @@ pub struct OwnSkillUninstall {
     /// The tree held edits that were never uploaded, so a `removed-own` backup
     /// was kept.
     pub local_edits: bool,
+    /// Folder name on this device.
+    pub local_slug: String,
+    /// The backend install row this device held, when known.
+    pub installation_id: Option<String>,
 }
 
 /// Result of [`uninstall_skill_by_user`].

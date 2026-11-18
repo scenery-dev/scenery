@@ -29,6 +29,7 @@ pub mod crash;
 mod crash_redact;
 pub mod managed;
 pub mod model;
+pub mod own_uninstall_outbox;
 pub mod pack;
 pub mod policy;
 pub mod registry;

@@ -1086,3 +1086,39 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
     }
     out
 }
+
+#[tokio::test]
+async fn a_live_install_event_a_portal_reinstall_clears_the_uninstall_tombstone() {
+    let _home = FakeHome::new();
+    let (_t, state) = new_state();
+    scenery_core::own_uninstall_outbox::record(
+        &state,
+        &scenery_core::own_uninstall_outbox::Entry {
+            skill_id: "adam~pdf".into(),
+            local_slug: "pdf".into(),
+            installation_id: None,
+            local_edits: false,
+            registry_url: "http://127.0.0.1:9".into(),
+            attempts: 0,
+            next_try_at: 0,
+        },
+    )
+    .unwrap();
+    assert!(scenery_core::own_uninstall_outbox::is_tombstoned(
+        &state, "pdf"
+    ));
+    run(
+        SyncEvent::Install {
+            installation_id: uuid::Uuid::new_v4(),
+            skill_id: "adam~pdf".into(),
+            version: "1.0.0".into(),
+            source: None,
+        },
+        &state,
+    )
+    .await;
+    assert!(
+        !scenery_core::own_uninstall_outbox::is_tombstoned(&state, "pdf"),
+        "explicit reinstall lifts it"
+    );
+}

@@ -1416,3 +1416,66 @@ fn a_private_skill_is_fetched_by_its_registry_id_not_the_bare_folder_name() {
     catalog.assert();
     cleanup(&root);
 }
+
+// ── user-uninstalled own skill: tombstone vs snapshot / portal reinstall ─────
+
+fn tombstone(state: &AppState, skill_id: &str, slug: &str) {
+    scenery_core::own_uninstall_outbox::record(
+        state,
+        &scenery_core::own_uninstall_outbox::Entry {
+            skill_id: skill_id.to_string(),
+            local_slug: slug.to_string(),
+            installation_id: Some(install_id().to_string()),
+            local_edits: false,
+            registry_url: "http://127.0.0.1:9".to_string(),
+            attempts: 0,
+            next_try_at: 0,
+        },
+    )
+    .unwrap();
+}
+
+fn desired_pdf() -> Vec<InstallationRecord> {
+    vec![InstallationRecord {
+        installation_id: install_id(),
+        skill_id: "adam~pdf".to_string(),
+        version: "1.0.0".to_string(),
+        state: "installed".to_string(),
+        source: None,
+        local_slug: None,
+    }]
+}
+
+#[test]
+fn failed_archive_then_reconnect_snapshot_does_not_reinstall_the_skill() {
+    let root = temp_root("tombstone-snapshot");
+    let state = AppState::bootstrap_in(root.clone()).unwrap();
+    // Before the uninstall the stale backend row would install it.
+    assert_eq!(
+        build_derived_events_blocking(desired_pdf(), &state).len(),
+        1,
+        "control: without a tombstone the snapshot installs it"
+    );
+    tombstone(&state, "adam~pdf", "pdf");
+    assert!(
+        build_derived_events_blocking(desired_pdf(), &state).is_empty(),
+        "a tombstoned skill is never derived as an Install"
+    );
+    // Same after a daemon restart (a fresh AppState on the same state dir).
+    let again = AppState::bootstrap_in(root.clone()).unwrap();
+    assert!(build_derived_events_blocking(desired_pdf(), &again).is_empty());
+    cleanup(&root);
+}
+
+#[test]
+fn tombstone_lifts_once_confirmed_or_cleared() {
+    let root = temp_root("tombstone-clear");
+    let state = AppState::bootstrap_in(root.clone()).unwrap();
+    tombstone(&state, "adam~pdf", "pdf");
+    assert!(scenery_core::own_uninstall_outbox::clear(&state, "pdf"));
+    assert_eq!(
+        build_derived_events_blocking(desired_pdf(), &state).len(),
+        1
+    );
+    cleanup(&root);
+}

@@ -459,6 +459,14 @@ async fn dispatch_event(
         }
         _ => {}
     }
+    // A live `install` event is an explicit request (a portal Reinstall): it
+    // overrides a pending-uninstall tombstone. Snapshot-derived installs never
+    // reach this function (they are filtered in `build_derived_events_blocking`).
+    if let SyncEvent::Install { skill_id, .. } = &event {
+        if scenery_core::own_uninstall_outbox::clear(state, skill_id) {
+            info!(skill_id = %skill_id, "reconciler: portal reinstall clears the pending-uninstall tombstone");
+        }
+    }
     let event = localize_skill_names(event, state);
     match event {
         SyncEvent::Install {
@@ -3802,7 +3810,14 @@ fn build_derived_events_blocking(
                 // emit an Install event anyway — the handler will short-
                 // circuit via check_version_local and PATCH "installed" with
                 // the snapshot's installation_id, converging the row.
-                if !(locally_satisfied && backend_in_sync) {
+                // A skill the user uninstalled whose backend archive is not
+                // confirmed yet must not come back from a stale snapshot row.
+                if scenery_core::own_uninstall_outbox::is_tombstoned(state, &record.skill_id) {
+                    debug!(
+                        skill_id = %record.skill_id,
+                        "reconciler: snapshot install skipped — uninstalled by the user, archive pending"
+                    );
+                } else if !(locally_satisfied && backend_in_sync) {
                     events.push(SyncEvent::Install {
                         installation_id: record.installation_id,
                         skill_id: record.skill_id.clone(),

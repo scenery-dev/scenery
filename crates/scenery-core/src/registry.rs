@@ -1287,6 +1287,32 @@ impl RegistryClient {
         anyhow::bail!("user-uninstall failed (HTTP {status})")
     }
 
+    /// `PATCH /api/installations/{id}` `state: deactivated` (user bearer), so the
+    /// backend stops listing the install as desired. A 404 means it is already
+    /// gone, which is fine.
+    pub fn deactivate_installation(&self, installation_id: &str) -> Result<()> {
+        let token = self
+            .get_auth_token()
+            .ok_or_else(|| anyhow::anyhow!("not authenticated; cannot tell the registry"))?;
+        let url = format!(
+            "{}/api/installations/{}",
+            self.base_url.trim_end_matches('/'),
+            installation_id
+        );
+        let resp = self
+            .http
+            .patch(&url)
+            .bearer_auth(token)
+            .json(&serde_json::json!({ "state": "deactivated" }))
+            .send_tracked()
+            .with_context(|| format!("failed to reach registry at {url}"))?;
+        let status = resp.status();
+        if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(());
+        }
+        anyhow::bail!("deactivate installation failed (HTTP {status})")
+    }
+
     /// Fetch aggregated pre-install governance data for a skill.
     ///
     /// Deliberately sends NO `Authorization` header. The backend guards this

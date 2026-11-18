@@ -1000,6 +1000,10 @@ async fn convert(
             return Acted::Failed;
         }
     }
+    // The user recreated a folder they had uninstalled and it was re-ingested:
+    // a pending-uninstall tombstone must not archive it again or block it.
+    scenery_core::own_uninstall_outbox::clear(state, skill_id);
+    scenery_core::own_uninstall_outbox::clear(state, slug);
     // Recorded right after the upload answered, before the install: a crash
     // from here on is picked up by the next Install event for this skill.
     if let Err(e) =

@@ -2114,9 +2114,24 @@ fn handle_uninstall(
         None => return ToolCallResult::error_result("Missing required parameter: skill_id"),
     };
 
+    // Read before the row is deleted: the backend install must be deactivated
+    // too, or the reconciler would reinstall the skill on the next sync.
+    let installation_id: Option<String> = Connection::open(&state.db_path).ok().and_then(|c| {
+        c.query_row(
+            "SELECT installation_id FROM installed_skills WHERE skill_id = ?1",
+            [skill_id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+        .filter(|i| !i.is_empty())
+    });
     match uninstall_skill_by_user(state, skill_id) {
         Ok(Some(done)) => {
             let mut msg = format!("Successfully uninstalled {skill_id}@{}.", done.version);
+            let url = registry_url
+                .clone()
+                .unwrap_or_else(|| scenery_core::DEFAULT_REGISTRY_URL.to_string());
             if let Some(own) = done.own {
                 if own.local_edits {
                     msg.push_str(
@@ -2124,23 +2139,33 @@ fn handle_uninstall(
                          restore-backups/*/removed-own/.",
                     );
                 }
-                // Tell the registry to archive the private copy (best effort).
-                if let Some(url) = registry_url {
-                    let registry = RegistryClient::new(url).with_stored_auth(state);
-                    if let Ok(Some(d)) = state.get_sync_state("device_id") {
-                        registry.set_device_id(d);
+                let mut own = own;
+                if own.installation_id.is_none() {
+                    own.installation_id = installation_id;
+                }
+                // Queued durably first; the daemon retries until the backend confirms.
+                match scenery_core::own_uninstall_outbox::submit(state, &url, &own) {
+                    Ok(true) => msg.push_str(
+                        " Your private copy was archived in the registry; reinstall it from the portal.",
+                    ),
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::warn!(skill_id, error = %e, "uninstall: registry not told yet; queued for retry");
+                        msg.push_str(
+                            " The registry could not be reached; it is queued and the daemon will retry.",
+                        );
                     }
-                    match registry.notify_own_skill_uninstalled(&own.skill_id, own.local_edits) {
-                        Ok(true) => msg.push_str(
-                            " Your private copy was archived in the registry; reinstall it from the portal.",
-                        ),
-                        Ok(false) => {}
-                        Err(e) => tracing::warn!(
-                            skill_id,
-                            error = %e,
-                            "uninstall: could not tell the registry to archive the skill"
-                        ),
-                    }
+                }
+            } else if let Some(iid) = installation_id {
+                // Not an own skill: still deactivate the backend install so the
+                // reconciler does not reinstall it.
+                let registry = RegistryClient::new(&url).with_stored_auth(state);
+                if let Err(e) = registry.deactivate_installation(&iid) {
+                    tracing::warn!(skill_id, error = %e, "uninstall: could not deactivate the backend installation");
+                    msg.push_str(
+                        " Warning: could not deactivate the managed installation on the backend; \
+                         it may be reinstalled on the next sync.",
+                    );
                 }
             }
             ToolCallResult::success(msg)

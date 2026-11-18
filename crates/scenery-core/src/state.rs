@@ -1219,6 +1219,19 @@ CREATE TABLE IF NOT EXISTS auto_manage_attempts (
     next_try_at  INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (slug, source_path)
 );
+-- A user-uninstalled own skill the backend has not yet confirmed archived and
+-- deactivated. The reconciler never reinstalls these and the daemon retries the
+-- backend call until it is confirmed. See `own_uninstall_outbox`.
+CREATE TABLE IF NOT EXISTS own_uninstall_outbox (
+    skill_id        TEXT PRIMARY KEY,
+    local_slug      TEXT NOT NULL,
+    installation_id TEXT,
+    local_edits     INTEGER NOT NULL DEFAULT 0,
+    registry_url    TEXT NOT NULL,
+    created_at      INTEGER NOT NULL,
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    next_try_at     INTEGER NOT NULL DEFAULT 0
+);
 "#;
 
 /// Broadcast-model artifact revocation cache (see `crate::revocation`).

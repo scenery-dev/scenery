@@ -6318,9 +6318,10 @@ async fn cmd_skill_uninstall(id: &str, registry_url: Option<&str>) -> Result<()>
 }
 
 /// Tell the registry to archive the user's private copy of an own skill that
-/// was just uninstalled (`POST /runner/skills/user-uninstall`). Best effort: the
-/// local removal already succeeded and the owner can archive/reinstall from the
-/// portal either way.
+/// was just uninstalled and to deactivate its installs. The call is queued in
+/// the state DB first, so if it cannot be made now (offline, backend stopped)
+/// the daemon retries until the backend confirms and the reconciler will not
+/// bring the skill back meanwhile.
 async fn archive_own_skill_on_backend(
     state: &scenery_core::state::AppState,
     registry_url: Option<&str>,
@@ -6330,11 +6331,7 @@ async fn archive_own_skill_on_backend(
     let st = state.clone();
     let own = own.clone();
     let res = tokio::task::spawn_blocking(move || {
-        let client = scenery_core::registry::RegistryClient::new(&url).with_stored_auth(&st);
-        if let Ok(Some(d)) = st.get_sync_state("device_id") {
-            client.set_device_id(d);
-        }
-        client.notify_own_skill_uninstalled(&own.skill_id, own.local_edits)
+        scenery_core::own_uninstall_outbox::submit(&st, &url, &own)
     })
     .await;
     match res {
@@ -6343,7 +6340,8 @@ async fn archive_own_skill_on_backend(
         ),
         Ok(Ok(false)) => {}
         Ok(Err(e)) => eprintln!(
-            "warning: removed locally, but could not tell the registry to archive the skill: {e:#}"
+            "warning: removed locally; the registry could not be told yet ({e:#}). It is queued \
+             and the Scenery daemon will retry until it is archived."
         ),
         Err(e) => eprintln!("warning: archive call did not complete: {e}"),
     }
