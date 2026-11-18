@@ -1105,7 +1105,7 @@ async fn a_live_install_event_a_portal_reinstall_clears_the_uninstall_tombstone(
     )
     .unwrap();
     assert!(scenery_core::own_uninstall_outbox::is_tombstoned(
-        &state, "pdf"
+        &state, "adam~pdf"
     ));
     run(
         SyncEvent::Install {
@@ -1118,7 +1118,7 @@ async fn a_live_install_event_a_portal_reinstall_clears_the_uninstall_tombstone(
     )
     .await;
     assert!(
-        !scenery_core::own_uninstall_outbox::is_tombstoned(&state, "pdf"),
+        !scenery_core::own_uninstall_outbox::is_tombstoned(&state, "adam~pdf"),
         "explicit reinstall lifts it"
     );
 }

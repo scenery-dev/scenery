@@ -65,16 +65,17 @@ pub fn record(state: &AppState, e: &Entry) -> Result<()> {
     Ok(())
 }
 
-/// Is `name` (a registry id or a local folder name) waiting for confirmation?
-/// Fail-open on a DB error would risk a resurrection, so errors count as `false`
+/// Is the skill with registry id `skill_id` waiting for confirmation? Matches on
+/// the registry id ONLY: a different skill that reuses the same local folder
+/// name must not be skipped by the reconciler. Fail-open on a DB error would risk a resurrection, so errors count as `false`
 /// only because the caller has nothing better; they are logged by the caller's
 /// own DB use.
-pub fn is_tombstoned(state: &AppState, name: &str) -> bool {
+pub fn is_tombstoned(state: &AppState, skill_id: &str) -> bool {
     open(state)
         .and_then(|c| {
             c.query_row(
-                "SELECT 1 FROM own_uninstall_outbox WHERE skill_id = ?1 OR local_slug = ?1 LIMIT 1",
-                [name],
+                "SELECT 1 FROM own_uninstall_outbox WHERE skill_id = ?1 LIMIT 1",
+                [skill_id],
                 |_| Ok(true),
             )
             .or_else(|e| match e {
@@ -209,12 +210,19 @@ mod tests {
     }
 
     #[test]
-    fn record_survives_a_restart_and_matches_id_or_folder() {
+    fn record_survives_a_restart_and_is_tombstoned_by_id_only() {
         let dir = tempfile::tempdir().unwrap();
         record(&state(&dir), &entry("http://x")).unwrap();
         let reopened = state(&dir); // a daemon restart
         assert!(is_tombstoned(&reopened, "adam~pdf"));
-        assert!(is_tombstoned(&reopened, "pdf"));
+        assert!(
+            !is_tombstoned(&reopened, "pdf"),
+            "a folder name alone is not a tombstone"
+        );
+        assert!(
+            !is_tombstoned(&reopened, "bob~pdf"),
+            "another skill reusing the slug is not tombstoned"
+        );
         assert!(!is_tombstoned(&reopened, "other"));
         assert_eq!(due(&reopened).len(), 1);
         assert!(clear(&reopened, "pdf"));
@@ -235,7 +243,7 @@ mod tests {
             installation_id: Some("11111111-1111-4111-8111-111111111111".into()),
         };
         assert!(submit(&st, dead, &own).is_err());
-        assert!(is_tombstoned(&st, "pdf"), "still queued");
+        assert!(is_tombstoned(&st, "adam~pdf"), "still queued");
         assert!(due(&st).is_empty(), "backs off after a failure");
 
         // The backend comes back: the daemon retry (here: process) confirms.
@@ -265,7 +273,10 @@ mod tests {
         assert!(process(&st, &e).unwrap());
         archive.assert();
         deactivate.assert();
-        assert!(!is_tombstoned(&st, "pdf"), "confirmed: tombstone cleared");
+        assert!(
+            !is_tombstoned(&st, "adam~pdf"),
+            "confirmed: tombstone cleared"
+        );
     }
 
     #[test]
@@ -285,6 +296,6 @@ mod tests {
             .create();
         record(&st, &entry(&server.url())).unwrap();
         assert!(process(&st, &entry(&server.url())).is_err());
-        assert!(is_tombstoned(&st, "pdf"));
+        assert!(is_tombstoned(&st, "adam~pdf"));
     }
 }
