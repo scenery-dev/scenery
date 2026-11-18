@@ -1232,6 +1232,20 @@ CREATE TABLE IF NOT EXISTS own_uninstall_outbox (
     attempts        INTEGER NOT NULL DEFAULT 0,
     next_try_at     INTEGER NOT NULL DEFAULT 0
 );
+-- Phase 9a: who owns each managed skill (the snapshot's `authorship`) and the
+-- local-edit state the runner reports: the version the tree is based on, the
+-- last uploaded private version, and the branch state. One row per registry id.
+CREATE TABLE IF NOT EXISTS skill_local_state (
+    skill_id          TEXT PRIMARY KEY,
+    authorship        TEXT,
+    branch_state      TEXT NOT NULL DEFAULT 'none',
+    base_version      TEXT,
+    local_version     TEXT,
+    local_version_id  TEXT,
+    uploaded_tree     TEXT,
+    held_tree         TEXT,
+    updated_at        INTEGER NOT NULL DEFAULT 0
+);
 "#;
 
 /// Broadcast-model artifact revocation cache (see `crate::revocation`).

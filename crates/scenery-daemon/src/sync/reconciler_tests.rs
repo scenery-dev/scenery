@@ -125,6 +125,9 @@ fn snapshot_installs_missing_desired_skill() {
         state: "desired".to_string(),
         source: None,
         local_slug: None,
+        authorship: None,
+        branch_state: None,
+        base_version: None,
     }];
 
     let events = build_derived_events_blocking(installations, &state);
@@ -162,6 +165,9 @@ fn snapshot_no_op_when_skill_already_installed() {
         state: "installed".to_string(),
         source: None,
         local_slug: None,
+        authorship: None,
+        branch_state: None,
+        base_version: None,
     }];
 
     let events = build_derived_events_blocking(installations, &state);
@@ -195,6 +201,9 @@ fn snapshot_emits_install_when_locally_present_but_backend_not_yet_installed() {
         state: "desired".to_string(),
         source: None,
         local_slug: None,
+        authorship: None,
+        branch_state: None,
+        base_version: None,
     }];
 
     let events = build_derived_events_blocking(installations, &state);
@@ -233,6 +242,9 @@ fn snapshot_deactivates_active_skill_when_state_is_deactivated() {
         state: "deactivated".to_string(),
         source: None,
         local_slug: None,
+        authorship: None,
+        branch_state: None,
+        base_version: None,
     }];
 
     let events = build_derived_events_blocking(installations, &state);
@@ -264,6 +276,9 @@ fn snapshot_purges_present_skill_when_state_is_removed() {
         state: "removed".to_string(),
         source: None,
         local_slug: None,
+        authorship: None,
+        branch_state: None,
+        base_version: None,
     }];
 
     let events = build_derived_events_blocking(installations, &state);
@@ -292,6 +307,9 @@ fn snapshot_no_purge_when_skill_not_locally_present() {
         state: "removed".to_string(),
         source: None,
         local_slug: None,
+        authorship: None,
+        branch_state: None,
+        base_version: None,
     }];
 
     let events = build_derived_events_blocking(installations, &state);
@@ -317,6 +335,9 @@ fn snapshot_mixed_batch_generates_correct_events() {
             state: "desired".to_string(),
             source: None,
             local_slug: None,
+            authorship: None,
+            branch_state: None,
+            base_version: None,
         },
         InstallationRecord {
             installation_id: install_id(),
@@ -325,6 +346,9 @@ fn snapshot_mixed_batch_generates_correct_events() {
             state: "deactivated".to_string(),
             source: None,
             local_slug: None,
+            authorship: None,
+            branch_state: None,
+            base_version: None,
         },
         InstallationRecord {
             installation_id: install_id(),
@@ -333,6 +357,9 @@ fn snapshot_mixed_batch_generates_correct_events() {
             state: "removed".to_string(),
             source: None,
             local_slug: None,
+            authorship: None,
+            branch_state: None,
+            base_version: None,
         },
         InstallationRecord {
             installation_id: install_id(),
@@ -341,6 +368,9 @@ fn snapshot_mixed_batch_generates_correct_events() {
             state: "installed".to_string(),
             source: None,
             local_slug: None,
+            authorship: None,
+            branch_state: None,
+            base_version: None,
         },
     ];
 
@@ -385,6 +415,9 @@ fn snapshot_installed_state_treated_like_desired_when_missing_locally() {
         state: "installed".to_string(),
         source: None,
         local_slug: None,
+        authorship: None,
+        branch_state: None,
+        base_version: None,
     }];
 
     let events = build_derived_events_blocking(installations, &state);
@@ -420,6 +453,9 @@ fn snapshot_installed_state_noop_when_already_present_locally() {
         state: "installed".to_string(),
         source: None,
         local_slug: None,
+        authorship: None,
+        branch_state: None,
+        base_version: None,
     }];
 
     let events = build_derived_events_blocking(installations, &state);
@@ -444,6 +480,9 @@ fn snapshot_skips_rows_with_unresolved_latest_version() {
             state: "desired".to_string(),
             source: None,
             local_slug: None,
+            authorship: None,
+            branch_state: None,
+            base_version: None,
         },
         InstallationRecord {
             installation_id: install_id(),
@@ -452,6 +491,9 @@ fn snapshot_skips_rows_with_unresolved_latest_version() {
             state: "desired".to_string(),
             source: None,
             local_slug: None,
+            authorship: None,
+            branch_state: None,
+            base_version: None,
         },
     ];
 
@@ -473,6 +515,9 @@ fn snapshot_skips_error_state_rows() {
         state: "error".to_string(),
         source: None,
         local_slug: None,
+        authorship: None,
+        branch_state: None,
+        base_version: None,
     }];
 
     let events = build_derived_events_blocking(installations, &state);
@@ -500,6 +545,9 @@ fn snapshot_propagates_migrated_local_source_to_install_event() {
         state: "installed".to_string(),
         source: Some("migrated:local".to_string()),
         local_slug: None,
+        authorship: None,
+        branch_state: None,
+        base_version: None,
     }];
 
     let events = build_derived_events_blocking(installations, &state);
@@ -542,6 +590,9 @@ fn snapshot_propagates_none_source_when_backend_omits_it() {
         state: "desired".to_string(),
         source: None,
         local_slug: None,
+        authorship: None,
+        branch_state: None,
+        base_version: None,
     }];
 
     let events = build_derived_events_blocking(installations, &state);
@@ -1032,6 +1083,9 @@ fn snapshot_records_folder_name_and_later_events_use_it() {
             state: "installed".to_string(),
             source: Some("migrated:local".to_string()),
             local_slug: Some("x".to_string()),
+            authorship: None,
+            branch_state: None,
+            base_version: None,
         }],
         mcp_installations: None,
         plugin_installations: vec![],
@@ -1443,6 +1497,9 @@ fn desired_pdf() -> Vec<InstallationRecord> {
         state: "installed".to_string(),
         source: None,
         local_slug: None,
+        authorship: None,
+        branch_state: None,
+        base_version: None,
     }]
 }
 
@@ -1477,5 +1534,42 @@ fn tombstone_lifts_once_confirmed_or_cleared() {
         build_derived_events_blocking(desired_pdf(), &state).len(),
         1
     );
+    cleanup(&root);
+}
+
+#[test]
+fn snapshot_never_installs_a_different_catalog_version_over_a_local_branch() {
+    let root = temp_root("snapshot-branch");
+    let state = AppState::bootstrap_in(root.clone()).unwrap();
+    seed_skill_with_fs(&state, "cat-skill", "1.0.0", false);
+    let conn = Connection::open(&state.db_path).unwrap();
+    crate::managed_paths::local_edits::note_snapshot(
+        &conn,
+        "cat-skill",
+        Some("catalog"),
+        None,
+        None,
+    );
+    conn.execute(
+        "UPDATE skill_local_state SET branch_state = 'branch' WHERE skill_id = 'cat-skill'",
+        [],
+    )
+    .unwrap();
+    let rec = |branch: Option<&str>| InstallationRecord {
+        installation_id: install_id(),
+        skill_id: "cat-skill".to_string(),
+        version: "1.1.0".to_string(),
+        state: "desired".to_string(),
+        source: None,
+        local_slug: None,
+        authorship: Some("catalog".into()),
+        branch_state: branch.map(str::to_string),
+        base_version: None,
+    };
+    // the backend still says branch: the new catalog version waits
+    assert!(build_derived_events_blocking(vec![rec(Some("branch"))], &state).is_empty());
+    // after a rollback/discard the backend says none: it installs
+    let events = build_derived_events_blocking(vec![rec(Some("none"))], &state);
+    assert_eq!(events.len(), 1);
     cleanup(&root);
 }

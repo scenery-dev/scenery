@@ -3092,6 +3092,7 @@ pub(crate) async fn install_verified_version(
             .await;
 
         // F2: Push the skill into ~/.claude/skills/ after symlink flip.
+        forget_local_branch(state, &skill_id);
         push_skill_to_claude(pusher, &skill_id, Some(&installation_id.to_string()), state);
 
         return Ok(());
@@ -3121,9 +3122,18 @@ pub(crate) async fn install_verified_version(
     report_installation_status(installation_id, "installed", None, &reg_url, state).await;
 
     // F2: Push the skill into ~/.claude/skills/ after successful install.
+    forget_local_branch(state, &skill_id);
     push_skill_to_claude(pusher, &skill_id, Some(&installation_id.to_string()), state);
 
     Ok(())
+}
+
+/// A registry version was just installed: the device runs a plain version
+/// again, so any recorded local branch (Phase 9a) no longer applies.
+fn forget_local_branch(state: &AppState, skill_id: &str) {
+    if let Ok(conn) = rusqlite::Connection::open(&state.db_path) {
+        crate::managed_paths::local_edits::reset_branch(&conn, skill_id);
+    }
 }
 
 /// F2 helper: read the installed skill's SKILL.md from disk and push it into
@@ -3761,6 +3771,15 @@ fn build_derived_events_blocking(
     let mut events = Vec::new();
 
     for record in &installations {
+        // Phase 9a: remember who owns each skill (own | catalog), which decides
+        // what a local edit becomes.
+        crate::managed_paths::local_edits::note_snapshot(
+            &conn,
+            &record.skill_id,
+            record.authorship.as_deref(),
+            record.branch_state.as_deref(),
+            record.base_version.as_deref(),
+        );
         // Skip records with a non-semver version sentinel — the artifact
         // endpoint requires a concrete version and would 404. The backend
         // should have resolved "latest" before sending; if it didn't, the
@@ -3801,6 +3820,25 @@ fn build_derived_events_blocking(
                     .exists();
                 let locally_satisfied = db_match && fs_match;
                 let backend_in_sync = record.state == "installed";
+                // A catalog skill the user has edited is a BRANCH (Phase 9a): a
+                // different catalog version is never installed over it (the
+                // edit would be lost from disk). Resolved by a merge or by
+                // discarding the branch (9b), or by the backend resetting the
+                // branch (a rollback), which the snapshot reports.
+                let on_branch = record.branch_state.as_deref() == Some("branch")
+                    && crate::managed_paths::local_edits::load(&conn, &record.skill_id)
+                        .is_some_and(|l| l.branch_state == "branch")
+                    && local_state
+                        .get(&record.skill_id)
+                        .is_some_and(|(ver, _)| ver != &record.version);
+                if on_branch {
+                    debug!(
+                        skill_id = %record.skill_id,
+                        version = %record.version,
+                        "reconciler: catalog version differs from the local branch; not installing over it"
+                    );
+                    continue;
+                }
 
                 // Skip only when both sides already agree. If the skill is
                 // locally installed but the backend's desired-state row is

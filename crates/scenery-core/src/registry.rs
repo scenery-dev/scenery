@@ -283,6 +283,61 @@ pub struct RegisterSkillRequest<'a> {
     pub mode: &'a str,
 }
 
+/// Fields of one `POST /runner/skills/{skill_id}/versions/local` upload (local
+/// edits as versions, runner >= 2.5.0).
+#[derive(Debug, Clone)]
+pub struct LocalVersionRequest<'a> {
+    pub tar_gz: Vec<u8>,
+    pub skill_id: &'a str,
+    pub tree_hash: &'a str,
+    pub device_id: &'a str,
+    /// The version the edit started from (the marker's), if known.
+    pub base_version: Option<&'a str>,
+}
+
+/// Body of a 200 from `POST /runner/skills/{skill_id}/versions/local`.
+/// `outcome` is `stored` | `blocked` | `revoked`; `authorship` is the server's
+/// call (`own` | `catalog`) and `branch_state` what the install row now reports
+/// (`own` | `branch` | `none`). `conflict` and `update_available` are advisory.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct LocalVersionResponse {
+    #[serde(default)]
+    pub outcome: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub skill_id: String,
+    #[serde(default)]
+    pub authorship: String,
+    #[serde(default)]
+    pub branch_state: String,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub version_id: Option<String>,
+    #[serde(default)]
+    pub head_version: Option<String>,
+    #[serde(default)]
+    pub conflict: bool,
+    #[serde(default)]
+    pub update_available: bool,
+    #[serde(default)]
+    pub idempotent: bool,
+    #[serde(default)]
+    pub scan: AutoManageScan,
+    #[serde(default)]
+    pub files: Vec<serde_json::Value>,
+}
+
+/// Branch fields of `PATCH /api/installations/{id}` (runner >= 2.5.0).
+#[derive(Debug, Clone, Default)]
+pub struct BranchReport<'a> {
+    /// `none` | `own` | `branch`.
+    pub branch_state: &'a str,
+    pub base_version: Option<&'a str>,
+    pub local_version_id: Option<&'a str>,
+}
+
 /// Body of a 200 from `POST /runner/skills/preview-scan`: what the scan and the
 /// org's gate would say about a tree. Nothing is stored as a skill or version.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1374,6 +1429,77 @@ impl RegistryClient {
             .text("device_id", req.device_id.to_string())
             .text("mode", req.mode.to_string());
         self.authoring_post("/runner/skills/register", form)
+    }
+
+    /// Upload the edited tree of a managed skill as a private version (own
+    /// skill) or a branch (catalog skill), `POST /runner/skills/{id}/versions/local`.
+    /// The server scans it and alerts; it never blocks.
+    pub fn upload_local_version(
+        &self,
+        req: LocalVersionRequest<'_>,
+    ) -> Result<AuthoringReply<LocalVersionResponse>> {
+        let file_part = reqwest::blocking::multipart::Part::bytes(req.tar_gz)
+            .file_name("skill-source.tar.gz")
+            .mime_str("application/gzip")
+            .context("invalid MIME type for local-version upload")?;
+        let mut form = reqwest::blocking::multipart::Form::new()
+            .part("file", file_part)
+            .text("tree_hash", req.tree_hash.to_string())
+            .text("device_id", req.device_id.to_string());
+        if let Some(b) = req.base_version {
+            form = form.text("base_version", b.to_string());
+        }
+        let encoded: String = req
+            .skill_id
+            .bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    (b as char).to_string()
+                }
+                _ => format!("%{b:02X}"),
+            })
+            .collect();
+        self.authoring_post(&format!("/runner/skills/{encoded}/versions/local"), form)
+    }
+
+    /// Report the local-edit state of an install (`PATCH /api/installations/{id}`
+    /// with `state: installed` plus the branch fields). A pure branch report:
+    /// the backend does not treat it as an install. Best effort for callers.
+    pub fn report_branch_state(
+        &self,
+        installation_id: &str,
+        report: &BranchReport<'_>,
+    ) -> Result<()> {
+        let token = self
+            .get_auth_token()
+            .ok_or_else(|| anyhow::anyhow!("not authenticated; cannot tell the registry"))?;
+        let url = format!(
+            "{}/api/installations/{}",
+            self.base_url.trim_end_matches('/'),
+            installation_id
+        );
+        let mut body = serde_json::json!({
+            "state": "installed",
+            "branch_state": report.branch_state,
+        });
+        if let Some(b) = report.base_version {
+            body["base_version"] = serde_json::json!(b);
+        }
+        if let Some(l) = report.local_version_id {
+            body["local_version_id"] = serde_json::json!(l);
+        }
+        let resp = self
+            .http
+            .patch(&url)
+            .bearer_auth(token)
+            .json(&body)
+            .send_tracked()
+            .with_context(|| format!("failed to reach registry at {url}"))?;
+        let status = resp.status();
+        if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(());
+        }
+        anyhow::bail!("branch report failed (HTTP {status})")
     }
 
     /// Scan preview of a tree (`POST /runner/skills/preview-scan`): verdict,

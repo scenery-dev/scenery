@@ -24,10 +24,27 @@
 //! marker so the next desired-state snapshot triggers a fresh install from the
 //! registry.
 //!
+//! ## Skills: whole-tree drift and local edits (Phase 9a)
+//!
+//! A skill marker with `hash_version = 2` is compared by the whole-tree hash
+//! (`scenery_core::skill_tree`), so an edit to ANY file, an added file or a
+//! removed file is an edit. A v1 marker (only `SKILL.md` was compared) is
+//! re-baselined to v2 once, if its `SKILL.md` still matches; otherwise it is an
+//! edit. A skill edit is [`DriftStatus::EditedOwn`] (the user's own skill) or
+//! [`DriftStatus::EditedCatalog`] (someone else's), decided by the snapshot's
+//! `authorship` ([`super::local_edits`]):
+//!
+//! - own: uploaded as a new private version, always runs, in EVERY mode.
+//! - catalog, `audit_only`/`warn`: uploaded as a branch, keeps running.
+//! - catalog, `quarantine`/`approve_required`: uploaded as a branch first (so
+//!   the work is not lost), then today's path (quarantine / awaiting approval).
+//!
+//! MCP and plugin drift are unchanged ([`DriftStatus::Drifted`]).
+//!
 //! The killswitch `SCENERY_DISABLE_FILESYSTEM_RECONCILER=1` makes every
 //! public entry-point a no-op.
 
-use super::marker::ManagedPathMarker;
+use super::marker::{ManagedPathMarker, Provenance};
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use scenery_core::atomic_file;
@@ -68,7 +85,12 @@ pub struct DriftOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriftStatus {
     Clean,
+    /// An MCP entry or plugin whose content changed.
     Drifted,
+    /// A skill whose tree changed and whose owner is the user.
+    EditedOwn,
+    /// A skill whose tree changed and that belongs to the catalog.
+    EditedCatalog,
     Deleted,
 }
 
@@ -227,34 +249,95 @@ impl DriftScanner {
                         }
                     }
                 }
-                DriftStatus::Drifted
-                    if outcome.kind == "skill" && self.is_auto_managed(&outcome.path) =>
-                {
-                    // Plan 4.5.4: the user's OWN skill (converted by auto-manage)
-                    // is never quarantined or moved aside, in any mode, strict
-                    // included. An edit is the user working; it is reported once
-                    // (the marker is re-baselined to what is on disk now, so
-                    // the next cycle does not repeat it) and keeps running.
+                DriftStatus::EditedOwn => {
+                    // The user's OWN skill is never quarantined or moved aside,
+                    // in any mode, strict included (plan 4.5.1, decision 13).
+                    // The edit becomes a new private version (debounced: an edit
+                    // still being typed waits for the next scan) and the new
+                    // baseline, so it is reported once.
                     stats.drifted += 1;
                     let current_hash = outcome.current_hash.clone().unwrap_or_default();
-                    if let Err(e) = rebaseline_marker(&self.state, &outcome.path, &current_hash) {
-                        warn!(slug = %outcome.slug, error = %e, "drift: could not re-baseline an edited own skill");
+                    let marker = marker_of(&outcome);
+                    let edit = super::local_edits::upload_edit(
+                        &self.state,
+                        &self.registry_url,
+                        &marker,
+                        false,
+                    )
+                    .await;
+                    if let Some(item) =
+                        edit_report_item(&outcome, current_hash, edit, "own_skill_edited")
+                    {
+                        to_report.push(item);
                     }
-                    info!(
-                        slug = %outcome.slug,
-                        "drift: own (auto-managed) skill edited — reported, never quarantined"
-                    );
+                }
+                DriftStatus::EditedCatalog if mode_is_strict(mode) => {
+                    // Strict: today's path (quarantine / awaiting approval). The
+                    // edit is still uploaded as a branch first so the work is
+                    // not lost, and the quarantined copy stays on disk too.
+                    stats.drifted += 1;
+                    let current_hash = outcome.current_hash.clone().unwrap_or_default();
+                    let marker = marker_of(&outcome);
+                    let uploaded = super::local_edits::upload_edit(
+                        &self.state,
+                        &self.registry_url,
+                        &marker,
+                        true,
+                    )
+                    .await;
+                    let branch_uploaded =
+                        matches!(uploaded, super::local_edits::EditOutcome::Stored { .. });
+                    let action = match mode {
+                        PolicyMode::Quarantine => match quarantine_item(&outcome) {
+                            Ok(quarantined_to) => {
+                                drop_marker(&self.state, &outcome.path).ok();
+                                info!(
+                                    slug = %outcome.slug,
+                                    dest = %quarantined_to.display(),
+                                    branch_uploaded,
+                                    "drift: quarantined an edited catalog skill (strict mode)"
+                                );
+                                "quarantined"
+                            }
+                            Err(e) => {
+                                warn!(slug = %outcome.slug, error = %e, "drift: quarantine failed; downgrading to reported");
+                                "reported"
+                            }
+                        },
+                        _ => "awaiting_approval",
+                    };
                     to_report.push(DriftReportItem {
                         slug: outcome.slug,
                         kind: outcome.kind,
                         current_hash,
                         expected_hash: outcome.expected_hash,
-                        action: "reported".to_string(),
+                        action: action.to_string(),
                         detail: Some(serde_json::json!({
                             "path": outcome.path,
-                            "reason": "own_skill_edited",
+                            "reason": "catalog_skill_edited",
+                            "branch_uploaded": branch_uploaded,
                         })),
                     });
+                }
+                DriftStatus::EditedCatalog => {
+                    // Not strict: a BRANCH. A private version that keeps
+                    // running, is scanned and only alerts; catalog updates do
+                    // not overwrite it.
+                    stats.drifted += 1;
+                    let current_hash = outcome.current_hash.clone().unwrap_or_default();
+                    let marker = marker_of(&outcome);
+                    let edit = super::local_edits::upload_edit(
+                        &self.state,
+                        &self.registry_url,
+                        &marker,
+                        false,
+                    )
+                    .await;
+                    if let Some(item) =
+                        edit_report_item(&outcome, current_hash, edit, "catalog_skill_branched")
+                    {
+                        to_report.push(item);
+                    }
                 }
                 DriftStatus::Drifted => {
                     stats.drifted += 1;
@@ -337,17 +420,9 @@ impl DriftScanner {
             {
                 continue;
             }
-            out.push(classify(&marker));
+            out.push(classify(&self.state, &conn, &marker));
         }
         Ok(out)
-    }
-
-    /// Is the marker row at `path` an auto-managed (the user's own) skill?
-    /// Read from the DB row, never from the marker file.
-    fn is_auto_managed(&self, path: &str) -> bool {
-        Connection::open(self.state.db_path.as_std_path())
-            .map(|conn| super::marker::marker_provenance(&conn, path).is_auto_managed())
-            .unwrap_or(false)
     }
 
     async fn report(&self, events: Vec<DriftReportItem>) -> Result<()> {
@@ -393,6 +468,73 @@ impl DriftScanner {
         .await
         .unwrap_or_default()
     }
+}
+
+fn mode_is_strict(mode: PolicyMode) -> bool {
+    matches!(mode, PolicyMode::Quarantine | PolicyMode::ApproveRequired)
+}
+
+/// The marker row an outcome was classified from (what `upload_edit` needs).
+fn marker_of(o: &DriftOutcome) -> ManagedPathMarker {
+    ManagedPathMarker {
+        path: o.path.clone(),
+        kind: o.kind.clone(),
+        slug: o.slug.clone(),
+        installation_id: None,
+        source_sha256: o.expected_hash.clone(),
+        migrated_at: String::new(),
+    }
+}
+
+/// The backend report line for an uploaded (or held) skill edit; `None` for a
+/// settling or retrying edit, which is reported once it resolves.
+fn edit_report_item(
+    o: &DriftOutcome,
+    current_hash: String,
+    edit: super::local_edits::EditOutcome,
+    reason: &str,
+) -> Option<DriftReportItem> {
+    use super::local_edits::EditOutcome;
+    let detail = match edit {
+        EditOutcome::Stored {
+            branch_state,
+            version,
+            conflict,
+            update_available,
+            scan_verdict,
+            ..
+        } => serde_json::json!({
+            "path": o.path,
+            "reason": reason,
+            "branch_state": branch_state,
+            "version": version,
+            "conflict": conflict,
+            "update_available": update_available,
+            "scan_verdict": scan_verdict,
+        }),
+        EditOutcome::Held { reason: why } => {
+            if why == "unchanged since it was held" {
+                return None;
+            }
+            serde_json::json!({ "path": o.path, "reason": reason, "not_uploaded": why })
+        }
+        EditOutcome::Settling => {
+            debug!(slug = %o.slug, "drift: skill edit still being typed; uploading on a later scan");
+            return None;
+        }
+        EditOutcome::Retry { reason: why } => {
+            debug!(slug = %o.slug, why, "drift: skill edit not uploaded yet; will retry");
+            return None;
+        }
+    };
+    Some(DriftReportItem {
+        slug: o.slug.clone(),
+        kind: o.kind.clone(),
+        current_hash,
+        expected_hash: o.expected_hash.clone(),
+        action: "reported".to_string(),
+        detail: Some(detail),
+    })
 }
 
 #[derive(Debug, Default)]
@@ -489,17 +631,14 @@ fn accept_local(state: &AppState, slug: &str, kind: &str) -> Result<()> {
         "UPDATE managed_path_markers SET source_sha256 = ?1 WHERE path = ?2",
         rusqlite::params![current, marker.path],
     )?;
+    if kind == "skill" {
+        // The whole-tree baseline moves with it, or the next scan would see the
+        // same edit again.
+        if let Ok(s) = scenery_core::skill_tree::survey(Path::new(&marker.path)) {
+            let _ = super::marker::set_tree_baseline(&conn, &marker.path, &s.tree_hash, &current);
+        }
+    }
     info!(slug, "drift: accepted local edit as new canonical");
-    Ok(())
-}
-
-/// Accept the on-disk hash as the marker baseline (an own skill was edited).
-fn rebaseline_marker(state: &AppState, path: &str, hash: &str) -> Result<()> {
-    let conn = Connection::open(state.db_path.as_std_path())?;
-    conn.execute(
-        "UPDATE managed_path_markers SET source_sha256 = ?1 WHERE path = ?2",
-        rusqlite::params![hash, path],
-    )?;
     Ok(())
 }
 
@@ -511,7 +650,12 @@ fn restore_canonical(state: &AppState, slug: &str, kind: &str) -> Result<()> {
     // with the registry copy would throw their work away.
     if kind == "skill" {
         let conn = Connection::open(state.db_path.as_std_path())?;
-        if super::marker::marker_provenance(&conn, &marker.path).is_auto_managed() {
+        let prov = super::marker::marker_provenance(&conn, &marker.path);
+        let id = super::local_edits::registry_id_for(state, &marker, &prov);
+        if prov.is_auto_managed()
+            || super::local_edits::authorship(&conn, &id, &prov)
+                == super::local_edits::Authorship::Own
+        {
             anyhow::bail!(
                 "drift: refusing restore_canonical for {slug}: it is the user's own \
                  (auto-managed) skill; their edits are not discarded"
@@ -528,6 +672,15 @@ fn restore_canonical(state: &AppState, slug: &str, kind: &str) -> Result<()> {
     // backend will trigger a fresh install via the F2 pusher.
     remove_path_for(&marker)?;
     drop_marker(state, &marker.path)?;
+    if kind == "skill" {
+        // "Restore canonical" of a branch discards it: the reinstall is a plain
+        // registry version again.
+        if let Ok(conn) = Connection::open(state.db_path.as_std_path()) {
+            let prov = Provenance::default();
+            let id = super::local_edits::registry_id_for(state, &marker, &prov);
+            super::local_edits::reset_branch(&conn, &id);
+        }
+    }
     info!(
         slug,
         "drift: restored canonical (removed local; awaiting re-install via snapshot)"
@@ -581,7 +734,10 @@ fn back_up_before_restore(state: &AppState, marker: &ManagedPathMarker) -> Resul
 
 // ── Classification ────────────────────────────────────────────────────────────
 
-fn classify(marker: &ManagedPathMarker) -> DriftOutcome {
+fn classify(state: &AppState, conn: &Connection, marker: &ManagedPathMarker) -> DriftOutcome {
+    if marker.kind == "skill" {
+        return classify_skill(state, conn, marker);
+    }
     let outcome_status;
     let current_hash = match current_hash_for(marker) {
         Ok(Some(h)) => {
@@ -609,6 +765,62 @@ fn classify(marker: &ManagedPathMarker) -> DriftOutcome {
         expected_hash: marker.source_sha256.clone(),
         current_hash,
         status: outcome_status,
+    }
+}
+
+/// Skill drift by the whole-tree hash (see the module docs).
+fn classify_skill(state: &AppState, conn: &Connection, marker: &ManagedPathMarker) -> DriftOutcome {
+    use super::marker::{marker_provenance, set_tree_baseline, HASH_VERSION_TREE};
+    let dir = PathBuf::from(&marker.path);
+    let mk = |status, current: Option<String>| DriftOutcome {
+        slug: marker.slug.clone(),
+        kind: marker.kind.clone(),
+        path: marker.path.clone(),
+        expected_hash: marker.source_sha256.clone(),
+        current_hash: current,
+        status,
+    };
+    if !dir.join("SKILL.md").exists() {
+        return mk(DriftStatus::Deleted, None);
+    }
+    let prov = marker_provenance(conn, &marker.path);
+    let edited = |current: Option<String>| {
+        let id = super::local_edits::registry_id_for(state, marker, &prov);
+        match super::local_edits::authorship(conn, &id, &prov) {
+            super::local_edits::Authorship::Own => mk(DriftStatus::EditedOwn, current),
+            super::local_edits::Authorship::Catalog => mk(DriftStatus::EditedCatalog, current),
+        }
+    };
+    let survey = match scenery_core::skill_tree::survey(&dir) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(slug = %marker.slug, error = %e, "drift: could not hash the skill tree; treating as clean");
+            return mk(DriftStatus::Clean, None);
+        }
+    };
+    let tree = survey.tree_hash;
+    match (prov.hash_version, prov.tree_hash.as_deref()) {
+        (Some(v), Some(baseline)) if v >= HASH_VERSION_TREE => {
+            if tree == baseline {
+                mk(DriftStatus::Clean, Some(tree))
+            } else {
+                edited(Some(tree))
+            }
+        }
+        _ => {
+            // A v1 marker: only SKILL.md was compared. Re-baseline it once, but
+            // only if SKILL.md is still what was recorded; otherwise it is an edit.
+            let md_sha = current_hash_for(marker).ok().flatten();
+            if md_sha.as_deref() == Some(marker.source_sha256.as_str()) {
+                if let Err(e) = set_tree_baseline(conn, &marker.path, &tree, &marker.source_sha256)
+                {
+                    warn!(slug = %marker.slug, error = %e, "drift: could not re-baseline a v1 marker");
+                }
+                mk(DriftStatus::Clean, Some(tree))
+            } else {
+                edited(Some(tree))
+            }
+        }
     }
 }
 

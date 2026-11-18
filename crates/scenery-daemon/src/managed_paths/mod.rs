@@ -44,6 +44,7 @@ pub mod discoveries;
 pub mod drift;
 pub mod foreign;
 pub mod links;
+pub mod local_edits;
 pub mod marker;
 pub mod mcp_args;
 pub mod mcp_discovery;

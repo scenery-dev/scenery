@@ -1136,6 +1136,17 @@ pub struct InstallationRecord {
     /// match (and from older backends).
     #[serde(default)]
     pub local_slug: Option<String>,
+    /// Phase 9a: `"own"` (the user's own private skill) or `"catalog"`. Decides
+    /// what an edit of the skill becomes (a new version or a branch). `None`
+    /// from a backend older than 9a.
+    #[serde(default)]
+    pub authorship: Option<String>,
+    /// `"none"` | `"own"` | `"branch"`: what the backend recorded for this
+    /// device's install (runner >= 2.5.0 reports it).
+    #[serde(default)]
+    pub branch_state: Option<String>,
+    #[serde(default)]
+    pub base_version: Option<String>,
 }
 
 /// One entry in a [`SyncEvent::Snapshot`] plugin installations list.

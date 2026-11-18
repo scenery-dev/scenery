@@ -227,6 +227,37 @@ pub fn set_marker_provenance(conn: &Connection, path: &str, prov: &Provenance) -
     Ok(())
 }
 
+/// The hash version of a skill marker that carries the whole-tree hash as its
+/// drift baseline (`provenance.tree_hash`). Markers without it (written by a
+/// runner older than 2.3.0, or with the hash unavailable) are version 1: only
+/// `SKILL.md` was compared.
+pub const HASH_VERSION_TREE: u32 = 2;
+
+/// Make `tree_hash` the drift baseline of the skill marker row at `path`
+/// (`hash_version = 2`), and `skill_md_sha256` the `SKILL.md` hash the link
+/// integrity check and ownership check compare. Used to re-baseline a v1
+/// marker once, and after an edit was uploaded as a version.
+pub fn set_tree_baseline(
+    conn: &Connection,
+    path: &str,
+    tree_hash: &str,
+    skill_md_sha256: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE managed_path_markers \
+         SET tree_hash = ?1, hash_version = ?2, source_sha256 = ?3 \
+         WHERE path = ?4",
+        rusqlite::params![
+            tree_hash,
+            i64::from(HASH_VERSION_TREE),
+            skill_md_sha256,
+            path
+        ],
+    )
+    .context("failed to write the tree baseline")?;
+    Ok(())
+}
+
 /// Is the skill directory `dir` an auto-managed one according to the
 /// authoritative DB row (never the marker file)? Compares canonicalised
 /// paths like [`tracked_marker_for_path`].

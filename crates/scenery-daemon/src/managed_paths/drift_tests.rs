@@ -29,6 +29,15 @@ fn fresh_conn() -> (TempDir, Connection) {
     (td, conn)
 }
 
+/// `classify` against a throwaway state DB (no rows: a skill marker is v1).
+fn classify_t(marker: &ManagedPathMarker) -> DriftOutcome {
+    let td = TempDir::new().unwrap();
+    let root = camino::Utf8PathBuf::from_path_buf(td.path().join("data")).unwrap();
+    let state = scenery_core::state::AppState::bootstrap_in(root).unwrap();
+    let conn = Connection::open(state.db_path.as_std_path()).unwrap();
+    classify(&state, &conn, marker)
+}
+
 #[test]
 fn hex_sha256_matches_pusher_output() {
     // hashes must agree with the F2 pusher's hex_sha256 so an in-place file
@@ -56,7 +65,7 @@ fn classify_clean_when_skill_matches_marker() {
         source_sha256: hex_sha256(body),
         migrated_at: "2026-05-24T00:00:00Z".to_string(),
     };
-    let outcome = classify(&marker);
+    let outcome = classify_t(&marker);
     assert_eq!(outcome.status, DriftStatus::Clean);
 }
 
@@ -78,8 +87,10 @@ fn classify_drifted_when_skill_edited() {
     // Mutate the file.
     fs::write(skill_dir.join("SKILL.md"), b"hand-edited").unwrap();
 
-    let outcome = classify(&marker);
-    assert_eq!(outcome.status, DriftStatus::Drifted);
+    let outcome = classify_t(&marker);
+    // A skill edit is EditedCatalog (no ownership evidence) or EditedOwn;
+    // `Drifted` is for MCP entries and plugins only.
+    assert_eq!(outcome.status, DriftStatus::EditedCatalog);
     assert!(outcome.current_hash.is_some());
     assert_ne!(
         outcome.current_hash.as_deref(),
@@ -102,7 +113,7 @@ fn classify_deleted_when_skill_file_missing() {
         source_sha256: "abc".to_string(),
         migrated_at: "2026-05-24T00:00:00Z".to_string(),
     };
-    let outcome = classify(&marker);
+    let outcome = classify_t(&marker);
     assert_eq!(outcome.status, DriftStatus::Deleted);
     assert!(outcome.current_hash.is_none());
 }
@@ -123,10 +134,10 @@ fn classify_plugin_drift() {
         source_sha256: hex_sha256(b"{\"name\":\"my-plugin\"}"),
         migrated_at: "2026-05-24T00:00:00Z".to_string(),
     };
-    assert_eq!(classify(&marker).status, DriftStatus::Clean);
+    assert_eq!(classify_t(&marker).status, DriftStatus::Clean);
 
     fs::write(inner.join("plugin.json"), b"{\"name\":\"hacked\"}").unwrap();
-    assert_eq!(classify(&marker).status, DriftStatus::Drifted);
+    assert_eq!(classify_t(&marker).status, DriftStatus::Drifted);
 }
 
 #[test]
@@ -146,12 +157,12 @@ fn classify_mcp_drift_via_claude_json() {
         source_sha256: hex_sha256(entry.to_string().as_bytes()),
         migrated_at: "2026-05-24T00:00:00Z".to_string(),
     };
-    assert_eq!(classify(&marker).status, DriftStatus::Clean);
+    assert_eq!(classify_t(&marker).status, DriftStatus::Clean);
 
     // Hand-edit the entry.
     let new_root = serde_json::json!({"mcpServers": {"fs": {"command":"rogue"}}});
     fs::write(&claude_json, serde_json::to_vec_pretty(&new_root).unwrap()).unwrap();
-    assert_eq!(classify(&marker).status, DriftStatus::Drifted);
+    assert_eq!(classify_t(&marker).status, DriftStatus::Drifted);
 
     // Remove the entry entirely.
     let empty_root = serde_json::json!({"mcpServers": {}});
@@ -160,7 +171,7 @@ fn classify_mcp_drift_via_claude_json() {
         serde_json::to_vec_pretty(&empty_root).unwrap(),
     )
     .unwrap();
-    assert_eq!(classify(&marker).status, DriftStatus::Deleted);
+    assert_eq!(classify_t(&marker).status, DriftStatus::Deleted);
 }
 
 #[test]
@@ -894,10 +905,9 @@ mod own_skill_guard {
                 !f.home.join(".claude/.scenery-quarantine").exists(),
                 "{mode}: nothing was moved aside"
             );
-            // The marker row survives and was re-baselined: the same edit is
-            // not re-reported every cycle.
+            // The marker row survives (the upload and re-baseline are covered
+            // against a mock registry in `local_edits_tests`).
             assert!(is_auto_managed_row(&f, &dir));
-            assert_eq!(f.cycle().await.drifted, 0, "{mode}: reported once");
         }
     }
 
