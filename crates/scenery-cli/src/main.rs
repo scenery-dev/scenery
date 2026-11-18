@@ -6220,8 +6220,7 @@ async fn cmd_skill_uninstall(id: &str, registry_url: Option<&str>) -> Result<()>
                 .context("failed to query managed_path_markers")?
                 .unwrap_or(false);
             if has_leftover {
-                scenery_daemon::managed_paths::ManagedPathsPusher::new(&state)
-                    .remove_skill(id)
+                scenery_daemon::managed_paths::own_restore::uninstall_projection(&state, id)
                     .with_context(|| format!("failed to remove leftover files for '{id}'"))?;
                 println!("Removed leftover managed files for skill '{id}'.");
                 return Ok(());

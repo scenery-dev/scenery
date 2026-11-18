@@ -74,6 +74,12 @@ pub const MAX_TRACKED_UPLOADS_PER_TICK: usize = 10;
 /// changed tree is always retried. Keeps an admin policy change or a fix on
 /// the backend from being masked forever.
 const TERMINAL_RETRY_AFTER_SECS: i64 = 24 * 3600;
+
+/// Attempt reason recorded when the user uninstalled an auto-managed skill and
+/// its original was restored. Sticky: never expires and ignores tree edits, so
+/// the skill is not converted again (no re-convert loop). Cleared once the
+/// directory is gone.
+pub const USER_UNINSTALLED: &str = "user_uninstalled";
 /// Tracked foreign-installer skills are re-uploaded at most this often.
 const FOREIGN_REUPLOAD_MIN_SECS: i64 = 3600;
 
@@ -257,6 +263,9 @@ pub fn should_attempt(state: &AppState, slug: &str, source_path: &str, tree_hash
     let Some(a) = get_attempt(state, slug, source_path) else {
         return true;
     };
+    if a.reason.as_deref() == Some(USER_UNINSTALLED) {
+        return false;
+    }
     if a.last_hash.as_deref() != Some(tree_hash) {
         return true;
     }
@@ -483,6 +492,7 @@ pub fn note_local_holds(state: &AppState, items: &[DiscoveryItem]) {
             }
         }
     }
+    forget_uninstalled_gone(state);
     for a in attention_list(state) {
         if !Path::new(&a.source_path).exists() {
             if let Ok(conn) = open(state) {
@@ -491,6 +501,27 @@ pub fn note_local_holds(state: &AppState, items: &[DiscoveryItem]) {
                     [&a.slug, &a.source_path],
                 );
             }
+        }
+    }
+}
+
+/// Drop `user_uninstalled` rows whose directory no longer exists, so a skill
+/// the user later recreates at that path is managed like any new one.
+fn forget_uninstalled_gone(state: &AppState) {
+    let Ok(conn) = open(state) else { return };
+    let rows: Vec<(String, String)> = conn
+        .prepare("SELECT slug, source_path FROM auto_manage_attempts WHERE reason = ?1")
+        .and_then(|mut st| {
+            st.query_map([USER_UNINSTALLED], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map(|it| it.flatten().collect())
+        })
+        .unwrap_or_default();
+    for (slug, path) in rows {
+        if std::fs::symlink_metadata(&path).is_err() {
+            let _ = conn.execute(
+                "DELETE FROM auto_manage_attempts WHERE slug = ?1 AND source_path = ?2",
+                [&slug, &path],
+            );
         }
     }
 }

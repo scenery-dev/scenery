@@ -976,6 +976,46 @@ async fn revoking_an_unedited_own_skill_takes_no_backup() {
     assert!(walk(state.root_dir.join("restore-backups").as_std_path()).is_empty());
 }
 
+// ── A portal-driven uninstall restores; a revoke does not ─────────────────────
+
+#[tokio::test]
+async fn portal_uninstall_restores_the_users_original_own_skill() {
+    let home = FakeHome::new();
+    let (_t, state) = new_state();
+    state.record_skill_local_name("adam~pdf", "pdf").unwrap();
+    let dir = home.agents("pdf");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("SKILL.md"), "---\nname: pdf\n---\nMINE\n").unwrap();
+    state
+        .record_pending_auto_managed_takeover("pdf", &dir.to_string_lossy(), "adam~pdf", "u")
+        .unwrap();
+    seed_skill(&state, "adam~pdf", "0.1.0", true);
+    ManagedPathsPusher::new(&state)
+        .push_skill_adopting_in_place("pdf", None, b"---\nname: pdf\n---\nCOMPILED\n", &[])
+        .unwrap();
+    assert_eq!(
+        std::fs::read(dir.join("SKILL.md")).unwrap(),
+        b"---\nname: pdf\n---\nCOMPILED\n"
+    );
+
+    run(
+        SyncEvent::Purge {
+            installation_id: uuid::Uuid::new_v4(),
+            skill_id: "adam~pdf".into(),
+        },
+        &state,
+    )
+    .await;
+
+    assert_eq!(
+        std::fs::read(dir.join("SKILL.md")).unwrap(),
+        b"---\nname: pdf\n---\nMINE\n",
+        "the user's original is back"
+    );
+    assert!(!dir.join(".scenery-managed.json").exists());
+    assert!(home.link("pdf").symlink_metadata().is_err());
+}
+
 fn walk(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     if let Ok(rd) = std::fs::read_dir(dir) {

@@ -1193,3 +1193,167 @@ async fn a_failed_install_clears_the_pending_takeover() {
         .is_none());
     assert!(!dir.join(".scenery-managed.json").exists());
 }
+
+// ── Uninstall restores the user's original (own_restore) ─────────────────────
+
+#[cfg(unix)]
+fn make_exec(p: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(p, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Snapshot of (relative path, bytes, exec bit) for a tree.
+fn snapshot(root: &Path) -> Vec<(String, Vec<u8>, bool)> {
+    fn go(root: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>, bool)>) {
+        for e in fs::read_dir(dir).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                go(root, &p, out);
+            } else {
+                #[cfg(unix)]
+                let exec = {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::metadata(&p).unwrap().permissions().mode() & 0o111 != 0
+                };
+                #[cfg(not(unix))]
+                let exec = false;
+                let rel = p.strip_prefix(root).unwrap().to_string_lossy().to_string();
+                out.push((rel, fs::read(&p).unwrap(), exec));
+            }
+        }
+    }
+    let mut v = Vec::new();
+    go(root, root, &mut v);
+    v.sort();
+    v
+}
+
+async fn convert_pdf(env: &mut Env) -> PathBuf {
+    let dir = env.user_skill(&env.agents(), "pdf");
+    #[cfg(unix)]
+    {
+        fs::write(dir.join("references/run.sh"), "#!/bin/sh\necho hi\n").unwrap();
+        make_exec(&dir.join("references/run.sh"));
+    }
+    env.seed_registry_version("pdf", "0.1.0");
+    let m = env.managed_response("adam~pdf", "0.1.0", "manage", 1);
+    let items = env.scan();
+    let s = process_response(
+        &env.ctx(true),
+        response(vec![directive(&dir, "manage")]),
+        &items,
+    )
+    .await;
+    m.assert();
+    assert_eq!(s.managed, 1, "{s:?}");
+    dir
+}
+
+#[tokio::test]
+async fn uninstall_restores_the_original_byte_identical_and_never_reconverts() {
+    let mut env = Env::new().await;
+    let probe = env.user_skill(&env.home.join("probe"), "pdf");
+    #[cfg(unix)]
+    {
+        fs::write(probe.join("references/run.sh"), "#!/bin/sh\necho hi\n").unwrap();
+        make_exec(&probe.join("references/run.sh"));
+    }
+    let original = snapshot(&probe);
+    let dir = convert_pdf(&mut env).await;
+    assert!(fs::read_to_string(dir.join("SKILL.md"))
+        .unwrap()
+        .contains("COMPILED"));
+
+    // `scenery skill uninstall pdf` (registry id or folder name).
+    let acted = super::super::own_restore::uninstall_projection(&env.state, "adam~pdf").unwrap();
+    assert!(acted);
+
+    assert_eq!(snapshot(&dir), original, "original bytes + exec bits");
+    assert!(!dir.join(".scenery-managed.json").exists());
+    assert!(fs::symlink_metadata(env.claude().join("pdf")).is_err());
+    let conn = Connection::open(&env.state.db_path).unwrap();
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM managed_path_markers", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(rows, 0, "no tracked marker rows left");
+    // No stale restore entries for a later whole-product uninstall.
+    assert!(
+        scenery_core::restore_journal::RestoreJournal::for_state(&env.state)
+            .read_all()
+            .unwrap()
+            .is_empty()
+    );
+    // The backups stay on disk.
+    assert!(env.state.root_dir.join("restore-backups").exists());
+
+    // Next ticks: the backend still says "manage", the runner must not.
+    let _never = env.managed_response("adam~pdf", "0.1.0", "manage", 0);
+    let items = env.scan();
+    let s = process_response(
+        &env.ctx(true),
+        response(vec![directive(&dir, "manage")]),
+        &items,
+    )
+    .await;
+    assert_eq!(s.managed, 0, "{s:?}");
+    assert_eq!(snapshot(&dir), original, "still the user's original");
+
+    // Even after the user edits it, an uninstalled skill stays unmanaged.
+    fs::write(dir.join("SKILL.md"), "---\nname: pdf\n---\nedited later\n").unwrap();
+    let items = env.scan();
+    let s = process_response(
+        &env.ctx(true),
+        response(vec![directive(&dir, "manage")]),
+        &items,
+    )
+    .await;
+    assert_eq!(s.managed, 0, "{s:?}");
+    assert!(!dir.join(".scenery-managed.json").exists());
+}
+
+#[tokio::test]
+async fn uninstall_keeps_edits_made_after_conversion() {
+    let mut env = Env::new().await;
+    let dir = convert_pdf(&mut env).await;
+    fs::write(dir.join("SKILL.md"), "MY NEW EDITS").unwrap();
+
+    super::super::own_restore::uninstall_projection(&env.state, "pdf").unwrap();
+
+    assert_eq!(fs::read(dir.join("SKILL.md")).unwrap(), b"MY NEW EDITS");
+    assert!(!dir.join(".scenery-managed.json").exists());
+    assert!(fs::symlink_metadata(env.claude().join("pdf")).is_err());
+    // The original is still recoverable from its backup.
+    let kept = walk_files(
+        &env.state
+            .root_dir
+            .join("restore-backups")
+            .into_std_path_buf(),
+    );
+    assert!(kept.iter().any(|p| p.ends_with("adopted/pdf/SKILL.md")));
+}
+
+#[tokio::test]
+async fn uninstall_never_deletes_a_tracked_or_unmanaged_skill() {
+    let env = Env::new().await;
+    let dir = env.user_skill(&env.agents(), "devrepo");
+    fs::create_dir_all(dir.join(".git")).unwrap();
+    let before = snapshot(&dir);
+    let acted = super::super::own_restore::uninstall_projection(&env.state, "devrepo").unwrap();
+    assert!(!acted);
+    assert_eq!(snapshot(&dir), before);
+}
+
+fn walk_files(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for e in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            out.extend(walk_files(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out
+}

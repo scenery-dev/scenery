@@ -3569,8 +3569,12 @@ async fn handle_purge(
     let state_clone = Arc::clone(state);
     let reg_url = registry_url.to_string();
 
-    let result =
-        tokio::task::spawn_blocking(move || purge_skill_blocking(&state_clone, &skill_id)).await;
+    let result = tokio::task::spawn_blocking(move || {
+        // A portal-driven uninstall is a user action: an own skill that
+        // Scenery converted goes back to the user's original.
+        purge_skill_blocking_with(&state_clone, &skill_id, true)
+    })
+    .await;
 
     match result {
         Ok(Ok(_)) => {
@@ -3603,6 +3607,13 @@ async fn handle_purge(
 /// The projection is keyed by the LOCAL slug (`skill_local_name`), which can
 /// differ from the registry `skill_id`; both are removed when they differ.
 fn purge_skill_blocking(state: &AppState, skill_id: &str) -> Result<bool> {
+    purge_skill_blocking_with(state, skill_id, false)
+}
+
+/// [`purge_skill_blocking`], optionally restoring the user's own original for
+/// an auto-managed skill (`restore_own`). Revoke/kill switch passes `false`
+/// (restoring would re-expose a revoked skill); a user/portal uninstall `true`.
+fn purge_skill_blocking_with(state: &AppState, skill_id: &str, restore_own: bool) -> Result<bool> {
     let mut removed = false;
     let mut errors: Vec<String> = Vec::new();
     // Read before anything is deleted.
@@ -3636,7 +3647,12 @@ fn purge_skill_blocking(state: &AppState, skill_id: &str) -> Result<bool> {
         slugs.push(skill_id.to_string());
     }
     for slug in &slugs {
-        match pusher.remove_skill(slug) {
+        let torn_down = if restore_own {
+            crate::managed_paths::own_restore::uninstall_projection(state, slug)
+        } else {
+            pusher.remove_skill(slug)
+        };
+        match torn_down {
             Ok(r) => removed |= r,
             Err(e) => errors.push(format!("F2 remove_skill '{slug}' failed: {e:#}")),
         }
