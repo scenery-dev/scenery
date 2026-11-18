@@ -296,12 +296,29 @@ pub fn is_legacy_provenance(prov: &Provenance) -> bool {
     is_blank(&prov.origin) && is_blank(&prov.skill_id) && is_blank(&prov.tree_hash)
 }
 
-/// Delete a legacy marker row, and the `.scenery-managed.json` sidecar beside
-/// the skill only if it too carries no provenance. Best effort.
-pub fn drop_legacy_row(conn: &Connection, row_path: &str, skill_dir: &Path) {
-    if !is_legacy_provenance(&marker_provenance(conn, row_path)) {
-        return;
+/// A pre-provenance row is "legacy" (written by an older adopt/migrate pass
+/// for a skill another installer owns) only if it also has no
+/// `installation_id`: catalog installs made by runners before 2.3.0 carry an
+/// installation id but no provenance, and are Scenery-managed. A sidecar with
+/// an installation id counts the same way.
+pub fn is_legacy_row(conn: &Connection, row: &ManagedPathMarker, skill_dir: &Path) -> bool {
+    if !is_blank(&row.installation_id) {
+        return false;
     }
+    if !is_legacy_provenance(&marker_provenance(conn, &row.path)) {
+        return false;
+    }
+    match read_file_marker(skill_dir) {
+        Ok(Some(f)) => is_blank(&f.installation_id),
+        _ => true,
+    }
+}
+
+/// Delete a legacy marker row. The `.scenery-managed.json` sidecar beside the
+/// skill is removed too, but only if it carries no provenance and the skill
+/// dir is a real directory inside `scanned_root` (a symlinked or outside-root
+/// skill is the user's own tree: leave it alone). Best effort.
+pub fn drop_legacy_row(conn: &Connection, row_path: &str, skill_dir: &Path, scanned_root: &Path) {
     if let Err(e) = conn.execute(
         "DELETE FROM managed_path_markers WHERE path = ?1 AND kind = 'skill'",
         [row_path],
@@ -309,8 +326,25 @@ pub fn drop_legacy_row(conn: &Connection, row_path: &str, skill_dir: &Path) {
         warn!(path = row_path, error = %e, "managed_paths/marker: could not drop legacy row");
         return;
     }
+    let is_symlink = std::fs::symlink_metadata(skill_dir)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(true);
+    let inside_root = match (
+        std::fs::canonicalize(skill_dir),
+        std::fs::canonicalize(scanned_root),
+    ) {
+        (Ok(d), Ok(r)) => d.starts_with(r),
+        _ => false,
+    };
+    if is_symlink || !inside_root {
+        return;
+    }
     if let Ok(Some(f)) = read_file_marker(skill_dir) {
-        if is_blank(&f.origin) && is_blank(&f.skill_id) && is_blank(&f.tree_hash) {
+        if is_blank(&f.origin)
+            && is_blank(&f.skill_id)
+            && is_blank(&f.tree_hash)
+            && is_blank(&f.installation_id)
+        {
             let _ = std::fs::remove_file(skill_dir.join(MANAGED_MARKER_FILENAME));
         }
     }
@@ -372,7 +406,7 @@ pub fn db_ownership(conn: &Connection, kind: &str, dir: &Path) -> DbOwnership {
             return DbOwnership::Untracked;
         }
     };
-    if is_legacy_provenance(&marker_provenance(conn, &row.path)) {
+    if is_legacy_row(conn, &row, dir) {
         return DbOwnership::Legacy { row_path: row.path };
     }
     match super::drift::current_hash_for(&row) {

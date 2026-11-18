@@ -380,7 +380,7 @@ pub fn collect_discoveries(roots: &[PathBuf], state: &AppState) -> Vec<Discovery
                         }
                         DbOwnership::Legacy { row_path } => {
                             debug!(slug = %item.slug, "discoveries: legacy marker row proves nothing — dropping it and classifying normally");
-                            drop_legacy_row(&conn, &row_path, path);
+                            drop_legacy_row(&conn, &row_path, path, root);
                             None
                         }
                         DbOwnership::HashMismatch => Some("managed_hash_mismatch"),
@@ -1204,6 +1204,62 @@ mod tests {
             Some("managed_hash_mismatch")
         );
         assert_eq!(row_count(&state), 1, "real rows are never dropped");
+    }
+
+    #[test]
+    fn pre_2_3_catalog_row_with_installation_id_stays_verified() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("skills");
+        let ours = write_skill(&root, "catalog");
+        forge_marker(&ours);
+        let (state, _guard) = temp_state();
+        insert_legacy_row(
+            &state,
+            &ours,
+            "catalog",
+            &hex_sha256(b"---\nname: catalog\n---\n"),
+        );
+        Connection::open(&state.db_path)
+            .unwrap()
+            .execute(
+                "UPDATE managed_path_markers SET installation_id = 'inst-1'",
+                [],
+            )
+            .unwrap();
+
+        let items = collect_discoveries(&[root], &state);
+        assert!(
+            items.is_empty(),
+            "must stay Verified, not reported: {items:?}"
+        );
+        assert_eq!(row_count(&state), 1, "row kept");
+        assert!(ours.join(".scenery-managed.json").exists(), "sidecar kept");
+    }
+
+    #[test]
+    fn legacy_row_on_a_symlinked_skill_drops_the_row_but_keeps_the_sidecar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real_root = tmp.path().join("real");
+        let real = write_skill(&real_root, "dev-skill");
+        forge_marker(&real);
+        let root = tmp.path().join("skills");
+        fs::create_dir_all(&root).unwrap();
+        let link = root.join("dev-skill");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let (state, _guard) = temp_state();
+        insert_legacy_row(
+            &state,
+            &link,
+            "dev-skill",
+            &hex_sha256(b"---\nname: dev-skill\n---\n"),
+        );
+
+        let _ = collect_discoveries(&[root], &state);
+        assert_eq!(row_count(&state), 0, "row dropped");
+        assert!(
+            real.join(".scenery-managed.json").exists(),
+            "user tree untouched"
+        );
     }
 
     // ── 9. R2: merged batch contains both a skill and an MCP item ─────────────
