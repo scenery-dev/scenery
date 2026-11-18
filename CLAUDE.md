@@ -80,6 +80,16 @@ cargo clippy
 cargo fmt
 ```
 
+## Testing unreleased builds
+
+`scripts/dev-push.sh [host] [--status|--revert]` builds the working tree on
+spaceghost (remote cargo, no tag/signing/brew), installs it to
+`~/.local/share/Scenery/dev-bin/`, and activates it via a second systemd
+drop-in (`zz-dev-binary.conf`; `local.conf` untouched). Use `scenery-dev` for the
+dev CLI. The override survives `brew services restart` until `--revert`. On macOS:
+`brew services stop scenery`, `cargo build --release`, then run
+`target/release/scenery daemon run --foreground`.
+
 ## Releasing
 
 After bumping the workspace `Cargo.toml` version, tag `vX.Y.Z` and push the tag
