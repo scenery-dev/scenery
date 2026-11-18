@@ -156,6 +156,11 @@ impl Conversion {
     }
 
     /// The directory the new tree must be written into.
+    /// Where the original was backed up (set by [`swap`](Self::swap)).
+    pub(crate) fn backup_path(&self) -> Option<&str> {
+        self.intent.backup_path.as_deref()
+    }
+
     pub(crate) fn staging(&self) -> &Path {
         Path::new(&self.intent.staging)
     }

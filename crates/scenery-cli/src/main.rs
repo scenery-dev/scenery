@@ -6174,7 +6174,7 @@ async fn cmd_skill_uninstall(id: &str, registry_url: Option<&str>) -> Result<()>
     use rusqlite::{Connection, OptionalExtension};
     use scenery_core::{
         audit::{write_audit_event_direct, AuditEvent},
-        installer::uninstall_skill,
+        installer::uninstall_skill_restoring,
         state::AppState,
     };
 
@@ -6230,7 +6230,8 @@ async fn cmd_skill_uninstall(id: &str, registry_url: Option<&str>) -> Result<()>
     };
 
     // Perform the local removal (files + DB rows).
-    uninstall_skill(&state, id).with_context(|| format!("failed to remove skill '{id}'"))?;
+    uninstall_skill_restoring(&state, id)
+        .with_context(|| format!("failed to remove skill '{id}'"))?;
 
     // Emit audit event.
     let ts = scenery_core::timefmt::now_rfc3339();

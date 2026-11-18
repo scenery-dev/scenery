@@ -1357,3 +1357,116 @@ fn walk_files(dir: &Path) -> Vec<PathBuf> {
     }
     out
 }
+
+/// Ensure an `installed_skills` row for `pdf` (the updater / CLI uninstall key).
+fn ensure_install_row(env: &Env) {
+    let root = env.state.root_dir.join("skills/pdf");
+    Connection::open(&env.state.db_path)
+        .unwrap()
+        .execute(
+            "INSERT OR REPLACE INTO installed_skills \
+             (skill_id, active_version, install_root, current_status, deactivated) \
+             VALUES ('pdf', '0.1.0', ?1, 'active', 0)",
+            [root.as_str()],
+        )
+        .unwrap();
+}
+
+fn removed_own_backups(env: &Env) -> Vec<PathBuf> {
+    walk_files(
+        &env.state
+            .root_dir
+            .join("restore-backups")
+            .into_std_path_buf(),
+    )
+    .into_iter()
+    .filter(|p| p.to_string_lossy().contains("removed-own"))
+    .collect()
+}
+
+#[tokio::test]
+async fn registry_deleted_teardown_never_restores_and_takes_no_backup_when_unedited() {
+    let mut env = Env::new().await;
+    crate::managed_paths::register_core_hooks();
+    let dir = convert_pdf(&mut env).await;
+    ensure_install_row(&env);
+
+    // The updater's "unknown to the registry" path is `uninstall_skill`.
+    let r = scenery_core::installer::uninstall_skill(&env.state, "pdf").unwrap();
+    assert!(r.is_some());
+
+    assert!(
+        !dir.exists(),
+        "revoke-style teardown removes, never restores"
+    );
+    assert!(fs::symlink_metadata(env.claude().join("pdf")).is_err());
+    assert!(
+        removed_own_backups(&env).is_empty(),
+        "an unedited own skill needs no removed-own backup"
+    );
+}
+
+#[tokio::test]
+async fn registry_deleted_teardown_of_an_edited_own_skill_backs_up_and_does_not_restore() {
+    let mut env = Env::new().await;
+    crate::managed_paths::register_core_hooks();
+    let dir = convert_pdf(&mut env).await;
+    fs::write(dir.join("SKILL.md"), "MY EDITS").unwrap();
+    ensure_install_row(&env);
+
+    scenery_core::installer::uninstall_skill(&env.state, "pdf").unwrap();
+
+    assert!(!dir.exists());
+    assert!(!removed_own_backups(&env).is_empty());
+}
+
+#[tokio::test]
+async fn user_uninstall_through_the_core_hook_restores() {
+    let mut env = Env::new().await;
+    crate::managed_paths::register_core_hooks();
+    let dir = convert_pdf(&mut env).await;
+    ensure_install_row(&env);
+    scenery_core::installer::uninstall_skill_restoring(&env.state, "pdf").unwrap();
+    assert!(fs::read_to_string(dir.join("SKILL.md"))
+        .unwrap()
+        .contains("ORIGINAL body"));
+}
+
+#[tokio::test]
+async fn reconvert_after_revoke_restores_the_second_original_not_the_stale_first() {
+    let mut env = Env::new().await;
+    crate::managed_paths::register_core_hooks();
+    let dir = convert_pdf(&mut env).await;
+    // Revoke-style teardown (leaves the first cycle's Adopted entry behind).
+    ensure_install_row(&env);
+    scenery_core::installer::uninstall_skill(&env.state, "pdf").unwrap();
+    assert!(!dir.exists());
+    // The user recreates the skill with new content and it is converted again.
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("SKILL.md"),
+        "---\nname: pdf\n---\nSECOND original\n",
+    )
+    .unwrap();
+    Connection::open(&env.state.db_path)
+        .unwrap()
+        .execute("DELETE FROM auto_manage_attempts", [])
+        .unwrap();
+    env.seed_registry_version("pdf", "0.1.0");
+    let m = env.managed_response("adam~pdf", "0.1.0", "manage", 1);
+    let items = env.scan();
+    let s = process_response(
+        &env.ctx(true),
+        response(vec![directive(&dir, "manage")]),
+        &items,
+    )
+    .await;
+    m.assert();
+    assert_eq!(s.managed, 1, "{s:?}");
+
+    super::super::own_restore::uninstall_projection(&env.state, "pdf").unwrap();
+    assert_eq!(
+        fs::read_to_string(dir.join("SKILL.md")).unwrap(),
+        "---\nname: pdf\n---\nSECOND original\n"
+    );
+}

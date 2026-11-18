@@ -90,6 +90,11 @@ pub use pusher::{push_missing_active_skills, ManagedPathsPusher};
 /// `~/.claude/skills/<slug>` link. Idempotent; call once at process start.
 pub fn register_core_hooks() {
     scenery_core::installer::register_skill_projection_remover(|state, slug| {
+        ManagedPathsPusher::new(state)
+            .remove_skill(slug)
+            .map(|_| ())
+    });
+    scenery_core::installer::register_skill_restoring_remover(|state, slug| {
         own_restore::uninstall_projection(state, slug).map(|_| ())
     });
 }

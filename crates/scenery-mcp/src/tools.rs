@@ -33,7 +33,7 @@ use rusqlite::Connection;
 use scenery_core::{
     auth::{self, AuthClient},
     executor::{run_skill, RunResult},
-    installer::{install_unpacked_skill, uninstall_skill, InstallMode},
+    installer::{install_unpacked_skill, uninstall_skill_restoring, InstallMode},
     mcp_governance,
     model::{ModelClient, ModelSource},
     policy::PolicyClient,
@@ -2110,7 +2110,7 @@ fn handle_uninstall(arguments: &serde_json::Value, state: &AppState) -> ToolCall
         None => return ToolCallResult::error_result("Missing required parameter: skill_id"),
     };
 
-    match uninstall_skill(state, skill_id) {
+    match uninstall_skill_restoring(state, skill_id) {
         Ok(Some(version)) => {
             ToolCallResult::success(format!("Successfully uninstalled {skill_id}@{version}."))
         }

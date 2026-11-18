@@ -374,7 +374,12 @@ impl ManagedPathsPusher {
             }
             return Err(e);
         }
-        // Marked: the conversion (if any) is complete; drop the old dir.
+        // Marked: the conversion (if any) is complete; drop the old dir. The
+        // backup of THIS conversion is recorded in the push entry so a later
+        // uninstall restores it, not an older cycle's.
+        let adopted_backup = conversion
+            .as_ref()
+            .and_then(|c| c.backup_path().map(str::to_string));
         if let Some(c) = conversion.take() {
             c.commit();
         }
@@ -415,6 +420,7 @@ impl ManagedPathsPusher {
                     "tree_sha256": tree_sha256,
                     "origin": prov.origin,
                     "skill_id": prov.skill_id,
+                    "adopted_backup": adopted_backup,
                 })),
         );
 

@@ -156,7 +156,26 @@ fn symlink_version_dir(source: &Utf8Path, version_dir: &Utf8Path) -> Result<()> 
 ///
 /// Returns `Ok(Some(version))` with the previously active version string, or
 /// `Ok(None)` if the skill was not installed.
+///
+/// Teardown only: an auto-managed own skill is removed, never restored (the
+/// registry-sync "deleted upstream" path uses this). A user-initiated
+/// uninstall calls [`uninstall_skill_restoring`] instead.
 pub fn uninstall_skill(state: &AppState, skill_id: &str) -> Result<Option<String>> {
+    uninstall_skill_inner(state, skill_id, false)
+}
+
+/// [`uninstall_skill`] for a USER-initiated uninstall (`scenery skill
+/// uninstall`, the MCP `scenery_uninstall` tool): the user's own original of an
+/// auto-managed skill is put back instead of deleted.
+pub fn uninstall_skill_restoring(state: &AppState, skill_id: &str) -> Result<Option<String>> {
+    uninstall_skill_inner(state, skill_id, true)
+}
+
+fn uninstall_skill_inner(
+    state: &AppState,
+    skill_id: &str,
+    restore_own: bool,
+) -> Result<Option<String>> {
     let conn = Connection::open(&state.db_path)?;
 
     let row: Option<(String, String)> = conn
@@ -200,7 +219,14 @@ pub fn uninstall_skill(state: &AppState, skill_id: &str) -> Result<Option<String
     //
     // Non-fatal: the pusher refuses to touch anything lacking our marker
     // (user content at the same slug), and that must not fail the uninstall.
-    if let Some(remover) = SKILL_PROJECTION_REMOVER.get() {
+    let hook = if restore_own {
+        SKILL_RESTORING_REMOVER
+            .get()
+            .or(SKILL_PROJECTION_REMOVER.get())
+    } else {
+        SKILL_PROJECTION_REMOVER.get()
+    };
+    if let Some(remover) = hook {
         if let Err(e) = remover(state, skill_id) {
             tracing::warn!(
                 skill_id,
@@ -219,6 +245,15 @@ pub type SkillProjectionRemover = fn(&AppState, &str) -> Result<()>;
 
 static SKILL_PROJECTION_REMOVER: std::sync::OnceLock<SkillProjectionRemover> =
     std::sync::OnceLock::new();
+
+static SKILL_RESTORING_REMOVER: std::sync::OnceLock<SkillProjectionRemover> =
+    std::sync::OnceLock::new();
+
+/// Register the remover used by [`uninstall_skill_restoring`] (restores the
+/// user's original for an auto-managed own skill). First registration wins.
+pub fn register_skill_restoring_remover(remover: SkillProjectionRemover) {
+    let _ = SKILL_RESTORING_REMOVER.set(remover);
+}
 
 /// Register the projection remover invoked by [`uninstall_skill`]. First
 /// registration wins; repeated calls are no-ops.

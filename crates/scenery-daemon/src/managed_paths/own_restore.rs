@@ -77,7 +77,7 @@ pub fn restore_own_skill(state: &AppState, slug: &str) -> Result<OwnOutcome> {
     }
     let journal = RestoreJournal::for_state(state);
     let entries = journal.read_all().context("own-restore: read journal")?;
-    let Some(adopted) = oldest_existing_backup(&entries, slug) else {
+    let Some(adopted) = current_conversion_backup(&entries, slug) else {
         warn!(slug, "own-restore: no adopted backup found; plain teardown");
         return Ok(OwnOutcome::NotOwn);
     };
@@ -101,16 +101,41 @@ pub fn restore_own_skill(state: &AppState, slug: &str) -> Result<OwnOutcome> {
     Ok(outcome)
 }
 
-/// Oldest `Adopted` journal entry for `slug` whose backup still exists (the
-/// oldest is the pre-Scenery state; later ones can back up half-converted trees).
-fn oldest_existing_backup<'a>(entries: &'a [JournalEntry], slug: &str) -> Option<&'a JournalEntry> {
-    entries.iter().find(|e| {
+/// The `Adopted` entry of the CURRENT conversion of `slug`: the one whose
+/// backup the newest conversion push recorded (`adopted_backup`). Older cycles
+/// (convert, revoke, recreate, convert) leave earlier `Adopted` entries behind
+/// whose originals are stale, so the oldest is NOT used. Without a recorded
+/// backup (pre-fix journals) the newest existing entry is the best guess.
+fn current_conversion_backup<'a>(
+    entries: &'a [JournalEntry],
+    slug: &str,
+) -> Option<&'a JournalEntry> {
+    let exists = |e: &&JournalEntry| {
         e.source == JournalSource::Adopted
             && e.slug.as_deref() == Some(slug)
             && e.backup_path
                 .as_deref()
                 .is_some_and(|b| fs::symlink_metadata(b).is_ok())
-    })
+    };
+    let recorded = entries
+        .iter()
+        .rev()
+        .filter(|e| {
+            e.source == JournalSource::Managed
+                && e.op == JournalOp::ArtifactPush
+                && e.slug.as_deref() == Some(slug)
+        })
+        .find_map(|e| e.detail.get("adopted_backup").and_then(|v| v.as_str()));
+    if let Some(bp) = recorded {
+        if let Some(e) = entries
+            .iter()
+            .filter(exists)
+            .find(|e| e.backup_path.as_deref() == Some(bp))
+        {
+            return Some(e);
+        }
+    }
+    entries.iter().rev().find(exists)
 }
 
 /// Live tree still equals what Scenery last wrote (journal fingerprint).
@@ -193,7 +218,10 @@ fn restore_elsewhere(
         // Something is there now: never overwrite it. Keep the managed copy.
         return Ok(keep_edited(canonical, slug, backup));
     }
-    copy_tree(backup, target).context("own-restore: restoring the original")?;
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent).context("own-restore: creating the original's parent")?;
+    }
+    swap_in_original(backup, target)?;
     if pristine {
         unlink_clients(slug);
         ManagedPathsPusher::new(state).remove_skill(slug)?;
