@@ -99,4 +99,4 @@ jobs:
       - name: Install cargo-deny
         run: cargo install cargo-deny --locked --version 0.20.2
       - name: cargo deny
-        run: cargo deny --locked check advisories bans sources
+        run: cargo deny --locked check
