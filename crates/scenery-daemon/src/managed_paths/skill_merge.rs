@@ -993,6 +993,8 @@ pub async fn share_branch(
             match local_edits::upload_edit(state, registry_url, marker, true).await {
                 local_edits::EditOutcome::Stored { branch_state, .. }
                     if branch_state == local_edits::BRANCH_BRANCH => {}
+                // The same tree is already stored as the branch: just submit it.
+                local_edits::EditOutcome::AlreadyUploaded => {}
                 local_edits::EditOutcome::Stored { .. } => {
                     bail!("'{slug}' is not a branch of a catalog skill (the registry treats it as your own)")
                 }
