@@ -3148,14 +3148,22 @@ async fn live_edit_pending(state: &Arc<AppState>, slug: &str) -> bool {
         let Ok(conn) = rusqlite::Connection::open(&st.db_path) else {
             return false;
         };
-        match crate::managed_paths::local_edits::marker_path_for_slug(&conn, &slug) {
-            Some(path) => crate::managed_paths::local_edits::tree_is_dirty(
-                &conn,
-                &path,
-                std::path::Path::new(&path),
-            ),
-            None => false,
+        let dirty = crate::managed_paths::local_edits::marker_path_for_slug(&conn, &slug)
+            .is_some_and(|path| {
+                crate::managed_paths::local_edits::tree_is_dirty(
+                    &conn,
+                    &path,
+                    std::path::Path::new(&path),
+                )
+            });
+        // Visible, not silent: the drift report and `scenery doctor` list a
+        // skill whose update is blocked, so a permanently held one shows up.
+        if dirty {
+            crate::managed_paths::local_edits::mark_update_blocked(&st, &slug);
+        } else {
+            crate::managed_paths::local_edits::clear_update_blocked(&st, &slug);
         }
+        dirty
     })
     .await
     .unwrap_or(true)

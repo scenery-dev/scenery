@@ -901,6 +901,11 @@ fn auto_manage_status_lines(state: &scenery_core::state::AppState) -> Vec<String
             a.reason.as_deref().unwrap_or("unknown reason")
         ));
     }
+    for slug in scenery_daemon::managed_paths::local_edits::update_blocked_slugs(state) {
+        out.push(format!(
+            "  update blocked: {slug} (local edits not uploaded yet; the catalog update waits)"
+        ));
+    }
     let backups = state.root_dir.join("restore-backups");
     let bytes = dir_size_bytes(backups.as_std_path());
     if bytes > 0 {

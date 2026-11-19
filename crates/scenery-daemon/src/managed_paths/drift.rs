@@ -208,6 +208,9 @@ impl DriftScanner {
         for outcome in outcomes {
             match outcome.status {
                 DriftStatus::Clean => {
+                    if outcome.kind == "skill" {
+                        super::local_edits::clear_update_blocked(&self.state, &outcome.slug);
+                    }
                     // Content is intact, but Claude Code's link may have been
                     // replaced by a real directory — a distinct tamper signal
                     // from content drift, and invisible to hashing because the
@@ -288,23 +291,46 @@ impl DriftScanner {
                     )
                     .await;
                     use super::local_edits::EditOutcome;
-                    // Quarantine only once the work is saved (Stored/AlreadyUploaded)
-                    // or will never be (Held). On Retry/Settling leave the tree and
-                    // marker in place so the next scan retries the upload.
-                    let upload_settled = matches!(
-                        uploaded,
-                        EditOutcome::Stored { .. }
-                            | EditOutcome::Held { .. }
-                            | EditOutcome::AlreadyUploaded
-                    );
+                    // Quarantine once the work is saved (Stored/AlreadyUploaded),
+                    // will never be (Held), or can never be (Failed: unhashable,
+                    // unpackable; the quarantine dir keeps the files locally).
+                    // A transient failure (offline, 5xx, 401, 426) keeps the tree
+                    // and marker for the next scan, but only for the grace window
+                    // (24 h from the first failure): then it is quarantined anyway.
+                    // Either way the scan always reports it, with `not_uploaded`.
                     let branch_uploaded = matches!(
                         uploaded,
                         EditOutcome::Stored { .. } | EditOutcome::AlreadyUploaded
                     );
+                    let not_uploaded: Option<String> = match &uploaded {
+                        EditOutcome::Failed { reason } | EditOutcome::Retry { reason } => {
+                            Some(reason.clone())
+                        }
+                        EditOutcome::Settling => Some("still being edited".to_string()),
+                        EditOutcome::Held { reason } => Some(reason.clone()),
+                        EditOutcome::Stored { .. } | EditOutcome::AlreadyUploaded => None,
+                    };
+                    let quarantine_now = match &uploaded {
+                        EditOutcome::Stored { .. }
+                        | EditOutcome::Held { .. }
+                        | EditOutcome::AlreadyUploaded
+                        | EditOutcome::Failed { .. } => true,
+                        EditOutcome::Retry { .. } | EditOutcome::Settling => {
+                            super::local_edits::upload_grace_expired(&self.state, &outcome.path)
+                        }
+                    };
+                    if branch_uploaded || matches!(uploaded, EditOutcome::Held { .. }) {
+                        super::local_edits::clear_first_upload_failure(&self.state, &outcome.path);
+                    }
+                    if let Some(why) = &not_uploaded {
+                        if mode == PolicyMode::Quarantine && quarantine_now {
+                            warn!(slug = %outcome.slug, why, "drift: quarantining an edit that was never uploaded");
+                        }
+                    }
                     let action = match mode {
-                        PolicyMode::Quarantine if !upload_settled => {
+                        PolicyMode::Quarantine if !quarantine_now => {
                             debug!(slug = %outcome.slug, "drift: edit not uploaded yet; quarantine waits for the next scan");
-                            continue;
+                            "reported"
                         }
                         PolicyMode::Quarantine => match quarantine_item(&outcome) {
                             Ok(quarantined_to) => {
@@ -334,6 +360,7 @@ impl DriftScanner {
                             "path": outcome.path,
                             "reason": "catalog_skill_edited",
                             "branch_uploaded": branch_uploaded,
+                            "not_uploaded": not_uploaded,
                         })),
                     });
                 }
@@ -408,6 +435,20 @@ impl DriftScanner {
             }
         }
 
+        // A catalog update skipped because the tree has edits that are not
+        // uploaded yet (see the reconciler): report it so it is never silent.
+        for slug in super::local_edits::update_blocked_slugs(&self.state) {
+            to_report.push(DriftReportItem {
+                slug,
+                kind: "skill".to_string(),
+                current_hash: String::new(),
+                expected_hash: String::new(),
+                action: "reported".to_string(),
+                detail: Some(serde_json::json!({
+                    "reason": "update_blocked_local_edits_not_uploaded",
+                })),
+            });
+        }
         if !to_report.is_empty() {
             self.report(to_report).await?;
         }
@@ -541,10 +582,10 @@ fn edit_report_item(
             return None;
         }
         EditOutcome::AlreadyUploaded => return None,
-        EditOutcome::Retry { reason: why } if why.starts_with("could not hash the tree") => {
-            // A tree that cannot be hashed (size cap) can never be uploaded or
-            // compared: say so instead of looking clean.
-            warn!(slug = %o.slug, why, "drift: skill tree cannot be hashed; edit not tracked");
+        EditOutcome::Failed { reason: why } => {
+            // A tree that cannot be hashed (size cap), packed or secret-scanned
+            // can never be uploaded: say so instead of looking clean.
+            warn!(slug = %o.slug, why, "drift: skill edit cannot be uploaded; not tracked");
             serde_json::json!({ "path": o.path, "reason": reason, "not_uploaded": why })
         }
         EditOutcome::Retry { reason: why } => {

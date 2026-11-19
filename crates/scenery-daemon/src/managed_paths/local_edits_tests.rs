@@ -529,6 +529,70 @@ async fn strict_quarantine_waits_for_the_upload_and_never_loses_an_unuploaded_ed
 }
 
 #[tokio::test]
+async fn strict_quarantine_does_not_wait_for_an_upload_that_can_never_succeed() {
+    let mut f = Fx::new().await;
+    f.set_mode("quarantine");
+    let report = f
+        .server
+        .mock("POST", "/portal/managed-paths/drift")
+        .match_body(Matcher::Regex("not_uploaded".into()))
+        .with_status(200)
+        .with_body("{}")
+        .expect(1)
+        .create_async()
+        .await;
+    let dir = f.push("cat", false);
+    // More files than the hard cap: the tree cannot be hashed, so no upload.
+    let bulk = dir.join("bulk");
+    fs::create_dir_all(&bulk).unwrap();
+    for i in 0..10_001 {
+        fs::write(bulk.join(format!("f{i}")), "x").unwrap();
+    }
+    f.cycle().await;
+    report.assert_async().await;
+    assert!(
+        !dir.exists(),
+        "quarantined at once, nothing silently kept running"
+    );
+    assert!(f.home.join(".claude/.scenery-quarantine").exists());
+}
+
+#[tokio::test]
+async fn strict_quarantine_gives_up_waiting_for_a_transient_failure_after_the_grace_window() {
+    let mut f = Fx::new().await;
+    f.set_mode("quarantine");
+    let report = f
+        .server
+        .mock("POST", "/portal/managed-paths/drift")
+        .match_body(Matcher::Regex("not_uploaded".into()))
+        .with_status(200)
+        .with_body("{}")
+        .expect_at_least(2)
+        .create_async()
+        .await;
+    let _fail = f
+        .server
+        .mock("POST", STORED_BRANCH_MOCK_PATH)
+        .with_status(503)
+        .expect_at_least(2)
+        .create_async()
+        .await;
+    let dir = f.push("cat", false);
+    fs::write(dir.join("prompts/p.md"), "never uploaded").unwrap();
+    f.cycle().await;
+    assert!(dir.exists(), "inside the grace window it waits");
+    // The first failure was 25 hours ago.
+    let key = format!("edit_upload_first_fail:{}", dir.to_string_lossy());
+    let old = now_secs() - 25 * 3600;
+    f.state.set_sync_state(&key, &old.to_string()).unwrap();
+    f.cycle().await;
+    report.assert_async().await;
+    assert!(!dir.exists(), "quarantined anyway after 24h");
+    let q = f.home.join(".claude/.scenery-quarantine");
+    assert!(q.exists(), "the files are kept in the quarantine dir");
+}
+
+#[tokio::test]
 async fn a_catalog_update_never_overwrites_an_edit_that_is_not_uploaded_yet() {
     let f = Fx::new().await;
     let dir = f.push("cat", false);
@@ -549,6 +613,25 @@ async fn a_catalog_update_never_overwrites_an_edit_that_is_not_uploaded_yet() {
         fs::read_to_string(dir.join("prompts/p.md")).unwrap(),
         "offline edit, not uploaded"
     );
+    // Visible, not silent: listed for `scenery doctor` and the drift report.
+    assert_eq!(
+        crate::managed_paths::local_edits::update_blocked_slugs(&f.state),
+        vec!["cat".to_string()]
+    );
+    let mut f = f;
+    let blocked = f
+        .server
+        .mock("POST", "/portal/managed-paths/drift")
+        .match_body(Matcher::Regex(
+            "update_blocked_local_edits_not_uploaded".into(),
+        ))
+        .with_status(200)
+        .with_body("{}")
+        .expect(1)
+        .create_async()
+        .await;
+    f.cycle().await;
+    blocked.assert_async().await;
     // And the pusher itself refuses as a backstop.
     let err = ManagedPathsPusher::new(&f.state)
         .push_skill("cat", None, b"---\nname: x\n---\nv2", &[])

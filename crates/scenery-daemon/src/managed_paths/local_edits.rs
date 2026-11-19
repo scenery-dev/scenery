@@ -198,6 +198,78 @@ pub fn marker_path_for_slug(conn: &Connection, slug: &str) -> Option<String> {
     .flatten()
 }
 
+const ENV_STRICT_GRACE: &str = "SCENERY_STRICT_UPLOAD_GRACE_SECS";
+const DEFAULT_STRICT_GRACE_SECS: i64 = 24 * 3600;
+
+/// How long a strict-mode edit may stay unquarantined while its upload keeps
+/// failing for a transient reason (default 24 h).
+pub fn strict_upload_grace_secs() -> i64 {
+    std::env::var(ENV_STRICT_GRACE)
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(DEFAULT_STRICT_GRACE_SECS)
+}
+
+fn first_fail_key(path: &str) -> String {
+    format!("edit_upload_first_fail:{path}")
+}
+
+/// Record the first failed upload attempt for the skill dir at `path` (kept if
+/// already set) and return its unix time.
+pub fn note_first_upload_failure(state: &AppState, path: &str) -> i64 {
+    let key = first_fail_key(path);
+    if let Some(t) = state
+        .get_sync_state(&key)
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<i64>().ok())
+    {
+        return t;
+    }
+    let now = now_secs();
+    let _ = state.set_sync_state(&key, &now.to_string());
+    now
+}
+
+pub fn clear_first_upload_failure(state: &AppState, path: &str) {
+    let _ = state.delete_sync_state(&first_fail_key(path));
+}
+
+/// Has this skill's upload been failing for longer than the grace window?
+pub fn upload_grace_expired(state: &AppState, path: &str) -> bool {
+    now_secs() - note_first_upload_failure(state, path) >= strict_upload_grace_secs()
+}
+
+const BLOCKED_PREFIX: &str = "update_blocked:";
+
+/// A catalog update was skipped for `slug` because its tree has edits that are
+/// not uploaded yet. Shown by the drift report and `scenery doctor`.
+pub fn mark_update_blocked(state: &AppState, slug: &str) {
+    let _ = state.set_sync_state(&format!("{BLOCKED_PREFIX}{slug}"), &now_secs().to_string());
+}
+
+pub fn clear_update_blocked(state: &AppState, slug: &str) {
+    let _ = state.delete_sync_state(&format!("{BLOCKED_PREFIX}{slug}"));
+}
+
+/// Slugs whose catalog update is currently blocked by unuploaded local edits.
+pub fn update_blocked_slugs(state: &AppState) -> Vec<String> {
+    let Ok(conn) = Connection::open(&state.db_path) else {
+        return Vec::new();
+    };
+    let Ok(mut stmt) = conn.prepare("SELECT key FROM sync_state WHERE key LIKE 'update_blocked:%'")
+    else {
+        return Vec::new();
+    };
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0));
+    let Ok(rows) = rows else {
+        return Vec::new();
+    };
+    rows.flatten()
+        .filter_map(|k| k.strip_prefix(BLOCKED_PREFIX).map(str::to_string))
+        .collect()
+}
+
 fn settle_window() -> Duration {
     Duration::from_secs(
         std::env::var(ENV_SETTLE)
@@ -224,8 +296,12 @@ pub enum EditOutcome {
     /// Not uploaded and not retried until the tree changes (a secret pattern
     /// was found, or the registry refused it for good). Names only.
     Held { reason: String },
-    /// Could not reach the registry or not signed in: retried next scan.
+    /// Could not reach the registry or not signed in (offline, 5xx, 401, 426):
+    /// transient, retried next scan.
     Retry { reason: String },
+    /// This tree can never be uploaded as it is (cannot be hashed, packed or
+    /// secret-scanned). Not retried by waiting.
+    Failed { reason: String },
     /// This exact tree was already uploaded (strict mode keeps the old
     /// baseline, so the same edit is seen again): nothing to send.
     AlreadyUploaded,
@@ -394,7 +470,7 @@ fn prepare(
     })?;
     let prov = marker::marker_provenance(&conn, &marker.path);
     let skill_id = registry_id_for(state, marker, &prov);
-    let survey = skill_tree::survey(dir).map_err(|e| EditOutcome::Retry {
+    let survey = skill_tree::survey(dir).map_err(|e| EditOutcome::Failed {
         reason: format!("could not hash the tree: {e:#}"),
     })?;
     let tree_hash = survey.tree_hash.clone();
@@ -418,12 +494,12 @@ fn prepare(
         }
         Ok(_) => {}
         Err(e) => {
-            return Err(EditOutcome::Retry {
+            return Err(EditOutcome::Failed {
                 reason: format!("secret scan failed: {e:#}"),
             })
         }
     }
-    let tar_gz = pack::pack_dir_to_tar_gz_no_links(dir).map_err(|e| EditOutcome::Retry {
+    let tar_gz = pack::pack_dir_to_tar_gz_no_links(dir).map_err(|e| EditOutcome::Failed {
         reason: format!("could not pack the tree: {e:#}"),
     })?;
     // The version the edit started from: what the last upload (or install) left.

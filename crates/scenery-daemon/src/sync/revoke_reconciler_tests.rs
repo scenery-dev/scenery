@@ -125,6 +125,15 @@ async fn dispatch(
     // `~/.claude` — point HOME at a temp dir so these tests never read or
     // modify the real one.
     let _home = FakeHome::new();
+    dispatch_in_current_home(event, state, backend_registry).await;
+}
+
+/// [`dispatch`] without taking the fake HOME (the caller already holds one).
+async fn dispatch_in_current_home(
+    event: SyncEvent,
+    state: &Arc<AppState>,
+    backend_registry: &Arc<BackendRegistry>,
+) {
     let registry_url = "https://example.invalid".to_string();
     let event = crate::test_support::prepare_event(event, state, &registry_url);
     let sem = Arc::new(tokio::sync::Semaphore::new(4));
@@ -813,4 +822,81 @@ async fn install_mcp_event_is_refused_for_an_already_revoked_server() {
     );
 
     cleanup(&root);
+}
+
+// ── Revoke wins over unuploaded local edits (plan 4.5.1) ──────────────────────
+
+/// Push a catalog skill, dirty its tree with `dirty`, try a catalog update
+/// (skipped: not overwritten), then revoke. The managed dir and the Claude link
+/// must be gone: the kill switch never leaves a dirty tree running.
+async fn revoke_removes_a_dirty_skill(label: &str, dirty: fn(&std::path::Path)) {
+    let _home = FakeHome::new();
+    let root = temp_root(label);
+    let state = Arc::new(AppState::bootstrap_in(root.clone()).unwrap());
+    seed_installed_skill(&state, "cat", "1.0.0");
+    let pusher = crate::managed_paths::ManagedPathsPusher::new(&state);
+    pusher
+        .push_skill("cat", None, b"---\nname: cat\n---\nv1", &[])
+        .unwrap();
+    let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+    let dir = home.join(".agents/skills/cat");
+    let link = home.join(".claude/skills/cat");
+    assert!(dir.exists() && link.exists(), "precondition");
+
+    dirty(&dir);
+    // The catalog update is skipped, the edit survives.
+    super::install_verified_version(
+        install_id(),
+        "cat",
+        "1.1.0",
+        &state,
+        "https://example.invalid",
+        Some(&pusher),
+    )
+    .await
+    .unwrap();
+    assert!(dir.join("SKILL.md").exists());
+    assert_eq!(
+        crate::managed_paths::local_edits::update_blocked_slugs(&state),
+        vec!["cat".to_string()]
+    );
+
+    dispatch_in_current_home(
+        SyncEvent::Revoke {
+            artifact_type: "skill".to_string(),
+            artifact_key: "cat".to_string(),
+            version: None,
+        },
+        &state,
+        &Arc::new(BackendRegistry::new()),
+    )
+    .await;
+    assert!(!dir.exists(), "revoke removed the dirty managed dir");
+    assert!(
+        !link.exists() && !link.is_symlink(),
+        "and the Claude Code link"
+    );
+    assert!(revocation_row_exists(&state, "skill", "cat"));
+    cleanup(&root);
+}
+
+#[tokio::test]
+async fn revoke_removes_a_skill_whose_edit_was_not_uploaded() {
+    revoke_removes_a_dirty_skill("revoke-dirty", |dir| {
+        std::fs::write(dir.join("SKILL.md"), "offline edit").unwrap();
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn revoke_removes_a_held_or_unhashable_catalog_skill_whose_update_was_skipped() {
+    revoke_removes_a_dirty_skill("revoke-unhashable", |dir| {
+        // Over the hard file cap: cannot be hashed, so the update stays skipped.
+        let bulk = dir.join("bulk");
+        std::fs::create_dir_all(&bulk).unwrap();
+        for i in 0..10_001 {
+            std::fs::write(bulk.join(format!("f{i}")), "x").unwrap();
+        }
+    })
+    .await;
 }
