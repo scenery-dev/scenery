@@ -68,7 +68,14 @@ pub async fn cmd_skill_merge(
             dir,
             head_version,
             conflicts,
+            abandoned,
         } => {
+            if let Some(old) = abandoned {
+                println!(
+                    "Your earlier unfinished merge was kept at {}.",
+                    old.display()
+                );
+            }
             println!(
                 "Merged the catalog update{} into your edits at {}.",
                 head_version.map(|v| format!(" ({v})")).unwrap_or_default(),

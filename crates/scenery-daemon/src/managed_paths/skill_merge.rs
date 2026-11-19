@@ -68,6 +68,13 @@ pub struct MergeMeta {
     pub uploaded_version_id: Option<String>,
     #[serde(default)]
     pub uploaded_tree: Option<String>,
+    /// Paths with a `.theirs` sidecar when the merge was written.
+    #[serde(default)]
+    pub sidecar_files: Vec<String>,
+    /// Tree hash of the merge folder as `prepare_merge` wrote it; a different
+    /// hash later means the user worked in it.
+    #[serde(default)]
+    pub written_tree: Option<String>,
 }
 
 /// `<data dir>/merges`.
@@ -211,53 +218,69 @@ fn set_exec(path: &Path, exec: bool) {
 #[cfg(not(unix))]
 fn set_exec(_path: &Path, _exec: bool) {}
 
-/// Files of `dir` (relative, `/` separated) that still hold a conflict:
-/// a `<<<<<<<` / `>>>>>>>` line anywhere, a `=======` line in a file that was
-/// written with markers (`conflicted`), or a `.theirs` sidecar.
-pub fn remaining_conflicts(dir: &Path, conflicted: &[String]) -> Vec<String> {
+/// Files of `dir` (relative, `/` separated) that still hold a conflict. Only
+/// the files the merge recorded as conflicted are looked at: a text file in
+/// `text_conflicted` with a `<<<<<<<` / `=======` / `>>>>>>>` line, and a path in
+/// `sidecar_conflicted` whose `.theirs` copy still exists. Other files are
+/// never inspected (a doc may legitimately contain marker-like lines).
+pub fn remaining_conflicts(
+    dir: &Path,
+    text_conflicted: &[String],
+    sidecar_conflicted: &[String],
+) -> Vec<String> {
     let mut out = Vec::new();
-    walk_files(dir, Path::new(""), &mut |rel, abs| {
-        let shown = rel.to_string_lossy().replace('\\', "/");
-        if shown.ends_with(THEIRS_SUFFIX) {
-            out.push(shown);
-            return;
-        }
-        let Ok(bytes) = fs::read(abs) else { return };
-        let Ok(text) = String::from_utf8(bytes) else {
-            return;
+    for shown in text_conflicted {
+        let Some(rel) = safe_rel(shown) else { continue };
+        let Ok(bytes) = fs::read(dir.join(rel)) else {
+            continue;
         };
-        let was_conflicted = conflicted.iter().any(|c| c == &shown);
+        let Ok(text) = String::from_utf8(bytes) else {
+            continue;
+        };
         let hit = text.lines().any(|l| {
-            l.starts_with("<<<<<<<")
-                || l.starts_with(">>>>>>>")
-                || (was_conflicted && l.trim_end() == "=======")
+            l.starts_with("<<<<<<<") || l.starts_with(">>>>>>>") || l.trim_end() == "======="
         });
         if hit {
-            out.push(shown);
+            out.push(shown.clone());
         }
-    });
+    }
+    for main in sidecar_conflicted {
+        let theirs = format!("{main}{THEIRS_SUFFIX}");
+        let Some(rel) = safe_rel(&theirs) else {
+            continue;
+        };
+        if fs::symlink_metadata(dir.join(rel)).is_ok() {
+            out.push(theirs);
+        }
+    }
     out.sort();
     out.dedup();
     out
 }
 
-fn walk_files(root: &Path, rel: &Path, f: &mut dyn FnMut(&Path, &Path)) {
-    let dir = root.join(rel);
-    let Ok(rd) = fs::read_dir(&dir) else { return };
-    let mut names: Vec<_> = rd.flatten().map(|e| e.file_name()).collect();
-    names.sort();
-    for n in names {
-        let r = rel.join(&n);
-        let abs = root.join(&r);
-        let Ok(meta) = fs::symlink_metadata(&abs) else {
-            continue;
-        };
-        if meta.is_dir() {
-            walk_files(root, &r, f);
-        } else if meta.is_file() {
-            f(&r, &abs);
-        }
+/// Before a merge folder is replaced: when the user worked in it (its tree is
+/// not what was written or uploaded), move it to
+/// `merges/<slug>.abandoned-<ts>` instead of deleting it. `Some(path)` when it
+/// was moved.
+fn preserve_unfinished_merge(state: &AppState, slug: &str) -> Result<Option<PathBuf>> {
+    let dir = merge_dir(state, slug);
+    if !dir.is_dir() {
+        return Ok(None);
     }
+    let baseline = load_meta(state, slug).and_then(|m| m.uploaded_tree.or(m.written_tree));
+    let now = skill_tree::survey(&dir).ok().map(|s| s.tree_hash);
+    if baseline.is_some() && baseline == now {
+        return Ok(None);
+    }
+    let dest = merges_root(state).join(format!("{slug}.abandoned-{}", stamp()));
+    fs::rename(&dir, &dest).with_context(|| {
+        format!(
+            "could not keep your unfinished merge at {} before replacing it",
+            dir.display()
+        )
+    })?;
+    warn!(slug, saved = %dest.display(), "skill merge: unfinished merge saved aside before it was replaced");
+    Ok(Some(dest))
 }
 
 /// Replace the contents of `live` with `src`, keeping `live`'s Scenery marker
@@ -465,6 +488,8 @@ pub enum MergeOutcome {
         dir: PathBuf,
         head_version: Option<String>,
         conflicts: Vec<String>,
+        /// Where an earlier unfinished merge of yours was kept, if it was replaced.
+        abandoned: Option<PathBuf>,
     },
 }
 
@@ -498,6 +523,7 @@ pub async fn prepare_merge(
         });
     }
     let dir = merge_dir(state, slug);
+    let abandoned = preserve_unfinished_merge(state, slug)?;
     let written = write_merge_tree(&dir, &preview)?;
     let conflicts = written.conflicts();
     let meta = MergeMeta {
@@ -507,6 +533,8 @@ pub async fn prepare_merge(
         head_version: preview.head_version.clone(),
         branch_version_id: preview.branch_version_id.clone(),
         conflicted_files: written.conflicted_text.clone(),
+        sidecar_files: written.sidecar_conflicts.clone(),
+        written_tree: skill_tree::survey(&dir).ok().map(|s| s.tree_hash),
         ..Default::default()
     };
     save_meta(state, slug, &meta)?;
@@ -519,6 +547,7 @@ pub async fn prepare_merge(
         dir,
         head_version: preview.head_version,
         conflicts,
+        abandoned,
     })
 }
 
@@ -551,7 +580,7 @@ pub async fn continue_merge(
             dir.display()
         );
     }
-    let left = remaining_conflicts(&dir, &meta.conflicted_files);
+    let left = remaining_conflicts(&dir, &meta.conflicted_files, &meta.sidecar_files);
     if !left.is_empty() {
         bail!(
             "conflicts remain in {}: {}. Resolve them (remove the <<<<<<< / ======= / >>>>>>> lines, \
@@ -649,6 +678,18 @@ async fn apply_merge_tree(
             Some("the skill has no managed folder on this device".into()),
         ));
     };
+    // The merge was computed from one branch version. If the branch moved since
+    // (a newer synced upload), applying would drop that newer work.
+    if meta.branch_version_id.is_none() || meta.branch_version_id != local.state.local_version_id {
+        return Ok((
+            None,
+            Some(
+                "your branch changed since this merge was computed; the merge is saved only. \
+                 Run `scenery skill merge` again"
+                    .into(),
+            ),
+        ));
+    }
     let live = PathBuf::from(&marker.path);
     // Unsynced edits (the live tree is not what was last uploaded) are never
     // overwritten.
@@ -744,6 +785,9 @@ pub struct MergeEvent {
     pub base_version: Option<String>,
     #[serde(default)]
     pub head_version: Option<String>,
+    /// The branch version this merge was computed from.
+    #[serde(default)]
+    pub branch_version_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -796,6 +840,7 @@ pub async fn handle_merge_event(
         AuthoringReply::Refused(r) => return Err(refusal_error("download", &r)),
     };
     let dir = merge_dir(state, &slug);
+    preserve_unfinished_merge(state, &slug)?;
     let (d, b) = (dir.clone(), bytes);
     tokio::task::spawn_blocking(move || unpack_source(&b, &d))
         .await
@@ -806,8 +851,10 @@ pub async fn handle_merge_event(
         slug: slug.clone(),
         base_version: ev.base_version.clone(),
         head_version: ev.head_version.clone(),
-        branch_version_id: Some(ev.version_id.clone()),
+        branch_version_id: ev.branch_version_id.clone(),
         conflicted_files: vec![],
+        sidecar_files: vec![],
+        written_tree: None,
         uploaded_version: ev.version.clone(),
         uploaded_version_id: Some(ev.version_id.clone()),
         uploaded_tree: Some(tree_hash),

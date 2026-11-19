@@ -185,26 +185,26 @@ fn write_merge_tree_writes_markers_sidecars_and_exec_bits_and_rejects_unsafe_pat
 }
 
 #[test]
-fn remaining_conflicts_sees_markers_theirs_sidecars_and_a_lone_separator_only_in_conflicted_files()
-{
+fn remaining_conflicts_only_looks_at_files_recorded_as_conflicted() {
     let tmp = tempfile::tempdir().unwrap();
     let d = tmp.path();
+    let text = vec!["SKILL.md".to_string()];
+    let side = vec!["x.bin".to_string()];
     fs::write(d.join("SKILL.md"), CONFLICT_MD).unwrap();
     fs::write(d.join("x.bin.theirs"), [1u8, 2]).unwrap();
+    // not recorded as conflicted: neither a marker-like doc nor a stray .theirs counts
+    fs::write(d.join("notes.md"), "<<<<<<< not ours\n>>>>>>>\n").unwrap();
     fs::write(d.join("heading.md"), "Title\n=======\ntext\n").unwrap();
-    fs::write(d.join("blob.bin"), [0xffu8, 0xfe, 0x00]).unwrap();
-    let left = remaining_conflicts(d, &["SKILL.md".to_string()]);
+    fs::write(d.join("other.bin.theirs"), [3u8]).unwrap();
+    let left = remaining_conflicts(d, &text, &side);
     assert_eq!(left, vec!["SKILL.md", "x.bin.theirs"]);
-    // resolved: no markers, sidecar deleted; a setext heading is not a conflict
+    // resolved: markers gone and sidecar deleted
     fs::write(d.join("SKILL.md"), CLEAN_SKILL_MD).unwrap();
     fs::remove_file(d.join("x.bin.theirs")).unwrap();
-    assert!(remaining_conflicts(d, &["SKILL.md".to_string()]).is_empty());
+    assert!(remaining_conflicts(d, &text, &side).is_empty());
     // a leftover separator in a file that WAS conflicted still counts
     fs::write(d.join("SKILL.md"), "a\n=======\nb\n").unwrap();
-    assert_eq!(
-        remaining_conflicts(d, &["SKILL.md".to_string()]),
-        vec!["SKILL.md"]
-    );
+    assert_eq!(remaining_conflicts(d, &text, &side), vec!["SKILL.md"]);
 }
 
 #[test]
@@ -302,6 +302,7 @@ async fn merge_writes_conflicts_aside_continue_refuses_then_uploads_and_apply_sw
         dir,
         conflicts,
         head_version,
+        ..
     } = out
     else {
         panic!("expected a written merge")
@@ -410,7 +411,146 @@ fn event(f: &Fx) -> MergeEvent {
         version: Some("1.1.0+local.x.9".into()),
         base_version: Some("1.1.0".into()),
         head_version: Some("1.1.0".into()),
+        branch_version_id: Some("vid-old".into()),
     }
+}
+
+fn set_local_version_id(f: &Fx, id: &str) {
+    f.conn()
+        .execute(
+            "UPDATE skill_local_state SET local_version_id = ?1 WHERE skill_id = 'cat'",
+            [id],
+        )
+        .unwrap();
+}
+
+async fn mock_clean_preview(f: &mut Fx) {
+    f.server
+        .mock("GET", Matcher::Regex(r"^/runner/skills/cat/merge-preview\?device_id=dev-1$".into()))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            serde_json::to_string(&serde_json::json!({
+                "skill_id":"cat","base_version":"1.0.0","head_version":"1.1.0",
+                "branch_version_id":"vid-old","branch_version":"1.0.0+local.x.1",
+                "clean":true,"up_to_date":false,
+                "files":[
+                  {"path":"SKILL.md","executable":false,"encoding":"utf8","content":CLEAN_SKILL_MD,"conflict":null,"sidecar":false},
+                  {"path":"prompts/p.md","executable":false,"encoding":"utf8","content":"my branch","conflict":null,"sidecar":false}
+                ]
+            }))
+            .unwrap(),
+        )
+        .create_async()
+        .await;
+}
+
+#[tokio::test]
+async fn continue_apply_refuses_when_the_branch_moved_since_the_merge_was_computed() {
+    let mut f = Fx::new().await;
+    let live = f.branch();
+    let before = fs::read(live.join("SKILL.md")).unwrap();
+    mock_clean_preview(&mut f).await;
+    f.server
+        .mock("POST", "/runner/skills/cat/versions/local")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"outcome":"stored","skill_id":"cat","authorship":"catalog","branch_state":"branch","version":"1.1.0+local.x.2","version_id":"vid-new","head_version":"1.1.0","scan":{"verdict":"clean"}}"#)
+        .create_async()
+        .await;
+    let url = f.server.url();
+    prepare_merge(&f.state, &url, "cat").await.unwrap();
+    // a newer, synced branch upload lands between prepare and apply
+    set_local_version_id(&f, "vid-newer");
+    let out = continue_merge(&f.state, &url, "cat", true).await.unwrap();
+    assert!(!out.applied);
+    let why = out.not_applied_reason.unwrap();
+    assert!(why.contains("scenery skill merge"), "{why}");
+    assert_eq!(fs::read(live.join("SKILL.md")).unwrap(), before);
+    let ls = local_edits::load(&f.conn(), "cat").unwrap();
+    assert_eq!(ls.local_version_id.as_deref(), Some("vid-newer"));
+}
+
+#[tokio::test]
+async fn a_merge_event_is_saved_only_when_the_branch_moved_or_the_event_has_no_base() {
+    for base in [None, Some("vid-old")] {
+        let mut f = Fx::new().await;
+        let live = f.branch();
+        mock_source(&mut f).await;
+        let before = fs::read(live.join("SKILL.md")).unwrap();
+        set_local_version_id(&f, "vid-newer");
+        let mut ev = event(&f);
+        ev.branch_version_id = base.map(str::to_string);
+        let url = f.server.url();
+        let out = handle_merge_event(&f.state, &url, ev).await.unwrap();
+        let EventOutcome::SavedOnly { reason, .. } = out else {
+            panic!("expected saved only, got {out:?}")
+        };
+        assert!(reason.contains("scenery skill merge"), "{reason}");
+        assert_eq!(fs::read(live.join("SKILL.md")).unwrap(), before);
+    }
+}
+
+#[tokio::test]
+async fn a_rerun_keeps_an_edited_unfinished_merge_aside_and_replaces_an_untouched_one() {
+    let mut f = Fx::new().await;
+    f.branch();
+    mock_clean_preview(&mut f).await;
+    let url = f.server.url();
+    let first = prepare_merge(&f.state, &url, "cat").await.unwrap();
+    let MergeOutcome::Written { dir, abandoned, .. } = first else {
+        panic!("written")
+    };
+    assert!(abandoned.is_none());
+    // untouched: replaced without a copy
+    let again = prepare_merge(&f.state, &url, "cat").await.unwrap();
+    let MergeOutcome::Written { abandoned, .. } = again else {
+        panic!("written")
+    };
+    assert!(abandoned.is_none());
+    // user work: kept aside
+    fs::write(dir.join("prompts/p.md"), "my resolution").unwrap();
+    let third = prepare_merge(&f.state, &url, "cat").await.unwrap();
+    let MergeOutcome::Written { abandoned, .. } = third else {
+        panic!("written")
+    };
+    let kept = abandoned.unwrap();
+    assert!(kept.to_string_lossy().contains("cat.abandoned-"));
+    assert_eq!(
+        fs::read_to_string(kept.join("prompts/p.md")).unwrap(),
+        "my resolution"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.join("prompts/p.md")).unwrap(),
+        "my branch"
+    );
+}
+
+#[tokio::test]
+async fn a_merge_event_keeps_an_edited_unfinished_merge_aside() {
+    let mut f = Fx::new().await;
+    f.branch();
+    mock_clean_preview(&mut f).await;
+    mock_source(&mut f).await;
+    let url = f.server.url();
+    prepare_merge(&f.state, &url, "cat").await.unwrap();
+    let dir = merge_dir(&f.state, "cat");
+    fs::write(dir.join("prompts/p.md"), "half resolved").unwrap();
+    handle_merge_event(&f.state, &url, event(&f)).await.unwrap();
+    let kept: Vec<_> = fs::read_dir(merges_root(&f.state))
+        .unwrap()
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("cat.abandoned-")
+        })
+        .collect();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(
+        fs::read_to_string(kept[0].path().join("prompts/p.md")).unwrap(),
+        "half resolved"
+    );
 }
 
 async fn mock_source(f: &mut Fx) {
