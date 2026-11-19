@@ -31,10 +31,7 @@ use scenery_core::{
 };
 use scenery_mcp::ownership;
 use serde::{Deserialize, Serialize};
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
+use std::{fs, path::Path};
 use tracing::{debug, info, warn};
 
 // ── Backup manifest ───────────────────────────────────────────────────────────
@@ -235,7 +232,6 @@ pub async fn migrate_item(
                 // Drop the backup copy made above: nothing was adopted, so
                 // there is nothing to roll back to.
                 let backup_dir = match item.kind {
-                    ItemKind::Skill => Some(backup_root.join("skills").join(&item.slug)),
                     ItemKind::Plugin => Some(backup_root.join("plugins").join(&item.slug)),
                     ItemKind::Mcp => None,
                 };
@@ -277,7 +273,7 @@ pub async fn migrate_item(
 
     // For skills and plugins also write the sidecar file into the item's dir.
     match item.kind {
-        ItemKind::Skill | ItemKind::Plugin => {
+        ItemKind::Plugin => {
             if let Err(e) = write_file_marker(
                 &item.source_path,
                 maybe_installation_id.as_deref(),
@@ -296,11 +292,6 @@ pub async fn migrate_item(
     // ── 5. Manifest entry ─────────────────────────────────────────────────────
     // Derive the backup path for this item so the rollback module can restore it.
     let backup_path = match item.kind {
-        ItemKind::Skill => backup_root
-            .join("skills")
-            .join(&item.slug)
-            .to_string_lossy()
-            .to_string(),
         ItemKind::Plugin => backup_root
             .join("plugins")
             .join(&item.slug)
@@ -331,7 +322,7 @@ pub async fn migrate_item(
     // still recorded now — same `config_edit` vocabulary as `write_mcp_entry`
     // — so the ledger already has an entry once the live rewrite lands.
     let (journal_op, journal_target) = match item.kind {
-        ItemKind::Skill | ItemKind::Plugin => (JournalOp::FileReplace, path_key.clone()),
+        ItemKind::Plugin => (JournalOp::FileReplace, path_key.clone()),
         ItemKind::Mcp => (
             JournalOp::ConfigEdit,
             item.files
@@ -385,11 +376,6 @@ pub async fn migrate_item(
 
 fn backup_item(item: &MigrationItem, backup_root: &Path) -> Result<()> {
     match item.kind {
-        ItemKind::Skill => {
-            let dest = backup_root.join("skills").join(&item.slug);
-            copy_dir_recursive(&item.source_path, &dest)
-                .with_context(|| format!("failed to backup skill dir to {}", dest.display()))?;
-        }
         ItemKind::Plugin => {
             let dest = backup_root.join("plugins").join(&item.slug);
             copy_dir_recursive(&item.source_path, &dest)
@@ -438,11 +424,6 @@ struct MigratedItem {
     installation_id: String,
     #[allow(dead_code)]
     is_new: bool,
-    /// Registry name, when the backend registered this skill under a name
-    /// other than its folder (another user's private skill held the folder
-    /// name). Absent from older backends.
-    #[serde(default)]
-    skill_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -543,15 +524,6 @@ async fn post_migrate(
     }
 
     let first = migrate_resp.migrated.into_iter().next();
-    if let Some(registry_id) = first
-        .as_ref()
-        .and_then(|m| m.skill_id.as_deref())
-        .filter(|id| *id != item.slug)
-    {
-        if let Err(e) = state.record_skill_local_name(registry_id, &item.slug) {
-            warn!(slug = %item.slug, error = %e, "managed_paths: failed to record skill local name");
-        }
-    }
     let installation_id = first.map(|m| m.installation_id);
 
     Ok(installation_id)
@@ -566,24 +538,12 @@ async fn post_migrate(
 /// key cannot be mapped to.
 fn is_revoked_locally(state: &AppState, item: &MigrationItem) -> Result<bool> {
     match item.kind {
-        ItemKind::Skill => skill_slug_revoked(state, &item.slug),
-        ItemKind::Plugin => artifact_whole_revoked(state, "plugin", &item.slug, false),
+        ItemKind::Plugin => artifact_whole_revoked(state, "plugin", &item.slug),
         ItemKind::Mcp => Ok(false),
     }
 }
 
-/// Is skill folder `slug` covered by a whole-artifact revocation (by registry
-/// name or by the local folder a registry name is recorded under)?
-pub(crate) fn skill_slug_revoked(state: &AppState, slug: &str) -> Result<bool> {
-    artifact_whole_revoked(state, "skill", slug, true)
-}
-
-fn artifact_whole_revoked(
-    state: &AppState,
-    artifact_type: &str,
-    slug: &str,
-    resolve_local_name: bool,
-) -> Result<bool> {
+fn artifact_whole_revoked(state: &AppState, artifact_type: &str, slug: &str) -> Result<bool> {
     let entries =
         scenery_core::revocation::list_all(state).context("failed to read the revocation cache")?;
     for e in entries {
@@ -591,9 +551,7 @@ fn artifact_whole_revoked(
         if e.artifact_type != artifact_type || !whole {
             continue;
         }
-        if e.artifact_key == slug
-            || (resolve_local_name && state.skill_local_name(&e.artifact_key) == slug)
-        {
+        if e.artifact_key == slug {
             return Ok(true);
         }
     }
@@ -604,7 +562,6 @@ fn artifact_whole_revoked(
 /// canonicalised — see step 0.5 in [`migrate_item`]).
 fn is_tracked(conn: &Connection, item: &MigrationItem) -> Result<bool> {
     let kind = match item.kind {
-        ItemKind::Skill => "skill",
         ItemKind::Plugin => "plugin",
         // MCP rows are keyed on the virtual `<claude.json>:<key>` path, which
         // the exact-path check already covers.
@@ -612,24 +569,6 @@ fn is_tracked(conn: &Connection, item: &MigrationItem) -> Result<bool> {
     };
     if tracked_marker_for_path(conn, kind, &item.source_path)?.is_some() {
         return Ok(true);
-    }
-    // Copy-mode link (Windows without symlink support): `~/.claude/skills/<slug>`
-    // is a real copy of our canonical `~/.agents/skills/<slug>` dir, so the
-    // paths do not canonicalise together. Accept it only when a row exists at
-    // the canonical path AND the copy's content hash equals that row's.
-    if item.kind == ItemKind::Skill {
-        if let (Some(link_dir), Some(canonical_root)) = (
-            super::paths::claude_skills_link_dir(),
-            super::paths::agents_skills_dir(),
-        ) {
-            if item.source_path.parent() == Some(link_dir.as_path()) {
-                if let Some(row) =
-                    tracked_marker_for_path(conn, "skill", &canonical_root.join(&item.slug))?
-                {
-                    return Ok(row.source_sha256 == item.canonical_hash);
-                }
-            }
-        }
     }
     Ok(false)
 }
@@ -646,11 +585,6 @@ fn is_tracked(conn: &Connection, item: &MigrationItem) -> Result<bool> {
 pub(crate) fn migrate_payload(item: &MigrationItem) -> serde_json::Value {
     let mut out = serde_json::Map::new();
     match item.kind {
-        ItemKind::Skill => {
-            if let Some(md) = item.payload.get("skill_md").filter(|v| v.is_string()) {
-                out.insert("skill_md".to_string(), md.clone());
-            }
-        }
         ItemKind::Plugin => {
             let raw = item
                 .payload
@@ -724,274 +658,6 @@ fn buffer_audit_event(
     )
     .context("managed_paths: failed to insert audit event")?;
     Ok(())
-}
-
-// ── ~/.claude/skills → ~/.agents/skills one-shot migration ────────────────────
-
-/// One-shot migration: move Scenery-managed skills from
-/// `~/.claude/skills/<slug>/` to `~/.agents/skills/<slug>/` and leave a
-/// symlink behind for Claude Code.
-///
-/// Only directories carrying a `.scenery-managed.json` marker are touched —
-/// user-authored skills in the same directory are left exactly as they are.
-/// Idempotent: already-migrated skills (the Claude path is a symlink) are
-/// skipped, so this is safe to run on every daemon start.
-///
-/// Returns the number of skills whose content was actually *moved* this run.
-/// Relink-only and re-key-only outcomes are not counted — they are repairs,
-/// not migrations.
-///
-/// # Failure handling
-///
-/// Every per-entry step is isolated: a skill that cannot be migrated is logged
-/// and skipped, and the remaining skills still migrate. Only a failure to read
-/// `~/.claude/skills` itself aborts the run, and even then the caller treats a
-/// migration failure as non-fatal — this never blocks daemon start.
-pub fn migrate_skills_to_agents_dir(conn: &Connection) -> Result<usize> {
-    if super::pusher::reconciler_disabled() {
-        return Ok(0);
-    }
-
-    let Some(claude_skills) = super::paths::claude_skills_link_dir() else {
-        return Ok(0);
-    };
-    let Some(canonical_root) = super::paths::agents_skills_dir() else {
-        return Ok(0);
-    };
-
-    // ── Repair pass ───────────────────────────────────────────────────────────
-    // Runs FIRST and unconditionally, before any filesystem walk, because the
-    // re-key must not depend on a move happening in the same call. A crash
-    // between the `rename` and the `UPDATE` used to leave a row keyed on the
-    // old Claude path that nothing could ever repair: the entry is a symlink
-    // by then, so the migration loop skips it forever. Driving the repair off
-    // the DB instead of off the directory entry also covers the case where the
-    // symlink itself was deleted — there is no entry left to walk, but the
-    // stale row is still there.
-    if let Err(e) = repair_stale_skill_markers(conn, &claude_skills, &canonical_root) {
-        warn!(error = %e, "migrator: stale skill marker repair failed (non-fatal)");
-    }
-
-    if !claude_skills.is_dir() {
-        return Ok(0);
-    }
-
-    let mut migrated = 0usize;
-
-    for entry in std::fs::read_dir(&claude_skills)
-        .with_context(|| format!("migrator: failed to read {}", claude_skills.display()))?
-    {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(e) => {
-                warn!(error = %e, "migrator: failed to read dir entry — skipping");
-                continue;
-            }
-        };
-        let old_path = entry.path();
-        let Some(slug) = old_path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .map(|s| s.to_string())
-        else {
-            continue;
-        };
-
-        match migrate_one_legacy_skill(conn, &old_path, &canonical_root, &slug) {
-            Ok(true) => {
-                migrated += 1;
-                info!(slug, "migrator: skill migrated to ~/.agents/skills/");
-            }
-            Ok(false) => {}
-            Err(e) => {
-                // Per-entry isolation: one bad skill must never block the rest,
-                // on this run or on any subsequent daemon start.
-                warn!(
-                    slug,
-                    error = %e,
-                    "migrator: failed to migrate skill — skipping (other skills unaffected)"
-                );
-            }
-        }
-    }
-
-    Ok(migrated)
-}
-
-/// Migrate a single `~/.claude/skills/<slug>` entry.
-///
-/// `Ok(true)` means content was moved to the canonical root; `Ok(false)` means
-/// the entry needed no move (already migrated, not ours, or repaired in place).
-fn migrate_one_legacy_skill(
-    conn: &Connection,
-    old_path: &Path,
-    canonical_root: &Path,
-    slug: &str,
-) -> Result<bool> {
-    // Already migrated, or someone else's link — leave it. Any stale DB row
-    // for this path was already fixed by `repair_stale_skill_markers`.
-    if old_path.is_symlink() || !old_path.is_dir() {
-        return Ok(false);
-    }
-    // Not ours — user-authored skill. Never moved, linked, backed up or marked.
-    if !scenery_mcp::ownership::is_scenery_managed(old_path) {
-        return Ok(false);
-    }
-
-    let new_path = canonical_root.join(slug);
-
-    if !new_path.exists() {
-        std::fs::create_dir_all(canonical_root)
-            .with_context(|| format!("migrator: failed to create {}", canonical_root.display()))?;
-        std::fs::rename(old_path, &new_path).with_context(|| {
-            format!(
-                "migrator: failed to move {} -> {}",
-                old_path.display(),
-                new_path.display()
-            )
-        })?;
-        super::links::link_dir(&new_path, old_path)
-            .with_context(|| format!("migrator: failed to link {}", old_path.display()))?;
-        rekey_skill_marker(conn, old_path, &new_path)?;
-        return Ok(true);
-    }
-
-    // ── Canonical already exists ──────────────────────────────────────────────
-    // This is not legacy content awaiting a move — it is a Claude-side copy
-    // sitting alongside a canonical directory that already has the content.
-    // Hand it to `link_dir`, which owns the decision:
-    //
-    //   * already byte-identical to canonical — returns `LinkMode::Copy`
-    //     having touched nothing, so a copy-mode host does not mint a fresh
-    //     backup on every daemon start;
-    //   * diverged — backs the Claude-side content up to
-    //     `~/.claude/.scenery-backup/<ts>/links/` (which `migrate rollback`
-    //     deliberately does not list — manual recovery only) and replaces it
-    //     with a link.
-    //
-    // Either way the DB row must end up keyed on canonical.
-    debug!(
-        slug,
-        canonical = %new_path.display(),
-        "migrator: canonical dir already exists — reconciling the Claude-side copy"
-    );
-    super::links::link_dir(&new_path, old_path)
-        .with_context(|| format!("migrator: failed to link {}", old_path.display()))?;
-    rekey_skill_marker(conn, old_path, &new_path)?;
-    Ok(false)
-}
-
-/// Re-point the `managed_path_markers` row for a skill from `old_path` to the
-/// canonical `new_path`. Idempotent, and safe to call when no row exists.
-///
-/// If a canonical row already exists (a `push_skill` between the move and this
-/// call inserts one, and `PRIMARY KEY (path)` happily lets both coexist), the
-/// stale row is deleted rather than merged: the canonical row carries the
-/// fresher hash, whereas the orphan carries the pre-push one and would report
-/// `DriftStatus::Drifted` on every reconcile cycle — `drift::current_hash_for`
-/// reads `<marker.path>/SKILL.md`, which follows the symlink through to the
-/// canonical content.
-fn rekey_skill_marker(conn: &Connection, old_path: &Path, new_path: &Path) -> Result<()> {
-    let old_key = old_path.to_string_lossy().to_string();
-    let new_key = new_path.to_string_lossy().to_string();
-    if old_key == new_key {
-        return Ok(());
-    }
-
-    conn.execute(
-        "DELETE FROM managed_path_markers \
-         WHERE path = ?1 AND kind = 'skill' \
-           AND EXISTS (SELECT 1 FROM managed_path_markers WHERE path = ?2 AND kind = 'skill')",
-        rusqlite::params![old_key, new_key],
-    )
-    .context("migrator: failed to drop superseded managed_path_markers row")?;
-
-    conn.execute(
-        "UPDATE managed_path_markers SET path = ?1 WHERE path = ?2 AND kind = 'skill'",
-        rusqlite::params![new_key, old_key],
-    )
-    .context("migrator: failed to repoint managed_path_markers")?;
-
-    Ok(())
-}
-
-/// Re-point every `kind='skill'` marker row still keyed under
-/// `~/.claude/skills/<slug>` onto a canonical counterpart that exists on disk
-/// **and is Scenery-managed**.
-///
-/// Two conditions must both hold, and neither is sufficient alone:
-///
-///   * The Claude-side entry is NOT a real directory — a symlink (the settled
-///     post-migration state) or nothing at all (the link was deleted). A real
-///     directory still sitting there is deliberately left to the migration
-///     loop, which is the only place that knows whether that content is ours.
-///   * The canonical directory carries a `.scenery-managed.json` marker.
-///     Slug collision is not proof of identity: a row for an F1-adopted *user*
-///     skill whose directory the user deleted would otherwise be re-keyed onto
-///     an unrelated same-slug directory, whose sha can never match the row's —
-///     a permanent false-drift row. Left alone, drift correctly classifies the
-///     vanished path as DELETED and drops the marker.
-///
-/// This pass runs only at daemon start, so it repairs rows that exist *at that
-/// moment*; a row orphaned by a `push_skill` on an already-running daemon
-/// survives until the next start. That bounds the orphan by a restart rather
-/// than eliminating it.
-///
-/// Returns the number of rows repaired.
-fn repair_stale_skill_markers(
-    conn: &Connection,
-    claude_skills: &Path,
-    canonical_root: &Path,
-) -> Result<usize> {
-    let keys: Vec<String> = {
-        let mut stmt = conn
-            .prepare("SELECT path FROM managed_path_markers WHERE kind = 'skill'")
-            .context("migrator: failed to prepare marker scan")?;
-        let rows = stmt
-            .query_map([], |r| r.get::<_, String>(0))
-            .context("migrator: failed to query managed_path_markers")?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .context("migrator: failed to read managed_path_markers rows")?
-    };
-
-    let mut repaired = 0usize;
-    for key in keys {
-        let old_path = PathBuf::from(&key);
-        if old_path.parent() != Some(claude_skills) {
-            continue;
-        }
-        // A real directory here is still the migration loop's business.
-        if matches!(std::fs::symlink_metadata(&old_path), Ok(m) if m.is_dir()) {
-            continue;
-        }
-        let Some(name) = old_path.file_name() else {
-            continue;
-        };
-        let new_path = canonical_root.join(name);
-        if !new_path.is_dir() {
-            continue;
-        }
-        // Same slug is not the same skill. Only re-key onto content we own.
-        if !ownership::is_scenery_managed(&new_path) {
-            debug!(
-                from = %key,
-                candidate = %new_path.display(),
-                "migrator: canonical dir with this slug is not Scenery-managed — \
-                 leaving the stale row for drift to retire"
-            );
-            continue;
-        }
-
-        rekey_skill_marker(conn, &old_path, &new_path)?;
-        repaired += 1;
-        info!(
-            from = %key,
-            to = %new_path.display(),
-            "migrator: repaired stale managed_path_markers row"
-        );
-    }
-
-    Ok(repaired)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

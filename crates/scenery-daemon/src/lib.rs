@@ -475,26 +475,6 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
         }
     }
 
-    // ── Task 5: ~/.claude/skills → ~/.agents/skills one-shot migration ───────
-    //
-    // Every existing user has real managed skill directories at
-    // ~/.claude/skills/<slug>/ with SQLite rows keyed on those old paths (the
-    // pre-pivot layout). Run this before F1's migrate_existing() below so F1
-    // always scans an already-normalized ~/.claude/skills/ (real managed dirs
-    // converted to symlinks) rather than a transitional mix of the two
-    // layouts. Idempotent and gated by the same env var; failure is
-    // non-fatal — log and continue, never block daemon start.
-    if std::env::var("SCENERY_DISABLE_FILESYSTEM_RECONCILER").is_err() {
-        match rusqlite::Connection::open(&state.db_path) {
-            Ok(conn) => match managed_paths::migrator::migrate_skills_to_agents_dir(&conn) {
-                Ok(0) => {}
-                Ok(n) => info!(count = n, "migrated skills to ~/.agents/skills/"),
-                Err(e) => warn!(error = %e, "skill migration to ~/.agents/skills/ failed"),
-            },
-            Err(e) => warn!(error = %e, "skill migration: failed to open state DB (non-fatal)"),
-        }
-    }
-
     // ── Native-content cleanup ────────────────────────────────────────────────
     //
     // Earlier builds adopted plugins from Anthropic's official marketplace
@@ -539,21 +519,19 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
             Ok(reconciler) => match reconciler.migrate_existing().await {
                 Ok(report) => {
                     info!(
-                        skills = report.skills_migrated,
                         plugins = report.plugins_migrated,
                         mcps = report.mcps_migrated,
                         errors = report.errors.len(),
                         "managed_paths: first-run migration complete"
                     );
-                    let adopted =
-                        report.skills_migrated + report.plugins_migrated + report.mcps_migrated;
+                    let adopted = report.plugins_migrated + report.mcps_migrated;
                     if adopted > 0 && !headless {
                         let msg = format!(
                             "Scenery adopted {adopted} tool(s) for governance \
-                             ({} skill(s), {} plugin(s), {} MCP server(s)). They are private \
+                             ({} plugin(s), {} MCP server(s)). They are private \
                              and pending IT review — review them in the portal, or run \
                              `scenery migrate rollback` to undo.",
-                            report.skills_migrated, report.plugins_migrated, report.mcps_migrated
+                            report.plugins_migrated, report.mcps_migrated
                         );
                         if let Ok(mut guard) = pending_alert.lock() {
                             *guard = Some((msg, std::time::Instant::now()));

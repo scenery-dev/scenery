@@ -1023,11 +1023,11 @@ async fn device_revoked_403_still_stops_after_degraded_401s() {
     assert_eq!(fake.event_times.lock().unwrap().len(), 6);
 }
 
-/// A revoked slug's source dir must never be copied into the managed dirs,
-/// even briefly; a non-revoked one still is (control).
+/// The legacy adopt/publish pushes were removed in AUTO-MANAGE Phase 8: an old
+/// backend (or stale queue) emitting them must not copy anything onto disk.
 #[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread")]
-async fn discovery_adopted_does_not_copy_a_revoked_slug() {
+async fn legacy_discovery_events_do_nothing() {
     let _guard = crate::managed_paths::ENV_MUTEX
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -1036,51 +1036,29 @@ async fn discovery_adopted_does_not_copy_a_revoked_slug() {
     std::env::set_var("HOME", home.path());
 
     let (state, _tmp) = bootstrap_state();
-    scenery_core::revocation::upsert_revocation(&state, "skill", "revoked-adopt", None).unwrap();
     let (tx, _rx) = tokio::sync::mpsc::channel(4);
     let mut last_event_id = None;
-    for slug in ["revoked-adopt", "fine-adopt"] {
-        let src = home.path().join("src").join(slug);
-        std::fs::create_dir_all(&src).unwrap();
-        std::fs::write(src.join("SKILL.md"), format!("---\nname: {slug}\n---\n")).unwrap();
+    let src = home.path().join("src").join("legacy");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("SKILL.md"), "---\nname: legacy\n---\n").unwrap();
+    for ev in ["discovery_adopted", "discovery_publish_requested"] {
         let data = serde_json::json!({
-            "slug": slug, "kind": "skill", "source_path": src.to_string_lossy(),
+            "slug": "legacy", "kind": "skill", "source_path": src.to_string_lossy(),
+            "discovery_id": "d1",
         })
         .to_string();
-        dispatch_event(
-            "discovery_adopted",
-            &data,
-            &None,
-            &mut last_event_id,
-            &state,
-            &tx,
-        )
-        .await
-        .unwrap();
+        // Unknown event types are an error from the parser, never an action.
+        let _ = dispatch_event(ev, &data, &None, &mut last_event_id, &state, &tx).await;
     }
-
-    let fine = home.path().join(".agents/skills/fine-adopt");
-    for _ in 0..100 {
-        if fine.exists() {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    let fine_pushed = fine.exists();
-    let revoked_copied = home.path().join(".agents/skills/revoked-adopt").exists()
-        || home
-            .path()
-            .join(".claude/skills/revoked-adopt")
-            .symlink_metadata()
-            .is_ok();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let copied = home.path().join(".agents/skills/legacy").exists();
 
     if let Some(v) = prev {
         std::env::set_var("HOME", v);
     } else {
         std::env::remove_var("HOME");
     }
-    assert!(fine_pushed, "control: a non-revoked adopt is still pushed");
-    assert!(!revoked_copied, "a revoked slug must not be copied");
+    assert!(!copied, "a legacy adopt event must not copy anything");
 }
 
 // ── M5: byte-level line splitting ────────────────────────────────────────────

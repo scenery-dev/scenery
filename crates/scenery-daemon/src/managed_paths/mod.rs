@@ -1,27 +1,22 @@
 //! Managed-paths filesystem reconciler — Phase F1.
 //!
-//! On daemon startup, scans three watched paths, migrates existing items into
-//! Scenery's DB as locally-owned submissions, and backs up originals before
-//! taking ownership.  No quarantine, no drift detection, no write-on-install
-//! yet — those are F3 and F2 respectively.
+//! On daemon startup, scans two watched paths, migrates existing plugins and
+//! MCP entries into Scenery's DB as locally-owned submissions, and backs up
+//! originals before taking ownership.
 //!
 //! # Watched paths (macOS + Linux)
 //!
 //! | Path                  | What we scan                              |
 //! |-----------------------|-------------------------------------------|
-//! | `~/.claude/skills/`   | Immediate subdirs that contain `SKILL.md` |
 //! | `~/.claude/plugins/`  | Immediate subdirs, excluding Anthropic    |
 //! |                       | plumbing dirs (marketplaces/cache/data)   |
 //! | `~/.claude.json`      | `mcpServers` object (excluding `scenery`) |
 //!
-//! F1 still *scans* `~/.claude/skills/` — that is where a Claude Code user's
-//! own skills live — but it is no longer where managed skills land. Since the
-//! pivot, adopted skills are written to the canonical `~/.agents/skills/<slug>/`
-//! and surfaced to Claude Code via a symlink at `~/.claude/skills/<slug>`, so
-//! this scan sees a mix of real user directories (adoptable) and Scenery's
-//! own links (skipped). `migrator::migrate_skills_to_agents_dir` normalises
-//! the pre-pivot layout before this runs; unmanaged skill *discovery* in the
-//! canonical root is `discoveries.rs`'s job, not F1's.
+//! Skills are NOT migrated here. Since AUTO-MANAGE Phase 8 (plan
+//! `context/2026-11-16-auto-manage-adoption-plan.md`) every skill found on the
+//! device, including those under `~/.claude/skills/`, goes through
+//! `discoveries.rs` and the auto-manage converter (`auto_manage.rs`); the old
+//! F1 skill migrator re-adopted skills that auto-manage already tracked.
 //!
 //! # Idempotency
 //!
@@ -35,7 +30,6 @@
 //! itself returns `Ok(MigrationReport)` unless something catastrophic prevents
 //! even opening the DB.  Migration failure must NOT crash the daemon.
 
-pub mod adopt_publish;
 pub mod authoring;
 pub mod auto_manage;
 pub mod builtin;
@@ -54,7 +48,6 @@ pub mod own_uninstall;
 pub mod paths;
 pub mod plugin_marketplace;
 pub mod projection_outcome;
-pub mod publish;
 pub mod pusher;
 pub mod rollback;
 pub mod scanner;
@@ -116,7 +109,6 @@ pub struct MigrationError {
 /// Which category of managed path item this is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ItemKind {
-    Skill,
     Plugin,
     Mcp,
 }
@@ -124,7 +116,6 @@ pub enum ItemKind {
 impl std::fmt::Display for ItemKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ItemKind::Skill => write!(f, "skill"),
             ItemKind::Plugin => write!(f, "plugin"),
             ItemKind::Mcp => write!(f, "mcp"),
         }
@@ -134,7 +125,6 @@ impl std::fmt::Display for ItemKind {
 /// Summary produced by one `migrate_existing` run.
 #[derive(Debug, Default)]
 pub struct MigrationReport {
-    pub skills_migrated: usize,
     pub plugins_migrated: usize,
     pub mcps_migrated: usize,
     pub backed_up_to: Option<PathBuf>,
@@ -168,7 +158,6 @@ impl ManagedPathsReconciler {
         let home = dirs::home_dir()
             .ok_or_else(|| anyhow::anyhow!("managed_paths: HOME directory not resolvable"))?;
 
-        let skills_dir = home.join(".claude").join("skills");
         let plugins_dir = home.join(".claude").join("plugins");
         let claude_json = home.join(".claude.json");
 
@@ -180,44 +169,6 @@ impl ManagedPathsReconciler {
             backed_up_to: Some(backup_root.clone()),
             ..Default::default()
         };
-
-        // ── Skills ────────────────────────────────────────────────────────────
-        let skill_items = match scanner::scan_skills_dir(&skills_dir) {
-            Ok(items) => items,
-            Err(e) => {
-                warn!(error = %e, "managed_paths: failed to scan skills dir; skipping skills");
-                vec![]
-            }
-        };
-
-        for item in skill_items {
-            let slug = item.slug.clone();
-            match migrator::migrate_item(
-                &item,
-                &backup_root,
-                &self.state,
-                &self.registry_url,
-                &self.http_client,
-            )
-            .await
-            {
-                Ok(true) => {
-                    info!(slug = %slug, kind = %item.kind, "managed_paths: migrated");
-                    report.skills_migrated += 1;
-                }
-                Ok(false) => {
-                    // Already tracked — idempotent skip.
-                }
-                Err(e) => {
-                    warn!(slug = %slug, error = %e, "managed_paths: migration failed for skill");
-                    report.errors.push(MigrationError {
-                        slug,
-                        kind: ItemKind::Skill,
-                        message: e.to_string(),
-                    });
-                }
-            }
-        }
 
         // ── Plugins ───────────────────────────────────────────────────────────
         // Two layouts: legacy immediate-child dirs under ~/.claude/plugins/, and

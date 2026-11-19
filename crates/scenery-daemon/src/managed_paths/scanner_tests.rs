@@ -3,13 +3,6 @@
 use super::*;
 use std::fs;
 
-fn write_skill_dir(base: &std::path::Path, slug: &str, skill_md: &str) -> std::path::PathBuf {
-    let dir = base.join(slug);
-    fs::create_dir_all(&dir).unwrap();
-    fs::write(dir.join("SKILL.md"), skill_md).unwrap();
-    dir
-}
-
 fn write_plugin_dir(base: &std::path::Path, slug: &str, manifest: &str) -> std::path::PathBuf {
     let dir = base.join(slug).join(".claude-plugin");
     fs::create_dir_all(&dir).unwrap();
@@ -21,107 +14,6 @@ fn write_claude_json(base: &std::path::Path, content: &str) -> std::path::PathBu
     let path = base.join(".claude.json");
     fs::write(&path, content).unwrap();
     path
-}
-
-// ── Skills ────────────────────────────────────────────────────────────────────
-
-#[test]
-fn scan_skills_empty_dir_returns_empty() {
-    let tmp = tempfile::tempdir().unwrap();
-    let skills = tmp.path().join("skills");
-    fs::create_dir_all(&skills).unwrap();
-    let items = scan_skills_dir(&skills).unwrap();
-    assert!(items.is_empty());
-}
-
-#[test]
-fn scan_skills_nonexistent_dir_returns_empty() {
-    let items = scan_skills_dir(std::path::Path::new("/tmp/does-not-exist-managed-paths")).unwrap();
-    assert!(items.is_empty());
-}
-
-#[test]
-fn scan_skills_one_valid_skill() {
-    let tmp = tempfile::tempdir().unwrap();
-    let skills = tmp.path().join("skills");
-    fs::create_dir_all(&skills).unwrap();
-    write_skill_dir(&skills, "my-skill", "---\nname: my-skill\n---\nHelp text");
-
-    let items = scan_skills_dir(&skills).unwrap();
-    assert_eq!(items.len(), 1);
-    let item = &items[0];
-    assert_eq!(item.slug, "my-skill");
-    assert_eq!(item.kind, ItemKind::Skill);
-    assert!(!item.canonical_hash.is_empty());
-    assert!(item.files.iter().any(|f| f.ends_with("SKILL.md")));
-}
-
-#[test]
-fn scan_skills_missing_skill_md_skipped() {
-    let tmp = tempfile::tempdir().unwrap();
-    let skills = tmp.path().join("skills");
-    fs::create_dir_all(&skills).unwrap();
-    // Dir with no SKILL.md — should be skipped.
-    fs::create_dir_all(skills.join("bad-skill")).unwrap();
-    // Dir with SKILL.md — should be found.
-    write_skill_dir(&skills, "good-skill", "---\nname: good-skill\n---");
-
-    let items = scan_skills_dir(&skills).unwrap();
-    assert_eq!(items.len(), 1);
-    assert_eq!(items[0].slug, "good-skill");
-}
-
-#[test]
-fn scan_skills_files_in_root_skipped() {
-    let tmp = tempfile::tempdir().unwrap();
-    let skills = tmp.path().join("skills");
-    fs::create_dir_all(&skills).unwrap();
-    // A plain file — should be skipped (not a dir).
-    fs::write(skills.join("README.md"), "hi").unwrap();
-
-    let items = scan_skills_dir(&skills).unwrap();
-    assert!(items.is_empty());
-}
-
-/// F13: the scanner no longer trusts the `.scenery-managed.json` file —
-/// anyone can drop one into a skill. It hands every well-formed dir to the
-/// migrator, which decides ownership from `managed_path_markers` (exact
-/// canonical path + hash). So both a forged-marker dir and the production
-/// symlink shape (`~/.claude/skills/<slug>` -> canonical managed dir) are
-/// returned here; `migrator_tests` pins that the real managed one is skipped.
-#[test]
-fn scan_skills_returns_marked_dirs_for_the_migrator_to_judge() {
-    let tmp = tempfile::tempdir().unwrap();
-    let skills = tmp.path().join("skills");
-    fs::create_dir_all(&skills).unwrap();
-
-    let canonical_root = tmp.path().join("agents-skills");
-    let canonical_dir = write_skill_dir(
-        &canonical_root,
-        "managed-skill",
-        "---\nname: managed-skill\n---",
-    );
-    fs::write(
-        canonical_dir.join(scenery_mcp::ownership::MANAGED_MARKER_FILENAME),
-        r#"{"marker_version":1,"installation_id":null,"source_sha256":"abc","migrated_at":"2026-01-01T00:00:00Z"}"#,
-    )
-    .unwrap();
-    std::os::unix::fs::symlink(&canonical_dir, skills.join("managed-skill")).unwrap();
-
-    // A third-party skill that ships a forged marker.
-    let forged = write_skill_dir(&skills, "forged-skill", "---\nname: forged-skill\n---");
-    fs::write(
-        forged.join(scenery_mcp::ownership::MANAGED_MARKER_FILENAME),
-        "{}",
-    )
-    .unwrap();
-
-    write_skill_dir(&skills, "native-skill", "---\nname: native-skill\n---");
-
-    let items = scan_skills_dir(&skills).unwrap();
-    let mut slugs: Vec<&str> = items.iter().map(|i| i.slug.as_str()).collect();
-    slugs.sort();
-    assert_eq!(slugs, vec!["forged-skill", "managed-skill", "native-skill"]);
 }
 
 // ── Plugins ───────────────────────────────────────────────────────────────────

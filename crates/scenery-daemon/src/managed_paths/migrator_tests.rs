@@ -1,7 +1,6 @@
 #![allow(clippy::unwrap_used)]
 
 use super::*;
-use crate::managed_paths::ENV_MUTEX;
 use scenery_core::state::AppState;
 use std::fs;
 
@@ -14,36 +13,38 @@ fn temp_state() -> (AppState, tempfile::TempDir) {
     (state, tmp)
 }
 
-fn skill_item(slug: &str, dir: &std::path::Path) -> MigrationItem {
+fn plugin_item(slug: &str, dir: &std::path::Path) -> MigrationItem {
     let source_path = dir.join(slug);
-    fs::create_dir_all(&source_path).unwrap();
-    let skill_md = source_path.join("SKILL.md");
-    fs::write(&skill_md, "---\nname: test\n---\n").unwrap();
+    let manifest_dir = source_path.join(".claude-plugin");
+    fs::create_dir_all(&manifest_dir).unwrap();
+    let manifest = manifest_dir.join("plugin.json");
+    fs::write(&manifest, r#"{"name":"test"}"#).unwrap();
     MigrationItem {
-        kind: ItemKind::Skill,
+        kind: ItemKind::Plugin,
         slug: slug.to_string(),
         source_path: source_path.clone(),
-        files: vec![skill_md],
+        files: vec![manifest],
         canonical_hash: "deadbeef1234".to_string(),
-        payload: serde_json::json!({"skill_md": "---\nname: test\n---\n"}),
+        payload: serde_json::json!({"manifest_json": {"name": "test"}}),
     }
 }
 
 // ── Backup tests ──────────────────────────────────────────────────────────────
 
 #[test]
-fn backup_skill_item_copies_files() {
+fn backup_plugin_item_copies_files() {
     let tmp = tempfile::tempdir().unwrap();
-    let item = skill_item("backup-skill", tmp.path());
+    let item = plugin_item("backup-skill", tmp.path());
     let backup_root = tmp.path().join("backup");
 
     backup_item(&item, &backup_root).unwrap();
 
-    let backed_up_skill_md = backup_root
-        .join("skills")
+    let backed_up = backup_root
+        .join("plugins")
         .join("backup-skill")
-        .join("SKILL.md");
-    assert!(backed_up_skill_md.exists(), "SKILL.md should be backed up");
+        .join(".claude-plugin")
+        .join("plugin.json");
+    assert!(backed_up.exists(), "plugin.json should be backed up");
 }
 
 #[test]
@@ -99,7 +100,7 @@ fn backup_mcp_item_idempotent_for_claude_json() {
 async fn migrate_item_idempotent_second_run_is_noop() {
     let tmp = tempfile::tempdir().unwrap();
     let (state, _guard) = temp_state();
-    let item = skill_item("idem-skill", tmp.path());
+    let item = plugin_item("idem-skill", tmp.path());
     let backup_root = tmp.path().join("backup");
 
     // Pre-seed the marker so the first call is also a no-op for this test.
@@ -131,10 +132,10 @@ async fn migrate_item_idempotent_second_run_is_noop() {
 /// marker row, so the drift reconciler now governs it. Runs offline: with no
 /// auth token the backend POST is skipped, but ownership is still taken.
 #[tokio::test]
-async fn migrate_item_marks_adopted_skill_as_managed() {
+async fn migrate_item_marks_adopted_plugin_as_managed() {
     let tmp = tempfile::tempdir().unwrap();
     let (state, _guard) = temp_state();
-    let item = skill_item("adopt-me", tmp.path());
+    let item = plugin_item("adopt-me", tmp.path());
     let backup_root = tmp.path().join("backup");
 
     let client = reqwest::Client::new();
@@ -171,70 +172,11 @@ async fn migrate_item_marks_adopted_skill_as_managed() {
 // ── Revoked artifacts are left for the reconciler ───────────────────────────
 
 #[tokio::test]
-async fn migrate_item_skips_a_revoked_skill_without_backup_marker_or_upload() {
-    let tmp = tempfile::tempdir().unwrap();
-    let (state, _guard) = temp_state();
-    scenery_core::revocation::upsert_revocation(&state, "skill", "revoked-one", None).unwrap();
-    let item = skill_item("revoked-one", tmp.path());
-    let backup_root = tmp.path().join("backup");
-
-    let client = reqwest::Client::new();
-    let migrated = migrate_item(&item, &backup_root, &state, "http://unused", &client)
-        .await
-        .unwrap();
-
-    assert!(!migrated, "a revoked skill must not be adopted");
-    // The backup, the backend POST and the marker all come after the gate.
-    assert!(!backup_root.exists(), "nothing may be backed up");
-    assert!(!item
-        .source_path
-        .join(scenery_mcp::ownership::MANAGED_MARKER_FILENAME)
-        .exists());
-    assert_eq!(row_count(&state), 0, "no managed_path_markers row");
-    // The `managed_path_migrated` audit event is the extra event a restart
-    // used to upload next to the revoke's `repeat_pass` one.
-    let conn = rusqlite::Connection::open(&state.db_path).unwrap();
-    let audits: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM audit_events WHERE event_type = 'managed_path_migrated'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(audits, 0);
-}
-
-#[tokio::test]
-async fn migrate_item_skips_a_skill_revoked_under_its_registry_id() {
-    // The local folder differs from the registry name the revocation names.
-    let tmp = tempfile::tempdir().unwrap();
-    let (state, _guard) = temp_state();
-    state
-        .record_skill_local_name("registry-name", "local-folder")
-        .unwrap();
-    scenery_core::revocation::upsert_revocation(&state, "skill", "registry-name", None).unwrap();
-    let item = skill_item("local-folder", tmp.path());
-
-    let client = reqwest::Client::new();
-    let migrated = migrate_item(
-        &item,
-        &tmp.path().join("backup"),
-        &state,
-        "http://unused",
-        &client,
-    )
-    .await
-    .unwrap();
-    assert!(!migrated);
-    assert_eq!(row_count(&state), 0);
-}
-
-#[tokio::test]
 async fn migrate_item_skips_a_revoked_plugin() {
     let tmp = tempfile::tempdir().unwrap();
     let (state, _guard) = temp_state();
     scenery_core::revocation::upsert_revocation(&state, "plugin", "bad-plugin", None).unwrap();
-    let mut item = skill_item("bad-plugin", tmp.path());
+    let mut item = plugin_item("bad-plugin", tmp.path());
     item.kind = ItemKind::Plugin;
 
     let client = reqwest::Client::new();
@@ -260,7 +202,7 @@ async fn migrate_item_still_adopts_when_only_another_artifact_or_version_is_revo
     scenery_core::revocation::upsert_revocation(&state, "skill", "someone-else", None).unwrap();
     scenery_core::revocation::upsert_revocation(&state, "skill", "fine-skill", Some("9.9.9"))
         .unwrap();
-    let item = skill_item("fine-skill", tmp.path());
+    let item = plugin_item("fine-skill", tmp.path());
 
     let client = reqwest::Client::new();
     let migrated = migrate_item(
@@ -289,7 +231,7 @@ async fn migrate_item_treats_backend_403_artifact_revoked_as_terminal() {
         .expect(1)
         .create_async()
         .await;
-    let item = skill_item("late", tmp.path());
+    let item = plugin_item("late", tmp.path());
 
     let client = reqwest::Client::new();
     let migrated = migrate_item(
@@ -325,7 +267,7 @@ async fn migrate_item_treats_200_with_artifact_revoked_error_as_terminal() {
         .expect(1)
         .create_async()
         .await;
-    let item = skill_item("late", tmp.path());
+    let item = plugin_item("late", tmp.path());
     let backup_root = tmp.path().join("backup");
 
     let client = reqwest::Client::new();
@@ -369,7 +311,7 @@ async fn migrate_item_stops_on_any_per_item_backend_error() {
         .with_body(r#"{"migrated":[],"errors":[{"kind":"skill","slug":"oops","message":"compile failed"}]}"#)
         .create_async()
         .await;
-    let item = skill_item("oops", tmp.path());
+    let item = plugin_item("oops", tmp.path());
 
     let client = reqwest::Client::new();
     let result = migrate_item(
@@ -414,32 +356,6 @@ fn row_count(state: &AppState) -> i64 {
     .unwrap()
 }
 
-/// F13: a `.scenery-managed.json` file is attacker-controllable, so a skill
-/// that ships one but has no `managed_path_markers` row is NOT ours and must
-/// be adopted (and so reported) like any other user skill.
-#[tokio::test]
-async fn migrate_item_adopts_skill_with_forged_marker_and_no_row() {
-    let tmp = tempfile::tempdir().unwrap();
-    let (state, _guard) = temp_state();
-    let item = skill_item("forged", tmp.path());
-    fs::write(
-        item.source_path
-            .join(scenery_mcp::ownership::MANAGED_MARKER_FILENAME),
-        r#"{"marker_version":1,"installation_id":null,"source_sha256":"abc","migrated_at":"2026-01-01T00:00:00Z"}"#,
-    )
-    .unwrap();
-    let backup_root = tmp.path().join("backup");
-
-    let client = reqwest::Client::new();
-    let result = migrate_item(&item, &backup_root, &state, "http://unused", &client)
-        .await
-        .unwrap();
-    assert!(
-        result,
-        "a forged marker must not hide a skill from adoption"
-    );
-}
-
 /// F13 (reviewer's bypass): same for plugin dirs.
 #[tokio::test]
 async fn migrate_item_adopts_plugin_with_forged_marker_and_no_row() {
@@ -478,60 +394,13 @@ async fn migrate_item_adopts_plugin_with_forged_marker_and_no_row() {
     );
 }
 
-/// The production self-adoption shape: the DB row is keyed on the canonical
-/// `~/.agents/skills/<slug>` dir and the scanner hands back the
-/// `~/.claude/skills/<slug>` symlink. Matching on the canonicalised path keeps
-/// Scenery from re-adopting its own skill — without trusting the marker.
-#[tokio::test]
-async fn migrate_item_skips_symlink_to_db_tracked_canonical_skill() {
-    let tmp = tempfile::tempdir().unwrap();
-    let (state, _guard) = temp_state();
-    let canonical = tmp.path().join("agents-skills");
-    let item_canon = skill_item("ours", &canonical);
-    insert_row(
-        &state,
-        &item_canon.source_path,
-        "skill",
-        "ours",
-        &sha256_hex(b"---\nname: test\n---\n"),
-    );
-    let links = tmp.path().join("claude-skills");
-    fs::create_dir_all(&links).unwrap();
-    let link = links.join("ours");
-    std::os::unix::fs::symlink(&item_canon.source_path, &link).unwrap();
-
-    let item = MigrationItem {
-        source_path: link.clone(),
-        ..item_canon.clone()
-    };
-    let client = reqwest::Client::new();
-    let result = migrate_item(
-        &item,
-        &tmp.path().join("backup"),
-        &state,
-        "http://unused",
-        &client,
-    )
-    .await
-    .unwrap();
-    assert!(
-        !result,
-        "our own skill reached through its link must not be re-adopted"
-    );
-    assert_eq!(
-        row_count(&state),
-        1,
-        "no second marker row at the link path"
-    );
-}
-
 /// A DB-tracked path whose content changed is drift's business (drift reports
 /// it to the backend); F1 must not adopt it a second time.
 #[tokio::test]
 async fn migrate_item_skips_tracked_path_even_when_hash_differs() {
     let tmp = tempfile::tempdir().unwrap();
     let (state, _guard) = temp_state();
-    let item = skill_item("drifted", tmp.path());
+    let item = plugin_item("drifted", tmp.path());
     insert_row(&state, &item.source_path, "skill", "drifted", "0000");
     let client = reqwest::Client::new();
     let result = migrate_item(
@@ -659,10 +528,10 @@ async fn post_migrate_strips_non_allowlisted_payload_fields() {
 /// pointing at the SAME backup the legacy `.scenery-backup/` manifest uses
 /// — not a second copy.
 #[tokio::test]
-async fn migrate_item_appends_native_restore_journal_entry_for_skill() {
+async fn migrate_item_appends_native_restore_journal_entry_for_plugin() {
     let tmp = tempfile::tempdir().unwrap();
     let (state, _guard) = temp_state();
-    let item = skill_item("journal-skill", tmp.path());
+    let item = plugin_item("journal-skill", tmp.path());
     let backup_root = tmp.path().join("backup");
 
     let client = reqwest::Client::new();
@@ -697,14 +566,17 @@ async fn migrate_item_appends_native_restore_journal_entry_for_skill() {
     assert_eq!(
         backup_path,
         &backup_root
-            .join("skills")
+            .join("plugins")
             .join("journal-skill")
             .to_string_lossy()
             .to_string(),
         "restore journal must point at the SAME .scenery-backup/ location, not a new copy"
     );
     assert!(
-        std::path::Path::new(backup_path).join("SKILL.md").exists(),
+        std::path::Path::new(backup_path)
+            .join(".claude-plugin")
+            .join("plugin.json")
+            .exists(),
         "the backup this entry points at must actually exist on disk"
     );
 }
@@ -766,7 +638,7 @@ async fn migrate_item_appends_native_restore_journal_entry_for_mcp() {
 #[test]
 fn buffer_audit_event_writes_row() {
     let tmp = tempfile::tempdir().unwrap();
-    let item = skill_item("audit-skill", tmp.path());
+    let item = plugin_item("audit-skill", tmp.path());
     let conn = rusqlite::Connection::open(tmp.path().join("test.db")).unwrap();
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS audit_events (
@@ -790,581 +662,6 @@ fn buffer_audit_event_writes_row() {
 }
 
 // ── copy_dir_recursive ────────────────────────────────────────────────────────
-
-// ── ~/.claude/skills → ~/.agents/skills migration ───────────────────────────
-
-#[test]
-fn migrates_managed_skill_from_claude_to_agents_and_relinks() {
-    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-    let fake_home = tempfile::tempdir().unwrap();
-    let prev_home = std::env::var_os("HOME");
-    std::env::set_var("HOME", fake_home.path());
-
-    // A pre-pivot managed skill: real dir under .claude/skills with a marker.
-    let old = fake_home.path().join(".claude/skills/demo");
-    std::fs::create_dir_all(&old).unwrap();
-    std::fs::write(old.join("SKILL.md"), b"---\nname: demo\n---\n").unwrap();
-    std::fs::write(old.join(".scenery-managed.json"), br#"{"marker_version":1,"installation_id":null,"source_sha256":"abc","migrated_at":"2026-01-01T00:00:00Z"}"#).unwrap();
-
-    // An unmanaged, user-authored skill that must be left completely alone.
-    let user_skill = fake_home.path().join(".claude/skills/mine");
-    std::fs::create_dir_all(&user_skill).unwrap();
-    std::fs::write(user_skill.join("SKILL.md"), b"user content").unwrap();
-
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    conn.execute_batch(
-        "CREATE TABLE managed_path_markers (
-            path TEXT NOT NULL, kind TEXT NOT NULL, slug TEXT NOT NULL,
-            installation_id TEXT, source_sha256 TEXT NOT NULL,
-            migrated_at TEXT NOT NULL, PRIMARY KEY (path))",
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO managed_path_markers VALUES (?1,'skill','demo',NULL,'abc','2026-01-01T00:00:00Z')",
-        [old.to_string_lossy().to_string()],
-    )
-    .unwrap();
-
-    let result = super::migrate_skills_to_agents_dir(&conn);
-
-    let canonical = fake_home.path().join(".agents/skills/demo");
-    let new_key: String = conn
-        .query_row(
-            "SELECT path FROM managed_path_markers WHERE slug='demo'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-
-    if let Some(v) = prev_home {
-        std::env::set_var("HOME", v);
-    } else {
-        std::env::remove_var("HOME");
-    }
-
-    assert_eq!(result.unwrap(), 1);
-    // Content moved to canonical.
-    assert!(canonical.join("SKILL.md").exists());
-    assert!(!canonical.is_symlink());
-    // Claude path is now a link.
-    assert!(old.is_symlink());
-    assert!(old.join("SKILL.md").exists());
-    // SQLite now keys on the canonical path.
-    assert_eq!(new_key, canonical.to_string_lossy().to_string());
-    // The user's own skill is untouched and still a real directory.
-    assert!(!user_skill.is_symlink());
-    assert_eq!(
-        std::fs::read(user_skill.join("SKILL.md")).unwrap(),
-        b"user content"
-    );
-}
-
-// ── Helpers for the ~/.claude/skills → ~/.agents/skills tests ────────────────
-
-/// Restore `$HOME` after a test that mutated it.
-struct HomeGuard(Option<std::ffi::OsString>);
-
-impl HomeGuard {
-    fn set(path: &std::path::Path) -> Self {
-        let prev = std::env::var_os("HOME");
-        std::env::set_var("HOME", path);
-        HomeGuard(prev)
-    }
-}
-
-impl Drop for HomeGuard {
-    fn drop(&mut self) {
-        match self.0.take() {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
-    }
-}
-
-fn markers_conn() -> rusqlite::Connection {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    conn.execute_batch(
-        "CREATE TABLE managed_path_markers (
-            path TEXT NOT NULL, kind TEXT NOT NULL, slug TEXT NOT NULL,
-            installation_id TEXT, source_sha256 TEXT NOT NULL,
-            migrated_at TEXT NOT NULL, PRIMARY KEY (path))",
-    )
-    .unwrap();
-    conn
-}
-
-/// Create a Scenery-managed skill directory at `dir`.
-fn write_managed_skill(dir: &std::path::Path, slug: &str, body: &str) {
-    fs::create_dir_all(dir).unwrap();
-    fs::write(
-        dir.join("SKILL.md"),
-        format!("---\nname: {slug}\n---\n{body}"),
-    )
-    .unwrap();
-    fs::write(
-        dir.join(".scenery-managed.json"),
-        br#"{"marker_version":1,"installation_id":null,"source_sha256":"abc","migrated_at":"2026-01-01T00:00:00Z"}"#,
-    )
-    .unwrap();
-}
-
-fn insert_marker(conn: &rusqlite::Connection, path: &std::path::Path, slug: &str, sha: &str) {
-    conn.execute(
-        "INSERT INTO managed_path_markers VALUES (?1,'skill',?2,NULL,?3,'2026-01-01T00:00:00Z')",
-        rusqlite::params![path.to_string_lossy().to_string(), slug, sha],
-    )
-    .unwrap();
-}
-
-fn marker_paths(conn: &rusqlite::Connection, slug: &str) -> Vec<String> {
-    let mut stmt = conn
-        .prepare("SELECT path FROM managed_path_markers WHERE slug = ?1 ORDER BY path")
-        .unwrap();
-    let rows = stmt
-        .query_map([slug], |r| r.get::<_, String>(0))
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-    rows
-}
-
-/// Snapshot a directory tree as (relative path, kind, content) triples.
-fn snapshot(root: &std::path::Path) -> Vec<(String, String)> {
-    fn walk(root: &std::path::Path, rel: &std::path::Path, out: &mut Vec<(String, String)>) {
-        let Ok(entries) = fs::read_dir(root.join(rel)) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let key = rel.join(entry.file_name());
-            let path = entry.path();
-            let meta = fs::symlink_metadata(&path).unwrap();
-            if meta.is_symlink() {
-                out.push((
-                    key.to_string_lossy().to_string(),
-                    format!("link:{}", fs::read_link(&path).unwrap().display()),
-                ));
-            } else if meta.is_dir() {
-                out.push((key.to_string_lossy().to_string(), "dir".into()));
-                walk(root, &key, out);
-            } else {
-                out.push((
-                    key.to_string_lossy().to_string(),
-                    format!("file:{}", fs::read_to_string(&path).unwrap_or_default()),
-                ));
-            }
-        }
-    }
-    let mut out = vec![];
-    walk(root, std::path::Path::new(""), &mut out);
-    out.sort();
-    out
-}
-
-#[test]
-fn migration_is_idempotent_with_a_real_managed_skill() {
-    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-    let fake_home = tempfile::tempdir().unwrap();
-    let _home = HomeGuard::set(fake_home.path());
-
-    let old = fake_home.path().join(".claude/skills/demo");
-    write_managed_skill(&old, "demo", "body");
-    let conn = markers_conn();
-    insert_marker(&conn, &old, "demo", "abc");
-
-    let first = super::migrate_skills_to_agents_dir(&conn).unwrap();
-    let after_first = snapshot(fake_home.path());
-    let rows_after_first = marker_paths(&conn, "demo");
-
-    let second = super::migrate_skills_to_agents_dir(&conn).unwrap();
-    let after_second = snapshot(fake_home.path());
-
-    let canonical = fake_home.path().join(".agents/skills/demo");
-
-    // First run migrates exactly one skill.
-    assert_eq!(first, 1);
-    assert!(canonical.join("SKILL.md").exists());
-    assert!(old.is_symlink());
-    assert_eq!(
-        rows_after_first,
-        vec![canonical.to_string_lossy().to_string()]
-    );
-
-    // Second run is a genuine no-op.
-    assert_eq!(second, 0, "second run must not re-migrate");
-    assert_eq!(
-        after_first, after_second,
-        "second run must leave disk state byte-identical (no new backup dir)"
-    );
-    assert!(
-        !fake_home.path().join(".claude/.scenery-backup").exists(),
-        "an already-migrated skill must never be backed up again"
-    );
-    assert_eq!(
-        marker_paths(&conn, "demo"),
-        vec![canonical.to_string_lossy().to_string()],
-        "second run must not duplicate the marker row"
-    );
-}
-
-#[test]
-fn migration_is_idempotent_on_empty_home() {
-    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-    let fake_home = tempfile::tempdir().unwrap();
-    let _home = HomeGuard::set(fake_home.path());
-
-    let conn = markers_conn();
-    assert_eq!(super::migrate_skills_to_agents_dir(&conn).unwrap(), 0);
-    assert_eq!(super::migrate_skills_to_agents_dir(&conn).unwrap(), 0);
-}
-
-#[test]
-fn migrates_several_skills_and_leaves_user_skills_alone() {
-    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-    let fake_home = tempfile::tempdir().unwrap();
-    let _home = HomeGuard::set(fake_home.path());
-
-    let skills = fake_home.path().join(".claude/skills");
-    let conn = markers_conn();
-
-    for slug in ["alpha", "beta", "gamma"] {
-        let dir = skills.join(slug);
-        write_managed_skill(&dir, slug, slug);
-        insert_marker(&conn, &dir, slug, "abc");
-    }
-
-    // Two unmanaged, user-authored skills — must be completely untouched.
-    let mine = skills.join("mine");
-    fs::create_dir_all(mine.join("nested")).unwrap();
-    fs::write(mine.join("SKILL.md"), "user content").unwrap();
-    fs::write(mine.join("nested/notes.md"), "notes").unwrap();
-    let theirs = skills.join("theirs");
-    fs::create_dir_all(&theirs).unwrap();
-    fs::write(theirs.join("SKILL.md"), "other user content").unwrap();
-
-    let mine_before = snapshot(&mine);
-
-    let migrated = super::migrate_skills_to_agents_dir(&conn).unwrap();
-
-    assert_eq!(migrated, 3);
-    for slug in ["alpha", "beta", "gamma"] {
-        let canonical = fake_home.path().join(".agents/skills").join(slug);
-        assert!(canonical.join("SKILL.md").exists(), "{slug} not moved");
-        assert!(!canonical.is_symlink());
-        assert!(skills.join(slug).is_symlink(), "{slug} not relinked");
-        assert_eq!(
-            marker_paths(&conn, slug),
-            vec![canonical.to_string_lossy().to_string()],
-            "{slug} marker not re-keyed"
-        );
-    }
-
-    // User content: not moved, not linked, not backed up, no row.
-    assert!(!mine.is_symlink());
-    assert!(!theirs.is_symlink());
-    assert_eq!(snapshot(&mine), mine_before);
-    assert_eq!(
-        fs::read_to_string(theirs.join("SKILL.md")).unwrap(),
-        "other user content"
-    );
-    assert!(!fake_home.path().join(".agents/skills/mine").exists());
-    assert!(!fake_home.path().join(".agents/skills/theirs").exists());
-    assert!(marker_paths(&conn, "mine").is_empty());
-    assert!(marker_paths(&conn, "theirs").is_empty());
-    assert!(!fake_home.path().join(".claude/.scenery-backup").exists());
-}
-
-/// FINDING 1 (Critical) regression: a crash between `fs::rename` and the
-/// SQLite `UPDATE` leaves canonical + symlink on disk but the row still keyed
-/// on the old Claude path. Before the fix, the migration loop skipped the
-/// symlink entry and the row stayed stale forever.
-#[test]
-fn repairs_marker_stranded_by_a_crash_between_rename_and_update() {
-    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-    let fake_home = tempfile::tempdir().unwrap();
-    let _home = HomeGuard::set(fake_home.path());
-
-    // Post-crash disk state: content at canonical, symlink at the Claude path.
-    let canonical = fake_home.path().join(".agents/skills/demo");
-    write_managed_skill(&canonical, "demo", "body");
-    let old = fake_home.path().join(".claude/skills/demo");
-    fs::create_dir_all(old.parent().unwrap()).unwrap();
-    std::os::unix::fs::symlink(&canonical, &old).unwrap();
-
-    // …but the row is still keyed on the old path.
-    let conn = markers_conn();
-    insert_marker(&conn, &old, "demo", "abc");
-
-    let migrated = super::migrate_skills_to_agents_dir(&conn).unwrap();
-
-    // Nothing to move, but the row must be repaired.
-    assert_eq!(migrated, 0);
-    assert_eq!(
-        marker_paths(&conn, "demo"),
-        vec![canonical.to_string_lossy().to_string()],
-        "stale row was not repaired — it would report false drift forever"
-    );
-    assert!(old.is_symlink(), "the link must be left alone");
-    assert!(canonical.join("SKILL.md").exists());
-}
-
-/// FINDING 2: once `push_skill` has inserted a canonical row alongside the
-/// stale one, `PRIMARY KEY (path)` lets both coexist and the orphan reports
-/// false drift. The repair must collapse them to exactly one row — the
-/// canonical one, which carries the fresher hash.
-#[test]
-fn repair_drops_orphan_row_when_canonical_row_already_exists() {
-    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-    let fake_home = tempfile::tempdir().unwrap();
-    let _home = HomeGuard::set(fake_home.path());
-
-    let canonical = fake_home.path().join(".agents/skills/demo");
-    write_managed_skill(&canonical, "demo", "post-push body");
-    let old = fake_home.path().join(".claude/skills/demo");
-    fs::create_dir_all(old.parent().unwrap()).unwrap();
-    std::os::unix::fs::symlink(&canonical, &old).unwrap();
-
-    let conn = markers_conn();
-    insert_marker(&conn, &old, "demo", "stale-pre-push-sha");
-    insert_marker(&conn, &canonical, "demo", "fresh-post-push-sha");
-
-    super::migrate_skills_to_agents_dir(&conn).unwrap();
-
-    assert_eq!(
-        marker_paths(&conn, "demo"),
-        vec![canonical.to_string_lossy().to_string()],
-        "duplicate rows must collapse to one"
-    );
-    let sha: String = conn
-        .query_row(
-            "SELECT source_sha256 FROM managed_path_markers WHERE slug='demo'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(sha, "fresh-post-push-sha", "the fresher row must survive");
-}
-
-/// FINDING 1, second interleaving: the symlink itself was deleted, so there is
-/// no directory entry left to walk. A filesystem-driven repair would miss
-/// this; the DB-driven pass must still fix the row.
-#[test]
-fn repairs_marker_when_the_claude_symlink_is_gone() {
-    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-    let fake_home = tempfile::tempdir().unwrap();
-    let _home = HomeGuard::set(fake_home.path());
-
-    let canonical = fake_home.path().join(".agents/skills/demo");
-    write_managed_skill(&canonical, "demo", "body");
-    let old = fake_home.path().join(".claude/skills/demo");
-    fs::create_dir_all(old.parent().unwrap()).unwrap();
-
-    let conn = markers_conn();
-    insert_marker(&conn, &old, "demo", "abc");
-
-    super::migrate_skills_to_agents_dir(&conn).unwrap();
-
-    assert_eq!(
-        marker_paths(&conn, "demo"),
-        vec![canonical.to_string_lossy().to_string()]
-    );
-}
-
-/// FINDING A: the repair pass must not re-key a row onto a same-slug canonical
-/// directory that is not ours.
-///
-/// A row for an F1-adopted *user* skill at `~/.claude/skills/notes`, whose
-/// directory the user then deleted, must be left alone so drift classifies it
-/// DELETED and drops the marker. Re-pointing it at an unrelated
-/// `~/.agents/skills/notes` produces a permanent false-drift row instead: the
-/// foreign content's sha will never match the row's.
-#[test]
-fn repair_does_not_repoint_onto_foreign_canonical_content() {
-    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-    let fake_home = tempfile::tempdir().unwrap();
-    let _home = HomeGuard::set(fake_home.path());
-
-    // An unrelated directory — no `.scenery-managed.json` — happens to
-    // share the slug under the canonical root.
-    let canonical = fake_home.path().join(".agents/skills/notes");
-    fs::create_dir_all(&canonical).unwrap();
-    fs::write(canonical.join("SKILL.md"), b"someone else's notes skill").unwrap();
-
-    // The row's Claude-side directory is gone: the user deleted it.
-    let old = fake_home.path().join(".claude/skills/notes");
-    fs::create_dir_all(old.parent().unwrap()).unwrap();
-
-    let conn = markers_conn();
-    insert_marker(&conn, &old, "notes", "abc");
-
-    super::migrate_skills_to_agents_dir(&conn).unwrap();
-
-    assert_eq!(
-        marker_paths(&conn, "notes"),
-        vec![old.to_string_lossy().to_string()],
-        "row must NOT be repointed at foreign content — drift must still see it as DELETED"
-    );
-    assert_eq!(
-        fs::read(canonical.join("SKILL.md")).unwrap(),
-        b"someone else's notes skill",
-        "the foreign directory must be left completely untouched"
-    );
-}
-
-/// The same repair, when the canonical directory *is* ours, must still happen —
-/// this pins that the `is_scenery_managed` guard did not disable the repair.
-#[test]
-fn repair_still_repoints_onto_our_own_canonical_content() {
-    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-    let fake_home = tempfile::tempdir().unwrap();
-    let _home = HomeGuard::set(fake_home.path());
-
-    let canonical = fake_home.path().join(".agents/skills/notes");
-    write_managed_skill(&canonical, "notes", "ours");
-    let old = fake_home.path().join(".claude/skills/notes");
-    fs::create_dir_all(old.parent().unwrap()).unwrap();
-
-    let conn = markers_conn();
-    insert_marker(&conn, &old, "notes", "abc");
-
-    super::migrate_skills_to_agents_dir(&conn).unwrap();
-
-    assert_eq!(
-        marker_paths(&conn, "notes"),
-        vec![canonical.to_string_lossy().to_string()],
-        "a marked canonical dir is ours — the row must still be repaired"
-    );
-}
-
-/// FINDING 3: one unmigratable entry must not abort the whole run. A *file*
-/// at the canonical path makes `link_dir` bail for that slug only.
-#[test]
-fn one_bad_entry_does_not_block_the_other_skills() {
-    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-    let fake_home = tempfile::tempdir().unwrap();
-    let _home = HomeGuard::set(fake_home.path());
-
-    let skills = fake_home.path().join(".claude/skills");
-    let canonical_root = fake_home.path().join(".agents/skills");
-    fs::create_dir_all(&canonical_root).unwrap();
-
-    let conn = markers_conn();
-    for slug in ["aaa-bad", "bbb-good", "ccc-good"] {
-        let dir = skills.join(slug);
-        write_managed_skill(&dir, slug, slug);
-        insert_marker(&conn, &dir, slug, "abc");
-    }
-    // Canonical path for the first (alphabetically first, so it is hit first)
-    // is a regular FILE — the move is skipped and `link_dir` bails.
-    fs::write(canonical_root.join("aaa-bad"), "not a directory").unwrap();
-
-    let migrated = super::migrate_skills_to_agents_dir(&conn).unwrap();
-
-    assert_eq!(migrated, 2, "the two healthy skills must still migrate");
-    for slug in ["bbb-good", "ccc-good"] {
-        assert!(skills.join(slug).is_symlink(), "{slug} not migrated");
-        assert_eq!(
-            marker_paths(&conn, slug),
-            vec![canonical_root.join(slug).to_string_lossy().to_string()]
-        );
-    }
-    // The bad one is untouched and still keyed on its original path — no data
-    // lost, and it will be retried next start.
-    assert!(skills.join("aaa-bad").is_dir());
-    assert!(!skills.join("aaa-bad").is_symlink());
-    assert_eq!(
-        fs::read_to_string(canonical_root.join("aaa-bad")).unwrap(),
-        "not a directory"
-    );
-    assert_eq!(
-        marker_paths(&conn, "aaa-bad"),
-        vec![skills.join("aaa-bad").to_string_lossy().to_string()]
-    );
-}
-
-/// FINDING 5: when the Claude-side directory is a real, byte-identical copy of
-/// canonical, the migration must not tear it down and rebuild it.
-///
-/// The identity check now lives in `link_dir` rather than here, so this holds
-/// on *every* platform and via *every* caller — and it holds more strictly than
-/// before: an identical copy is recognised as settled state and left alone, so
-/// not even the first backup happens. (The previous migrator-side version healed
-/// the copy into a symlink on Unix, costing one backup, and only suppressed the
-/// churn on a copy-mode host. Nothing is lost by leaving it: the copy's content
-/// is correct by definition, and the moment it diverges — which any push does,
-/// since a push rewrites canonical — `link_dir` backs it up and relinks, as
-/// `stale_legacy_content_is_backed_up_and_replaced` below pins.)
-#[test]
-fn identical_copy_converges_and_stops_creating_backups() {
-    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-    let fake_home = tempfile::tempdir().unwrap();
-    let _home = HomeGuard::set(fake_home.path());
-
-    let canonical = fake_home.path().join(".agents/skills/demo");
-    let old = fake_home.path().join(".claude/skills/demo");
-    write_managed_skill(&canonical, "demo", "same body");
-    write_managed_skill(&old, "demo", "same body");
-
-    let conn = markers_conn();
-    insert_marker(&conn, &old, "demo", "abc");
-
-    let backup_root = fake_home.path().join(".claude/.scenery-backup");
-
-    // Three runs, and no run creates a backup at all.
-    for run in 1..=3 {
-        assert_eq!(super::migrate_skills_to_agents_dir(&conn).unwrap(), 0);
-        assert!(
-            !backup_root.exists(),
-            "run {run} created a timestamped backup for an already-identical copy"
-        );
-        assert_eq!(
-            marker_paths(&conn, "demo"),
-            vec![canonical.to_string_lossy().to_string()],
-            "run {run}: the row must be keyed on canonical"
-        );
-    }
-
-    // Content is intact on both sides and the copy was left as a real dir.
-    assert!(!old.is_symlink());
-    assert!(canonical.join("SKILL.md").exists());
-    assert_eq!(
-        fs::read(old.join("SKILL.md")).unwrap(),
-        fs::read(canonical.join("SKILL.md")).unwrap()
-    );
-}
-
-/// The genuinely-stale legacy case must still be replaced: Claude-side content
-/// differs from canonical, so it is backed up and replaced by a link.
-#[test]
-fn stale_legacy_content_is_backed_up_and_replaced() {
-    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-    let fake_home = tempfile::tempdir().unwrap();
-    let _home = HomeGuard::set(fake_home.path());
-
-    let canonical = fake_home.path().join(".agents/skills/demo");
-    let old = fake_home.path().join(".claude/skills/demo");
-    write_managed_skill(&canonical, "demo", "NEW canonical body");
-    write_managed_skill(&old, "demo", "OLD stale body");
-
-    let conn = markers_conn();
-    insert_marker(&conn, &old, "demo", "abc");
-
-    super::migrate_skills_to_agents_dir(&conn).unwrap();
-
-    assert!(old.is_symlink(), "stale content must be replaced by a link");
-    assert!(fs::read_to_string(old.join("SKILL.md"))
-        .unwrap()
-        .contains("NEW canonical body"));
-    assert_eq!(
-        marker_paths(&conn, "demo"),
-        vec![canonical.to_string_lossy().to_string()]
-    );
-    // The displaced content is recoverable under the links backup root.
-    let backups = snapshot(&fake_home.path().join(".claude/.scenery-backup"));
-    assert!(
-        backups.iter().any(|(_, v)| v.contains("OLD stale body")),
-        "stale content must be preserved in a backup: {backups:?}"
-    );
-}
 
 #[test]
 fn copy_dir_recursive_copies_nested_files() {
