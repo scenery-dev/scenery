@@ -1004,7 +1004,8 @@ pub async fn share_branch(
                 local_edits::EditOutcome::Settling => {
                     bail!("the skill was just edited; try again in a few seconds")
                 }
-                local_edits::EditOutcome::Retry { reason } => {
+                local_edits::EditOutcome::Retry { reason }
+                | local_edits::EditOutcome::Failed { reason } => {
                     bail!("could not upload the edits: {reason}")
                 }
             }
