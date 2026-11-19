@@ -84,14 +84,7 @@ jobs:
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked --version 0.22.2
       - name: cargo audit
-        # Keep this ignore list in sync with deny.toml (residuals that need a
-        # Cargo.toml bump in crates/; see deny.toml for the reasons).
-        run: >
-          cargo audit
-          --ignore RUSTSEC-2023-0071
-          --ignore RUSTSEC-2026-0387
-          --ignore RUSTSEC-2026-0258
-          --ignore RUSTSEC-2024-0449
+        run: cargo audit
 
   deny:
     name: cargo deny

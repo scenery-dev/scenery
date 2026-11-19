@@ -21,7 +21,7 @@ repository = "https://github.com/scenery-dev/scenery"
 tokio = { version = "1", features = ["rt-multi-thread", "rt", "macros", "io-util", "net", "fs", "time", "sync", "signal", "process"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_yaml = "0.9"
+serde_yaml = { package = "serde_norway", version = "0.9" }
 thiserror = "1"
 anyhow = "1"
 tracing = "0.1"

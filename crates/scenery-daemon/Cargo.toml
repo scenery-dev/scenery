@@ -64,7 +64,7 @@ axum = { version = "0.8", default-features = false, features = ["http1", "query"
 # `rust_crypto` (pure Rust, no C toolchain needed for cross builds).
 # `use_pem` is for the tests' PEM signing keys; production builds JWKS
 # keys from their base64url `x`/`y` via `DecodingKey::from_ec_components`.
-jsonwebtoken = { version = "10.3", default-features = false, features = ["rust_crypto", "use_pem"] }
+jsonwebtoken = { version = "10.3", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 
 # Imported plugins' binary files arrive base64-encoded from the registry.
 # Already linked through scenery-core.

@@ -14,7 +14,7 @@ scenery-manifest = { path = "../scenery-manifest" }
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-serde_yaml = "0.9"
+serde_yaml = { package = "serde_norway", version = "0.9" }
 thiserror.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
@@ -27,7 +27,7 @@ time.workspace = true
 dirs.workspace = true
 camino.workspace = true
 semver.workspace = true
-jsonschema = "0.17"
+jsonschema = { version = "0.17", default-features = false }
 tar = "0.4"
 flate2 = "1"
 tempfile.workspace = true
