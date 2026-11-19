@@ -497,11 +497,21 @@ impl ManagedPathsPusher {
         match super::links::link_dir(&skill_dir, &link_path) {
             Ok(mode) => debug!(slug, ?mode, "pusher: linked skill for Claude Code"),
             Err(e) => {
-                warn!(
-                    slug,
-                    error = %e,
-                    "pusher: failed to link skill for Claude Code — canonical copy is still live"
-                );
+                if self.is_pending_takeover_source(slug, &link_path) {
+                    // Expected: takeover removes this real dir and relinks
+                    // right after the push (takeover::relink_if_claude_source).
+                    debug!(
+                        slug,
+                        error = %e,
+                        "pusher: link deferred — takeover will replace the source dir"
+                    );
+                } else {
+                    warn!(
+                        slug,
+                        error = %e,
+                        "pusher: failed to link skill for Claude Code — canonical copy is still live"
+                    );
+                }
                 outcome.link_refused = Some(link_path);
             }
         }
@@ -518,6 +528,20 @@ impl ManagedPathsPusher {
 
         info!(slug, dest = %skill_dir.display(), "pusher: skill pushed to ~/.agents/skills/");
         Ok(outcome)
+    }
+
+    /// True when `path` is the recorded source of a pending adopt takeover
+    /// for `slug`. Any DB error reads as "no" so a real conflict still WARNs.
+    fn is_pending_takeover_source(&self, slug: &str, path: &Path) -> bool {
+        let Ok(conn) = Connection::open(&self.db_path) else {
+            return false;
+        };
+        let src: rusqlite::Result<String> = conn.query_row(
+            "SELECT source_path FROM adopt_pending_takeovers WHERE slug = ?1",
+            [slug],
+            |r| r.get(0),
+        );
+        matches!(src, Ok(s) if Path::new(&s) == path)
     }
 
     /// Remove a skill from `~/.agents/skills/<slug>/`, dropping its

@@ -1825,3 +1825,25 @@ fn adopt_in_place_conversion_writes_bundled_files_and_keeps_a_backup() {
         assert!(backups.is_dir(), "the user's original was backed up");
     });
 }
+
+#[test]
+fn pending_takeover_source_is_recognised_only_for_its_own_slug_and_path() {
+    let (pusher, _tmp) = make_pusher();
+    let conn = Connection::open(&pusher.db_path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE adopt_pending_takeovers (
+            slug TEXT PRIMARY KEY, source_path TEXT NOT NULL,
+            recorded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+    )
+    .unwrap();
+    let p = std::path::Path::new("/h/.claude/skills/demo");
+    assert!(!pusher.is_pending_takeover_source("demo", p));
+    conn.execute(
+        "INSERT INTO adopt_pending_takeovers (slug, source_path) VALUES ('demo', '/h/.claude/skills/demo')",
+        [],
+    )
+    .unwrap();
+    assert!(pusher.is_pending_takeover_source("demo", p));
+    assert!(!pusher.is_pending_takeover_source("other", p));
+    assert!(!pusher.is_pending_takeover_source("demo", std::path::Path::new("/elsewhere")));
+}
