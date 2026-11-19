@@ -922,3 +922,28 @@ fn the_snapshot_row_carries_authorship_and_branch_fields_and_old_backends_omit_t
     .unwrap();
     assert!(old.authorship.is_none() && old.branch_state.is_none());
 }
+
+#[tokio::test]
+async fn the_strict_not_uploaded_warning_fires_once_per_skill_per_grace_window() {
+    let f = Fx::new().await;
+    let state = &f.state;
+    assert!(should_warn_not_uploaded(state, "/p/a"));
+    assert!(
+        !should_warn_not_uploaded(state, "/p/a"),
+        "same window: quiet"
+    );
+    assert!(should_warn_not_uploaded(state, "/p/b"), "per skill");
+    clear_first_upload_failure(state, "/p/a");
+    assert!(
+        should_warn_not_uploaded(state, "/p/a"),
+        "after the upload recovered"
+    );
+    // A window that has passed warns again.
+    state
+        .set_sync_state(
+            &warned_key("/p/b"),
+            &(now_secs() - strict_upload_grace_secs() - 1).to_string(),
+        )
+        .unwrap();
+    assert!(should_warn_not_uploaded(state, "/p/b"));
+}

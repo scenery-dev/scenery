@@ -1753,13 +1753,14 @@ async fn cmd_skill_list() -> Result<()> {
     );
     println!("{}", "-".repeat(75));
     for r in &rows {
+        let live = skill_edits::listed_version(&state, &r.skill_id, &r.active_version);
         let update_suffix = update_hints
             .get(r.skill_id.as_str())
             .map(|latest| format!("  (update available: {latest})"))
             .unwrap_or_default();
         println!(
-            "{:<30} {:<12} {:<12} {}{}",
-            r.skill_id, r.active_version, r.current_status, r.installed_at, update_suffix
+            "{:<30} {:<12} {:<12} {}{}{}",
+            r.skill_id, live.version, r.current_status, r.installed_at, live.note, update_suffix
         );
     }
 

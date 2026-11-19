@@ -48,12 +48,17 @@ pub async fn cmd_skill_merge(
             );
         } else if let Some(why) = &out.not_applied_reason {
             println!("Not applied: {why}.");
+            if apply {
+                println!("Your merged version is uploaded; `scenery skill merge {slug} --apply` can retry the switch.");
+            }
         } else {
             println!(
                 "The live skill is unchanged. Run `scenery skill merge {slug} --apply` to switch \
                  it to the merged tree."
             );
         }
+        // `--apply` asked for the switch: not doing it is a failure, not a note.
+        apply_result(apply, &out)?;
         println!("You can now submit it: `scenery skill share {slug}`.");
         return Ok(());
     }
@@ -98,6 +103,17 @@ pub async fn cmd_skill_merge(
         }
     }
     Ok(())
+}
+
+/// `--apply` that did not apply must exit non-zero.
+fn apply_result(apply: bool, out: &skill_merge::ContinueOutcome) -> Result<()> {
+    match (&out.not_applied_reason, apply && !out.applied) {
+        (Some(why), true) => {
+            bail!("the merge was uploaded but not applied to the live skill: {why}")
+        }
+        (None, true) => bail!("the merge was uploaded but not applied to the live skill"),
+        _ => Ok(()),
+    }
 }
 
 /// `scenery skill share <slug>`: a catalog branch goes to IT as a change
@@ -316,3 +332,70 @@ pub async fn cmd_skill_rollback(
         ),
     }
 }
+
+/// What `scenery skill list` shows for one skill: the version of the tree that
+/// is actually live, plus a short note. While a catalog branch is held the
+/// registry version in `installed_skills` is not what runs, so the branch (and
+/// whether it has edits not uploaded yet) is shown instead.
+pub struct ListedVersion {
+    pub version: String,
+    pub note: String,
+}
+
+pub fn listed_version(state: &AppState, skill_id: &str, active_version: &str) -> ListedVersion {
+    let plain = || ListedVersion {
+        version: active_version.to_string(),
+        note: String::new(),
+    };
+    let Ok(conn) = rusqlite::Connection::open(&state.db_path) else {
+        return plain();
+    };
+    let ls = local_edits::load(&conn, skill_id);
+    let slug = state.skill_local_name(skill_id);
+    let unsynced = local_edits::marker_path_for_slug(&conn, &slug)
+        .is_some_and(|p| local_edits::tree_is_dirty(&conn, &p, std::path::Path::new(&p)));
+    let Some(ls) = ls else {
+        return ListedVersion {
+            note: if unsynced {
+                "  (live copy has edits not uploaded yet)".into()
+            } else {
+                String::new()
+            },
+            ..plain()
+        };
+    };
+    if ls.branch_state == local_edits::BRANCH_BRANCH {
+        let live = ls
+            .local_version
+            .clone()
+            .or(ls.base_version.clone())
+            .unwrap_or_else(|| active_version.to_string());
+        let mut note = format!(
+            "  (your branch of {}",
+            ls.base_version.as_deref().unwrap_or("?")
+        );
+        if ls.base_version.as_deref() != Some(active_version) {
+            note.push_str(&format!("; catalog {active_version} not applied"));
+        }
+        if unsynced {
+            note.push_str("; edits not uploaded yet");
+        }
+        note.push(')');
+        return ListedVersion {
+            version: live,
+            note,
+        };
+    }
+    ListedVersion {
+        note: if unsynced {
+            "  (live copy has edits not uploaded yet)".into()
+        } else {
+            String::new()
+        },
+        ..plain()
+    }
+}
+
+#[cfg(test)]
+#[path = "skill_edits_tests.rs"]
+mod tests;

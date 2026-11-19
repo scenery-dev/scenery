@@ -325,6 +325,17 @@ impl DriftScanner {
                     if let Some(why) = &not_uploaded {
                         if mode == PolicyMode::Quarantine && quarantine_now {
                             warn!(slug = %outcome.slug, why, "drift: quarantining an edit that was never uploaded");
+                        } else if !branch_uploaded
+                            && super::local_edits::should_warn_not_uploaded(
+                                &self.state,
+                                &outcome.path,
+                            )
+                        {
+                            warn!(
+                                slug = %outcome.slug,
+                                why,
+                                "drift: strict mode: an edit of this catalog skill is not uploaded yet (offline or failing); it will be retried every scan"
+                            );
                         }
                     }
                     let action = match mode {

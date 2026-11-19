@@ -240,6 +240,29 @@ pub fn note_first_upload_failure(state: &AppState, path: &str) -> i64 {
 
 pub fn clear_first_upload_failure(state: &AppState, path: &str) {
     let _ = state.delete_sync_state(&first_fail_key(path));
+    let _ = state.delete_sync_state(&warned_key(path));
+}
+
+fn warned_key(path: &str) -> String {
+    format!("strict_not_uploaded_warned:{path}")
+}
+
+/// True when a "strict mode is waiting for an upload" warning should be logged
+/// now: once per skill per grace window (the first time, then again only after
+/// the window has passed), so an offline machine is not spammed every scan.
+pub fn should_warn_not_uploaded(state: &AppState, path: &str) -> bool {
+    let key = warned_key(path);
+    let now = now_secs();
+    let last = state
+        .get_sync_state(&key)
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<i64>().ok());
+    if last.is_some_and(|t| now - t < strict_upload_grace_secs()) {
+        return false;
+    }
+    let _ = state.set_sync_state(&key, &now.to_string());
+    true
 }
 
 /// Has this skill's upload been failing for longer than the grace window?
