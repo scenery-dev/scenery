@@ -17,7 +17,7 @@ pub enum SafePathError {
     Empty { what: String },
     #[error("{what}: longer than {MAX_COMPONENT_LEN} bytes")]
     TooLong { what: String },
-    #[error("{what}: contains a character outside [A-Za-z0-9._~-]")]
+    #[error("{what}: contains a character outside [A-Za-z0-9._~+-]")]
     BadChar { what: String },
     #[error("{what}: must not start with '.'")]
     LeadingDot { what: String },
@@ -27,7 +27,7 @@ pub enum SafePathError {
     Escapes { what: String },
 }
 
-/// Validate one name component: 1-128 bytes of `[A-Za-z0-9._-]`, no leading
+/// Validate one name component: 1-128 bytes of `[A-Za-z0-9._~+-]`, no leading
 /// `.`, and exactly one `Component::Normal` when parsed as a path.
 pub fn validate_component(what: &str, s: &str) -> Result<(), SafePathError> {
     let w = || what.to_string();
@@ -45,8 +45,10 @@ pub fn validate_component(what: &str, s: &str) -> Result<(), SafePathError> {
     }
     for b in s.bytes() {
         // `~` is allowed (not leading): a private skill's registry id is
-        // `<owner_namespace>~<slug>`.
-        let ok = b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'~');
+        // `<owner_namespace>~<slug>`. `+` is allowed for semver build metadata
+        // (own private versions are `0.1.0+<hash>`); it is a plain filename
+        // character on every OS and is percent-encoded when it goes into a URL.
+        let ok = b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'~' | b'+');
         if !ok {
             return Err(SafePathError::BadChar { what: w() });
         }

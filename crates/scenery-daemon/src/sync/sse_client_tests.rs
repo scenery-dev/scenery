@@ -1176,6 +1176,12 @@ fn events_with_unsafe_names_are_rejected() {
     ] {
         assert!(parse_sync_event(ev, data).is_err(), "{ev}: {data}");
     }
+    // Private versions carry semver build metadata (`0.1.0+<hash>`).
+    assert!(parse_sync_event(
+        "install",
+        r#"{"installation_id":"00000000-0000-0000-0000-000000000001","skill_id":"adam~pdf","version":"0.1.0+e80735de6655"}"#
+    )
+    .is_ok());
     // Sane names still parse.
     assert!(parse_sync_event(
         "purge",

@@ -77,3 +77,20 @@ fn safe_join_rel_requires_normal_components() {
 fn encode_segment_escapes_slashes() {
     assert_eq!(encode_segment("a/b c"), "a%2Fb%20c");
 }
+
+#[test]
+fn semver_build_metadata_versions_are_one_component() {
+    for v in [
+        "0.1.0+e80735de6655",
+        "0.1.1+local.abc123",
+        "1.0.0-rc.1+build.5",
+    ] {
+        validate_component("version", v).unwrap();
+        let root = std::path::Path::new("/r");
+        assert_eq!(safe_join(root, v).unwrap(), root.join(v));
+    }
+    assert!(validate_component("version", "+x").is_ok());
+    assert!(validate_component("version", "0.1.0+a/b").is_err());
+    assert!(validate_component("version", "0.1.0 +a").is_err());
+    assert_eq!(encode_segment("0.1.0+abc"), "0.1.0%2Babc");
+}
