@@ -116,6 +116,7 @@ impl std::error::Error for DirtyLocalEdit {}
 /// Pushes Scenery-managed items into Claude Code's native directories.
 ///
 /// Cheaply cloneable — the only fields are two paths.
+#[derive(Clone)]
 pub struct ManagedPathsPusher {
     db_path: camino::Utf8PathBuf,
     root_dir: camino::Utf8PathBuf,
@@ -566,6 +567,9 @@ impl ManagedPathsPusher {
         }
         scenery_core::safe_path::validate_single_component("skill slug", slug)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
+        // Held to the end: drift must not see the directory gone while the
+        // row is still present (it would report a false "deleted").
+        let _removal_lock = super::marker::lock_skill_removal(self.db_path.as_std_path())?;
         let mut removed = false;
 
         let skills_dir = resolve_skills_dir()?;

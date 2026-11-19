@@ -432,6 +432,9 @@ impl DriftScanner {
                     });
                 }
                 DriftStatus::Deleted => {
+                    if !deletion_confirmed(&self.state, &outcome) {
+                        continue;
+                    }
                     stats.deleted += 1;
                     drop_marker(&self.state, &outcome.path).ok();
                     to_report.push(DriftReportItem {
@@ -503,7 +506,7 @@ impl DriftScanner {
         }
         let body = DriftReportBody {
             device_id: load_device_id(&self.state),
-            events,
+            events: scrub_report_hashes(events),
         };
         let url = format!("{}/portal/managed-paths/drift", self.registry_url);
         let resp = self
@@ -1192,6 +1195,52 @@ fn find_marker_by_slug_kind(
         })
         .ok();
     Ok(result)
+}
+
+/// An MCP entry's hash digests the raw entry, env secrets included, so a
+/// short secret could be brute-forced from it: it stays on the device.
+fn scrub_report_hashes(mut events: Vec<DriftReportItem>) -> Vec<DriftReportItem> {
+    for e in events.iter_mut().filter(|e| e.kind == "mcp") {
+        e.current_hash.clear();
+        e.expected_hash.clear();
+    }
+    events
+}
+
+/// A skill that looks deleted is only reported as deleted when that still
+/// holds under the lock `remove_skill` takes: otherwise a scan can land between
+/// its directory removal and its row removal and report a teardown as a user
+/// deletion. Under the lock the marker row is either still there with the
+/// directory gone (a real deletion) or already gone (a finished teardown).
+fn deletion_confirmed(state: &AppState, outcome: &DriftOutcome) -> bool {
+    if outcome.kind != "skill" {
+        return true;
+    }
+    // Never block: this runs on the daemon's runtime thread and a teardown
+    // (possibly in the CLI process) can hold the lock for a while. A busy
+    // lock means a removal is in flight, so the report is deferred.
+    let _guard = match super::marker::try_lock_skill_removal(state.db_path.as_std_path()) {
+        Ok(Some(g)) => g,
+        Ok(None) => {
+            debug!(slug = %outcome.slug, "drift: a skill removal is in flight; deferring the deleted report");
+            return false;
+        }
+        Err(e) => {
+            warn!(slug = %outcome.slug, error = %e, "drift: could not take the skill-removal lock; deferring the deleted report");
+            return false;
+        }
+    };
+    let Ok(conn) = Connection::open(state.db_path.as_std_path()) else {
+        return false;
+    };
+    let row_present: bool = conn
+        .query_row(
+            "SELECT 1 FROM managed_path_markers WHERE path = ?1",
+            rusqlite::params![&outcome.path],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    row_present && !Path::new(&outcome.path).join("SKILL.md").exists()
 }
 
 fn drop_marker(state: &AppState, path: &str) -> Result<()> {

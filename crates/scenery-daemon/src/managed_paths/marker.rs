@@ -162,6 +162,39 @@ pub fn read_file_marker(dir_path: &Path) -> Result<Option<ManagedMarkerFile>> {
 
 // ── SQLite marker ─────────────────────────────────────────────────────────────
 
+/// Exclusive lock serialising the teardown of a skill (directory, then its
+/// `managed_path_markers` row) against drift deciding the skill was deleted.
+/// Held for the duration of `ManagedPathsPusher::remove_skill`; released on drop.
+/// Blocking: call from a blocking context (never an async task).
+pub fn lock_skill_removal(db_path: &Path) -> Result<std::fs::File> {
+    use fs2::FileExt;
+    let file = open_removal_lock(db_path)?;
+    file.lock_exclusive()
+        .context("failed to lock skill-removal.lock")?;
+    Ok(file)
+}
+
+/// Non-blocking variant: `Ok(None)` when a removal holds the lock.
+pub fn try_lock_skill_removal(db_path: &Path) -> Result<Option<std::fs::File>> {
+    use fs2::FileExt;
+    let file = open_removal_lock(db_path)?;
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(Some(file)),
+        Err(e) if e.kind() == fs2::lock_contended_error().kind() => Ok(None),
+        Err(e) => Err(e).context("failed to lock skill-removal.lock"),
+    }
+}
+
+fn open_removal_lock(db_path: &Path) -> Result<std::fs::File> {
+    let lock_path = db_path.with_file_name("skill-removal.lock");
+    std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("failed to open {}", lock_path.display()))
+}
+
 /// Insert or ignore a `managed_path_markers` row.
 ///
 /// Uses `INSERT OR IGNORE` so this is idempotent on the primary key (`path`).

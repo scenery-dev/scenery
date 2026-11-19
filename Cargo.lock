@@ -2388,6 +2388,7 @@ dependencies = [
  "http 1.4.0",
  "jsonschema",
  "keyring",
+ "libc",
  "mockito",
  "reqwest 0.12.28",
  "rusqlite",

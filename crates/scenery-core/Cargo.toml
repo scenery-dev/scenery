@@ -57,6 +57,9 @@ unicode-normalization = "0.1"
 #     on every install. Linux users fall through to the SQLite-with-0600
 #     storage path (same as headless macOS / CI / containers). Matches the
 #     convention used by `gh`, `kubectl`, `aws cli`.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", default-features = false, features = ["apple-native"] }
 

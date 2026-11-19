@@ -728,31 +728,53 @@ async fn skill_lock_does_not_serialize_different_skills() {
 
 // ── marker_present_for_slug short-circuit (v1.0.53) ──────────────────────────
 
-/// `marker_present_for_slug` returns true when a `kind='skill'` row exists for
-/// the slug, false otherwise. Used by `do_install` to short-circuit the
-/// download step for skills that were imported by F1 (no artifact in the
-/// registry — trying to download flaps the row into `error`).
+/// `marker_row_at` is true only for a `kind='skill'` row for the slug AT the
+/// given path. A row for the same slug elsewhere, or of another kind, does not
+/// prove Scenery owns the canonical directory.
 #[tokio::test]
-async fn marker_present_returns_true_when_f2_marker_exists() {
+async fn marker_present_returns_true_only_for_the_canonical_path() {
     use std::sync::Arc;
     let root = temp_root("marker-present");
     let state = Arc::new(AppState::bootstrap_in(root.clone()).unwrap());
-
-    // Initially absent.
-    assert!(!super::marker_present_for_slug(&state, "demo").await);
-
-    // Seed a marker row directly.
     let conn = Connection::open(&state.db_path).unwrap();
+
+    assert!(!super::marker_row_at(
+        &conn,
+        "demo",
+        "/h/.agents/skills/demo"
+    ));
+
+    // A user's own copy of the same name, somewhere else.
     conn.execute(
         "INSERT INTO managed_path_markers (path, kind, slug, source_sha256, migrated_at) \
-         VALUES ('/x/demo', 'skill', 'demo', 'abc', 't')",
+         VALUES ('/elsewhere/demo', 'skill', 'demo', 'abc', 't')",
         [],
     )
     .unwrap();
+    assert!(!super::marker_row_at(
+        &conn,
+        "demo",
+        "/h/.agents/skills/demo"
+    ));
+    assert!(super::marker_row_at(&conn, "demo", "/elsewhere/demo"));
 
-    assert!(super::marker_present_for_slug(&state, "demo").await);
-    // Other slugs still absent.
-    assert!(!super::marker_present_for_slug(&state, "other").await);
+    conn.execute(
+        "INSERT INTO managed_path_markers (path, kind, slug, source_sha256, migrated_at) \
+         VALUES ('/h/.agents/skills/demo', 'skill', 'demo', 'abc', 't')",
+        [],
+    )
+    .unwrap();
+    assert!(super::marker_row_at(
+        &conn,
+        "demo",
+        "/h/.agents/skills/demo"
+    ));
+    assert!(!super::marker_row_at(
+        &conn,
+        "other",
+        "/h/.agents/skills/demo"
+    ));
+
     // Wrong kind doesn't match.
     conn.execute(
         "INSERT INTO managed_path_markers (path, kind, slug, source_sha256, migrated_at) \
@@ -760,7 +782,7 @@ async fn marker_present_returns_true_when_f2_marker_exists() {
         [],
     )
     .unwrap();
-    assert!(!super::marker_present_for_slug(&state, "mcp-only").await);
+    assert!(!super::marker_row_at(&conn, "mcp-only", "/x/mcp-slug"));
 
     cleanup(&root);
 }
@@ -1225,11 +1247,14 @@ async fn f2_marker_alone_is_not_phantom_but_pending_takeover_is() {
     let root = temp_root("phantom-guard");
     let state = std::sync::Arc::new(AppState::bootstrap_in(root.clone()).unwrap());
     {
+        let canonical = crate::managed_paths::paths::agents_skills_dir()
+            .unwrap()
+            .join("demo");
         let conn = Connection::open(&state.db_path).unwrap();
         conn.execute(
             "INSERT INTO managed_path_markers (path, kind, slug, source_sha256, migrated_at) \
-             VALUES ('/x/demo', 'skill', 'demo', 'h', '2026-01-01T00:00:00Z')",
-            [],
+             VALUES (?1, 'skill', 'demo', 'h', '2026-01-01T00:00:00Z')",
+            [canonical.to_string_lossy().to_string()],
         )
         .unwrap();
     }

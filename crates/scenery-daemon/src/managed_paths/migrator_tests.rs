@@ -661,6 +661,64 @@ fn buffer_audit_event_writes_row() {
     assert_eq!(event_type, "managed_path_migrated");
 }
 
+// ── Uploaded hash of an MCP entry (SEC1 follow-up 1) ─────────────────────────
+
+fn mcp_item_with_env(secret: &str) -> MigrationItem {
+    let raw = serde_json::json!({
+        "command": "npx",
+        "args": ["-y", "some-server"],
+        "env": {"API_KEY": secret},
+    });
+    let items = {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(".claude.json");
+        fs::write(
+            &path,
+            serde_json::json!({"mcpServers": {"srv": raw}}).to_string(),
+        )
+        .unwrap();
+        super::super::scanner::scan_claude_json(&path).unwrap()
+    };
+    items.into_iter().next().unwrap()
+}
+
+/// The hash that leaves the machine for an MCP entry must not be a digest of
+/// the raw entry: a low-entropy secret in `env` could be brute-forced from it.
+#[test]
+fn upload_hash_of_mcp_entry_does_not_depend_on_secret_values() {
+    let a = mcp_item_with_env("short-1");
+    let b = mcp_item_with_env("short-2");
+    // The local hash (drift baseline) still covers the whole raw entry.
+    assert_ne!(a.canonical_hash, b.canonical_hash);
+    assert_ne!(upload_hash(&a), a.canonical_hash);
+    assert_eq!(upload_hash(&a), upload_hash(&b));
+}
+
+#[test]
+fn upload_hash_of_plugin_is_its_canonical_hash() {
+    let tmp = tempfile::tempdir().unwrap();
+    let item = plugin_item("p", tmp.path());
+    assert_eq!(upload_hash(&item), item.canonical_hash);
+}
+
+#[test]
+fn audit_event_for_mcp_carries_the_upload_hash_not_the_raw_hash() {
+    let item = mcp_item_with_env("short-1");
+    let tmp = tempfile::tempdir().unwrap();
+    let conn = rusqlite::Connection::open(tmp.path().join("test.db")).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE audit_events (id INTEGER PRIMARY KEY AUTOINCREMENT, event_type TEXT NOT NULL,
+         payload TEXT NOT NULL, created_at INTEGER NOT NULL, uploaded INTEGER NOT NULL DEFAULT 0)",
+    )
+    .unwrap();
+    buffer_audit_event(&conn, &item, None).unwrap();
+    let payload: String = conn
+        .query_row("SELECT payload FROM audit_events", [], |r| r.get(0))
+        .unwrap();
+    assert!(!payload.contains(&item.canonical_hash));
+    assert!(payload.contains(&upload_hash(&item)));
+}
+
 // ── copy_dir_recursive ────────────────────────────────────────────────────────
 
 #[test]

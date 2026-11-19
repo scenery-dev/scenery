@@ -50,6 +50,7 @@ pub mod verifier;
 
 // M1 modules
 pub mod auth;
+pub mod bundle_dir;
 pub mod executor;
 pub mod gateway_model;
 pub mod http;

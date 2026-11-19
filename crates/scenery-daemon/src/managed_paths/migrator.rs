@@ -462,7 +462,7 @@ async fn post_migrate(
         "items": [{
             "kind": item.kind.to_string(),
             "slug": item.slug,
-            "canonical_hash": item.canonical_hash,
+            "canonical_hash": upload_hash(item),
             "payload": migrate_payload(item),
         }]
     });
@@ -616,6 +616,22 @@ pub(crate) fn migrate_payload(item: &MigrationItem) -> serde_json::Value {
     serde_json::Value::Object(out)
 }
 
+/// The hash that is sent to the backend (migrate body and audit event).
+///
+/// For an MCP entry `canonical_hash` is a SHA-256 of the raw entry, env and
+/// header secrets included, and a low-entropy secret could be brute-forced
+/// from it. It stays local (the drift baseline); what leaves the machine is
+/// the hash of the sanitized upload payload. Plugins hash a manifest that
+/// carries no secrets, so they keep `canonical_hash`.
+pub(crate) fn upload_hash(item: &MigrationItem) -> String {
+    match item.kind {
+        ItemKind::Mcp => scenery_core::restore_journal::sha256_hex(
+            &serde_json::to_vec(&migrate_payload(item)).unwrap_or_default(),
+        ),
+        ItemKind::Plugin => item.canonical_hash.clone(),
+    }
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Load the access token for `registry_url` from SQLite.
@@ -641,7 +657,7 @@ fn buffer_audit_event(
     let payload = serde_json::json!({
         "kind": item.kind.to_string(),
         "slug": item.slug,
-        "canonical_hash": item.canonical_hash,
+        "canonical_hash": upload_hash(item),
         "installation_id": installation_id,
         "source_path": item.source_path.to_string_lossy(),
     });

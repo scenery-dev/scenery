@@ -953,3 +953,65 @@ mod own_skill_guard {
         assert!(marker_provenance(&conn, &dir.to_string_lossy()).is_auto_managed());
     }
 }
+
+/// SEC1 follow-up: `remove_skill` deletes the directory and then the row. A
+/// drift scan that lands between the two sees "dir gone, row present" and used
+/// to report a false `deleted`. The decision is taken under the lock the
+/// removal holds; when the lock is busy the report is deferred (never blocks
+/// the daemon's runtime thread).
+#[test]
+fn deleted_is_deferred_while_a_removal_is_in_flight() {
+    let td = TempDir::new().unwrap();
+    let root = camino::Utf8PathBuf::from_path_buf(td.path().join("data")).unwrap();
+    let state = scenery_core::state::AppState::bootstrap_in(root).unwrap();
+    let skill_dir = td.path().join("half-removed");
+    let path = skill_dir.to_string_lossy().to_string();
+    let marker = ManagedPathMarker {
+        path: path.clone(),
+        kind: "skill".to_string(),
+        slug: "half-removed".to_string(),
+        installation_id: None,
+        source_sha256: "abc".to_string(),
+        migrated_at: "2026-05-24T00:00:00Z".to_string(),
+    };
+    let conn = Connection::open(state.db_path.as_std_path()).unwrap();
+    insert_db_marker(&conn, &marker).unwrap();
+    let outcome = classify(&state, &conn, &marker);
+    assert_eq!(outcome.status, DriftStatus::Deleted);
+
+    let lock =
+        crate::managed_paths::marker::lock_skill_removal(state.db_path.as_std_path()).unwrap();
+    let started = std::time::Instant::now();
+    assert!(!deletion_confirmed(&state, &outcome), "busy lock defers");
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(200),
+        "must not block while the lock is held"
+    );
+    drop(lock);
+
+    // No removal running, row still there, dir gone: a genuine deletion.
+    assert!(deletion_confirmed(&state, &outcome));
+    // The removal finished the row: nothing to report.
+    conn.execute("DELETE FROM managed_path_markers WHERE path = ?1", [&path])
+        .unwrap();
+    assert!(!deletion_confirmed(&state, &outcome));
+}
+
+/// An MCP entry's hash is a digest of the raw entry (env secrets included); a
+/// low-entropy secret could be brute-forced from it, so it never leaves the
+/// device in a drift report.
+#[test]
+fn drift_reports_carry_no_raw_hash_for_mcp_entries() {
+    let mk = |kind: &str| DriftReportItem {
+        slug: "s".into(),
+        kind: kind.into(),
+        current_hash: "raw-cur".into(),
+        expected_hash: "raw-exp".into(),
+        action: "reported".into(),
+        detail: None,
+    };
+    let out = scrub_report_hashes(vec![mk("mcp"), mk("skill")]);
+    assert_eq!(out[0].current_hash, "");
+    assert_eq!(out[0].expected_hash, "");
+    assert_eq!(out[1].current_hash, "raw-cur");
+}

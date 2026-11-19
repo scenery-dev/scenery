@@ -3294,28 +3294,39 @@ fn push_skill_to_claude(
     }
 }
 
-/// Return true if `managed_path_markers` has a `kind='skill'` row for this slug.
+/// Return true if `managed_path_markers` has a `kind='skill'` row for this slug
+/// at the canonical managed location (`~/.agents/skills/<slug>`).
 ///
-/// The F2 marker is the canonical signal "Scenery already owns this skill's
-/// `~/.claude/skills/<slug>/` directory" — for example because F1 migrated it
-/// from local disk. In that case the registry has no artifact to download.
+/// The row is the signal "Scenery already owns this skill's directory" — for
+/// example because F1 migrated it from local disk. In that case the registry
+/// has no artifact to download. It is matched by path, not by slug alone: a
+/// row for the same slug at some other location (a user's own copy that
+/// happens to share the name) does not prove Scenery owns the canonical one.
 async fn marker_present_for_slug(state: &Arc<AppState>, slug: &str) -> bool {
+    let Some(canonical) = crate::managed_paths::paths::agents_skills_dir() else {
+        return false;
+    };
+    let path = canonical.join(slug).to_string_lossy().to_string();
     let state_clone = Arc::clone(state);
     let slug = slug.to_string();
-    tokio::task::spawn_blocking(move || {
-        let conn = match rusqlite::Connection::open(&state_clone.db_path) {
-            Ok(c) => c,
-            Err(_) => return false,
-        };
-        let row: rusqlite::Result<i64> = conn.query_row(
-            "SELECT 1 FROM managed_path_markers WHERE kind = 'skill' AND slug = ?1 LIMIT 1",
-            rusqlite::params![slug],
-            |r| r.get(0),
-        );
-        row.is_ok()
-    })
+    tokio::task::spawn_blocking(
+        move || match rusqlite::Connection::open(&state_clone.db_path) {
+            Ok(conn) => marker_row_at(&conn, &slug, &path),
+            Err(_) => false,
+        },
+    )
     .await
     .unwrap_or(false)
+}
+
+/// True when a `kind='skill'` marker row for `slug` sits exactly at `path`.
+fn marker_row_at(conn: &rusqlite::Connection, slug: &str, path: &str) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM managed_path_markers WHERE kind = 'skill' AND slug = ?1 AND path = ?2 LIMIT 1",
+        rusqlite::params![slug, path],
+        |r| r.get::<_, i64>(0),
+    )
+    .is_ok()
 }
 
 /// Decide whether an `Install` event targets a phantom (byte-less) artifact.
@@ -3603,11 +3614,19 @@ async fn handle_deactivate_with(
             // F2: Remove the skill from ~/.claude/skills/.
             if let Some(p) = pusher {
                 let slug = state.skill_local_name(&skill_id_for_pusher);
-                let torn_down = if user_uninstall {
-                    crate::managed_paths::own_uninstall::uninstall_projection(state, &slug)
-                } else {
-                    p.remove_skill(&slug)
-                };
+                // Blocking file work (and the skill-removal flock): keep it
+                // off the runtime thread.
+                let st = state.clone();
+                let p = p.clone();
+                let torn_down = tokio::task::spawn_blocking(move || {
+                    if user_uninstall {
+                        crate::managed_paths::own_uninstall::uninstall_projection(&st, &slug)
+                    } else {
+                        p.remove_skill(&slug)
+                    }
+                })
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("teardown task failed: {e}")));
                 if let Err(e) = torn_down {
                     warn!(
                         skill_id = %skill_id_for_pusher,

@@ -1,3 +1,4 @@
+use crate::bundle_dir::BundleDir;
 use crate::scan::{ScanClient, ScanVerdict};
 use anyhow::{Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
@@ -109,7 +110,10 @@ impl PreparedImport {
         let canon_parent = canonical_utf8(&parent)?;
         let output_dir = canon_parent.join(&self.id);
 
-        ensure_real_dir(&output_dir)?;
+        // Hold the bundle directory open: every later write goes through this
+        // handle, so swapping the path for a symlink after this point cannot
+        // redirect a write.
+        let bundle_dir = BundleDir::open_or_create(&output_dir)?;
         let canon_out = canonical_utf8(&output_dir)?;
         if canon_out != output_dir || canon_out.parent() != Some(canon_parent.as_path()) {
             anyhow::bail!(
@@ -119,7 +123,7 @@ impl PreparedImport {
         }
 
         let files = scaffold_bundle(
-            &output_dir,
+            &bundle_dir,
             &self.display_name,
             &self.frontmatter,
             self.body.trim(),
@@ -248,22 +252,6 @@ fn canonical_utf8(path: &Utf8Path) -> Result<Utf8PathBuf> {
         .map_err(|p| anyhow::anyhow!("path is not UTF-8: {}", p.display()))
 }
 
-/// Create `dir` if it is missing; if it exists it must be a real directory,
-/// not a symlink (to a directory or anything else).
-fn ensure_real_dir(dir: &Utf8Path) -> Result<()> {
-    match fs::symlink_metadata(dir) {
-        Ok(meta) if meta.file_type().is_symlink() => {
-            anyhow::bail!("refusing to write through symlink {dir}")
-        }
-        Ok(meta) if meta.is_dir() => Ok(()),
-        Ok(_) => anyhow::bail!("{dir} exists and is not a directory"),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir(dir).with_context(|| format!("failed to create directory {dir}"))
-        }
-        Err(e) => Err(e).with_context(|| format!("failed to inspect {dir}")),
-    }
-}
-
 fn parse_frontmatter(content: &str) -> Result<(SkillMdFrontmatter, &str)> {
     let after_open = content
         .strip_prefix("---\n")
@@ -282,26 +270,23 @@ fn parse_frontmatter(content: &str) -> Result<(SkillMdFrontmatter, &str)> {
     Ok((frontmatter, body))
 }
 
-/// `dir` must already be a verified real directory (see [`ensure_real_dir`]).
 fn scaffold_bundle(
-    dir: &Utf8Path,
+    dir: &BundleDir,
     display_name: &str,
     frontmatter: &SkillMdFrontmatter,
     system_prompt: &str,
 ) -> Result<Vec<String>> {
-    ensure_real_dir(&dir.join("prompts"))?;
-    ensure_real_dir(&dir.join("schemas"))?;
+    let prompts = dir.subdir("prompts")?;
+    let schemas = dir.subdir("schemas")?;
 
     let mut written: Vec<String> = Vec::new();
 
-    write_file(dir, "prompts/system.txt", system_prompt, &mut written)?;
-    write_file(dir, "schemas/input.schema.json", INPUT_SCHEMA, &mut written)?;
-    write_file(
-        dir,
-        "schemas/output.schema.json",
-        OUTPUT_SCHEMA,
-        &mut written,
-    )?;
+    prompts.write_file("system.txt", system_prompt.as_bytes())?;
+    written.push("prompts/system.txt".to_string());
+    schemas.write_file("input.schema.json", INPUT_SCHEMA.as_bytes())?;
+    written.push("schemas/input.schema.json".to_string());
+    schemas.write_file("output.schema.json", OUTPUT_SCHEMA.as_bytes())?;
+    written.push("schemas/output.schema.json".to_string());
 
     let workflow = "name: imported_skill\nsteps:\n\
          \x20 - id: generate\n\
@@ -310,61 +295,14 @@ fn scaffold_bundle(
          \x20   inputs:\n\
          \x20     input: input.input\n\
          \x20   output_schema: schemas/output.schema.json\n";
-    write_file(dir, "workflow.yaml", workflow, &mut written)?;
+    dir.write_file("workflow.yaml", workflow.as_bytes())?;
+    written.push("workflow.yaml".to_string());
 
     let skill_md = build_skill_md(display_name, frontmatter, system_prompt);
-    write_file(dir, "SKILL.md", &skill_md, &mut written)?;
+    dir.write_file("SKILL.md", skill_md.as_bytes())?;
+    written.push("SKILL.md".to_string());
 
     Ok(written)
-}
-
-/// Write `dir/rel` without following a symlink or writing into a hard-linked
-/// inode: refuse an existing symlink, write a fresh temp file created with
-/// `create_new` next to the target, then rename it over the target.
-fn write_file(dir: &Utf8Path, rel: &str, content: &str, log: &mut Vec<String>) -> Result<()> {
-    use std::io::Write;
-
-    let path = dir.join(rel);
-    match fs::symlink_metadata(&path) {
-        Ok(meta) if meta.file_type().is_symlink() => {
-            anyhow::bail!("refusing to write through symlink {path}")
-        }
-        Ok(meta) if meta.is_dir() => anyhow::bail!("{path} exists and is a directory"),
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e).with_context(|| format!("failed to inspect {path}")),
-    }
-
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| anyhow::anyhow!("{path} has no file name"))?;
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let tmp = path.with_file_name(format!(
-        ".{file_name}.vh-import-{}-{nanos}.tmp",
-        std::process::id()
-    ));
-
-    let result = (|| -> Result<()> {
-        let mut f = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
-            .with_context(|| format!("failed to create {tmp}"))?;
-        f.write_all(content.as_bytes())
-            .with_context(|| format!("failed to write {tmp}"))?;
-        drop(f);
-        fs::rename(&tmp, &path).with_context(|| format!("failed to write {path}"))
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
-    result?;
-
-    log.push(rel.to_string());
-    Ok(())
 }
 
 fn build_skill_md(display_name: &str, fm: &SkillMdFrontmatter, body: &str) -> String {
