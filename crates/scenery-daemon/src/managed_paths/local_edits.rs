@@ -124,7 +124,11 @@ pub fn note_snapshot(
     let res = conn.execute(
         "INSERT INTO skill_local_state (skill_id, authorship, branch_state, base_version, updated_at) \
          VALUES (?1, ?2, COALESCE(?3, 'none'), ?4, ?5) \
-         ON CONFLICT(skill_id) DO UPDATE SET authorship = excluded.authorship, updated_at = excluded.updated_at",
+         ON CONFLICT(skill_id) DO UPDATE SET authorship = excluded.authorship, \
+           base_version = CASE WHEN skill_local_state.branch_state = 'branch' \
+             THEN skill_local_state.base_version \
+             ELSE COALESCE(excluded.base_version, skill_local_state.base_version) END, \
+           updated_at = excluded.updated_at",
         rusqlite::params![skill_id, a, branch_state, base_version, now_secs()],
     );
     if let Err(e) = res {
@@ -153,13 +157,16 @@ pub fn registry_id_for(state: &AppState, marker: &ManagedPathMarker, prov: &Prov
 }
 
 /// The skill is a plain registry version again (restored or reinstalled): forget
-/// any branch and report `none`.
-pub fn reset_branch(conn: &Connection, skill_id: &str) {
+/// any branch and report `none`. `new_base` is the registry version now on the
+/// device: the next edit starts from it, not from the old branch's base (`None`
+/// falls back to the installed version at upload time).
+pub fn reset_branch(conn: &Connection, skill_id: &str, new_base: Option<&str>) {
     let _ = conn.execute(
         "UPDATE skill_local_state SET branch_state = 'none', local_version = NULL, \
-         local_version_id = NULL, uploaded_tree = NULL, held_tree = NULL, updated_at = ?2 \
+         local_version_id = NULL, uploaded_tree = NULL, held_tree = NULL, \
+         base_version = ?3, updated_at = ?2 \
          WHERE skill_id = ?1",
-        rusqlite::params![skill_id, now_secs()],
+        rusqlite::params![skill_id, now_secs(), new_base],
     );
 }
 

@@ -3115,7 +3115,7 @@ pub(crate) async fn install_verified_version(
             .await;
 
         // F2: Push the skill into ~/.claude/skills/ after symlink flip.
-        forget_local_branch(state, &skill_id);
+        forget_local_branch(state, &skill_id, &version);
         push_skill_to_claude(pusher, &skill_id, Some(&installation_id.to_string()), state);
 
         return Ok(());
@@ -3145,7 +3145,7 @@ pub(crate) async fn install_verified_version(
     report_installation_status(installation_id, "installed", None, &reg_url, state).await;
 
     // F2: Push the skill into ~/.claude/skills/ after successful install.
-    forget_local_branch(state, &skill_id);
+    forget_local_branch(state, &skill_id, &version);
     push_skill_to_claude(pusher, &skill_id, Some(&installation_id.to_string()), state);
 
     Ok(())
@@ -3182,9 +3182,9 @@ async fn live_edit_pending(state: &Arc<AppState>, slug: &str) -> bool {
 
 /// A registry version was just installed: the device runs a plain version
 /// again, so any recorded local branch (Phase 9a) no longer applies.
-fn forget_local_branch(state: &AppState, skill_id: &str) {
+fn forget_local_branch(state: &AppState, skill_id: &str, version: &str) {
     if let Ok(conn) = rusqlite::Connection::open(&state.db_path) {
-        crate::managed_paths::local_edits::reset_branch(&conn, skill_id);
+        crate::managed_paths::local_edits::reset_branch(&conn, skill_id, Some(version));
     }
 }
 

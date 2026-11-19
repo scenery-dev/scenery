@@ -744,7 +744,7 @@ fn restore_canonical(state: &AppState, slug: &str, kind: &str) -> Result<()> {
         if let Ok(conn) = Connection::open(state.db_path.as_std_path()) {
             let prov = Provenance::default();
             let id = super::local_edits::registry_id_for(state, &marker, &prov);
-            super::local_edits::reset_branch(&conn, &id);
+            super::local_edits::reset_branch(&conn, &id, None);
         }
     }
     info!(

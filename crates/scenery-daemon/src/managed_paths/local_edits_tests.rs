@@ -391,6 +391,71 @@ async fn a_catalog_edit_in_a_non_strict_mode_is_a_branch_that_keeps_running() {
 }
 
 #[tokio::test]
+async fn the_next_edit_after_an_approved_change_starts_from_the_new_catalog_version() {
+    let mut f = Fx::new().await;
+    f.set_mode("audit_only");
+    f.drift_sink().await;
+    let dir = f.push("cat", false);
+    f.conn()
+        .execute(
+            "INSERT INTO installed_skills (skill_id, active_version, installed_at, install_path) VALUES ('cat', '0.1.2', 'now', 'p')",
+            [],
+        )
+        .ok();
+    // The old branch was based on 0.1.1; approve promoted it to 0.1.2 and the
+    // device installed that (the reconciler resets the branch to the new base).
+    note_snapshot(&f.conn(), "cat", Some("catalog"), None, None);
+    f.conn()
+        .execute(
+            "UPDATE skill_local_state SET branch_state='branch', base_version='0.1.1', \
+             local_version='0.1.1+local.x.1', uploaded_tree='old' WHERE skill_id='cat'",
+            [],
+        )
+        .unwrap();
+    reset_branch(&f.conn(), "cat", Some("0.1.2"));
+    let ls = load(&f.conn(), "cat").unwrap();
+    assert_eq!(
+        (ls.branch_state.as_str(), ls.base_version.as_deref()),
+        ("none", Some("0.1.2"))
+    );
+    // A backend snapshot that still says 0.1.2 and no branch keeps it.
+    note_snapshot(
+        &f.conn(),
+        "cat",
+        Some("catalog"),
+        Some("none"),
+        Some("0.1.2"),
+    );
+    assert_eq!(
+        load(&f.conn(), "cat").unwrap().base_version.as_deref(),
+        Some("0.1.2")
+    );
+
+    let up = f
+        .server
+        .mock("POST", "/runner/skills/cat/versions/local")
+        .match_body(mockito::Matcher::Regex(
+            "name=\"base_version\"\r\n\r\n0\\.1\\.2".into(),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(STORED_BRANCH)
+        .expect(1)
+        .create_async()
+        .await;
+    let _patch = f
+        .server
+        .mock("PATCH", "/api/installations/inst-1")
+        .with_status(200)
+        .with_body("{}")
+        .create_async()
+        .await;
+    fs::write(dir.join("prompts/p.md"), "first edit after the approval").unwrap();
+    assert_eq!(f.cycle().await.drifted, 1);
+    up.assert_async().await;
+}
+
+#[tokio::test]
 async fn a_catalog_edit_in_strict_mode_is_uploaded_as_a_branch_then_quarantined_as_today() {
     for mode in ["quarantine", "approve_required"] {
         let mut f = Fx::new().await;
