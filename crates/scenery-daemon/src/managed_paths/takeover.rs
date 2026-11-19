@@ -1,25 +1,20 @@
-//! Adopt-publish takeover — removes a skill's original discovered
+//! Auto-manage takeover — removes a skill's original discovered
 //! `source_path` (e.g. `~/.agents/skills/<slug>`) once a real Scenery
 //! F2-managed copy of that skill is confirmed present on disk.
 //!
 //! # Why this exists
 //!
-//! Adopting a locally-discovered skill uploads it through the org's normal
-//! scan/approval gate ([`crate::managed_paths::adopt_publish`]). Two
-//! outcomes are possible:
+//! Auto-managing a locally-discovered skill uploads it first
+//! ([`crate::managed_paths::auto_manage`]); the registry copy is then installed
+//! through the normal install path. Until a real managed copy is confirmed on
+//! disk, the original `source_path` and whatever local copy already exists
+//! must be left alone.
 //!
-//! - `published`: a real registry artifact exists immediately, so the origin
-//!   device installs it via the normal install path.
-//! - `pending_review`: no real artifact yet — the original `source_path` and
-//!   whatever local copy already exists must be left alone until IT approves.
-//!
-//! Both cases converge on the same rule: **only remove `source_path` after
-//! the managed replacement is verified on disk.** [`perform_if_pending`] is
-//! the single choke point that enforces this — it is called both right after
-//! the immediate `published` install and, later, from the reconciler's
-//! normal `Install` handling when the deferred-approval version finally
-//! installs (see `sync::reconciler::push_skill_to_claude` and the
-//! phantom-artifact branch in `sync::reconciler::do_install`).
+//! The rule: **only remove `source_path` after the managed replacement is
+//! verified on disk.** [`perform_if_pending`] is the single choke point that
+//! enforces this: it is called right after the install in
+//! `sync::reconciler::push_skill_to_claude` and from the phantom-artifact
+//! branch in `sync::reconciler::do_install`.
 //!
 //! # Data-loss guard (backup before delete)
 //!

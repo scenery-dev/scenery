@@ -139,7 +139,7 @@ fn link_dir_does_not_churn_backups_when_the_copy_already_matches_canonical() {
     // The unbounded-backup bug: on a copy-mode host (Windows without Developer
     // Mode) `link_dir` tore down its own byte-identical copy into a fresh
     // timestamped backup on *every* call — and `push_skill` calls it every
-    // push, `migrate_skills_to_agents_dir` every daemon start. The identity
+    // push and every daemon start. The identity
     // check makes an already-correct copy a no-op, so nothing accumulates.
     //
     // This is testable without Windows because the identity path is taken

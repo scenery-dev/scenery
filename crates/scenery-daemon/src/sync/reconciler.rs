@@ -2936,11 +2936,10 @@ async fn handle_install(
 ///
 /// Runs the phantom-artifact backstop check first, then delegates the real
 /// work to [`install_verified_version`]. Callers that already *know* a real
-/// artifact exists (the adopt-publish immediate-install path — see
-/// `managed_paths::adopt_publish`) call [`install_verified_version`] directly
-/// to skip this check: it can misfire on the F2 marker the adopt flow's own
-/// local-copy push already wrote for the slug (see `is_phantom`'s marker
-/// fallback below), even though the backend just confirmed real bytes exist.
+/// artifact exists (the auto-manage conversion) call
+/// [`install_verified_version`] directly to skip this check: it can misfire on
+/// a marker already written for the slug (see `is_phantom`'s marker fallback
+/// below), even though the backend just confirmed real bytes exist.
 async fn do_install(
     installation_id: Uuid,
     skill_id: &str,
@@ -2996,12 +2995,11 @@ async fn do_install(
 
             // Adopt-takeover convergence (deferred-approval path): this branch is
             // what a real, non-phantom `Install` event hits when a marker was
-            // already written for this slug by the adopt flow's own local-copy
-            // push (see `do_install`'s doc comment). If IT has since approved
-            // publication — signalled here by a real (non-"0.0.0") version — and
-            // this slug has a lingering discovered `source_path` recorded by
-            // `managed_paths::adopt_publish`, this is the confirmation needed to
-            // safely remove it. No-ops if nothing is pending for this slug.
+            // already written for this slug (see `do_install`'s doc comment). If
+            // a real (non-"0.0.0") version arrives and this slug has a lingering
+            // discovered `source_path` recorded by auto-manage, this is the
+            // confirmation needed to safely remove it. No-ops if nothing is
+            // pending for this slug.
             if version != "0.0.0" {
                 if let Err(e) =
                     crate::managed_paths::takeover::perform_if_pending(&state_clone, &skill_id)
@@ -3044,13 +3042,12 @@ async fn do_install(
 /// Shared by two callers:
 /// - [`do_install`], after its phantom-artifact check passes for a normal SSE
 ///   `Install` event.
-/// - `managed_paths::adopt_publish`, which calls this **directly** — bypassing
+/// - `managed_paths::auto_manage`, which calls this **directly** — bypassing
 ///   `do_install`'s phantom check entirely — right after the backend's
-///   adopt-publish endpoint returns `outcome: "published"`. At that point a
-///   real artifact is known to exist even though the slug may already carry
-///   an F2 marker (written by the adopt flow's own immediate local-copy push)
-///   that would otherwise make `do_install`'s marker-based phantom fallback
-///   misfire.
+///   auto-manage endpoint returns `outcome: "managed"`. At that point a real
+///   artifact is known to exist even though the slug may already carry a
+///   marker that would otherwise make `do_install`'s marker-based phantom
+///   fallback misfire.
 pub(crate) async fn install_verified_version(
     installation_id: Uuid,
     skill_id: &str,

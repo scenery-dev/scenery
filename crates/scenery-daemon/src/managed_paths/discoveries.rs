@@ -879,7 +879,7 @@ mod tests {
     #[test]
     fn respects_disable_env_var() {
         // This mutates the process-global SCENERY_DISABLE_FILESYSTEM_RECONCILER
-        // env var, which other tests (e.g. adopt_publish's) read indirectly via
+        // env var, which other tests (e.g. auto-manage's) read indirectly via
         // `reconciler_disabled()` — take the shared cross-file mutex so this
         // window can't be observed mid-test by an unrelated thread.
         let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());

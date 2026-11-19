@@ -420,10 +420,9 @@ pub async fn rollback(
 ///
 /// # Pivot awareness
 ///
-/// F1 adopts skills in place at `~/.claude/skills/<slug>`, so that is what the
-/// manifest records. `migrate_skills_to_agents_dir` then moves the adopted
-/// directory to `~/.agents/skills/<slug>` and leaves a symlink at the old
-/// path. `original_path.is_dir()` follows that symlink and returns true, so
+/// F1 adopted skills in place at `~/.claude/skills/<slug>`, so that is what an
+/// old manifest records. A later move of the adopted directory to
+/// `~/.agents/skills/<slug>` leaves a symlink at the old path. `original_path.is_dir()` follows that symlink and returns true, so
 /// removing it naively unlinks only the link and the adopted copy survives —
 /// still live for every client that scans the canonical root. When
 /// `original_path` is a symlink into `<home>/.agents/skills/<slug>`, both are
@@ -577,8 +576,8 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
 /// Delete the `managed_path_markers` row for `(kind, slug)`.
 ///
 /// Keyed on `(kind, slug)` rather than on the manifest's `f2_marker_path`
-/// because that path goes stale: `migrate_skills_to_agents_dir` re-keys skill
-/// rows from `~/.claude/skills/<slug>` to `~/.agents/skills/<slug>` after F1
+/// because that path goes stale: skill rows were re-keyed from
+/// `~/.claude/skills/<slug>` to `~/.agents/skills/<slug>` after F1
 /// wrote the manifest, so a `WHERE path = <claude path>` delete matches
 /// nothing and drift keeps governing the orphaned row. `(kind, slug)` is
 /// stable across the pivot and across any future relocation.
@@ -792,11 +791,10 @@ mod tests {
 
     /// **Regression (rollback is not pivot-aware).**
     ///
-    /// F1 adopts a user skill in place at `~/.claude/skills/<slug>` and writes
+    /// F1 adopted a user skill in place at `~/.claude/skills/<slug>` and wrote
     /// a manifest whose `original_path` and `f2_marker_path` both point there.
-    /// The next daemon start's `migrate_skills_to_agents_dir` then MOVES that
-    /// directory to `~/.agents/skills/<slug>`, leaves a symlink behind, and
-    /// re-keys the SQLite row to the canonical path.
+    /// A later move put that directory at `~/.agents/skills/<slug>`, left a
+    /// symlink behind, and re-keyed the SQLite row to the canonical path.
     ///
     /// Rollback — the user-facing undo for adoption — must cope with that:
     ///
@@ -854,7 +852,7 @@ mod tests {
              CREATE TABLE IF NOT EXISTS managed_path_markers (path TEXT PRIMARY KEY, kind TEXT, slug TEXT, installation_id TEXT, source_sha256 TEXT, migrated_at TEXT);",
         )
         .unwrap();
-        // The row as `migrate_skills_to_agents_dir` re-keyed it: canonical path.
+        // The row as the later move re-keyed it: canonical path.
         conn.execute(
             "INSERT INTO managed_path_markers (path, kind, slug, installation_id, source_sha256, migrated_at) \
              VALUES (?1, 'skill', ?2, NULL, 'abc', '2025-07-01T00:00:00Z')",
