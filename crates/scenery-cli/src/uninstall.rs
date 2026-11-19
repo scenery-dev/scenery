@@ -177,6 +177,7 @@ pub async fn run(opts: UninstallOpts) -> Result<()> {
     // ── 3. Restore first, so a failure mid-way never loses user data. ──
     // Native `~/.claude` takeovers + adopted originals from the restore journal.
     let originals_dir = report_folder(&opts);
+    keep_unsynced_branch_edits(&originals_dir, &mut report);
     restore_from_journal_in(&journal_entries, &mut report, &originals_dir);
     forget_kept_own_markers(&report);
     // Skills tracked in place were never changed; undo only what the kill
@@ -211,6 +212,36 @@ pub async fn run(opts: UninstallOpts) -> Result<()> {
     print_summary(&report, &paths);
     println!("\nRestart your AI client(s) to apply the change.");
     failure_result(&report)
+}
+
+/// Catalog skills the user edited (a branch) and never uploaded: copy the edits
+/// to `<report folder>/branches/<slug>/` before the sweep removes the skill. A
+/// synced branch needs no copy. A failed copy fails the item loudly.
+fn keep_unsynced_branch_edits(folder: &Path, report: &mut RestoreReport) {
+    let Ok(state) = scenery_core::state::AppState::bootstrap() else {
+        return;
+    };
+    for saved in
+        scenery_daemon::managed_paths::skill_merge::save_unsynced_branch_edits(&state, folder, None)
+    {
+        match (saved.copy_at, saved.error) {
+            (Some(at), _) => report.kept.push(KeptItem {
+                name: saved.slug,
+                location: at.display().to_string(),
+                note: "your edits of this catalog skill were never uploaded; a copy is kept here"
+                    .into(),
+            }),
+            (None, err) => {
+                let msg = format!(
+                    "could not copy your unsynced edits of '{}' before removal: {}",
+                    saved.slug,
+                    err.unwrap_or_default()
+                );
+                report.warnings.push(msg.clone());
+                report.failed.push(msg);
+            }
+        }
+    }
 }
 
 /// Non-zero exit when anything could not be restored.

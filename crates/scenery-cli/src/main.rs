@@ -42,6 +42,7 @@ mod install;
 mod logging;
 mod pair;
 mod rotating_file;
+mod skill_edits;
 mod token_input;
 mod uninstall;
 
@@ -287,6 +288,80 @@ pub enum SkillCommand {
         id: String,
 
         /// Registry base URL (used to deactivate managed installs).
+        #[arg(
+            long,
+            env = "SCENERY_REGISTRY_URL",
+            default_value = DEFAULT_REGISTRY_URL, value_parser = parse_registry_url)]
+        registry_url: Option<String>,
+    },
+
+    /// Merge a catalog update into your edited copy of a skill (a branch).
+    ///
+    /// Writes the three-way merge, conflict markers included, to
+    /// `~/.local/share/Scenery/merges/<slug>/`; the running skill is not
+    /// touched. `--continue` uploads it once no markers remain; `--apply` also
+    /// switches the live skill to it (the old tree is kept).
+    Merge {
+        /// Skill folder name or registry ID.
+        slug: String,
+        /// Upload the resolved merge (refuses while conflict markers remain).
+        #[arg(long = "continue", default_value_t = false)]
+        continue_: bool,
+        /// Upload (if needed) and swap the merged tree into the live skill.
+        #[arg(long, default_value_t = false)]
+        apply: bool,
+        /// Registry base URL.
+        #[arg(
+            long,
+            env = "SCENERY_REGISTRY_URL",
+            default_value = DEFAULT_REGISTRY_URL, value_parser = parse_registry_url)]
+        registry_url: Option<String>,
+    },
+
+    /// Share a skill: submit your edited copy of a catalog skill to IT, or
+    /// share a development / own skill to the catalog (always reviewed by IT).
+    Share {
+        /// Skill folder name.
+        slug: String,
+        /// Catalog name to publish an own/dev skill under.
+        #[arg(long)]
+        name: Option<String>,
+        /// A note for the reviewer (catalog branches).
+        #[arg(long)]
+        notes: Option<String>,
+        /// Do not ask for confirmation.
+        #[arg(long, short = 'y', default_value_t = false)]
+        yes: bool,
+        /// Registry base URL.
+        #[arg(
+            long,
+            env = "SCENERY_REGISTRY_URL",
+            default_value = DEFAULT_REGISTRY_URL, value_parser = parse_registry_url)]
+        registry_url: Option<String>,
+    },
+
+    /// Show a skill's version history (catalog versions plus your own).
+    History {
+        /// Skill folder name or registry ID.
+        slug: String,
+        /// Registry base URL.
+        #[arg(
+            long,
+            env = "SCENERY_REGISTRY_URL",
+            default_value = DEFAULT_REGISTRY_URL, value_parser = parse_registry_url)]
+        registry_url: Option<String>,
+    },
+
+    /// Install an earlier version of a skill (a per-device pointer move; history is kept).
+    Rollback {
+        /// Skill folder name or registry ID.
+        slug: String,
+        /// Version to go back to.
+        version: String,
+        /// Only this device ID (default: all your devices with the skill).
+        #[arg(long)]
+        device: Option<String>,
+        /// Registry base URL.
         #[arg(
             long,
             env = "SCENERY_REGISTRY_URL",
@@ -738,6 +813,45 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Skill(SkillCommand::Uninstall { id, registry_url }) => {
             cmd_skill_uninstall(&id, registry_url.as_deref()).await
+        }
+        Command::Skill(SkillCommand::Merge {
+            slug,
+            continue_,
+            apply,
+            registry_url,
+        }) => skill_edits::cmd_skill_merge(&slug, continue_, apply, registry_url.as_deref()).await,
+        Command::Skill(SkillCommand::Share {
+            slug,
+            name,
+            notes,
+            yes,
+            registry_url,
+        }) => {
+            skill_edits::cmd_skill_share(
+                &slug,
+                name.as_deref(),
+                notes.as_deref(),
+                yes,
+                registry_url.as_deref(),
+            )
+            .await
+        }
+        Command::Skill(SkillCommand::History { slug, registry_url }) => {
+            skill_edits::cmd_skill_history(&slug, registry_url.as_deref()).await
+        }
+        Command::Skill(SkillCommand::Rollback {
+            slug,
+            version,
+            device,
+            registry_url,
+        }) => {
+            skill_edits::cmd_skill_rollback(
+                &slug,
+                &version,
+                device.as_deref(),
+                registry_url.as_deref(),
+            )
+            .await
         }
         Command::Skill(SkillCommand::Update {
             id,
@@ -6250,6 +6364,33 @@ async fn cmd_skill_uninstall(id: &str, registry_url: Option<&str>) -> Result<()>
             anyhow::bail!("skill '{id}' is not installed");
         }
     };
+
+    // A catalog skill with edits the registry never got: keep a copy first.
+    if let Some(home) = dirs::home_dir() {
+        let folder = home.join(format!(
+            "Scenery-uninstall-{}",
+            scenery_core::timefmt::now_rfc3339()
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                .collect::<String>()
+        ));
+        for saved in scenery_daemon::managed_paths::skill_merge::save_unsynced_branch_edits(
+            &state,
+            &folder,
+            Some(id),
+        ) {
+            match saved.copy_at {
+                Some(at) => eprintln!(
+                    "note: your edits of '{id}' were never uploaded; a copy was kept at {}.",
+                    at.display()
+                ),
+                None => anyhow::bail!(
+                    "could not copy your unsynced edits of '{id}' before removal ({}); nothing was removed",
+                    saved.error.unwrap_or_default()
+                ),
+            }
+        }
+    }
 
     // Perform the local removal (files + DB rows).
     let own = uninstall_skill_by_user(&state, id)

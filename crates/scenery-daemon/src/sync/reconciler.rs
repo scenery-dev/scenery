@@ -605,6 +605,16 @@ async fn dispatch_event(
                 install_tasks,
             );
         }
+        SyncEvent::SkillMerge { event } => {
+            let (st, url) = (Arc::clone(state), registry_url.to_string());
+            tokio::spawn(async move {
+                match crate::managed_paths::skill_merge::handle_merge_event(&st, &url, event).await
+                {
+                    Ok(out) => info!(?out, "reconciler: skill_merge handled"),
+                    Err(e) => warn!(error = %format!("{e:#}"), "reconciler: skill_merge failed"),
+                }
+            });
+        }
         SyncEvent::Revoke {
             artifact_type,
             artifact_key,
@@ -809,6 +819,7 @@ async fn dispatch_event(
                     | SyncEvent::InstallPlugin { .. }
                     | SyncEvent::DeactivatePlugin { .. }
                     | SyncEvent::Revoke { .. }
+                    | SyncEvent::SkillMerge { .. }
                     | SyncEvent::Unrevoke { .. } => {}
                 }
             }
@@ -3794,7 +3805,7 @@ async fn build_derived_events(
         })
 }
 
-fn build_derived_events_blocking(
+pub(crate) fn build_derived_events_blocking(
     installations: Vec<InstallationRecord>,
     state: &AppState,
 ) -> Vec<SyncEvent> {
@@ -3872,6 +3883,23 @@ fn build_derived_events_blocking(
                     && local_state
                         .get(&record.skill_id)
                         .is_some_and(|(ver, _)| ver != &record.version);
+                // The backend may have cleared the branch (a change request was
+                // approved, or a rollback) while this device still holds edits
+                // that were never uploaded: never install over those. The drift
+                // scan uploads them first, and the next snapshot converges.
+                let unsynced_edits = !on_branch
+                    && record.state != "deactivated"
+                    && crate::managed_paths::skill_merge::has_unsynced_branch_edits(
+                        state,
+                        &record.skill_id,
+                    );
+                if unsynced_edits {
+                    debug!(
+                        skill_id = %record.skill_id,
+                        "reconciler: local branch has edits that were not uploaded; not installing over them"
+                    );
+                    continue;
+                }
                 if on_branch {
                     debug!(
                         skill_id = %record.skill_id,

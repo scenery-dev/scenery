@@ -359,6 +359,106 @@ pub struct PreviewScan {
     pub suggestions: Vec<String>,
 }
 
+/// One file of a `GET /runner/skills/{id}/merge-preview` answer (Phase 9b).
+/// `conflict` is `None` for a clean file, else `text` (conflict markers are in
+/// `content`), `binary`, `delete_modify` or `add_add` (the path holds MINE, a
+/// `sidecar` entry `<path>.theirs` holds THEIRS).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct MergeFileEntry {
+    pub path: String,
+    #[serde(default)]
+    pub executable: bool,
+    /// `utf8` | `base64`.
+    #[serde(default)]
+    pub encoding: String,
+    #[serde(default)]
+    pub content: String,
+    #[serde(default)]
+    pub conflict: Option<String>,
+    #[serde(default)]
+    pub sidecar: bool,
+}
+
+/// Body of a 200 from `GET /runner/skills/{id}/merge-preview` (runner >= 2.6.0):
+/// the server's three-way merge of this device's branch onto the catalog head.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct MergePreview {
+    #[serde(default)]
+    pub skill_id: String,
+    #[serde(default)]
+    pub base_version: Option<String>,
+    #[serde(default)]
+    pub head_version: Option<String>,
+    #[serde(default)]
+    pub branch_version_id: Option<String>,
+    #[serde(default)]
+    pub branch_version: Option<String>,
+    #[serde(default)]
+    pub clean: bool,
+    #[serde(default)]
+    pub up_to_date: bool,
+    #[serde(default)]
+    pub files: Vec<MergeFileEntry>,
+}
+
+/// A change request as the registry returns it (the fields the CLI shows).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ChangeRequestReply {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub base_version: String,
+    #[serde(default)]
+    pub head_version: Option<String>,
+}
+
+/// One entry of a skill's version history for the signed-in user.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct HistoryEntry {
+    #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub lineage: String,
+    #[serde(default)]
+    pub is_published: bool,
+    #[serde(default)]
+    pub installable: bool,
+    #[serde(default)]
+    pub is_head: bool,
+    #[serde(default)]
+    pub base_version: Option<String>,
+    #[serde(default)]
+    pub installed_on: Vec<String>,
+}
+
+/// Body of `GET /runner/skills/{id}/history`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SkillHistory {
+    #[serde(default)]
+    pub skill_id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub authorship: String,
+    #[serde(default)]
+    pub head_version: Option<String>,
+    #[serde(default)]
+    pub versions: Vec<HistoryEntry>,
+}
+
+/// Body of `POST /runner/skills/{id}/rollback`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RollbackReply {
+    #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub devices: Vec<String>,
+}
+
 /// A protocol-level refusal from one of the authoring endpoints (401, 403,
 /// 404, 409, 422, 426, 503). Anything else non-2xx is an `Err`.
 #[derive(Debug, Clone, Default)]
@@ -1500,6 +1600,163 @@ impl RegistryClient {
             return Ok(());
         }
         anyhow::bail!("branch report failed (HTTP {status})")
+    }
+
+    /// Percent-encode a skill id for a path segment.
+    fn encode_segment(id: &str) -> String {
+        id.bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    (b as char).to_string()
+                }
+                _ => format!("%{b:02X}"),
+            })
+            .collect()
+    }
+
+    /// One runner-authenticated request answering JSON (Phase 9b endpoints).
+    fn runner_json<T: serde::de::DeserializeOwned>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> Result<AuthoringReply<T>> {
+        let token = self
+            .get_auth_token()
+            .ok_or_else(|| anyhow::anyhow!("not authenticated; run `scenery auth login` first"))?;
+        let url = format!("{}{path}", self.base_url.trim_end_matches('/'));
+        let http = crate::http::blocking_client_builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(AUTO_MANAGE_TIMEOUT)
+            .build()
+            .context("failed to build the registry HTTP client")?;
+        let mut req = http.request(method, &url).bearer_auth(token);
+        if let Some(b) = body {
+            req = req.json(&b);
+        }
+        let resp = req
+            .send_tracked()
+            .with_context(|| format!("failed to reach registry at {url}"))?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(AuthoringReply::Done(resp.json().with_context(|| {
+                format!("failed to deserialize the response of {path}")
+            })?));
+        }
+        let code = status.as_u16();
+        let text = resp.text().unwrap_or_default();
+        if matches!(code, 401 | 403 | 404 | 409 | 422 | 426 | 503) {
+            return Ok(AuthoringReply::Refused(authoring_refusal(code, &text)));
+        }
+        anyhow::bail!("{path} failed (HTTP {status}): {text}")
+    }
+
+    /// The server's merge of this device's branch onto the catalog head
+    /// (`GET /runner/skills/{id}/merge-preview`, runner >= 2.6.0).
+    pub fn merge_preview(
+        &self,
+        skill_id: &str,
+        device_id: &str,
+    ) -> Result<AuthoringReply<MergePreview>> {
+        self.runner_json(
+            reqwest::Method::GET,
+            &format!(
+                "/runner/skills/{}/merge-preview?device_id={}",
+                Self::encode_segment(skill_id),
+                Self::encode_segment(device_id)
+            ),
+            None,
+        )
+    }
+
+    /// Download the tree of one of the user's own local versions as a gzip tar
+    /// (`GET /runner/skills/{id}/local-versions/{version_id}/source`).
+    pub fn download_local_version_source(
+        &self,
+        skill_id: &str,
+        version_id: &str,
+    ) -> Result<AuthoringReply<Vec<u8>>> {
+        let token = self
+            .get_auth_token()
+            .ok_or_else(|| anyhow::anyhow!("not authenticated; run `scenery auth login` first"))?;
+        let path = format!(
+            "/runner/skills/{}/local-versions/{}/source",
+            Self::encode_segment(skill_id),
+            Self::encode_segment(version_id)
+        );
+        let url = format!("{}{path}", self.base_url.trim_end_matches('/'));
+        let http = crate::http::blocking_client_builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(AUTO_MANAGE_TIMEOUT)
+            .build()
+            .context("failed to build the registry HTTP client")?;
+        let resp = http
+            .get(&url)
+            .bearer_auth(token)
+            .send_tracked()
+            .with_context(|| format!("failed to reach registry at {url}"))?;
+        let status = resp.status();
+        if status.is_success() {
+            let bytes = resp.bytes().context("failed to read the version source")?;
+            return Ok(AuthoringReply::Done(bytes.to_vec()));
+        }
+        let code = status.as_u16();
+        let text = resp.text().unwrap_or_default();
+        if matches!(code, 401 | 403 | 404 | 409 | 422 | 426 | 503) {
+            return Ok(AuthoringReply::Refused(authoring_refusal(code, &text)));
+        }
+        anyhow::bail!("{path} failed (HTTP {status}): {text}")
+    }
+
+    /// Submit this device's branch of a catalog skill for IT review
+    /// (`POST /runner/skills/{id}/change-requests`). 409 `needs_rebase` when the
+    /// catalog head moved on: merge first.
+    pub fn submit_change_request(
+        &self,
+        skill_id: &str,
+        device_id: &str,
+        notes: Option<&str>,
+    ) -> Result<AuthoringReply<ChangeRequestReply>> {
+        let mut body = serde_json::json!({ "device_id": device_id });
+        if let Some(n) = notes {
+            body["notes"] = serde_json::json!(n);
+        }
+        self.runner_json(
+            reqwest::Method::POST,
+            &format!(
+                "/runner/skills/{}/change-requests",
+                Self::encode_segment(skill_id)
+            ),
+            Some(body),
+        )
+    }
+
+    /// Version history for the signed-in user (`GET /runner/skills/{id}/history`).
+    pub fn skill_history(&self, skill_id: &str) -> Result<AuthoringReply<SkillHistory>> {
+        self.runner_json(
+            reqwest::Method::GET,
+            &format!("/runner/skills/{}/history", Self::encode_segment(skill_id)),
+            None,
+        )
+    }
+
+    /// Re-pin this user's device(s) to an earlier version
+    /// (`POST /runner/skills/{id}/rollback`).
+    pub fn skill_rollback(
+        &self,
+        skill_id: &str,
+        version: &str,
+        device_id: Option<&str>,
+    ) -> Result<AuthoringReply<RollbackReply>> {
+        let mut body = serde_json::json!({ "version": version });
+        if let Some(d) = device_id {
+            body["device_id"] = serde_json::json!(d);
+        }
+        self.runner_json(
+            reqwest::Method::POST,
+            &format!("/runner/skills/{}/rollback", Self::encode_segment(skill_id)),
+            Some(body),
+        )
     }
 
     /// Scan preview of a tree (`POST /runner/skills/preview-scan`): verdict,
@@ -3691,5 +3948,61 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
         m.assert();
+    }
+    #[test]
+    fn phase_9b_endpoints_use_the_documented_paths_and_shapes() {
+        use mockito::{Matcher, Server};
+        let mut server = Server::new();
+        let _m = server
+            .mock("GET", Matcher::Regex(r"^/runner/skills/adam~pdf/merge-preview\?device_id=d1$".into()))
+            .with_status(200)
+            .with_body(r#"{"skill_id":"adam~pdf","head_version":"1.1.0","clean":false,"files":[{"path":"a.md","content":"x","encoding":"utf8","conflict":"text"},{"path":"b.bin.theirs","encoding":"base64","content":"AA==","conflict":"binary","sidecar":true}]}"#)
+            .create();
+        let _h = server
+            .mock("GET", "/runner/skills/pdf/history")
+            .with_status(200)
+            .with_body(r#"{"skill_id":"pdf","head_version":"1.0.0","versions":[{"version":"1.0.0","lineage":"catalog","is_head":true}]}"#)
+            .create();
+        let _r = server
+            .mock("POST", "/runner/skills/pdf/rollback")
+            .match_body(Matcher::Json(
+                serde_json::json!({"version":"0.9.0","device_id":"d1"}),
+            ))
+            .with_status(200)
+            .with_body(r#"{"version":"0.9.0","devices":["d1"]}"#)
+            .create();
+        let _s = server
+            .mock("GET", "/runner/skills/pdf/local-versions/v1/source")
+            .with_status(200)
+            .with_body("bytes")
+            .create();
+        let _c = server
+            .mock("POST", "/runner/skills/pdf/change-requests")
+            .with_status(409)
+            .with_body(r#"{"detail":{"code":"needs_rebase"}}"#)
+            .create();
+        let c = RegistryClient::new(server.url()).with_auth("tok");
+        let AuthoringReply::Done(p) = c.merge_preview("adam~pdf", "d1").unwrap() else {
+            panic!("preview")
+        };
+        assert!(!p.clean && p.files.len() == 2 && p.files[1].sidecar);
+        let AuthoringReply::Done(h) = c.skill_history("pdf").unwrap() else {
+            panic!("history")
+        };
+        assert!(h.versions[0].is_head);
+        let AuthoringReply::Done(r) = c.skill_rollback("pdf", "0.9.0", Some("d1")).unwrap() else {
+            panic!("rollback")
+        };
+        assert_eq!(r.devices, vec!["d1"]);
+        let AuthoringReply::Done(b) = c.download_local_version_source("pdf", "v1").unwrap() else {
+            panic!("source")
+        };
+        assert_eq!(b, b"bytes");
+        match c.submit_change_request("pdf", "d1", None).unwrap() {
+            AuthoringReply::Refused(r) => {
+                assert_eq!((r.status, r.code.as_str()), (409, "needs_rebase"))
+            }
+            _ => panic!("expected refusal"),
+        }
     }
 }

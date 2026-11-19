@@ -1066,6 +1066,11 @@ pub enum SyncEvent {
         /// (`reason: "user_uninstall"`): remove it for good. Absent = false.
         user_uninstall: bool,
     },
+    /// The portal's clean "Merge update" (Phase 9b): the server stored a merge of
+    /// the catalog head into this device's branch; download and apply it.
+    SkillMerge {
+        event: crate::managed_paths::skill_merge::MergeEvent,
+    },
     /// Purge a skill (delete files and SQLite row).
     Purge {
         installation_id: Uuid,
@@ -1547,6 +1552,15 @@ pub(crate) fn parse_sync_event(event_type: &str, data: &str) -> Result<SyncEvent
                 installation_id: wire.installation_id,
                 plugin_slug: wire.plugin_slug,
             })
+        }
+        "skill_merge" => {
+            let ev: crate::managed_paths::skill_merge::MergeEvent = serde_json::from_str(data)
+                .with_context(|| format!("failed to parse skill_merge event: {data}"))?;
+            anyhow::ensure!(
+                name_ok("skill_id", &ev.skill_id) && name_ok("version_id", &ev.version_id),
+                "skill_merge event has an unsafe skill_id or version_id"
+            );
+            Ok(SyncEvent::SkillMerge { event: ev })
         }
         "revoke" => {
             // Broadcast-model kill switch: one event, fanned out to every

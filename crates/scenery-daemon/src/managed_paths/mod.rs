@@ -58,6 +58,7 @@ pub mod publish;
 pub mod pusher;
 pub mod rollback;
 pub mod scanner;
+pub mod skill_merge;
 pub mod takeover;
 pub mod tracked;
 
