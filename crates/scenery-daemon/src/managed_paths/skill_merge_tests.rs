@@ -763,6 +763,30 @@ async fn uninstall_copies_unsynced_branch_edits_and_skips_synced_ones() {
     assert!(save_unsynced_branch_edits(&f.state, &report2, None).is_empty());
 }
 
+#[tokio::test]
+async fn uninstall_keeps_a_first_edit_the_scan_has_not_seen_yet() {
+    let f = Fx::new().await;
+    // Installed, never scanned: no skill_local_state row, branch_state unset.
+    let live = f.branch();
+    f.conn()
+        .execute("DELETE FROM skill_local_state WHERE skill_id='cat'", [])
+        .unwrap();
+    let report = f.home.join("Scenery-uninstall-first");
+    assert!(
+        save_unsynced_branch_edits(&f.state, &report, None).is_empty(),
+        "an untouched install needs no copy"
+    );
+    fs::write(live.join("prompts/p.md"), "first edit, never scanned").unwrap();
+    let saved = save_unsynced_branch_edits(&f.state, &report, None);
+    assert_eq!(saved.len(), 1, "{saved:?}");
+    let at = saved[0].copy_at.clone().unwrap();
+    assert_eq!(at, report.join("branches/cat"));
+    assert_eq!(
+        fs::read_to_string(at.join("prompts/p.md")).unwrap(),
+        "first edit, never scanned"
+    );
+}
+
 // ── convergence: a cleared branch never installs over unsynced edits ─────────
 
 #[tokio::test]

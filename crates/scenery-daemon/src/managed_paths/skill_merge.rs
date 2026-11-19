@@ -928,7 +928,8 @@ pub struct SavedBranch {
 
 /// Before a catalog skill is removed: when its branch has edits the registry
 /// does not have (live tree differs from the last uploaded tree), copy the live
-/// tree to `<dest_root>/branches/<slug>/`. A synced branch needs no backup; own
+/// tree to `<dest_root>/branches/<slug>/`. This includes a first edit the scan
+/// has not seen yet. A synced branch needs no backup; own
 /// skills and skills without a branch are skipped (own skills have their own
 /// rule in uninstall). `only` limits it to one folder name.
 pub fn save_unsynced_branch_edits(
@@ -966,11 +967,13 @@ pub fn save_unsynced_branch_edits(
             migrated_at: String::new(),
         };
         let rid = local_edits::registry_id_for(state, &m, &prov);
-        let Some(ls) = local_edits::load(&conn, &rid) else {
-            continue;
-        };
-        if ls.branch_state != local_edits::BRANCH_BRANCH
-            || ls.authorship.as_deref() == Some(local_edits::AUTHORSHIP_OWN)
+        // The scan may not have seen the edit yet (no `skill_local_state` row,
+        // `branch_state` still `none`), so the live tree is compared with the
+        // marker baseline (Scenery's install, or the last uploaded tree) instead.
+        let ls = local_edits::load(&conn, &rid);
+        if ls
+            .as_ref()
+            .is_some_and(|l| l.authorship.as_deref() == Some(local_edits::AUTHORSHIP_OWN))
         {
             continue;
         }
@@ -978,8 +981,11 @@ pub fn save_unsynced_branch_edits(
         let Ok(tree) = skill_tree::survey(live).map(|s| s.tree_hash) else {
             continue;
         };
-        if ls.uploaded_tree.as_deref() == Some(tree.as_str()) {
-            continue; // synced: the registry holds exactly this tree
+        let uploaded = ls
+            .as_ref()
+            .is_some_and(|l| l.uploaded_tree.as_deref() == Some(tree.as_str()));
+        if uploaded || !local_edits::tree_is_dirty(&conn, &path, live) {
+            continue; // synced, or still exactly what Scenery installed
         }
         let mut dest = dest_root.join("branches").join(&slug);
         if fs::symlink_metadata(&dest).is_ok() {
