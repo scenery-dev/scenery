@@ -148,6 +148,8 @@ pub fn perform_if_pending(state: &AppState, slug: &str) -> Result<()> {
         format!("takeover: failed to remove original source_path: {source_path}")
     })?;
 
+    relink_if_claude_source(state, slug, Path::new(&source_path));
+
     state
         .clear_pending_adopt_takeover(slug)
         .context("takeover: failed to clear pending-takeover record")?;
@@ -158,6 +160,33 @@ pub fn perform_if_pending(state: &AppState, slug: &str) -> Result<()> {
         "adopt takeover: managed copy confirmed present — original discovered path removed"
     );
     Ok(())
+}
+
+/// A skill taken over from `~/.claude/skills/<slug>` leaves Claude Code with
+/// nothing at that path (the push's link was refused while the user's real
+/// directory sat there). Now that the original is backed up and gone, put the
+/// link to the managed copy in its place. Best-effort: the next push heals it.
+fn relink_if_claude_source(state: &AppState, slug: &str, source: &Path) {
+    let Some(link) = super::paths::claude_skills_link_dir().map(|d| d.join(slug)) else {
+        return;
+    };
+    let Some(canonical) = super::paths::agents_skills_dir().map(|d| d.join(slug)) else {
+        return;
+    };
+    if source != link {
+        return;
+    }
+    match super::links::link_dir(&canonical, &link) {
+        Ok(_) => {
+            let ok = super::projection_outcome::ProjectionOutcome::Ok;
+            if let Err(e) = super::projection_outcome::record(state, slug, &ok) {
+                warn!(slug, error = %e, "takeover: could not record the relinked projection");
+            }
+        }
+        Err(e) => {
+            warn!(slug, error = %e, "takeover: could not link the managed copy for Claude Code")
+        }
+    }
 }
 
 /// True iff `source_path` denotes the same location as

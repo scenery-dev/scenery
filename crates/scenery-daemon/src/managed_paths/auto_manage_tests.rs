@@ -100,7 +100,10 @@ impl Env {
     }
 
     fn scan(&self) -> Vec<DiscoveryItem> {
-        collect_discoveries(&[self.agents(), self.pi()], &self.state)
+        collect_discoveries(
+            &crate::managed_paths::discoveries::extra_roots(),
+            &self.state,
+        )
     }
 
     fn managed_response(
@@ -572,6 +575,81 @@ async fn the_directive_cannot_convert_what_the_local_classifier_tracks() {
     .await;
     assert_eq!(s.tracked, 0);
     m.assert();
+}
+
+// ── ~/.claude/skills is a scan root (real dirs only) ────────────────────────
+
+#[tokio::test]
+async fn a_fresh_claude_skill_is_converted_once_and_tracked_or_managed_ones_survive_restarts() {
+    let mut env = Env::new().await;
+    // Scenery's own link into the claude root must never be reported.
+    let own = env.user_skill(&env.agents(), "linked");
+    env.seed_registry_version("linked", "0.1.0");
+    let _m0 = env.managed_response("adam~linked", "0.1.0", "manage", 1);
+    let items = env.scan();
+    process_response(
+        &env.ctx(true),
+        response(vec![directive(&own, "manage")]),
+        &items,
+    )
+    .await;
+    assert!(fs::read_link(env.claude().join("linked")).is_ok());
+
+    // A dev skill in the claude root is tracked in place; a fresh one is new.
+    let dev = env.user_skill(&env.claude(), "devrepo");
+    fs::create_dir_all(dev.join(".git")).unwrap();
+    let fresh = env.user_skill(&env.claude(), "fresh");
+    env.seed_registry_version("fresh", "0.1.0");
+    let m_manage = env.managed_response("adam~fresh", "0.1.0", "manage", 1);
+    let m_track = env.managed_response("adam~devrepo", "0.3.0", "track", 1);
+
+    let items = env.scan();
+    let mut slugs: Vec<_> = items.iter().map(|i| i.slug.as_str()).collect();
+    slugs.sort();
+    assert_eq!(slugs, vec!["devrepo", "fresh"], "own links are skipped");
+    let s = process_response(
+        &env.ctx(true),
+        response(vec![directive(&fresh, "manage"), directive(&dev, "track")]),
+        &items,
+    )
+    .await;
+    assert_eq!((s.managed, s.tracked), (1, 1), "{s:?}");
+    m_manage.assert();
+    m_track.assert();
+
+    // Fresh: converted in place into the canonical root, then linked back.
+    let canonical = env.agents().join("fresh");
+    assert_eq!(marker_file(&canonical)["origin"], "auto_managed");
+    assert_eq!(
+        fs::read_link(env.claude().join("fresh")).unwrap(),
+        canonical,
+        "the claude path is now a link to the managed copy"
+    );
+    // Tracked: untouched, no marker.
+    assert!(!dev.join(".scenery-managed.json").exists());
+    assert!(fs::read_to_string(dev.join("SKILL.md"))
+        .unwrap()
+        .contains("ORIGINAL body"));
+
+    // Restarts: nothing is converted or uploaded again, bytes unchanged.
+    let before = (snapshot(&canonical), snapshot(&dev));
+    for _ in 0..2 {
+        let items = env.scan();
+        assert!(
+            items.iter().all(|i| i.slug == "devrepo"),
+            "only the tracked dev skill is re-reported"
+        );
+        let s = process_response(
+            &env.ctx(true),
+            response(vec![directive(&dev, "track")]),
+            &items,
+        )
+        .await;
+        assert_eq!((s.managed, s.tracked), (0, 0), "{s:?}");
+    }
+    assert_eq!(before, (snapshot(&canonical), snapshot(&dev)));
+    m_manage.assert();
+    m_track.assert();
 }
 
 // ── failure and crash safety ────────────────────────────────────────────────

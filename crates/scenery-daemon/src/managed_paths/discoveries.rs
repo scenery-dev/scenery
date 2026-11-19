@@ -313,13 +313,29 @@ pub async fn run_once(state: Arc<AppState>, registry_url: String) -> Result<usiz
 /// reported. `collect_discoveries` skips roots that don't exist, so this is
 /// a no-op scan on machines without Pi installed.
 ///
-/// Also includes any paths from `SCENERY_EXTRA_SKILL_ROOTS`.
+/// Also includes `~/.claude/skills/` (real, unmarked directories only: see
+/// [`is_client_link_root`]) and any paths from `SCENERY_EXTRA_SKILL_ROOTS`.
 pub fn extra_roots() -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = Vec::new();
 
     if let Some(home) = dirs::home_dir() {
         roots.push(home.join(".agents").join("skills"));
         roots.push(home.join(".pi").join("agent").join("skills"));
+    }
+
+    // Claude Code's own root: skills a user (or Claude) creates directly in
+    // `~/.claude/skills` are real directories there. Scenery's links into the
+    // same folder are skipped by `scan_root`'s real-dirs-only mode. Left out
+    // when the folder is itself a link to another root (no double scan).
+    if let Some(claude) = super::paths::claude_skills_link_dir() {
+        let same_as_other = fs::canonicalize(&claude).ok().is_some_and(|c| {
+            roots
+                .iter()
+                .any(|r| fs::canonicalize(r).ok().as_ref() == Some(&c))
+        });
+        if !same_as_other {
+            roots.push(claude);
+        }
     }
 
     if let Ok(extra) = std::env::var(ENV_EXTRA_ROOTS) {
@@ -365,7 +381,7 @@ pub fn collect_discoveries(roots: &[PathBuf], state: &AppState) -> Vec<Discovery
             continue;
         }
 
-        match scan_root(root) {
+        match scan_root(root, is_client_link_root(root)) {
             Ok(found) => {
                 for mut item in found {
                     let path = Path::new(&item.source_path);
@@ -490,9 +506,17 @@ fn mcp_item_to_discovery_item(item: mcp_discovery::McpDiscoveryItem) -> Discover
     }
 }
 
+/// True for `~/.claude/skills`: the folder Scenery links managed skills into.
+/// Its entries are scanned in real-dirs-only mode so Scenery's own links (and
+/// copy-mode copies, which carry the marker) are never reported as skills.
+fn is_client_link_root(root: &Path) -> bool {
+    super::paths::claude_skills_link_dir().is_some_and(|c| c == root)
+}
+
 /// Scan one root directory and return a `DiscoveryItem` per subdir containing
-/// `SKILL.md`.
-fn scan_root(root: &Path) -> Result<Vec<DiscoveryItem>> {
+/// `SKILL.md`. With `real_dirs_only`, symlinks and Scenery-marked directories
+/// are skipped (they are Scenery's own projections, not user content).
+fn scan_root(root: &Path, real_dirs_only: bool) -> Result<Vec<DiscoveryItem>> {
     let entries = fs::read_dir(root)
         .with_context(|| format!("discoveries: failed to read dir {}", root.display()))?;
 
@@ -508,6 +532,15 @@ fn scan_root(root: &Path) -> Result<Vec<DiscoveryItem>> {
         };
 
         let path = entry.path();
+
+        if real_dirs_only {
+            let is_real_dir = fs::symlink_metadata(&path)
+                .map(|m| m.file_type().is_dir())
+                .unwrap_or(false);
+            if !is_real_dir || scenery_mcp::ownership::is_scenery_managed(&path) {
+                continue;
+            }
+        }
 
         let meta = match fs::metadata(&path) {
             Ok(m) => m,
@@ -781,7 +814,7 @@ mod tests {
         write_skill(&root, ".demo.scenery-staging-abc");
         write_skill(&root, ".demo.scenery-old-abc");
 
-        let items = scan_root(&root).unwrap();
+        let items = scan_root(&root, false).unwrap();
         let slugs: Vec<&str> = items.iter().map(|i| i.slug.as_str()).collect();
         assert_eq!(slugs, vec!["demo"]);
     }
@@ -1439,6 +1472,10 @@ mod tests {
         assert!(
             roots.contains(&fake_home.path().join(".pi").join("agent").join("skills")),
             "expected ~/.pi/agent/skills in extra_roots, got {roots:?}"
+        );
+        assert!(
+            roots.contains(&fake_home.path().join(".claude").join("skills")),
+            "expected ~/.claude/skills in extra_roots, got {roots:?}"
         );
     }
 }
