@@ -41,6 +41,12 @@ pub enum ConfigFormat {
 /// [`command_needs_repair`] (used when checking an existing one).
 const CELLAR: &str = "/Cellar/scenery/";
 
+/// Serializes tests that point `HOME` at a temp dir (the restore journal
+/// `write_mcp_entry` appends to resolves its data dir from `$HOME`). Shared
+/// with `wire_tests` so the two modules never race on the process env.
+#[cfg(test)]
+pub(crate) static HOME_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// The name under which Scenery registers itself in AI client configs.
 ///
 /// Must match what `scenery-shim` advertises and what `mcp setup` writes.
@@ -497,7 +503,7 @@ pub fn detect_ai_clients() -> Vec<ClientConfig> {
 /// Separated from `detect_ai_clients` so tests can supply temp-dir paths
 /// without racing on the process-global HOME environment variable, and to
 /// allow simulating app bundle presence in tests.
-fn detect_ai_clients_in(
+pub(crate) fn detect_ai_clients_in(
     home: &std::path::Path,
     system_root: &std::path::Path,
 ) -> Vec<ClientConfig> {
@@ -1416,6 +1422,24 @@ fn is_scenery_configured(path: &std::path::Path, mcp_key: &str, format: ConfigFo
     }
 }
 
+/// Whether a `scenery` entry exists at all, in any shape (stdio or HTTP,
+/// current or stale). Unlike [`is_scenery_configured`] this does not judge
+/// the command, so a stale entry counts as present and is left to the
+/// repair pass. Used by the daemon's client wiring to tell "user removed it"
+/// from "still there".
+pub(crate) fn scenery_entry_present(
+    path: &std::path::Path,
+    mcp_key: &str,
+    format: ConfigFormat,
+) -> bool {
+    if format == ConfigFormat::Json
+        && read_scenery_entry_type(path, mcp_key).as_deref() == Some("http")
+    {
+        return true;
+    }
+    read_scenery_command(path, mcp_key, format).is_some()
+}
+
 /// Read the `type` string of the `scenery` entry (`{mcp_key}.scenery.type`)
 /// out of a JSON client config file. `None` if the file is missing,
 /// unparsable, or the entry has no `type` field at all (every stdio entry
@@ -1765,14 +1789,30 @@ fn toml_value_to_json(value: &toml_edit::Value) -> serde_json::Value {
 // ── Daemon-boot self-heal for stale MCP commands ───────────────────────────────
 
 /// Returns `true` when `command` looks like a stale `scenery` MCP command
-/// that daemon-boot repair should rewrite: an absolute path that either (a)
+/// that daemon-boot repair should rewrite. With `expected_bin` set (pkg
+/// installs), any `scenery`/`scn` command other than that binary also needs
+/// repair, so a leftover brew or curl entry converges on the pkg binary.
+/// Otherwise: an absolute path that either (a)
 /// no longer exists on disk — Homebrew deleted the old Cellar version on a
 /// later upgrade — or (b) still points inside a versioned Cellar directory
 /// (written by a pre-efb7fe1 `mcp setup`, still present but due to be pruned
 /// on the next upgrade). A bare command name (resolved via `PATH`) is left
 /// alone — it was never a Cellar path to begin with.
-fn command_needs_repair(command: &str, exists: impl Fn(&str) -> bool) -> bool {
+fn command_needs_repair(
+    command: &str,
+    exists: impl Fn(&str) -> bool,
+    expected_bin: Option<&str>,
+) -> bool {
     let path = std::path::Path::new(command);
+    if let Some(expected) = expected_bin {
+        let is_scenery_bin = matches!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("scenery" | "scn")
+        );
+        if is_scenery_bin && command != expected {
+            return true;
+        }
+    }
     if !path.is_absolute() {
         return false;
     }
@@ -1804,10 +1844,24 @@ fn command_needs_repair(command: &str, exists: impl Fn(&str) -> bool) -> bool {
 /// Returns the names of clients whose entry was rewritten. Per-client I/O
 /// failures are logged at WARN and skipped — never fatal to daemon startup.
 pub fn repair_stale_mcp_entries() -> Vec<String> {
+    let expected_bin = pkg_expected_bin();
     match home_dir() {
-        Some(home) => repair_stale_mcp_entries_in(&home, std::path::Path::new("/")),
+        Some(home) => {
+            repair_stale_mcp_entries_in(&home, std::path::Path::new("/"), expected_bin.as_deref())
+        }
         None => Vec::new(),
     }
+}
+
+/// The pkg binary path when this process is a pkg-managed install.
+#[cfg(feature = "daemon")]
+fn pkg_expected_bin() -> Option<String> {
+    scenery_core::pkg_mode::is_pkg_managed().then(|| scenery_core::pkg_mode::PKG_BIN.to_string())
+}
+
+#[cfg(not(feature = "daemon"))]
+fn pkg_expected_bin() -> Option<String> {
+    None
 }
 
 /// Core logic for [`repair_stale_mcp_entries`], parameterised on `home` and
@@ -1816,6 +1870,7 @@ pub fn repair_stale_mcp_entries() -> Vec<String> {
 fn repair_stale_mcp_entries_in(
     home: &std::path::Path,
     system_root: &std::path::Path,
+    expected_bin: Option<&str>,
 ) -> Vec<String> {
     let clients = detect_ai_clients_in(home, system_root);
     let mut repaired = Vec::new();
@@ -1832,7 +1887,7 @@ fn repair_stale_mcp_entries_in(
         else {
             continue;
         };
-        if !command_needs_repair(&command, |p| std::path::Path::new(p).exists()) {
+        if !command_needs_repair(&command, |p| std::path::Path::new(p).exists(), expected_bin) {
             continue;
         }
 
@@ -1986,8 +2041,6 @@ mod tests {
     /// throwaway temp dir keeps that side effect out of the developer's real
     /// `~/Library/Application Support/Scenery`; the mutex prevents
     /// parallel tests from racing on the process-global env var.
-    static HOME_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// Run `f` with `HOME` pointed at `fake_home`, restoring the original
     /// value afterward even if `f` panics.
     fn with_fake_home<T>(fake_home: &std::path::Path, f: impl FnOnce() -> T) -> T {
@@ -3397,7 +3450,7 @@ mod tests {
         )
         .unwrap();
 
-        let repaired = with_fake_home(&tmp, || repair_stale_mcp_entries_in(&tmp, &tmp));
+        let repaired = with_fake_home(&tmp, || repair_stale_mcp_entries_in(&tmp, &tmp, None));
         assert!(
             repaired.contains(&"VS Code".to_string()),
             "stale VS Code entry in mcp.json should be repaired, got: {repaired:?}"
@@ -3557,7 +3610,7 @@ mod tests {
         let mcp_json_path = vscode_mcp_json_path(&tmp).unwrap();
         assert!(!mcp_json_path.exists());
 
-        let repaired = with_fake_home(&tmp, || repair_stale_mcp_entries_in(&tmp, &tmp));
+        let repaired = with_fake_home(&tmp, || repair_stale_mcp_entries_in(&tmp, &tmp, None));
         assert!(
             repaired.iter().any(|c| c.contains("VS Code")),
             "repair pass should report the settings.json migration, got: {repaired:?}"
@@ -3600,7 +3653,7 @@ mod tests {
         let mcp_json_path = vscode_mcp_json_path(&tmp).unwrap();
         assert!(!mcp_json_path.exists());
 
-        let repaired = with_fake_home(&tmp, || repair_stale_mcp_entries_in(&tmp, &tmp));
+        let repaired = with_fake_home(&tmp, || repair_stale_mcp_entries_in(&tmp, &tmp, None));
         assert!(
             !repaired.iter().any(|c| c.contains("VS Code")),
             "no VS Code migration/write should have happened, got: {repaired:?}"
@@ -3880,10 +3933,28 @@ mod tests {
     // ── command_needs_repair ──────────────────────────────────────────────────
 
     #[test]
+    fn pkg_mode_rewrites_foreign_binary_command() {
+        use scenery_core::pkg_mode::PKG_BIN;
+        assert!(command_needs_repair(
+            "/opt/homebrew/bin/scenery",
+            |_| true,
+            Some(PKG_BIN)
+        ));
+        assert!(!command_needs_repair(PKG_BIN, |_| true, Some(PKG_BIN)));
+        // Without an expected binary the existing rules apply.
+        assert!(!command_needs_repair(
+            "/opt/homebrew/bin/scenery",
+            |_| true,
+            None
+        ));
+    }
+
+    #[test]
     fn command_needs_repair_when_path_does_not_exist() {
         assert!(command_needs_repair(
             "/home/linuxbrew/.linuxbrew/Cellar/scenery/1.0.65/bin/scenery",
             |_| false,
+            None,
         ));
     }
 
@@ -3894,6 +3965,7 @@ mod tests {
         assert!(command_needs_repair(
             "/opt/homebrew/Cellar/scenery/1.0.65/bin/scenery",
             |_| true,
+            None,
         ));
     }
 
@@ -3902,13 +3974,14 @@ mod tests {
         assert!(!command_needs_repair(
             "/home/linuxbrew/.linuxbrew/bin/scenery",
             |_| true,
+            None,
         ));
     }
 
     #[test]
     fn command_does_not_need_repair_for_bare_command() {
         // Not an absolute path — nothing for the repair pass to rewrite.
-        assert!(!command_needs_repair("scenery", |_| false));
+        assert!(!command_needs_repair("scenery", |_| false, None));
     }
 
     // ── repair_stale_mcp_entries ──────────────────────────────────────────────
@@ -3924,7 +3997,7 @@ mod tests {
         )
         .unwrap();
 
-        let repaired = with_fake_home(&tmp, || repair_stale_mcp_entries_in(&tmp, &tmp));
+        let repaired = with_fake_home(&tmp, || repair_stale_mcp_entries_in(&tmp, &tmp, None));
         assert_eq!(
             repaired,
             vec!["Claude Code".to_string()],
@@ -3954,7 +4027,7 @@ mod tests {
         });
         fs::write(&config_path, serde_json::to_string(&existing).unwrap()).unwrap();
 
-        let repaired = with_fake_home(&tmp, || repair_stale_mcp_entries_in(&tmp, &tmp));
+        let repaired = with_fake_home(&tmp, || repair_stale_mcp_entries_in(&tmp, &tmp, None));
         assert!(
             repaired.is_empty(),
             "an already-current command must not be rewritten"
@@ -3974,10 +4047,10 @@ mod tests {
         )
         .unwrap();
 
-        let first = with_fake_home(&tmp, || repair_stale_mcp_entries_in(&tmp, &tmp));
+        let first = with_fake_home(&tmp, || repair_stale_mcp_entries_in(&tmp, &tmp, None));
         assert_eq!(first, vec!["Claude Code".to_string()]);
 
-        let second = with_fake_home(&tmp, || repair_stale_mcp_entries_in(&tmp, &tmp));
+        let second = with_fake_home(&tmp, || repair_stale_mcp_entries_in(&tmp, &tmp, None));
         assert!(
             second.is_empty(),
             "a second repair pass must be a no-op once the entry is stable"
@@ -3997,7 +4070,7 @@ mod tests {
         )
         .unwrap();
 
-        with_fake_home(&tmp, || repair_stale_mcp_entries_in(&tmp, &tmp));
+        with_fake_home(&tmp, || repair_stale_mcp_entries_in(&tmp, &tmp, None));
 
         let json: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
@@ -4014,7 +4087,7 @@ mod tests {
         let tmp = temp_root("repair-missing");
         fs::create_dir_all(&tmp).unwrap();
         // No client config files exist at all.
-        let repaired = with_fake_home(&tmp, || repair_stale_mcp_entries_in(&tmp, &tmp));
+        let repaired = with_fake_home(&tmp, || repair_stale_mcp_entries_in(&tmp, &tmp, None));
         assert!(repaired.is_empty());
         let _ = fs::remove_dir_all(&tmp);
     }
@@ -4362,7 +4435,7 @@ mod tests {
         )
         .unwrap();
 
-        let repaired = with_fake_home(&tmp, || repair_stale_mcp_entries_in(&tmp, &tmp));
+        let repaired = with_fake_home(&tmp, || repair_stale_mcp_entries_in(&tmp, &tmp, None));
         assert!(
             repaired.contains(&"Codex".to_string()),
             "stale Codex command inside an inline mcp_servers table should be repaired, got: {repaired:?}"
@@ -4448,7 +4521,7 @@ mod tests {
         )
         .unwrap();
 
-        let repaired = with_fake_home(&tmp, || repair_stale_mcp_entries_in(&tmp, &tmp));
+        let repaired = with_fake_home(&tmp, || repair_stale_mcp_entries_in(&tmp, &tmp, None));
         assert!(
             repaired.contains(&"Codex".to_string()),
             "stale Codex TOML command should be repaired, got: {repaired:?}"

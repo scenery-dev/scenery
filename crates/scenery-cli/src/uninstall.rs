@@ -52,6 +52,10 @@ pub struct UninstallOpts {
     pub report_dir: Option<PathBuf>,
     /// Registry base URL, for the backend device-deprovision call.
     pub registry_url: String,
+    /// Restore client configs and remove Scenery's skills from clients on this
+    /// machine only. No server calls: the device stays paired and nothing is
+    /// archived. Used by the macOS pkg uninstaller.
+    pub local_only: bool,
 }
 
 /// One tool that only worked via Scenery and was removed outright.
@@ -142,8 +146,23 @@ pub struct PreservedItem {
     pub reason: String,
 }
 
+/// Printed when a user runs `scenery uninstall` on a Mac where the pkg manages
+/// the daemon. The system agent keeps running, so a user-level uninstall would
+/// half-remove Scenery; IT removes it with the pkg uninstaller instead.
+pub const PKG_MANAGED_UNINSTALL_MSG: &str =
+    "Scenery is managed by your IT department on this Mac. Ask IT to remove it.";
+
+/// Pure decision: refuse a user-run uninstall when the pkg manages this Mac,
+/// unless it is the pkg uninstaller's own `--local-only` call.
+pub(crate) fn refuse_uninstall(pkg_managed: bool, local_only: bool) -> bool {
+    pkg_managed && !local_only
+}
+
 /// Entry point wired from `main.rs`.
 pub async fn run(opts: UninstallOpts) -> Result<()> {
+    if refuse_uninstall(scenery_core::pkg_mode::is_pkg_managed(), opts.local_only) {
+        anyhow::bail!(PKG_MANAGED_UNINSTALL_MSG);
+    }
     let mut report = RestoreReport::default();
 
     // The restore journal is the source of truth for what to restore and for
@@ -194,7 +213,15 @@ pub async fn run(opts: UninstallOpts) -> Result<()> {
 
     // ── 6. Deprovision this device, revoke every session server side, and
     //       drop the local secrets. ──
-    sign_out_everywhere(&opts.registry_url, &mut report).await;
+    if opts.local_only {
+        report.kept.push(KeptItem {
+            name: "sign-out".into(),
+            location: opts.registry_url.clone(),
+            note: "local-only: skipped sign-out and device deprovision".into(),
+        });
+    } else {
+        sign_out_everywhere(&opts.registry_url, &mut report).await;
+    }
 
     // A fully successful uninstall starts the next install from a clean
     // ledger; otherwise keep it so a re-run can finish the job.
@@ -1564,6 +1591,14 @@ fn dirs_home() -> Option<PathBuf> {
 // completely untouched — no test here ever mutates them.
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn refuses_user_uninstall_only_when_pkg_managed() {
+        assert!(super::refuse_uninstall(true, false));
+        assert!(!super::refuse_uninstall(true, true));
+        assert!(!super::refuse_uninstall(false, false));
+        assert!(!super::refuse_uninstall(false, true));
+    }
+
     use super::*;
     use scenery_core::restore_journal::{JournalOp, JournalSource, RestoreJournal};
     use scenery_core::state::{AppState, McpInstallRow};
@@ -2886,6 +2921,121 @@ mod tests {
         let _ = fs::remove_dir_all(&fake_home);
     }
 
+    // ── --local-only: no server calls, tokens kept ────────────────────────────
+
+    /// Run `uninstall --local-only --yes` against a mockito server whose
+    /// deprovision/refresh/logout/revoke endpoints all expect zero hits.
+    /// Returns whether tokens survived and whether the client config still
+    /// holds the Scenery entry.
+    #[allow(clippy::await_holding_lock)]
+    async fn run_local_only(label: &str) -> (bool, bool, bool, bool) {
+        use scenery_core::auth::{load_tokens, save_tokens};
+
+        let _guard = HOME_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = temp_dir(label);
+        let report_dir = temp_dir(&format!("{label}-report"));
+        let original_home = std::env::var_os("HOME");
+        let original_keychain = std::env::var_os("SCENERY_DISABLE_KEYCHAIN");
+        std::env::set_var("HOME", &tmp);
+        std::env::set_var("SCENERY_DISABLE_KEYCHAIN", "1");
+
+        let mut server = mockito::Server::new_async().await;
+        let url = server.url();
+        let mut mocks = Vec::new();
+        for path in [
+            "/portal/auth/refresh",
+            "/api/devices/dev-9/deprovision",
+            "/portal/auth/logout",
+            "/portal/auth/revoke",
+        ] {
+            mocks.push(
+                server
+                    .mock("POST", path)
+                    .with_status(200)
+                    .with_body("{}")
+                    .expect(0)
+                    .create_async()
+                    .await,
+            );
+        }
+        let any = server
+            .mock("POST", mockito::Matcher::Any)
+            .with_status(200)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let config_path = tmp.join(".claude.json");
+        fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "mcpServers": {
+                    "scenery": {"command": "scenery", "args": ["mcp", "serve"]},
+                    "my-own-server": {"command": "my-tool", "args": []}
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let state = AppState::bootstrap().unwrap();
+        save_tokens(&state, &url, "expired-acc", "old-ref").unwrap();
+        state.set_sync_state("device_id", "dev-9").unwrap();
+
+        let result = run(UninstallOpts {
+            yes: true,
+            report_dir: Some(report_dir.clone()),
+            registry_url: url.clone(),
+            local_only: true,
+            ..Default::default()
+        })
+        .await;
+
+        let tokens_kept = load_tokens(&state, &url).unwrap().is_some();
+        let device_kept = state.get_sync_state("device_id").unwrap().is_some();
+        let cfg = fs::read_to_string(&config_path).unwrap();
+        let has_scenery = cfg.contains("\"scenery\"");
+        let keeps_own = cfg.contains("my-own-server");
+
+        match original_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match original_keychain {
+            Some(v) => std::env::set_var("SCENERY_DISABLE_KEYCHAIN", v),
+            None => std::env::remove_var("SCENERY_DISABLE_KEYCHAIN"),
+        }
+        let _ = fs::remove_dir_all(&tmp);
+        let _ = fs::remove_dir_all(&report_dir);
+
+        result.expect("local-only uninstall should succeed");
+        for m in &mocks {
+            m.assert_async().await;
+        }
+        any.assert_async().await;
+        (tokens_kept, device_kept, has_scenery, keeps_own)
+    }
+
+    #[tokio::test]
+    async fn local_only_makes_no_server_calls() {
+        // Mock `.expect(0)` assertions run inside the helper.
+        run_local_only("local-only-nocalls").await;
+    }
+
+    #[tokio::test]
+    async fn local_only_keeps_tokens() {
+        let (tokens_kept, device_kept, ..) = run_local_only("local-only-tokens").await;
+        assert!(tokens_kept, "tokens must survive --local-only");
+        assert!(device_kept, "device id must survive --local-only");
+    }
+
+    #[tokio::test]
+    async fn local_only_still_restores_client_config() {
+        let (_, _, has_scenery, keeps_own) = run_local_only("local-only-config").await;
+        assert!(!has_scenery, "the Scenery entry must be removed");
+        assert!(keeps_own, "the user's own entry must survive");
+    }
+
     // ── --dry-run mutates nothing ─────────────────────────────────────────────
 
     #[allow(clippy::await_holding_lock)]
@@ -2926,6 +3076,7 @@ mod tests {
             dry_run: true,
             report_dir: Some(report_dir.clone()),
             registry_url: "https://app.scenery.invalid".to_string(),
+            local_only: false,
         })
         .await;
 

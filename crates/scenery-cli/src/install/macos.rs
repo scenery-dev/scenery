@@ -453,6 +453,69 @@ pub(super) fn reconcile_competing_manager() -> Result<bool> {
     Ok(true)
 }
 
+// ── Pkg-managed stand-down ───────────────────────────────────────────────────
+
+/// Message printed instead of installing a per-user agent when the runner was
+/// installed system-wide by the macOS .pkg.
+pub const PKG_MANAGED_INSTALL_MSG: &str = "Scenery is managed by your IT department on this Mac (installed system-wide). Nothing to install.";
+
+/// `launchctl` argv (pure) that unloads and disables both per-user agents so
+/// the system agent (`dev.scenery.agent`) is the only daemon manager.
+/// For each label: `bootout` first, then `disable` (so it stays off at login).
+pub(crate) fn stand_down_argv(uid: u32) -> Vec<Vec<String>> {
+    [LABEL, BREW_SERVICE_LABEL]
+        .iter()
+        .flat_map(|label| {
+            ["bootout", "disable"].map(|verb| {
+                vec![
+                    "launchctl".to_string(),
+                    verb.to_string(),
+                    format!("gui/{uid}/{label}"),
+                ]
+            })
+        })
+        .collect()
+}
+
+/// True when a failed `launchctl` call just means the job is not loaded.
+pub(crate) fn launchctl_failure_is_benign(code: Option<i32>, stderr: &str) -> bool {
+    matches!(code, Some(3) | Some(113))
+        || stderr.contains("Could not find service")
+        || stderr.contains("No such process")
+        || stderr.contains("not find")
+}
+
+/// Boot out and disable the per-user agents (our own and brew's) when the
+/// pkg-installed system agent owns the daemon. Not-loaded failures are
+/// ignored. Never deletes files in `~/Library/LaunchAgents/`. Returns the
+/// labels that were actually booted out.
+pub fn stand_down_user_agents() -> Result<Vec<String>> {
+    let mut booted = Vec::new();
+    for argv in stand_down_argv(current_uid()) {
+        let output = Command::new(&argv[0])
+            .args(&argv[1..])
+            .output()
+            .context("failed to spawn launchctl")?;
+        let label = argv[2].rsplit('/').next().unwrap_or_default();
+        if output.status.success() {
+            if argv[1] == "bootout" {
+                booted.push(label.to_string());
+            }
+            continue;
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !launchctl_failure_is_benign(output.status.code(), &stderr) {
+            tracing::warn!(
+                label,
+                verb = %argv[1],
+                stderr = %stderr.trim(),
+                "launchctl stand-down step failed"
+            );
+        }
+    }
+    Ok(booted)
+}
+
 // ── Public install / uninstall ────────────────────────────────────────────────
 
 /// Install the LaunchAgent and start the daemon.
@@ -709,10 +772,56 @@ pub fn status() -> Result<InstallStatus> {
 #[cfg(test)]
 mod tests {
     use super::{
-        brew_recovery_action, brew_recovery_argv, brew_service_is_managing, render_plist,
-        resolve_registry_url_env, BrewRecoveryAction,
+        brew_recovery_action, brew_recovery_argv, brew_service_is_managing,
+        launchctl_failure_is_benign, render_plist, resolve_registry_url_env, stand_down_argv,
+        BrewRecoveryAction,
     };
     use std::path::Path;
+
+    #[test]
+    fn launchctl_not_loaded_failures_are_benign() {
+        assert!(launchctl_failure_is_benign(Some(3), ""));
+        assert!(launchctl_failure_is_benign(Some(113), ""));
+        assert!(launchctl_failure_is_benign(
+            Some(1),
+            "Could not find service"
+        ));
+        assert!(launchctl_failure_is_benign(Some(5), "No such process"));
+    }
+
+    #[test]
+    fn launchctl_real_failure_is_not_benign() {
+        assert!(!launchctl_failure_is_benign(
+            Some(1),
+            "Operation not permitted"
+        ));
+        assert!(!launchctl_failure_is_benign(None, ""));
+    }
+
+    // ── stand_down_argv ──────────────────────────────────────────────────────
+
+    #[test]
+    fn stand_down_targets_both_user_labels() {
+        let argv = stand_down_argv(501);
+        assert_eq!(argv.len(), 4);
+        for label in ["com.scenery.agent", "homebrew.mxcl.scenery"] {
+            let target = format!("gui/501/{label}");
+            let pos = |verb: &str| {
+                argv.iter()
+                    .position(|a| a == &["launchctl", verb, target.as_str()])
+                    .unwrap_or_else(|| panic!("missing {verb} {target}"))
+            };
+            assert!(pos("bootout") < pos("disable"));
+        }
+    }
+
+    #[test]
+    fn stand_down_never_touches_system_label() {
+        assert!(stand_down_argv(501)
+            .iter()
+            .flatten()
+            .all(|a| !a.contains("dev.scenery.agent")));
+    }
 
     // ── brew_service_is_managing ─────────────────────────────────────────────
     //

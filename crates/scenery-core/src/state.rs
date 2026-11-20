@@ -441,6 +441,28 @@ impl AppState {
         self.set_sync_state(AUTO_MANAGE_POLICY_KEY, &raw)
     }
 
+    /// Read a value from the generic `meta` key/value table.
+    pub fn meta_get(&self, key: &str) -> Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+        let conn = Connection::open(&self.db_path).context("failed to open state DB")?;
+        conn.query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| {
+            row.get::<_, String>(0)
+        })
+        .optional()
+        .context("failed to read meta")
+    }
+
+    /// Upsert a value into the generic `meta` key/value table.
+    pub fn meta_set(&self, key: &str, value: &str) -> Result<()> {
+        let conn = Connection::open(&self.db_path).context("failed to open state DB")?;
+        conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+            rusqlite::params![key, value],
+        )
+        .context("failed to write meta")?;
+        Ok(())
+    }
+
     pub fn get_sync_state(&self, key: &str) -> Result<Option<String>> {
         use rusqlite::OptionalExtension;
         let conn = Connection::open(&self.db_path).context("failed to open state DB")?;
@@ -1736,6 +1758,18 @@ mod tests {
         // Idempotent — clearing an already-clear session must not error.
         state.clear_device_session().expect("clear again (no-op)");
 
+        cleanup(&root);
+    }
+
+    #[test]
+    fn meta_roundtrip() {
+        let root = temp_root("meta-roundtrip");
+        let state = AppState::bootstrap_in(root.clone()).expect("bootstrap");
+        assert_eq!(state.meta_get("k").unwrap(), None);
+        state.meta_set("k", "v1").unwrap();
+        assert_eq!(state.meta_get("k").unwrap().as_deref(), Some("v1"));
+        state.meta_set("k", "v2").unwrap();
+        assert_eq!(state.meta_get("k").unwrap().as_deref(), Some("v2"));
         cleanup(&root);
     }
 

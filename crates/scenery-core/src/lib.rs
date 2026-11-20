@@ -32,6 +32,7 @@ pub mod managed;
 pub mod model;
 pub mod own_uninstall_outbox;
 pub mod pack;
+pub mod pkg_mode;
 pub mod policy;
 pub mod registry;
 pub mod registry_url;

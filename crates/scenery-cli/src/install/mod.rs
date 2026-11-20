@@ -51,12 +51,39 @@ pub enum InstallStatus {
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
+/// Whether `install`/`ensure_installed` should proceed.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum InstallDecision {
+    Proceed,
+    RefusePkgManaged,
+}
+
+pub(crate) fn install_decision(pkg_managed: bool) -> InstallDecision {
+    if pkg_managed {
+        InstallDecision::RefusePkgManaged
+    } else {
+        InstallDecision::Proceed
+    }
+}
+
+/// Printed when the pkg manages the daemon; no per-user agent is installed.
+#[cfg(target_os = "macos")]
+pub use macos::PKG_MANAGED_INSTALL_MSG;
+
 /// Install the platform auto-start unit and start the daemon immediately.
 ///
 /// Idempotent: if the unit is already installed and running this is a no-op
 /// (prints a notice and returns `Ok`). If it is installed but not running, the
 /// daemon is restarted.
 pub fn install() -> Result<()> {
+    if install_decision(scenery_core::pkg_mode::is_pkg_managed())
+        == InstallDecision::RefusePkgManaged
+    {
+        #[cfg(target_os = "macos")]
+        println!("{PKG_MANAGED_INSTALL_MSG}");
+        return Ok(());
+    }
+
     // Refuse to "install" into an overridden HOME (Homebrew `post_install`
     // sandbox, most commonly). Both platform installers below resolve their
     // unit path from HOME — macOS via `dirs::home_dir()`, Linux via
@@ -134,6 +161,13 @@ pub fn restart() -> Result<()> {
 /// Used by `mcp setup` to provision the daemon transparently. Never errors if
 /// the daemon is already running.
 pub fn ensure_installed() -> Result<()> {
+    if install_decision(scenery_core::pkg_mode::is_pkg_managed())
+        == InstallDecision::RefusePkgManaged
+    {
+        #[cfg(target_os = "macos")]
+        println!("{PKG_MANAGED_INSTALL_MSG}");
+        return Ok(());
+    }
     // Runs before the status check on purpose: after a `brew upgrade` race
     // our own duplicate unit can be the one running the daemon, so status()
     // says "installed and running" and install() — where this check also
@@ -952,10 +986,16 @@ mod tests {
     use super::{
         cgroup_is_service, cgroup_owning_service, cmdline_is_daemon_run, exe_is_stale,
         exec_start_is_daemon_run, find_other_owning_daemon_unit, home_is_overridden,
-        parse_exec_start_from_unit_file, parse_unit_file_state, should_remove_our_unit,
-        should_start_other_unit, unit_file_state_counts_as_owner, unit_is_healthy, SystemdState,
-        UnitFileState,
+        install_decision, parse_exec_start_from_unit_file, parse_unit_file_state,
+        should_remove_our_unit, should_start_other_unit, unit_file_state_counts_as_owner,
+        unit_is_healthy, InstallDecision, SystemdState, UnitFileState,
     };
+
+    #[test]
+    fn install_refuses_when_pkg_managed() {
+        assert_eq!(install_decision(true), InstallDecision::RefusePkgManaged);
+        assert_eq!(install_decision(false), InstallDecision::Proceed);
+    }
 
     // ── home_is_overridden ─────────────────────────────────────────────────
 

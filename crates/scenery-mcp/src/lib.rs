@@ -32,6 +32,7 @@ pub mod protocol;
 pub mod server;
 pub mod setup;
 pub mod stdio_process;
+pub mod wire;
 
 // Modules that depend on `scenery-core` and `scenery-manifest`.
 // Gated behind the `daemon` Cargo feature so the shim binary does not link

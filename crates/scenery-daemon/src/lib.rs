@@ -198,6 +198,12 @@ const SYNC_INTERVAL_SECS: u64 = 300;
 /// How often (in seconds) the token refresh loop checks for near-expiry tokens.
 const REFRESH_INTERVAL_SECS: u64 = 60;
 
+/// How often the daemon re-checks that the user's AI clients have the
+/// Scenery MCP entry (see `scenery_mcp::wire`). One `spawn_blocking` pass
+/// that only reads small config files and writes nothing when nothing
+/// changed.
+const WIRE_POLL: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Run the daemon to completion.
 ///
 /// Bootstraps state, builds the backend registry, starts the registry sync
@@ -897,9 +903,11 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
         state: state.clone(),
         registry_url: registry_url.clone(),
     };
+    let mut mcp_http_port: Option<u16> = None;
     let mcp_http_handle = match mcp_http::start_listener(mcp_http_ctx).await {
         Ok(Some((addr, handle))) => {
             info!(port = addr.port(), "local MCP HTTP resource server started");
+            mcp_http_port = Some(addr.port());
             Some(handle)
         }
         Ok(None) => {
@@ -926,6 +934,54 @@ pub async fn run_daemon(opts: DaemonOpts) -> Result<()> {
         .with_context(|| format!("failed to set socket permissions: {socket_path}"))?;
 
     info!(path = %socket_path, "listening on Unix socket");
+
+    // ── AI-client wiring ──────────────────────────────────────────────────────
+    //
+    // Spawned only after the instance lock AND the socket are ours, so a
+    // daemon that loses either never writes client configs.
+    //
+    // Add the Scenery MCP entry to the user's AI clients at start and every
+    // `WIRE_POLL` after (a client installed later gets wired within a
+    // minute). pkg installs enforce the entry; brew/curl installs add it
+    // once per client and respect a deliberate removal. The first tick
+    // fires immediately, so this is also the start-up pass.
+    if std::env::var("SCENERY_DISABLE_FILESYSTEM_RECONCILER").is_err() {
+        if let Some(home) = dirs::home_dir() {
+            let wire_state = state.clone();
+            let policy = if scenery_core::pkg_mode::is_pkg_managed() {
+                scenery_mcp::wire::WirePolicy::Enforce
+            } else {
+                scenery_mcp::wire::WirePolicy::FirstTimeOnly
+            };
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(WIRE_POLL);
+                loop {
+                    interval.tick().await;
+                    let state = wire_state.clone();
+                    let home = home.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        let claude_http = mcp_http_port
+                            .and_then(|port| state.local_mcp_key().ok().map(|key| (port, key)));
+                        scenery_mcp::wire::wire_clients_in(
+                            &home,
+                            std::path::Path::new("/"),
+                            policy,
+                            &state,
+                            claude_http,
+                        )
+                    })
+                    .await;
+                    match result {
+                        Ok(written) if !written.is_empty() => {
+                            info!(clients = ?written, "wired Scenery MCP entry into AI clients")
+                        }
+                        Ok(_) => {}
+                        Err(e) => warn!(error = %e, "client wiring pass failed; will retry"),
+                    }
+                }
+            });
+        }
+    }
 
     // ── Socket-identity watch ─────────────────────────────────────────────
     //

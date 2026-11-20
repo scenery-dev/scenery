@@ -124,6 +124,11 @@ pub enum Command {
         /// Registry URL for the backend device-deprovision call.
         #[arg(long, env = "SCENERY_REGISTRY_URL", value_parser = parse_registry_url)]
         registry_url: Option<String>,
+        /// Restore client configs and remove Scenery's skills from clients on
+        /// this machine only. No server calls: the device stays paired and
+        /// nothing is archived. Used by the macOS pkg uninstaller.
+        #[arg(long, conflicts_with = "purge")]
+        local_only: bool,
     },
 }
 
@@ -695,8 +700,61 @@ fn is_daemon_foreground(command: &Command) -> bool {
     matches!(command, Command::Daemon(DaemonCommand::Run { .. }))
 }
 
+/// For pkg installs, feed the managed-pref / installer-choice registry URL to
+/// clap's `env = "SCENERY_REGISTRY_URL"`. An explicit env var always wins.
+fn apply_pkg_registry_url() {
+    // Only pay the `defaults` spawn on pkg installs (the shim has a tight
+    // cold-start budget on brew installs).
+    if !scenery_core::pkg_mode::is_pkg_managed() {
+        return;
+    }
+    if std::env::var_os("SCENERY_REGISTRY_URL").is_some() {
+        return;
+    }
+    let choice = std::fs::read_to_string(scenery_core::pkg_mode::INSTALLER_CHOICE_FILE).ok();
+    if let Some(url) = scenery_core::pkg_mode::resolve_pkg_registry_url(
+        scenery_core::pkg_mode::managed_registry_url(),
+        choice,
+    ) {
+        // SAFETY: called first in `main`, before any threads are spawned.
+        unsafe { std::env::set_var("SCENERY_REGISTRY_URL", url) };
+    }
+}
+
+/// New `PATH` with `<home>/.local/bin` prepended, or `None` when it is already
+/// present. launchd gives system agents a minimal PATH, so `mcp setup` logic
+/// could not otherwise find `claude`.
+fn path_with_local_bin(
+    home: &std::path::Path,
+    path: &std::ffi::OsStr,
+) -> Option<std::ffi::OsString> {
+    let dir = home.join(".local/bin");
+    let mut entries: Vec<std::path::PathBuf> = std::env::split_paths(path)
+        .filter(|p| !p.as_os_str().is_empty())
+        .collect();
+    if entries.iter().any(|p| p == &dir) {
+        return None;
+    }
+    entries.insert(0, dir);
+    std::env::join_paths(entries).ok()
+}
+
 fn main() {
+    apply_pkg_registry_url();
     let cli = Cli::parse();
+
+    if cfg!(target_os = "macos")
+        && is_daemon_foreground(&cli.command)
+        && scenery_core::pkg_mode::is_pkg_managed()
+    {
+        if let Some(home) = std::env::var_os("HOME") {
+            let path = std::env::var_os("PATH").unwrap_or_default();
+            if let Some(new_path) = path_with_local_bin(std::path::Path::new(&home), &path) {
+                // SAFETY: still single-threaded here; logging/runtime not started.
+                unsafe { std::env::set_var("PATH", new_path) };
+            }
+        }
+    }
 
     // `skill uninstall`, the MCP `scenery_uninstall` tool and registry-sync
     // cleanup all go through `installer::uninstall_skill`, which must also
@@ -933,6 +991,7 @@ async fn run(cli: Cli) -> Result<()> {
             dry_run,
             report_dir,
             registry_url,
+            local_only,
         } => {
             uninstall::run(uninstall::UninstallOpts {
                 yes,
@@ -940,6 +999,7 @@ async fn run(cli: Cli) -> Result<()> {
                 dry_run,
                 report_dir,
                 registry_url: registry_url.unwrap_or_else(|| DEFAULT_REGISTRY_URL.to_string()),
+                local_only,
             })
             .await
         }
@@ -6138,6 +6198,17 @@ async fn cmd_daemon_run(
 ) -> Result<()> {
     use scenery_daemon::{run_daemon, DaemonOpts};
 
+    // pkg installs: the system agent owns the daemon, so stand down any
+    // per-user agents (ours and brew's) that would fight it for the lock.
+    #[cfg(target_os = "macos")]
+    if scenery_core::pkg_mode::is_pkg_managed() {
+        match tokio::task::spawn_blocking(install::macos::stand_down_user_agents).await {
+            Ok(Ok(labels)) => tracing::info!(?labels, "stood down per-user launchd agents"),
+            Ok(Err(e)) => tracing::warn!("failed to stand down per-user agents: {e:#}"),
+            Err(e) => tracing::warn!("stand-down task panicked: {e}"),
+        }
+    }
+
     let opts = DaemonOpts {
         registry_url,
         socket_path_override: None,
@@ -6776,3 +6847,31 @@ mod wait_until_tests;
 #[cfg(test)]
 #[path = "btpi_tests.rs"]
 mod btpi_tests;
+
+#[cfg(test)]
+mod path_local_bin_tests {
+    use super::path_with_local_bin;
+    use std::ffi::OsStr;
+    use std::path::Path;
+
+    #[test]
+    fn prepends_when_absent() {
+        let out = path_with_local_bin(Path::new("/Users/a"), OsStr::new("/usr/bin:/bin")).unwrap();
+        assert_eq!(out, OsStr::new("/Users/a/.local/bin:/usr/bin:/bin"));
+    }
+
+    #[test]
+    fn empty_path_yields_no_trailing_empty_entry() {
+        let out = path_with_local_bin(Path::new("/Users/a"), OsStr::new("")).unwrap();
+        assert_eq!(out, OsStr::new("/Users/a/.local/bin"));
+    }
+
+    #[test]
+    fn none_when_already_present() {
+        assert!(path_with_local_bin(
+            Path::new("/Users/a"),
+            OsStr::new("/usr/bin:/Users/a/.local/bin")
+        )
+        .is_none());
+    }
+}
