@@ -46,25 +46,35 @@ IS_DRAFT="$(gh release view "$TAG" --repo "$REPO" --json isDraft -q .isDraft)"
 [ "$IS_DRAFT" = "true" ] || { echo "error: release ${TAG} is not a draft (already published?)" >&2; exit 1; }
 
 echo "==> Downloading assets"
-gh release download "$TAG" --repo "$REPO" --dir "$WORK" --pattern '*.tar.gz' --pattern SHA256SUMS
+gh release download "$TAG" --repo "$REPO" --dir "$WORK" --pattern '*.tar.gz' --pattern 'scenery-*-macos.pkg' --pattern SHA256SUMS
 
 TARBALLS="$(cd "$WORK" && ls ./*.tar.gz | sed 's|^\./||')"
 [ -n "$TARBALLS" ] || { echo "error: no tarballs in draft" >&2; exit 1; }
 
+# The prod macOS pkg is optional (older tags have none) but, if present, must
+# be exactly scenery-<version>-macos.pkg and the only .pkg in the draft.
+PKG=""
+PKG_COUNT="$(cd "$WORK" && { ls ./*.pkg 2>/dev/null || true; } | wc -l | tr -d ' ')"
+if [ "$PKG_COUNT" != "0" ]; then
+  [ "$PKG_COUNT" = "1" ] && [ -f "$WORK/scenery-${VERSION}-macos.pkg" ] \
+    || { echo "error: expected only scenery-${VERSION}-macos.pkg, found: $(cd "$WORK" && ls ./*.pkg | tr '\n' ' ')" >&2; exit 1; }
+  PKG="scenery-${VERSION}-macos.pkg"
+fi
+
 echo "==> Verifying build provenance (gh attestation verify)"
-for f in $TARBALLS SHA256SUMS; do
+for f in $TARBALLS $PKG SHA256SUMS; do
   gh attestation verify "$WORK/$f" --repo "$REPO" \
     --signer-workflow "$SIGNER_WF" --source-ref "refs/tags/${TAG}" >/dev/null
   echo "    ok  $f"
 done
 
-echo "==> Checking tarballs against SHA256SUMS"
-for f in $TARBALLS; do
+echo "==> Checking tarballs${PKG:+ and pkg} against SHA256SUMS"
+for f in $TARBALLS $PKG; do
   want="$(awk -v f="$f" '$2==f || $2=="*"f {print $1}' "$WORK/SHA256SUMS")"
   [ -n "$want" ] || { echo "error: $f missing from SHA256SUMS" >&2; exit 1; }
   [ "$(sha256_of "$WORK/$f")" = "$want" ] || { echo "error: checksum mismatch for $f" >&2; exit 1; }
 done
-[ "$(wc -l < "$WORK/SHA256SUMS" | tr -d ' ')" = "$(echo "$TARBALLS" | wc -l | tr -d ' ')" ] \
+[ "$(wc -l < "$WORK/SHA256SUMS" | tr -d ' ')" = "$(echo "$TARBALLS $PKG" | wc -w | tr -d ' ')" ] \
   || { echo "error: SHA256SUMS has unexpected entries" >&2; exit 1; }
 
 echo "==> Signing SHA256SUMS with minisign (you will be prompted for the key password)"

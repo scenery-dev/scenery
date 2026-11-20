@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<installer-gui-script minSpecVersion="2">
+    <title>Scenery (dev flavor)</title>
+    <options customize="always" require-scripts="false" hostArchitectures="arm64,x86_64"/>
+    <allowed-os-versions>
+        <os-version min="12.0"/>
+    </allowed-os-versions>
+    <domains enable_localSystem="true"/>
+    <choices-outline>
+        <line choice="prod"/>
+        <line choice="dev"/>
+        <line choice="runner"/>
+    </choices-outline>
+    <!-- Prod is derived from dev, so exactly one is in effect. Prod is not user-togglable. -->
+    <choice id="prod" visible="true" enabled="false" title="Production" description="Connect to app.scenery.dev (default)." start_selected="true" selected="!choices['dev'].selected">
+        <pkg-ref id="dev.scenery.runner.prodregistry"/>
+    </choice>
+    <choice id="dev" visible="true" title="Dev (dev.scenery.dev)" description="Connect to the development registry." start_selected="false">
+        <pkg-ref id="dev.scenery.runner.devregistry"/>
+    </choice>
+    <choice id="runner" visible="false" enabled="false" title="Scenery" start_selected="true" selected="true">
+        <pkg-ref id="dev.scenery.runner"/>
+    </choice>
+    <pkg-ref id="dev.scenery.runner.prodregistry" version="@VERSION@">scenery-prodregistry.pkg</pkg-ref>
+    <pkg-ref id="dev.scenery.runner.devregistry" version="@VERSION@">scenery-devregistry.pkg</pkg-ref>
+    <pkg-ref id="dev.scenery.runner" version="@VERSION@" onConclusion="none">scenery-component.pkg</pkg-ref>
+</installer-gui-script>

@@ -1,0 +1,33 @@
+#!/bin/bash
+# Scenery pkg preinstall: stop the running agent so the binary can be replaced.
+# Runs as root under Installer; uses absolute paths only.
+set -euo pipefail
+
+LABEL="dev.scenery.agent"
+
+# Prints the uid of each user with a loaded gui/<uid> domain. Never uid 0 or
+# the Setup Assistant user. Uses absolute paths: Installer runs us as root
+# with a minimal PATH.
+gui_uids() {
+  local cand u uid skip seen=" "
+  skip="$(/usr/bin/id -u _mbsetupuser 2>/dev/null || true)"
+  cand="$(/usr/bin/stat -f %u /dev/console 2>/dev/null || true)"
+  for u in $(/usr/bin/who 2>/dev/null | /usr/bin/awk '{print $1}' | /usr/bin/sort -u); do
+    cand="$cand $(/usr/bin/id -u "$u" 2>/dev/null || true)"
+  done
+  for uid in $cand; do
+    [[ "$uid" =~ ^[0-9]+$ ]] || continue
+    [[ "$uid" == "0" || "$uid" == "$skip" ]] && continue
+    [[ "$seen" == *" $uid "* ]] && continue
+    seen="$seen$uid "
+    if /bin/launchctl print "gui/$uid" >/dev/null 2>&1; then
+      echo "$uid"
+    fi
+  done
+}
+
+for uid in $(gui_uids); do
+  echo "scenery preinstall: booting out gui/$uid/$LABEL"
+  /bin/launchctl bootout "gui/$uid/$LABEL" >/dev/null 2>&1 || true
+done
+exit 0

@@ -1,0 +1,5 @@
+#!/bin/bash
+# Prod choice in the dev-flavor installer: remove any dev choice file.
+set -euo pipefail
+/bin/rm -f "/Library/Application Support/Scenery/registry-url"
+exit 0

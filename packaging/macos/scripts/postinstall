@@ -1,0 +1,67 @@
+#!/bin/bash
+# Scenery pkg postinstall: symlinks, drop a stale dev choice file (prod flavor),
+# and start the agent for every logged-in user. Runs as root under Installer.
+set -euo pipefail
+
+PKG_ROOT="/Library/Application Support/Scenery"
+PKG_BIN="$PKG_ROOT/bin/scenery"
+PLIST="/Library/LaunchAgents/dev.scenery.agent.plist"
+LABEL="dev.scenery.agent"
+# Rewritten by scripts/build-pkg.sh: "prod" removes a leftover dev choice file,
+# "dev" leaves it to the Prod/Dev choice components.
+SCENERY_PKG_FLAVOR=prod
+
+# Prints the uid of each user with a loaded gui/<uid> domain. Never uid 0 or
+# the Setup Assistant user. Uses absolute paths: Installer runs us as root
+# with a minimal PATH.
+gui_uids() {
+  local cand u uid skip seen=" "
+  skip="$(/usr/bin/id -u _mbsetupuser 2>/dev/null || true)"
+  cand="$(/usr/bin/stat -f %u /dev/console 2>/dev/null || true)"
+  for u in $(/usr/bin/who 2>/dev/null | /usr/bin/awk '{print $1}' | /usr/bin/sort -u); do
+    cand="$cand $(/usr/bin/id -u "$u" 2>/dev/null || true)"
+  done
+  for uid in $cand; do
+    [[ "$uid" =~ ^[0-9]+$ ]] || continue
+    [[ "$uid" == "0" || "$uid" == "$skip" ]] && continue
+    [[ "$seen" == *" $uid "* ]] && continue
+    seen="$seen$uid "
+    if /bin/launchctl print "gui/$uid" >/dev/null 2>&1; then
+      echo "$uid"
+    fi
+  done
+}
+
+# Create a symlink only if absent or already ours; never clobber brew or others.
+link_ours() {
+  local link="$1"
+  if [[ -L "$link" && "$(/usr/bin/readlink "$link")" == "$PKG_BIN" ]]; then
+    return 0
+  elif [[ -e "$link" || -L "$link" ]]; then
+    echo "scenery postinstall: leaving existing $link alone"
+  else
+    /bin/ln -s "$PKG_BIN" "$link" || echo "scenery postinstall: could not link $link"
+  fi
+}
+
+/bin/mkdir -p /usr/local/bin || echo "scenery postinstall: cannot create /usr/local/bin"
+link_ours /usr/local/bin/scenery
+link_ours /usr/local/bin/scn
+
+if [[ "$SCENERY_PKG_FLAVOR" == "prod" ]]; then
+  /bin/rm -f "$PKG_ROOT/registry-url"
+fi
+
+for uid in $(gui_uids); do
+  if /bin/launchctl print "gui/$uid/$LABEL" >/dev/null 2>&1; then
+    echo "scenery postinstall: restarting gui/$uid/$LABEL"
+    /bin/launchctl kickstart -k "gui/$uid/$LABEL" || echo "scenery postinstall: kickstart failed for $uid"
+  else
+    echo "scenery postinstall: bootstrapping gui/$uid"
+    if ! /bin/launchctl bootstrap "gui/$uid" "$PLIST"; then
+      /bin/sleep 1
+      /bin/launchctl bootstrap "gui/$uid" "$PLIST" || echo "scenery postinstall: bootstrap failed for $uid"
+    fi
+  fi
+done
+exit 0
