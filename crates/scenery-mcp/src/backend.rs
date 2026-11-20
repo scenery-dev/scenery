@@ -616,7 +616,7 @@ impl RealBackend {
     /// This is the constructor used by the daemon for production. It wires in
     /// all context needed for `tools::handle_tool_call` and
     /// `tools::build_tool_list` so that management tools (`scenery_list`,
-    /// `scenery_install`, `scenery_search`, etc.) are reachable from
+    /// `scenery_install`, `search_skills`, etc.) are reachable from
     /// `list_tools` / `call_tool`.
     #[cfg(feature = "daemon")]
     #[allow(clippy::too_many_arguments)]
@@ -1044,7 +1044,7 @@ mod tests {
         const MENTIONABLE_TOOL_NAMES: &[&str] = &[
             "scenery_login",
             "scenery_list",
-            "scenery_search",
+            "search_skills",
             "scenery_mcp_catalog",
             "scenery_mcp_request",
         ];
@@ -1191,7 +1191,7 @@ mod tests {
             let instructions = init.instructions.unwrap_or_default();
             assert!(
                 instructions.contains("scenery_list")
-                    && instructions.contains("scenery_search")
+                    && instructions.contains("search_skills")
                     && instructions.contains("scenery_mcp_catalog"),
                 "expected the fully-exposed surface to still advertise its \
                  built-in tools; got: {instructions}"

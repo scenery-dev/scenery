@@ -21,7 +21,6 @@
 //! - `list_mcp_requests(base_url, …)`
 //! - `import_preview(base_url, …)`
 //! - `import_submit(base_url, …)`
-//! - `search_skills(base_url, query)` — stub; M1.4 wires real HTTP
 //! - `install_from_registry(base_url, …)` — stubbed with bail!("M1.4")
 
 use crate::{
@@ -211,6 +210,11 @@ fn build_tool_list_inner(
         });
     }
 
+    // Skills catalog on the backend's /mcp: always on once signed in.
+    if logged_in {
+        tools.extend(crate::remote_skills::tool_definitions());
+    }
+
     if !expose_builtins {
         return tools;
     }
@@ -247,28 +251,19 @@ fn build_tool_list_inner(
         }),
     });
 
-    // Install is always available — supports both local paths and registry IDs
+    // Local-path install (CLI-style). Registry installs go through `install_skill`.
     tools.push(ToolDefinition {
         name: "scenery_install".to_string(),
-        description: "Install a skill from a local path or from the Scenery registry by its ID."
-            .to_string(),
+        description: "Install a skill from a local bundle directory.".to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
-                "skill_id": {
-                    "type": "string",
-                    "description": "The ID of the skill to install from the registry (use this OR path, not both)"
-                },
                 "path": {
                     "type": "string",
-                    "description": "Local path to a skill bundle directory to install (use this OR skill_id, not both)"
-                },
-                "version": {
-                    "type": "string",
-                    "description": "Optional specific version to install from registry (default: latest)"
+                    "description": "Local path to a skill bundle directory to install"
                 }
             },
-            "required": []
+            "required": ["path"]
         }),
     });
 
@@ -418,25 +413,8 @@ fn build_tool_list_inner(
         });
     }
 
-    // Search and scan — public endpoints, no auth required
+    // Scan — public endpoint, no auth required
     if registry_url.is_some() {
-        tools.push(ToolDefinition {
-            name: "scenery_search".to_string(),
-            description: "Search the Scenery skill registry for skills that can be installed. \
-                Requires a search query — ask the user what they're looking for if none is provided."
-                .to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Search query (e.g., 'contract review', 'data analysis'). Must not be empty."
-                    }
-                },
-                "required": ["query"]
-            }),
-        });
-
         tools.push(ToolDefinition {
             name: "scenery_scan".to_string(),
             description: "Scan arbitrary content (SKILL.md, MCP JSON config, or package name) \
@@ -828,8 +806,10 @@ fn handle_tool_call_inner(
 
     let result = match name {
         "scenery_list" => handle_list(state),
-        "scenery_search" => handle_search(arguments, state, registry_url),
-        "scenery_install" => handle_install(arguments, state, registry_url),
+        n if crate::remote_skills::is_remote_skills_tool(n) => {
+            crate::remote_skills::handle(n, arguments, state, registry_url)
+        }
+        "scenery_install" => handle_install(arguments, state),
         "scenery_info" => handle_info(arguments, state),
         "scenery_validate" => handle_validate(arguments),
         "scenery_import" => handle_import(arguments, state, registry_url),
@@ -924,7 +904,7 @@ fn handle_list(state: &AppState) -> ToolCallResult {
     if skills.is_empty() {
         ToolCallResult::success(
             "No skills installed.\n\nTo get started:\n\
-             - Use scenery_search to browse the registry\n\
+             - Use search_skills to browse the catalog\n\
              - Use scenery_install with a local path to install a bundle\n\
              - Use scenery_import to import an external skill or MCP server"
                 .to_string(),
@@ -944,96 +924,28 @@ fn stored_access_token(state: &AppState, registry_url: &str) -> Option<String> {
     }
 }
 
-fn handle_search(
-    arguments: &serde_json::Value,
-    state: &AppState,
-    registry_url: &Option<String>,
-) -> ToolCallResult {
-    let url = match registry_url {
-        Some(u) => u,
-        None => return ToolCallResult::error_result("No registry URL configured"),
-    };
-
-    let query = arguments
-        .get("query")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
-    if query.trim().is_empty() {
+fn handle_install(arguments: &serde_json::Value, state: &AppState) -> ToolCallResult {
+    let Some(local_path) = arguments.get("path").and_then(|v| v.as_str()) else {
         return ToolCallResult::error_result(
-            "A search query is required. Ask the user what they're looking for.",
+            "Provide 'path' to a local skill bundle. To install from the catalog, use install_skill.",
         );
-    }
-
-    let Some(token) = stored_access_token(state, url) else {
-        return ToolCallResult::error_result(mcp_governance::SEARCH_SIGN_IN_MESSAGE);
     };
-    match mcp_governance::search_skills(url, query, Some(&token)) {
-        Ok(results) => {
-            if results.is_empty() {
-                ToolCallResult::success(format!("No skills found matching '{query}'."))
-            } else {
-                match serde_json::to_string_pretty(&results) {
-                    Ok(text) => ToolCallResult::success(text),
-                    Err(e) => ToolCallResult::error_result(format!("Failed to serialize: {e}")),
-                }
-            }
+    let utf8_path = camino::Utf8Path::new(local_path);
+    let pkg = match SkillPackage::load_from_dir(utf8_path) {
+        Ok(p) => p,
+        Err(e) => {
+            return ToolCallResult::error_result(format!(
+                "Failed to load skill bundle at {local_path}: {e}"
+            ))
         }
-        Err(e) => ToolCallResult::error_result(format!("Search failed: {e}")),
-    }
-}
-
-fn handle_install(
-    arguments: &serde_json::Value,
-    state: &AppState,
-    registry_url: &Option<String>,
-) -> ToolCallResult {
-    let path = arguments.get("path").and_then(|v| v.as_str());
-    let skill_id = arguments.get("skill_id").and_then(|v| v.as_str());
-
-    match (path, skill_id) {
-        // Local path install
-        (Some(local_path), _) => {
-            let utf8_path = camino::Utf8Path::new(local_path);
-            let pkg = match SkillPackage::load_from_dir(utf8_path) {
-                Ok(p) => p,
-                Err(e) => {
-                    return ToolCallResult::error_result(format!(
-                        "Failed to load skill bundle at {local_path}: {e}"
-                    ))
-                }
-            };
-            let id = pkg.manifest.id.clone();
-            let ver = pkg.manifest.version.to_string();
-            match install_unpacked_skill(state, &pkg, InstallMode::Copy) {
-                Ok(_) => ToolCallResult::success(format!(
-                    "Successfully installed {id}@{ver} from local path."
-                )),
-                Err(e) => ToolCallResult::error_result(format!("Failed to install {id}: {e}")),
-            }
-        }
-        // Registry install
-        (None, Some(id)) => {
-            let url = match registry_url {
-                Some(u) => u,
-                None => {
-                    return ToolCallResult::error_result(
-                        "No registry URL configured. Provide a local 'path' instead.",
-                    )
-                }
-            };
-            let version = arguments.get("version").and_then(|v| v.as_str());
-            match mcp_governance::install_from_registry(state, url, id, version) {
-                Ok(installed_ver) => ToolCallResult::success(format!(
-                    "Successfully installed {id}@{installed_ver} from registry."
-                )),
-                Err(e) => ToolCallResult::error_result(format!("Failed to install {id}: {e}")),
-            }
-        }
-        // Neither provided
-        (None, None) => ToolCallResult::error_result(
-            "Provide either 'path' (local install) or 'skill_id' (registry install)",
-        ),
+    };
+    let id = pkg.manifest.id.clone();
+    let ver = pkg.manifest.version.to_string();
+    match install_unpacked_skill(state, &pkg, InstallMode::Copy) {
+        Ok(_) => ToolCallResult::success(format!(
+            "Successfully installed {id}@{ver} from local path."
+        )),
+        Err(e) => ToolCallResult::error_result(format!("Failed to install {id}: {e}")),
     }
 }
 
@@ -2434,7 +2346,7 @@ fn maybe_build_update_prompt(skill_id: &str, cache: &UpdateCheckCache) -> Option
     Some(ToolCallResult::error_result(format!(
         "Update available for '{skill_id}' (v{latest} in registry).\n\n\
          Would you like to update before running? Options:\n\
-         1. Call scenery_install(skill_id=\"{skill_id}\") to install v{latest}, then retry.\n\
+         1. Call install_skill(skill_ids=[\"{skill_id}\"]) to install v{latest}, then retry.\n\
          2. Call this skill again with skip_update_check=true to run the current version."
     )))
 }
@@ -3237,7 +3149,7 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
 
         assert!(names.contains(&"scenery_list"));
-        assert!(names.contains(&"scenery_search"));
+        assert!(!names.contains(&"scenery_search"));
         assert!(names.contains(&"scenery_install"));
         assert!(names.contains(&"scenery_info"));
         assert!(names.contains(&"scenery_validate"));
@@ -3256,14 +3168,16 @@ mod tests {
         assert!(names.contains(&"scenery_list"));
         assert!(names.contains(&"scenery_validate"));
         assert!(names.contains(&"scenery_install"));
-        assert!(!names.contains(&"scenery_search"));
         assert!(!names.contains(&"scenery_logout"));
+        for n in crate::remote_skills::TOOL_NAMES {
+            assert!(!names.contains(&n), "{n} needs a registry");
+        }
 
         let _ = fs::remove_dir_all(&state_root);
     }
 
     #[test]
-    fn build_tool_list_search_available_without_login() {
+    fn build_tool_list_logged_out_has_login_but_no_skill_tools() {
         let state_root = temp_root("tool-list-search-no-login");
         let state = AppState::bootstrap_in(state_root.clone()).unwrap();
         let url = "http://localhost:8000".to_string();
@@ -3272,10 +3186,9 @@ mod tests {
         let tools = build_tool_list_with_builtins(&state, &Some(url));
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
 
-        assert!(
-            names.contains(&"scenery_search"),
-            "search should appear without login"
-        );
+        for n in crate::remote_skills::TOOL_NAMES {
+            assert!(!names.contains(&n), "{n} requires sign-in");
+        }
         assert!(
             names.contains(&"scenery_login"),
             "login should appear when not logged in"
@@ -3284,6 +3197,85 @@ mod tests {
             !names.contains(&"scenery_logout"),
             "logout should not appear when not logged in"
         );
+
+        let _ = fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn tool_list_includes_remote_skill_tools_when_logged_in_without_builtins_flag() {
+        let state_root = temp_root("tool-list-remote-skills");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+        let url = "http://localhost:8000".to_string();
+        fake_login(&state, &url);
+
+        // expose_builtins = false: the default surface.
+        let tools = build_tool_list_inner(&state, &Some(url), false, None);
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        for n in ["search_skills", "load_skill", "install_skill"] {
+            assert!(names.contains(&n), "{n} missing: {names:?}");
+        }
+        assert!(!names.contains(&"scenery_list"));
+
+        let _ = fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn tool_list_excludes_scenery_search() {
+        let state_root = temp_root("tool-list-no-scenery-search");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+        let url = "http://localhost:8000".to_string();
+        fake_login(&state, &url);
+
+        for expose in [false, true] {
+            let tools = build_tool_list_inner(&state, &Some(url.clone()), expose, None);
+            assert!(
+                !tools.iter().any(|t| t.name == "scenery_search"),
+                "scenery_search must be gone (expose_builtins={expose})"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn install_skill_dispatch_forwards_and_returns_backend_content() {
+        let state_root = temp_root("install-skill-dispatch");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+        state.set_sync_state("device_id", "dev-123").unwrap();
+
+        let mut server = mockito::Server::new();
+        let url = server.url();
+        fake_login(&state, &url);
+        let mock = server
+            .mock("POST", "/mcp")
+            .match_header("authorization", "Bearer fake-access")
+            .match_header("x-device-id", "dev-123")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "method": "tools/call",
+                "params": {"name": "install_skill", "arguments": {"skill_ids": ["pdf-tools"]}}
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"- pdf-tools: queued v1.0.0"}],"isError":true}}"#,
+            )
+            .create();
+
+        let policy = scenery_core::policy::MockPolicyClient::new();
+        let result = handle_tool_call(
+            "install_skill",
+            &serde_json::json!({"skill_ids": ["pdf-tools"]}),
+            &state,
+            &policy,
+            None,
+            &Some(url),
+            &empty_cache(),
+            None,
+            None,
+        );
+        mock.assert();
+        assert_eq!(result.content[0].text, "- pdf-tools: queued v1.0.0");
+        assert_eq!(result.is_error, Some(true), "isError is passed through");
 
         let _ = fs::remove_dir_all(&state_root);
     }
@@ -3440,29 +3432,14 @@ mod tests {
     }
 
     #[test]
-    fn handle_search_requires_registry() {
-        let state_root = temp_root("handle-search-no-registry");
-        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
-        let result = handle_search(&serde_json::json!({"query": "test"}), &state, &None);
-        let _ = fs::remove_dir_all(&state_root);
-        assert_eq!(result.is_error, Some(true));
-        assert!(result.content[0].text.contains("registry"));
-    }
-
-    #[test]
     fn handle_install_requires_path_or_skill_id() {
         let state_root = temp_root("handle-install-no-id");
         let state = AppState::bootstrap_in(state_root.clone()).unwrap();
 
-        let result = handle_install(
-            &serde_json::json!({}),
-            &state,
-            &Some("http://localhost:8000".to_string()),
-        );
+        let result = handle_install(&serde_json::json!({}), &state);
         assert_eq!(result.is_error, Some(true));
-        assert!(
-            result.content[0].text.contains("path") || result.content[0].text.contains("skill_id")
-        );
+        assert!(result.content[0].text.contains("path"));
+        assert!(result.content[0].text.contains("install_skill"));
 
         let _ = fs::remove_dir_all(&state_root);
     }
@@ -3475,11 +3452,7 @@ mod tests {
 
         write_test_skill(&skill_root);
 
-        let result = handle_install(
-            &serde_json::json!({"path": skill_root.as_str()}),
-            &state,
-            &None,
-        );
+        let result = handle_install(&serde_json::json!({"path": skill_root.as_str()}), &state);
         assert!(
             result.is_error.is_none(),
             "got: {:?}",
@@ -3493,117 +3466,6 @@ mod tests {
 
         let _ = fs::remove_dir_all(&state_root);
         let _ = fs::remove_dir_all(&skill_root);
-    }
-
-    #[test]
-    fn handle_install_registry_requires_url() {
-        let state_root = temp_root("handle-install-no-reg");
-        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
-
-        let result = handle_install(
-            &serde_json::json!({"skill_id": "some-skill"}),
-            &state,
-            &None,
-        );
-        assert_eq!(result.is_error, Some(true));
-        assert!(result.content[0].text.contains("registry"));
-
-        let _ = fs::remove_dir_all(&state_root);
-    }
-
-    #[test]
-    fn handle_install_from_registry_downloads_and_installs() {
-        use flate2::write::GzEncoder;
-        use flate2::Compression;
-        use mockito::Server;
-        use sha2::{Digest, Sha256};
-
-        let state_root = temp_root("handle-install-registry-ok");
-        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
-
-        // Build a minimal skill bundle in memory as a tar.gz.
-        let bundle_dir = temp_root("handle-install-registry-bundle");
-        write_test_skill(&bundle_dir);
-        let mut archive_bytes = Vec::new();
-        {
-            let enc = GzEncoder::new(&mut archive_bytes, Compression::default());
-            let mut tar = tar::Builder::new(enc);
-            tar.append_dir_all(".", bundle_dir.as_std_path()).unwrap();
-            let gz = tar.into_inner().unwrap();
-            gz.finish().unwrap();
-        }
-        let sha256 = hex::encode(Sha256::digest(&archive_bytes));
-
-        let mut server = Server::new();
-        let url = server.url();
-        let download_path = "/download/test-skill-0.1.0.cskill";
-
-        let _detail_mock = server
-            .mock("GET", "/portal/skills/test-skill")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(r#"{"skill_id":"test-skill","name":"Test Skill","latest_version":"0.1.0","publisher_name":"scenery","description":"A test skill."}"#)
-            .create();
-
-        // 2.2.0: artifact metadata must carry a signed `skill_artifact.v1`.
-        use scenery_core::signed::testing::{envelope, statement_json, trusted, TEST_KID};
-        state
-            .set_sync_state(scenery_core::verifier::REGISTRY_ORIGIN_KEY, &url)
-            .unwrap();
-        state
-            .set_sync_state(scenery_core::verifier::ORG_ID_KEY, "org-1")
-            .unwrap();
-        scenery_core::trust::pin_key(&state, &url, TEST_KID, &trusted(1, TEST_KID).pubkey).unwrap();
-        let payload = serde_json::to_vec(&serde_json::json!({
-            "skill_id": "test-skill", "version": "0.1.0", "sha256": sha256,
-            "size_bytes": archive_bytes.len(), "org": "org-1",
-        }))
-        .unwrap();
-        let statement = statement_json(
-            scenery_core::signed::TYP_SKILL_ARTIFACT,
-            &url,
-            "org-1",
-            "skill:test-skill@0.1.0",
-            1,
-            "active",
-            Some(&payload),
-        );
-        let signed =
-            serde_json::to_string(&envelope(1, TEST_KID, &statement, Some(&payload))).unwrap();
-
-        let _meta_mock = server
-            .mock("GET", "/skills/test-skill/versions/0.1.0")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(format!(
-                r#"{{"skill_id":"test-skill","version":"0.1.0","download_url":"{url}{download_path}","sha256":"{sha256}","size_bytes":{},"signed":{signed}}}"#,
-                archive_bytes.len()
-            ))
-            .create();
-
-        let _download_mock = server
-            .mock("GET", download_path)
-            .with_status(200)
-            .with_header("content-type", "application/octet-stream")
-            .with_body(archive_bytes)
-            .create();
-
-        let result = handle_install(
-            &serde_json::json!({"skill_id": "test-skill"}),
-            &state,
-            &Some(url),
-        );
-
-        assert_eq!(
-            result.is_error, None,
-            "expected success: {:?}",
-            result.content
-        );
-        assert!(result.content[0].text.contains("test-skill"));
-        assert!(result.content[0].text.contains("0.1.0"));
-
-        let _ = fs::remove_dir_all(&state_root);
-        let _ = fs::remove_dir_all(&bundle_dir);
     }
 
     #[test]

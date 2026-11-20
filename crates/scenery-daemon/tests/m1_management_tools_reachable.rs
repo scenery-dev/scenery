@@ -190,7 +190,6 @@ fn gap01_management_tools_present_and_callable() {
     // GAP-01: all management tools must be present
     let required_tools = [
         "scenery_list",
-        "scenery_search",
         "scenery_install",
         "scenery_info",
         "scenery_validate",

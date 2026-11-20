@@ -202,8 +202,9 @@ fn make_http_client() -> Result<Client> {
         .context("failed to build HTTP client")
 }
 
-/// Shown when catalog search is attempted without (valid) credentials.
-pub const SEARCH_SIGN_IN_MESSAGE: &str = "Sign in to search the catalog (`scenery auth login`).";
+/// Shown when the skills catalog is used without (valid) credentials.
+pub const SKILLS_SIGN_IN_MESSAGE: &str =
+    "Sign in to use the skills catalog (`scenery auth login`).";
 
 /// Fetch the org's MCP server catalog from the registry.
 ///
@@ -359,43 +360,64 @@ pub fn import_submit(
         .context("failed to deserialize import submit response")
 }
 
-/// Search the skill registry. The backend requires a signed-in user, so a
-/// missing token is reported up front instead of as a raw 401.
-pub fn search_skills(
+/// Call one of the backend's remote skills MCP tools (`search_skills`,
+/// `load_skill`, `install_skill`) over its stateless `POST {base_url}/mcp`
+/// JSON-RPC endpoint and return the MCP tool result object
+/// (`{"content": [...], "isError"?: bool}`) verbatim.
+///
+/// The portal bearer is required; `device_id` is sent as `X-Device-ID` so the
+/// backend can mark skills installed on this device and target installs.
+/// A missing token or a 401 is reported as [`SKILLS_SIGN_IN_MESSAGE`].
+pub fn call_remote_skills_tool(
     base_url: &str,
-    query: &str,
     auth_token: Option<&str>,
-) -> Result<Vec<serde_json::Value>> {
+    device_id: Option<&str>,
+    tool: &str,
+    arguments: &serde_json::Value,
+) -> Result<serde_json::Value> {
     let Some(token) = auth_token else {
-        anyhow::bail!("{SEARCH_SIGN_IN_MESSAGE}");
+        anyhow::bail!("{SKILLS_SIGN_IN_MESSAGE}");
     };
-    let url = format!(
-        "{}/api/skills/search?q={}",
-        base_url.trim_end_matches('/'),
-        urlencoding::encode(query)
-    );
+    let url = format!("{}/mcp", base_url.trim_end_matches('/'));
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": { "name": tool, "arguments": arguments },
+    });
 
     let client = make_http_client()?;
-    let resp = client
-        .get(&url)
-        .bearer_auth(token)
+    let mut req = client.post(&url).bearer_auth(token).json(&body);
+    if let Some(id) = device_id.filter(|d| !d.is_empty()) {
+        req = req.header("X-Device-ID", id);
+    }
+    let resp = req
         .send_tracked()
         .with_context(|| format!("failed to reach registry at {url}"))?;
 
     if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-        anyhow::bail!("{SEARCH_SIGN_IN_MESSAGE}");
+        anyhow::bail!("{SKILLS_SIGN_IN_MESSAGE}");
     }
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().unwrap_or_default();
-        anyhow::bail!("skill search failed (HTTP {status}): {body}");
+        let text = resp.text().unwrap_or_default();
+        anyhow::bail!("skills service failed (HTTP {status}): {text}");
     }
 
-    let results: serde_json::Value = resp
+    let reply: serde_json::Value = resp
         .json()
-        .context("failed to deserialize search results")?;
-
-    Ok(results.as_array().cloned().unwrap_or_default())
+        .context("failed to deserialize skills service response")?;
+    if let Some(err) = reply.get("error") {
+        let msg = err
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("unknown error");
+        anyhow::bail!("skills service error: {msg}");
+    }
+    reply
+        .get("result")
+        .cloned()
+        .context("skills service response had no result")
 }
 
 /// Install a skill from the registry by ID and optional version.
@@ -717,38 +739,86 @@ mod tests {
     }
 
     #[test]
-    fn search_skills_sends_bearer_token() {
+    fn call_remote_skills_tool_sends_bearer_and_device_header() {
         let mut server = Server::new();
         let mock = server
-            .mock("GET", "/api/skills/search?q=pdf")
+            .mock("POST", "/mcp")
             .match_header("authorization", "Bearer tok-123")
+            .match_header("x-device-id", "dev-123")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": {"name": "search_skills", "arguments": {"query": "pdf"}}
+            })))
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(r#"[{"skill_id":"pdf-tools"}]"#)
+            .with_body(
+                r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"1 skill(s)"}]}}"#,
+            )
             .create();
-        let results = search_skills(&server.url(), "pdf", Some("tok-123")).unwrap();
-        assert_eq!(results.len(), 1);
+        let out = call_remote_skills_tool(
+            &server.url(),
+            Some("tok-123"),
+            Some("dev-123"),
+            "search_skills",
+            &serde_json::json!({"query": "pdf"}),
+        )
+        .unwrap();
+        assert_eq!(out["content"][0]["text"], "1 skill(s)");
         mock.assert();
     }
 
     #[test]
-    fn search_skills_without_token_asks_to_sign_in_and_makes_no_request() {
+    fn call_remote_skills_tool_without_token_asks_to_sign_in() {
         let mut server = Server::new();
-        let mock = server.mock("GET", mockito::Matcher::Any).expect(0).create();
-        let err = search_skills(&server.url(), "pdf", None).unwrap_err();
+        let mock = server
+            .mock("POST", mockito::Matcher::Any)
+            .expect(0)
+            .create();
+        let err = call_remote_skills_tool(
+            &server.url(),
+            None,
+            None,
+            "search_skills",
+            &serde_json::json!({}),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("scenery auth login"));
         mock.assert();
     }
 
     #[test]
-    fn search_skills_maps_401_to_sign_in_message() {
+    fn call_remote_skills_tool_maps_401_to_sign_in_message() {
+        let mut server = Server::new();
+        let _mock = server.mock("POST", "/mcp").with_status(401).create();
+        let err = call_remote_skills_tool(
+            &server.url(),
+            Some("stale"),
+            None,
+            "load_skill",
+            &serde_json::json!({}),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("scenery auth login"));
+    }
+
+    #[test]
+    fn call_remote_skills_tool_surfaces_jsonrpc_errors() {
         let mut server = Server::new();
         let _mock = server
-            .mock("GET", "/api/skills/search?q=pdf")
-            .with_status(401)
+            .mock("POST", "/mcp")
+            .with_status(200)
+            .with_body(r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"skill_id is required"}}"#)
             .create();
-        let err = search_skills(&server.url(), "pdf", Some("stale")).unwrap_err();
-        assert!(err.to_string().contains("scenery auth login"));
+        let err = call_remote_skills_tool(
+            &server.url(),
+            Some("t"),
+            None,
+            "load_skill",
+            &serde_json::json!({}),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("skill_id is required"));
     }
 
     #[test]

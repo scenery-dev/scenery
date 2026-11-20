@@ -6,7 +6,7 @@
 //!
 //! # Must match `tools/list`
 //!
-//! The management tools (`scenery_list`, `scenery_search`,
+//! The management tools (`scenery_list`, `search_skills`,
 //! `scenery_mcp_catalog`, `scenery_mcp_request`) are hidden from
 //! `tools/list` by default — see `tools::build_tool_list`'s doc comment —
 //! and only surface when `SCENERY_EXPOSE_BUILTIN_TOOLS=1` and/or the user
@@ -103,7 +103,7 @@ pub fn build_instructions(
     out.trim().to_string()
 }
 
-/// Build the trailing "use scenery_list / _search / _mcp_catalog"
+/// Build the trailing "use scenery_list / search_skills / _mcp_catalog"
 /// sentence, including only the clauses for tools actually present in
 /// `exposed_tool_names`. Returns an empty string (not even a leading space)
 /// when none of the three are exposed, so callers can append it unconditionally.
@@ -114,8 +114,8 @@ fn build_discovery_hint(exposed_tool_names: &[String]) -> String {
     if has_tool("scenery_list") {
         clauses.push("scenery_list to show installed skills");
     }
-    if has_tool("scenery_search") {
-        clauses.push("scenery_search to find more");
+    if has_tool("search_skills") {
+        clauses.push("search_skills to find more");
     }
     if has_tool("scenery_mcp_catalog") {
         clauses.push("scenery_mcp_catalog to browse approved MCP servers");
@@ -173,7 +173,7 @@ mod tests {
     fn all_tools() -> Vec<String> {
         names(&[
             "scenery_list",
-            "scenery_search",
+            "search_skills",
             "scenery_mcp_catalog",
             "scenery_mcp_request",
             "scenery_login",
@@ -283,12 +283,12 @@ mod tests {
 
     /// The real default surface: builtins hidden (`SCENERY_EXPOSE_BUILTIN_TOOLS`
     /// unset). Unmanaged mode's generic copy previously always named
-    /// scenery_list/_search/_mcp_catalog regardless of what was actually
+    /// scenery_list/search_skills/_mcp_catalog regardless of what was actually
     /// exposed.
     #[test]
     fn unmanaged_default_surface_names_no_hidden_builtin_tools() {
         let s = build_instructions(None, "daemon", true, &no_builtins());
-        for tool in ["scenery_list", "scenery_search", "scenery_mcp_catalog"] {
+        for tool in ["scenery_list", "search_skills", "scenery_mcp_catalog"] {
             assert!(
                 !s.contains(tool),
                 "instructions must not name '{tool}' when it isn't exposed; got: {s}"
@@ -304,7 +304,7 @@ mod tests {
         let s = build_instructions(Some(&m), "daemon", true, &no_builtins());
         for tool in [
             "scenery_list",
-            "scenery_search",
+            "search_skills",
             "scenery_mcp_catalog",
             "scenery_mcp_request",
         ] {
@@ -324,8 +324,8 @@ mod tests {
     /// Only the exposed subset is named — not an all-or-nothing switch.
     #[test]
     fn discovery_hint_names_only_the_exposed_subset() {
-        let s = build_instructions(None, "daemon", true, &names(&["scenery_search"]));
-        assert!(s.contains("scenery_search"), "got: {s}");
+        let s = build_instructions(None, "daemon", true, &names(&["search_skills"]));
+        assert!(s.contains("search_skills"), "got: {s}");
         assert!(!s.contains("scenery_list"), "got: {s}");
         assert!(!s.contains("scenery_mcp_catalog"), "got: {s}");
     }
@@ -351,7 +351,7 @@ mod tests {
     fn fully_exposed_surface_still_names_every_builtin() {
         let s = build_instructions(None, "daemon", true, &all_tools());
         assert!(s.contains("scenery_list"), "got: {s}");
-        assert!(s.contains("scenery_search"), "got: {s}");
+        assert!(s.contains("search_skills"), "got: {s}");
         assert!(s.contains("scenery_mcp_catalog"), "got: {s}");
     }
 }

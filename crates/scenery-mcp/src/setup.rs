@@ -1125,7 +1125,7 @@ For approved servers, suggest using /mcp-install to activate them.
 name: skill-search
 description: Search the Scenery registry for available skills
 ---
-Search for skills in the Scenery registry. Call the scenery_search tool with the query from the arguments.
+Search for skills in the Scenery registry. Call the search_skills tool with the query from the arguments.
 
 If no query was provided, ask the user what they're looking for before calling the tool.
 
