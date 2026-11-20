@@ -868,6 +868,44 @@ fn purge_skill_blocking_removes_f2_claude_skills_projection() {
 }
 
 #[test]
+fn purge_removes_an_edited_skill_when_its_backup_fails_and_tells_it() {
+    let root = temp_root("purge-backup-fails");
+    let state = AppState::bootstrap_in(root.clone()).unwrap();
+    {
+        let conn = Connection::open(&state.db_path).unwrap();
+        seed_skill(&conn, "demo", "1.0.0", false);
+    }
+    with_fake_home(|home| {
+        let pusher = crate::managed_paths::ManagedPathsPusher::new(&state);
+        pusher
+            .push_skill("demo", Some("inst-1"), b"---\nname: demo\n---\n", &[])
+            .unwrap();
+        let canonical = home.join(".agents/skills/demo");
+        let conn = Connection::open(&state.db_path).unwrap();
+        let key = canonical.to_string_lossy().to_string();
+        let mut prov = crate::managed_paths::marker::marker_provenance(&conn, &key);
+        prov.origin = Some("auto_managed".into());
+        crate::managed_paths::marker::set_marker_provenance(&conn, &key, &prov).unwrap();
+        std::fs::write(canonical.join("SKILL.md"), b"user edits").unwrap();
+        // A file where `restore-backups/` must go: the backup cannot be made.
+        std::fs::write(root.join("restore-backups"), "blocker").unwrap();
+
+        super::purge_skill_blocking(&state, "demo").unwrap();
+
+        assert!(!canonical.exists(), "the revoke removes it regardless");
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_events WHERE event_type = 'skill_revoke_backup_failed'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "IT is told through the audit pipeline");
+    });
+    cleanup(&root);
+}
+
+#[test]
 fn purge_skill_blocking_removes_f2_projection_even_when_mode_is_warn() {
     let root = temp_root("purge-f2-warn-mode");
     let state = AppState::bootstrap_in(root.clone()).unwrap();

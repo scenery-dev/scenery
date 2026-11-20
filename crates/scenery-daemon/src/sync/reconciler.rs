@@ -3618,15 +3618,22 @@ async fn handle_deactivate_with(
                 // off the runtime thread.
                 let st = state.clone();
                 let p = p.clone();
+                // A user uninstall fails closed on a failed edit backup; an
+                // IT-driven deactivation removes the skill regardless (kill
+                // switch) and reports the backup failure to the backend.
                 let torn_down = tokio::task::spawn_blocking(move || {
                     if user_uninstall {
                         crate::managed_paths::own_uninstall::uninstall_projection(&st, &slug)
+                            .map(|_| None)
                     } else {
-                        p.remove_skill(&slug)
+                        p.remove_skill_for_revoke(&slug).map(|o| o.backup_failure)
                     }
                 })
                 .await
                 .unwrap_or_else(|e| Err(anyhow::anyhow!("teardown task failed: {e}")));
+                if let Ok(Some(_)) = &torn_down {
+                    record_revoke_backup_failure(state, &skill_id_for_pusher);
+                }
                 if let Err(e) = torn_down {
                     warn!(
                         skill_id = %skill_id_for_pusher,
@@ -3721,6 +3728,23 @@ async fn handle_purge(
     }
 }
 
+/// Tell IT that a revoke removed a skill whose local edits could not be backed
+/// up first (the kill switch won). Sent through the runner audit pipeline
+/// (`POST /runner/audit` on the next flush). Carries the skill id and a fixed
+/// reason only: the full error, with local paths, stays in the local log.
+fn record_revoke_backup_failure(state: &AppState, skill_id: &str) {
+    scenery_core::audit::write_audit_event_direct(
+        &state.db_path,
+        &scenery_core::audit::AuditEvent {
+            event_type: "skill_revoke_backup_failed".to_string(),
+            payload: serde_json::json!({
+                "skill_id": skill_id,
+                "reason": "skill removed by revoke; the backup of its local edits failed",
+            }),
+        },
+    );
+}
+
 /// Idempotent teardown of everything a skill has locally: the internal
 /// install dir, the SQLite rows, and the client-projected content (the
 /// `~/.agents/skills/<slug>` dir, its marker row and the `~/.claude/skills`
@@ -3769,8 +3793,15 @@ fn purge_skill_blocking(state: &AppState, skill_id: &str) -> Result<bool> {
         slugs.push(skill_id.to_string());
     }
     for slug in &slugs {
-        match pusher.remove_skill(slug) {
-            Ok(r) => removed |= r,
+        // Purge is revoke-driven: the kill switch wins over the edit backup
+        // (a failed backup is logged at error level by the pusher).
+        match pusher.remove_skill_for_revoke(slug) {
+            Ok(r) => {
+                removed |= r.removed;
+                if r.backup_failure.is_some() {
+                    record_revoke_backup_failure(state, skill_id);
+                }
+            }
             Err(e) => errors.push(format!("F2 remove_skill '{slug}' failed: {e:#}")),
         }
     }

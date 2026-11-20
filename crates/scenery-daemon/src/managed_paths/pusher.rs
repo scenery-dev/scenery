@@ -136,6 +136,15 @@ pub(crate) fn own_tree_has_unuploaded_edits(skill_dir: &Path, prov: &Provenance)
     }
 }
 
+/// Result of a skill teardown.
+#[derive(Debug, Default, Clone)]
+pub struct RemoveOutcome {
+    /// Something (link, directory or row) was actually removed.
+    pub removed: bool,
+    /// Revoke only: the safety backup failed and the skill was removed anyway.
+    pub backup_failure: Option<String>,
+}
+
 impl ManagedPathsPusher {
     /// Construct a pusher from the daemon's `AppState`.
     pub fn new(state: &AppState) -> Self {
@@ -623,8 +632,23 @@ impl ManagedPathsPusher {
     /// stays silent), `Ok(true)` if a link, directory or marker row was
     /// actually removed.
     pub fn remove_skill(&self, slug: &str) -> Result<bool> {
+        self.remove_skill_inner(slug, false).map(|o| o.removed)
+    }
+
+    /// [`remove_skill`](Self::remove_skill) for a revoke or any IT-driven
+    /// removal: the kill switch wins over the safety backup. If the backup of
+    /// a folder that may hold edits fails, the skill is removed anyway, the
+    /// failure is logged at error level and returned in
+    /// [`RemoveOutcome::backup_failure`] so the caller can report it. A
+    /// user-initiated uninstall keeps using `remove_skill`, which fails
+    /// closed (the user's own edits are not destroyed on their say-so).
+    pub fn remove_skill_for_revoke(&self, slug: &str) -> Result<RemoveOutcome> {
+        self.remove_skill_inner(slug, true)
+    }
+
+    fn remove_skill_inner(&self, slug: &str, revoke: bool) -> Result<RemoveOutcome> {
         if reconciler_disabled() {
-            return Ok(false);
+            return Ok(RemoveOutcome::default());
         }
         scenery_core::safe_path::validate_single_component("skill slug", slug)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -632,6 +656,7 @@ impl ManagedPathsPusher {
         // row is still present (it would report a false "deleted").
         let _removal_lock = super::marker::lock_skill_removal(self.db_path.as_std_path())?;
         let mut removed = false;
+        let mut backup_failure: Option<String> = None;
 
         let skills_dir = resolve_skills_dir()?;
         let skill_dir = skills_dir.join(slug);
@@ -683,12 +708,26 @@ impl ManagedPathsPusher {
                     path = %skill_dir.display(),
                     "pusher: refusing to remove the directory — not Scenery-managed; left in place"
                 );
-                return Ok(removed);
+                return Ok(RemoveOutcome {
+                    removed,
+                    backup_failure,
+                });
             }
             if !skill_dir.is_symlink() {
                 // The user's OWN skill may hold edits nothing else has: back
                 // them up first, and refuse to delete if that fails.
-                self.back_up_own_skill_before_removal(slug, &skill_dir, &path_key)?;
+                if let Err(e) = self.back_up_own_skill_before_removal(slug, &skill_dir, &path_key) {
+                    if !revoke {
+                        return Err(e);
+                    }
+                    let msg = format!("{e:#}");
+                    tracing::error!(
+                        slug,
+                        error = %msg,
+                        "pusher: backup failed during revoke; removing the skill anyway (kill switch)"
+                    );
+                    backup_failure = Some(msg);
+                }
             }
             if skill_dir.is_symlink() {
                 fs::remove_file(&skill_dir)
@@ -715,7 +754,10 @@ impl ManagedPathsPusher {
             .delete_db_marker(&path_key)
             .context("pusher: failed to delete managed_path_markers for skill")?;
 
-        Ok(removed)
+        Ok(RemoveOutcome {
+            removed,
+            backup_failure,
+        })
     }
 
     /// Before a teardown (revoke, purge, deactivate) deletes an auto-managed
@@ -1566,3 +1608,7 @@ where
 #[cfg(test)]
 #[path = "pusher_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "pusher_revoke_tests.rs"]
+mod revoke_tests;
