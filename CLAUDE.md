@@ -116,7 +116,7 @@ clean on main), waits for the release workflow, runs `scripts/sign-release.sh
 homebrew-tap formula (`scenery X.Y.Z`; refuses weekdays 9am-5pm ET unless
 `--force-hours`), and stages the runner on the demo box. Resume a failed run
 with `--from <preflight|wait|sign|formula|stage>`. Afterwards `brew upgrade
-scenery` on spaceghost (see the root CLAUDE.md). Test: `scripts/test_release.sh`.
+scenery` on spaceghost (see the root CLAUDE.md). Test: `scripts/test_release.sh` and `scripts/test_sign_release.sh`.
 
 ## Things to remember (per project conventions)
 
