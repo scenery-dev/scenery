@@ -499,6 +499,76 @@ pub fn db_ownership(conn: &Connection, kind: &str, dir: &Path) -> DbOwnership {
     }
 }
 
+/// True iff `managed_path_markers` holds a non-legacy row at exactly `dir`'s
+/// canonical path, i.e. Scenery itself wrote and tracks this directory.
+///
+/// This is the ownership gate for writes and deletes (SEC1 follow-up). The
+/// `.scenery-managed.json` sidecar is never consulted, not even to lift a
+/// legacy row: any skill author can ship one. A content-hash mismatch still
+/// counts as owned (the user edited a skill Scenery put there; callers back
+/// up and check for unsynced edits before they overwrite or delete). A
+/// legacy row (no installation id, no provenance), no row, or a DB error all
+/// answer `false`, so callers refuse rather than touch the directory.
+pub fn db_owns_path(conn: &Connection, kind: &str, dir: &Path) -> bool {
+    let row = match tracked_marker_for_path(conn, kind, dir) {
+        Ok(Some(row)) => row,
+        Ok(None) | Err(_) => return false,
+    };
+    !(is_blank(&row.installation_id) && is_legacy_provenance(&marker_provenance(conn, &row.path)))
+}
+
+/// Remember that `link` is a copy Scenery materialised from `canonical`.
+pub fn record_link_copy(conn: &Connection, link: &Path, canonical: &Path) {
+    if let Err(e) = conn.execute(
+        "INSERT OR REPLACE INTO skill_link_copies (path, canonical) VALUES (?1, ?2)",
+        [link.to_string_lossy(), canonical.to_string_lossy()],
+    ) {
+        warn!(path = %link.display(), error = %e, "managed_paths/marker: could not record link copy");
+    }
+}
+
+/// Forget a recorded link copy (it was removed or became a symlink).
+pub fn forget_link_copy(conn: &Connection, link: &Path) {
+    let _ = conn.execute(
+        "DELETE FROM skill_link_copies WHERE path = ?1",
+        [link.to_string_lossy()],
+    );
+}
+
+/// True iff `link` (a real directory under a client's skills folder) is a
+/// copy Scenery materialised from the DB-owned `canonical`: either recorded
+/// in `skill_link_copies` (edits by the user are fine, callers back it up),
+/// or, for copies made before that table existed, its `SKILL.md` hashes to
+/// the canonical row's recorded hash or the canonical file's current hash.
+/// Anything else there is user content.
+pub fn db_owns_link_copy(conn: &Connection, canonical: &Path, link: &Path) -> bool {
+    if !db_owns_path(conn, "skill", canonical) {
+        return false;
+    }
+    let recorded = conn
+        .query_row(
+            "SELECT 1 FROM skill_link_copies WHERE path = ?1 AND canonical = ?2",
+            [link.to_string_lossy(), canonical.to_string_lossy()],
+            |_| Ok(()),
+        )
+        .is_ok();
+    if recorded {
+        return true;
+    }
+    let Ok(copy_bytes) = std::fs::read(link.join("SKILL.md")) else {
+        return false;
+    };
+    let copy_hash = super::drift::hex_sha256(&copy_bytes);
+    if let Ok(Some(row)) = tracked_marker_for_path(conn, "skill", canonical) {
+        if row.source_sha256 == copy_hash {
+            return true;
+        }
+    }
+    std::fs::read(canonical.join("SKILL.md"))
+        .map(|b| super::drift::hex_sha256(&b) == copy_hash)
+        .unwrap_or(false)
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

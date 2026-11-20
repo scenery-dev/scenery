@@ -171,8 +171,21 @@ fn relink_if_claude_source(state: &AppState, slug: &str, source: &Path) {
     if source != link {
         return;
     }
-    match super::links::link_dir(&canonical, &link) {
-        Ok(_) => {
+    let copy_is_ours = rusqlite::Connection::open(&state.db_path)
+        .map(|c| super::marker::db_owns_link_copy(&c, &canonical, &link))
+        .unwrap_or(false);
+    match super::links::link_dir(&canonical, &link, copy_is_ours) {
+        Ok(mode) => {
+            if let Ok(conn) = rusqlite::Connection::open(&state.db_path) {
+                match mode {
+                    super::links::LinkMode::Copy => {
+                        super::marker::record_link_copy(&conn, &link, &canonical)
+                    }
+                    super::links::LinkMode::Symlink => {
+                        super::marker::forget_link_copy(&conn, &link)
+                    }
+                }
+            }
             let ok = super::projection_outcome::ProjectionOutcome::Ok;
             if let Err(e) = super::projection_outcome::record(state, slug, &ok) {
                 warn!(slug, error = %e, "takeover: could not record the relinked projection");

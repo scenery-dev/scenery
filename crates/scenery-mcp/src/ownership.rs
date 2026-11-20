@@ -213,32 +213,29 @@ pub fn author_is_anthropic(value: &Value) -> bool {
 }
 
 /// Classify a single plugin, given its marketplace name, its entry in that
-/// marketplace's `marketplace.json` `plugins[]` array, and (optionally) its
-/// on-disk directory for a marker check.
+/// marketplace's `marketplace.json` `plugins[]` array, and whether the state
+/// DB owns the plugin (`db_owned`: a `managed_path_markers` row at its exact
+/// path). The `.scenery-managed.json` file is never consulted: any plugin
+/// author can ship one.
 ///
 /// Order of precedence:
 /// 1. Anything in the official marketplace (`anthropics/claude-plugins-official`)
 ///    → [`Origin::AnthropicNative`], regardless of source type, author, or any
 ///    Scenery marker (a marker there is a stale artefact, never ownership).
-/// 2. A Scenery marker in `plugin_dir` → [`Origin::SceneryManaged`].
+/// 2. `db_owned` → [`Origin::SceneryManaged`].
 /// 3. Otherwise → [`Origin::Custom`].
-pub fn classify_plugin(marketplace_name: &str, entry: &Value, plugin_dir: Option<&Path>) -> Origin {
-    let marker_present = plugin_dir.map(is_scenery_managed).unwrap_or(false);
-    classify_plugin_with(
-        is_official_marketplace(marketplace_name),
-        entry,
-        marker_present,
-    )
+pub fn classify_plugin(marketplace_name: &str, entry: &Value, db_owned: bool) -> Origin {
+    classify_plugin_with(is_official_marketplace(marketplace_name), entry, db_owned)
 }
 
 /// Pure classifier core — no filesystem access. See [`classify_plugin`].
-pub fn classify_plugin_with(is_official: bool, _entry: &Value, marker_present: bool) -> Origin {
+pub fn classify_plugin_with(is_official: bool, _entry: &Value, db_owned: bool) -> Origin {
     // Product rule: the WHOLE official marketplace is off-limits, including the
     // third-party entries under `external_plugins/`.
     if is_official {
         return Origin::AnthropicNative;
     }
-    if marker_present {
+    if db_owned {
         return Origin::SceneryManaged;
     }
     Origin::Custom

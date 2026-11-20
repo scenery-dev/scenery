@@ -627,7 +627,7 @@ fn skill_tools_from_db(
         // `skill_id` is the skill's local folder name (the reconciler maps
         // registry names to it), which is what ~/.claude/skills uses.
         let (skill_id, install_root) = row?;
-        if native_skills_dir.is_some_and(|dir| has_native_copy(&dir.join(&skill_id))) {
+        if native_skills_dir.is_some_and(|dir| has_native_copy(&conn, &dir.join(&skill_id))) {
             continue;
         }
         let active_path = format!("{}/active", install_root);
@@ -639,8 +639,40 @@ fn skill_tools_from_db(
     Ok(tools)
 }
 
-fn has_native_copy(dir: &Path) -> bool {
-    dir.join("SKILL.md").is_file() && crate::ownership::is_scenery_managed(dir)
+/// True iff `dir` holds a `SKILL.md` and the state DB vouches for it: a
+/// `managed_path_markers` row of `kind='skill'` at its canonical path (a
+/// client link resolves to the row's path), or a recorded copy-mode
+/// directory in `skill_link_copies`. The `.scenery-managed.json` file is
+/// never trusted, since any skill author can ship one; unproven means the
+/// tool stays listed.
+fn has_native_copy(conn: &Connection, dir: &Path) -> bool {
+    if !dir.join("SKILL.md").is_file() {
+        return false;
+    }
+    let recorded = conn
+        .query_row(
+            "SELECT 1 FROM skill_link_copies WHERE path = ?1",
+            [dir.to_string_lossy().to_string()],
+            |_| Ok(()),
+        )
+        .is_ok();
+    if recorded {
+        return true;
+    }
+    let Ok(canonical) = std::fs::canonicalize(dir) else {
+        return false;
+    };
+    let Ok(mut stmt) = conn.prepare("SELECT path FROM managed_path_markers WHERE kind = 'skill'")
+    else {
+        return false;
+    };
+    let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) else {
+        return false;
+    };
+    let paths: Vec<String> = rows.flatten().collect();
+    paths
+        .iter()
+        .any(|path| std::fs::canonicalize(path).is_ok_and(|p| p == canonical))
 }
 
 /// Convert a single installed skill into an MCP tool definition.
@@ -3363,8 +3395,20 @@ mod tests {
         fs::write(dir.join("SKILL.md"), "the user's own skill").unwrap();
         assert!(lists_skill(native_dir));
 
-        // Scenery's copy is there: Claude Code has it natively.
+        // A forged marker file next to it proves nothing.
         fs::write(dir.join(crate::ownership::MANAGED_MARKER_FILENAME), "{}").unwrap();
+        assert!(lists_skill(native_dir));
+
+        // Scenery's copy is there: our DB row at this path matches its hash.
+        let conn = Connection::open(&state.db_path).unwrap();
+        conn.execute(
+            "INSERT INTO managed_path_markers (path, kind, slug, source_sha256, migrated_at) VALUES (?1, 'skill', 'test-skill', ?2, 'now')",
+            rusqlite::params![
+                dir.as_str(),
+                scenery_core::restore_journal::sha256_hex(b"the user's own skill")
+            ],
+        )
+        .unwrap();
         assert!(!lists_skill(native_dir));
         assert!(build_tool_list_inner(&state, &url, false, native_dir)
             .iter()

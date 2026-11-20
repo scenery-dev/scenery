@@ -287,3 +287,14 @@ fn agents_skills_dir_is_home_dot_agents_skills() {
     assert!(dir.ends_with("skills"));
     assert!(dir.parent().unwrap().ends_with(".agents"));
 }
+
+#[test]
+fn classify_plugin_ownership_comes_from_the_db_flag_not_a_marker_file() {
+    let entry = json!({ "name": "p" });
+    // `classify_plugin` reads no marker file; only the DB-derived flag counts.
+    assert_eq!(classify_plugin("nope", &entry, false), Origin::Custom);
+    assert_eq!(
+        classify_plugin("nope", &entry, true),
+        Origin::SceneryManaged
+    );
+}

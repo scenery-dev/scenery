@@ -27,7 +27,6 @@
 //! the link-integrity path.
 
 use anyhow::{bail, Context, Result};
-use scenery_mcp::ownership;
 use std::fs;
 use std::path::Path;
 
@@ -51,11 +50,12 @@ pub enum LinkMode {
 /// into `~/.claude/.scenery-backup/<ts>/links/` before removal, so the
 /// replacement is always recoverable — see [`backup_and_remove`].
 ///
-/// Ownership of a real directory is decided by the `.scenery-managed.json`
-/// marker the pusher writes into the canonical directory (which `copy_tree`
-/// necessarily carries along). Refuses to touch a real directory that is not
-/// ours — that is user content.
-pub fn link_dir(canonical: &Path, link_path: &Path) -> Result<LinkMode> {
+/// Ownership of a real directory is decided by the caller from the state DB
+/// (`copy_is_ours`, see `marker::db_owns_link_copy`): the `.scenery-managed.json`
+/// sidecar is never trusted, since any skill author can ship one. Refuses to
+/// touch a real directory that is not ours — that is user content, and so is
+/// one the DB cannot vouch for (a legacy install with no row).
+pub fn link_dir(canonical: &Path, link_path: &Path, copy_is_ours: bool) -> Result<LinkMode> {
     if !canonical.is_dir() {
         bail!(
             "links: canonical dir does not exist: {}",
@@ -74,7 +74,7 @@ pub fn link_dir(canonical: &Path, link_path: &Path) -> Result<LinkMode> {
             )
         })?;
     } else if link_path.exists() {
-        if !ownership::is_scenery_managed(link_path) {
+        if !copy_is_ours {
             bail!(
                 "links: refusing to replace a real directory at {} — \
                  not Scenery-managed",
@@ -105,7 +105,7 @@ pub fn link_dir(canonical: &Path, link_path: &Path) -> Result<LinkMode> {
         // Diverged. Back it up, then remove it and re-materialise below so the
         // call stays idempotent and heals into a symlink if possible.
         //
-        // The backup is what makes this recoverable: the marker proves
+        // The backup is what makes this recoverable: the DB proves
         // Scenery *wrote* the directory, but not that its current content
         // is still reproducible — a restored backup or a hand-customised
         // skill dir carries the marker too. Every other destructive path in
@@ -139,8 +139,8 @@ pub fn link_dir(canonical: &Path, link_path: &Path) -> Result<LinkMode> {
 /// Idempotent — absent is success. Never touches the canonical directory.
 ///
 /// This is the exact inverse of [`link_dir`] and applies the **same ownership
-/// rule**: a real directory here is removed only when it carries the
-/// `.scenery-managed.json` marker. The two disagreeing is a data-loss bug —
+/// rule**: a real directory here is removed only when the state DB vouches
+/// for it (`copy_is_ours`), never on the strength of a marker file. The two disagreeing is a data-loss bug —
 /// `link_dir` refuses to replace an unmarked real directory because it is user
 /// content, and drift can legitimately report that same directory as
 /// `link_replaced`, after which a policy-driven `remove_skill` calls straight
@@ -154,12 +154,12 @@ pub fn link_dir(canonical: &Path, link_path: &Path) -> Result<LinkMode> {
 /// every other destructive step on this path, not `remove_dir_all`.
 ///
 /// A symlink is unlinked outright: removing a link destroys no data.
-pub fn unlink_dir(link_path: &Path) -> Result<()> {
+pub fn unlink_dir(link_path: &Path, copy_is_ours: bool) -> Result<()> {
     if link_path.is_symlink() {
         fs::remove_file(link_path)
             .with_context(|| format!("links: failed to remove link: {}", link_path.display()))?;
     } else if link_path.is_dir() {
-        if !ownership::is_scenery_managed(link_path) {
+        if !copy_is_ours {
             bail!(
                 "links: refusing to remove a real directory at {} — \
                  not Scenery-managed",

@@ -25,7 +25,7 @@ fn fixture() -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
 fn link_dir_creates_symlink_that_resolves_to_canonical() {
     let (_tmp, canonical, link_path) = fixture();
 
-    let mode = link_dir(&canonical, &link_path).unwrap();
+    let mode = link_dir(&canonical, &link_path, false).unwrap();
 
     assert_eq!(mode, LinkMode::Symlink);
     assert!(link_path.is_symlink());
@@ -37,8 +37,8 @@ fn link_dir_creates_symlink_that_resolves_to_canonical() {
 fn link_dir_is_idempotent() {
     let (_tmp, canonical, link_path) = fixture();
 
-    link_dir(&canonical, &link_path).unwrap();
-    let mode = link_dir(&canonical, &link_path).unwrap();
+    link_dir(&canonical, &link_path, false).unwrap();
+    let mode = link_dir(&canonical, &link_path, false).unwrap();
 
     assert_eq!(mode, LinkMode::Symlink);
     assert!(link_is_intact(&canonical, &link_path).unwrap());
@@ -52,7 +52,7 @@ fn link_dir_replaces_a_stale_link_pointing_elsewhere() {
     #[cfg(unix)]
     std::os::unix::fs::symlink(&wrong, &link_path).unwrap();
 
-    let mode = link_dir(&canonical, &link_path).unwrap();
+    let mode = link_dir(&canonical, &link_path, false).unwrap();
 
     assert_eq!(mode, LinkMode::Symlink);
     assert!(link_is_intact(&canonical, &link_path).unwrap());
@@ -68,7 +68,7 @@ fn link_dir_refuses_to_clobber_a_real_directory() {
     fs::create_dir_all(&link_path).unwrap();
     fs::write(link_path.join("SKILL.md"), b"user content").unwrap();
 
-    let err = link_dir(&canonical, &link_path).unwrap_err();
+    let err = link_dir(&canonical, &link_path, false).unwrap_err();
 
     assert!(err.to_string().contains("real directory"));
     // The user's content survives untouched.
@@ -104,7 +104,7 @@ fn link_dir_replaces_its_own_prior_copy_materialisation() {
     let prev_home = std::env::var_os("HOME");
     std::env::set_var("HOME", fake_home.path());
 
-    let result = link_dir(&canonical, &link_path);
+    let result = link_dir(&canonical, &link_path, true);
 
     if let Some(v) = prev_home {
         std::env::set_var("HOME", v);
@@ -159,7 +159,7 @@ fn link_dir_does_not_churn_backups_when_the_copy_already_matches_canonical() {
     std::env::set_var("HOME", fake_home.path());
 
     let modes: Vec<_> = (0..5)
-        .map(|_| link_dir(&canonical, &link_path).unwrap())
+        .map(|_| link_dir(&canonical, &link_path, true).unwrap())
         .collect();
 
     if let Some(v) = prev_home {
@@ -203,7 +203,7 @@ fn link_dir_still_replaces_a_copy_that_has_diverged() {
     let prev_home = std::env::var_os("HOME");
     std::env::set_var("HOME", fake_home.path());
 
-    let result = link_dir(&canonical, &link_path);
+    let result = link_dir(&canonical, &link_path, true);
 
     if let Some(v) = prev_home {
         std::env::set_var("HOME", v);
@@ -237,7 +237,7 @@ fn link_dir_treats_a_copy_with_an_extra_file_as_diverged() {
     let prev_home = std::env::var_os("HOME");
     std::env::set_var("HOME", fake_home.path());
 
-    let result = link_dir(&canonical, &link_path);
+    let result = link_dir(&canonical, &link_path, true);
 
     if let Some(v) = prev_home {
         std::env::set_var("HOME", v);
@@ -291,7 +291,7 @@ fn link_dir_refuses_to_remove_when_the_backup_cannot_be_made() {
     let prev_home = std::env::var_os("HOME");
     std::env::set_var("HOME", &not_a_dir);
 
-    let result = link_dir(&canonical, &link_path);
+    let result = link_dir(&canonical, &link_path, true);
 
     if let Some(v) = prev_home {
         std::env::set_var("HOME", v);
@@ -323,9 +323,9 @@ fn link_is_intact_is_false_when_replaced_by_a_real_dir() {
 #[test]
 fn unlink_dir_removes_the_link_but_not_the_canonical_dir() {
     let (_tmp, canonical, link_path) = fixture();
-    link_dir(&canonical, &link_path).unwrap();
+    link_dir(&canonical, &link_path, false).unwrap();
 
-    unlink_dir(&link_path).unwrap();
+    unlink_dir(&link_path, false).unwrap();
 
     assert!(!link_path.exists());
     assert!(!link_path.is_symlink());
@@ -335,8 +335,8 @@ fn unlink_dir_removes_the_link_but_not_the_canonical_dir() {
 #[test]
 fn unlink_dir_is_idempotent_when_absent() {
     let (_tmp, _canonical, link_path) = fixture();
-    unlink_dir(&link_path).unwrap();
-    unlink_dir(&link_path).unwrap();
+    unlink_dir(&link_path, false).unwrap();
+    unlink_dir(&link_path, false).unwrap();
 }
 
 /// **Regression (unlink_dir / link_dir ownership disagreement).**
@@ -358,11 +358,11 @@ fn unlink_dir_refuses_to_delete_an_unmanaged_real_dir() {
 
     // `link_dir` already refuses this exact directory — the two must agree.
     assert!(
-        link_dir(&canonical, &link_path).is_err(),
+        link_dir(&canonical, &link_path, false).is_err(),
         "precondition: link_dir refuses an unmarked real dir here"
     );
 
-    let result = unlink_dir(&link_path);
+    let result = unlink_dir(&link_path, false);
 
     assert!(
         result.is_err(),
@@ -399,7 +399,7 @@ fn unlink_dir_backs_up_a_managed_real_dir_before_removing_it() {
     fs::write(link_path.join("SKILL.md"), b"a copy-mode materialisation").unwrap();
     fs::write(link_path.join(".scenery-managed.json"), b"{}").unwrap();
 
-    let result = unlink_dir(&link_path);
+    let result = unlink_dir(&link_path, true);
 
     let backup_root = fake_home.join(".claude").join(".scenery-backup");
     let recovered: Vec<_> = fs::read_dir(&backup_root)

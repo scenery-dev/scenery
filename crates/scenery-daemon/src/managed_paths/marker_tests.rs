@@ -17,6 +17,10 @@ fn temp_db() -> (Connection, tempfile::TempDir) {
             source_sha256 TEXT NOT NULL,
             migrated_at TEXT NOT NULL,
             PRIMARY KEY (path)
+        );
+        CREATE TABLE IF NOT EXISTS skill_link_copies (
+            path TEXT PRIMARY KEY, canonical TEXT NOT NULL,
+            recorded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )",
     )
     .unwrap();
@@ -134,4 +138,63 @@ fn db_marker_update_installation_id() {
         )
         .unwrap();
     assert_eq!(stored.as_deref(), Some("new-inst-id"));
+}
+
+// ── db_owns_path / db_owns_link_copy (SEC1 follow-up) ─────────────────────────
+
+fn skill_row(conn: &Connection, dir: &std::path::Path, hash: &str, inst: Option<&str>) {
+    insert_db_marker(
+        conn,
+        &ManagedPathMarker {
+            path: dir.to_string_lossy().to_string(),
+            kind: "skill".into(),
+            slug: "demo".into(),
+            installation_id: inst.map(str::to_string),
+            source_sha256: hash.into(),
+            migrated_at: "2026-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+}
+
+#[test]
+fn db_owns_path_needs_a_non_legacy_row_and_ignores_the_marker_file() {
+    let (conn, dir) = temp_db();
+    let skill = dir.path().join("demo");
+    std::fs::create_dir_all(&skill).unwrap();
+    std::fs::write(skill.join("SKILL.md"), b"x").unwrap();
+    std::fs::write(skill.join(".scenery-managed.json"), b"{}").unwrap();
+    // Forged marker file, no row.
+    assert!(!db_owns_path(&conn, "skill", &skill));
+    // Legacy row (no installation id, no provenance): proves nothing.
+    skill_row(&conn, &skill, "old", None);
+    assert!(!db_owns_path(&conn, "skill", &skill));
+    conn.execute("DELETE FROM managed_path_markers", [])
+        .unwrap();
+    // A catalog row with an installation id owns the path, even edited.
+    skill_row(&conn, &skill, "old", Some("inst-1"));
+    assert!(db_owns_path(&conn, "skill", &skill));
+}
+
+#[test]
+fn db_owns_link_copy_requires_an_owned_canonical_and_a_matching_copy() {
+    let (conn, dir) = temp_db();
+    let canonical = dir.path().join("agents/demo");
+    let link = dir.path().join("claude/demo");
+    std::fs::create_dir_all(&canonical).unwrap();
+    std::fs::create_dir_all(&link).unwrap();
+    std::fs::write(canonical.join("SKILL.md"), b"v1").unwrap();
+    std::fs::write(link.join("SKILL.md"), b"v1").unwrap();
+    // No row for canonical.
+    assert!(!db_owns_link_copy(&conn, &canonical, &link));
+    skill_row(
+        &conn,
+        &canonical,
+        &crate::managed_paths::drift::hex_sha256(b"v1"),
+        Some("inst-1"),
+    );
+    assert!(db_owns_link_copy(&conn, &canonical, &link));
+    // User content under the same slug is not a copy of ours.
+    std::fs::write(link.join("SKILL.md"), b"mine").unwrap();
+    assert!(!db_owns_link_copy(&conn, &canonical, &link));
 }

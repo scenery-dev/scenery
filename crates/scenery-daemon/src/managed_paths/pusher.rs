@@ -245,6 +245,39 @@ impl ManagedPathsPusher {
         )
     }
 
+    /// True iff the state DB vouches for `dir` (see `marker::db_owns_path`).
+    fn owns_path(&self, dir: &Path) -> bool {
+        Connection::open(&self.db_path)
+            .map(|c| super::marker::db_owns_path(&c, "skill", dir))
+            .unwrap_or(false)
+    }
+
+    /// True iff `link` is a copy of the DB-owned `canonical` (see
+    /// `marker::db_owns_link_copy`).
+    fn owns_link_copy(&self, canonical: &Path, link: &Path) -> bool {
+        Connection::open(&self.db_path)
+            .map(|c| super::marker::db_owns_link_copy(&c, canonical, link))
+            .unwrap_or(false)
+    }
+
+    /// Record (copy mode) or forget (symlink) the DB proof that Scenery owns
+    /// the real directory at `link`.
+    fn note_link_mode(&self, canonical: &Path, link: &Path, mode: super::links::LinkMode) {
+        let Ok(conn) = Connection::open(&self.db_path) else {
+            return;
+        };
+        match mode {
+            super::links::LinkMode::Copy => super::marker::record_link_copy(&conn, link, canonical),
+            super::links::LinkMode::Symlink => super::marker::forget_link_copy(&conn, link),
+        }
+    }
+
+    fn forget_link_copy(&self, link: &Path) {
+        if let Ok(conn) = Connection::open(&self.db_path) {
+            super::marker::forget_link_copy(&conn, link);
+        }
+    }
+
     fn push_skill_inner(
         &self,
         slug: &str,
@@ -262,6 +295,10 @@ impl ManagedPathsPusher {
         let skills_dir = resolve_skills_dir()?;
         let skill_dir = skills_dir.join(slug);
         let mut conversion: Option<super::conversion::Conversion> = None;
+        // Ownership is the state DB's call (a row at this exact path), never
+        // the `.scenery-managed.json` file: any skill author can ship one.
+        // Fail closed when the DB cannot be opened.
+        let owned_by_db = self.owns_path(&skill_dir);
 
         // A symlink at the canonical path must be unlinked before we create a
         // real directory here: writing files THROUGH a symlink would leak
@@ -277,14 +314,13 @@ impl ManagedPathsPusher {
         //
         // Scenery never puts a symlink at the canonical path itself — it
         // writes a real directory — so a link here is presumed foreign unless
-        // it resolves to content carrying our `.scenery-managed.json`
-        // marker. Refuse rather than clobber; the slug collision is the
+        // it resolves to a path our DB tracks. Refuse rather than clobber; the slug collision is the
         // caller's problem to report, and the user's link survives.
         //
         // No backup is taken: removing a link destroys no data (its target is
         // untouched), matching `link_dir`'s own stale-link handling.
         if skill_dir.is_symlink() {
-            if !ownership::is_scenery_managed(&skill_dir) {
+            if !owned_by_db {
                 return Err(anyhow::Error::new(CollisionRefused {
                     path: skill_dir.clone(),
                     what: "symlink",
@@ -301,7 +337,7 @@ impl ManagedPathsPusher {
                 slug,
                 "pusher: replaced a Scenery-managed symlink with a real managed dir"
             );
-        } else if skill_dir.is_dir() && !ownership::is_scenery_managed(&skill_dir) {
+        } else if skill_dir.is_dir() && !owned_by_db {
             if adopt_in_place {
                 // Adopt of the canonical directory itself. The new tree is
                 // built in a sibling staging dir, the user's copy is backed up,
@@ -337,11 +373,40 @@ impl ManagedPathsPusher {
 
         // Plan 4.5.1: a managed dir whose tree differs from its baseline holds an
         // edit that may not be uploaded yet; never write over it.
-        if conversion.is_none() && skill_dir.is_dir() && ownership::is_scenery_managed(&skill_dir) {
+        if conversion.is_none() && skill_dir.is_dir() && owned_by_db {
             if let Ok(conn) = Connection::open(&self.db_path) {
                 let key = skill_dir.to_string_lossy().to_string();
                 if super::local_edits::tree_is_dirty(&conn, &key, &skill_dir) {
                     return Err(anyhow::Error::new(DirtyLocalEdit { path: skill_dir }));
+                }
+            }
+        }
+
+        let sha256 = hex_sha256(skill_md_bytes);
+        let now_ts = scenery_core::timefmt::now_rfc3339();
+
+        // A fresh directory gets its DB row BEFORE it exists: ownership is
+        // the row, so a crash after the directory is created must leave a
+        // retry able to finish (not a directory nothing vouches for). The
+        // placeholder tree hash keeps the row from reading as legacy; the
+        // real provenance replaces it at the end of the push.
+        // Only when no row exists: an existing row (a heal pass re-creating a
+        // deleted folder) keeps the provenance it already carries.
+        let key = skill_dir.to_string_lossy().to_string();
+        let has_row = Connection::open(&self.db_path)
+            .ok()
+            .and_then(|c| is_already_marked(&c, &key).ok())
+            .unwrap_or(false);
+        if conversion.is_none() && !skill_dir.exists() && !has_row {
+            self.upsert_db_marker(&key, "skill", slug, installation_id, &sha256, &now_ts)
+                .context("pusher: failed to record the skill before writing it")?;
+            if let Ok(conn) = Connection::open(&self.db_path) {
+                let pending = Provenance {
+                    tree_hash: Some("pending".into()),
+                    ..Default::default()
+                };
+                if let Err(e) = set_marker_provenance(&conn, &key, &pending) {
+                    warn!(slug, error = %e, "pusher: could not mark the new row pending");
                 }
             }
         }
@@ -360,10 +425,6 @@ impl ManagedPathsPusher {
                 skill_dir.clone()
             }
         };
-
-        // Compute source hash from SKILL.md content.
-        let sha256 = hex_sha256(skill_md_bytes);
-        let now_ts = scenery_core::timefmt::now_rfc3339();
 
         // Provenance: a pending auto-manage takeover for this slug stamps the
         // marker (`origin = auto_managed`, registry ids); otherwise whatever
@@ -473,30 +534,23 @@ impl ManagedPathsPusher {
         // `~/.agents/skills`. Cursor, Codex, and Gemini CLI scan the canonical
         // path natively and need nothing here.
         //
-        // Ownership at the link path is decided by the marker file alone —
-        // `link_dir` replaces a real directory there only when it carries
-        // `.scenery-managed.json`, and refuses otherwise. That is an
-        // existence check on disk, deliberately NOT cross-checked against
-        // `managed_path_markers`.
-        //
-        // Why no DB cross-check: it would misfire on a legitimate, common
-        // case. If a prior `remove_skill` deleted the SQLite row but crashed
-        // before removing the directory, the leftover marked directory has no
-        // matching row — a cross-check would refuse to relink and leave Claude
-        // Code pointed at stale content instead of finishing the cleanup. The
-        // filesystem marker is the source of truth here (see
-        // `ownership::is_scenery_managed`); SQLite is an index, and an
-        // index that can disagree with the thing it indexes must not be the
-        // one holding the safety property.
-        //
-        // Note the marker proves only that Scenery *wrote* the directory,
-        // not that its current content is reproducible — which is why
-        // `link_dir` backs up before replacing, rather than relying on this
-        // call's `skill_md_bytes` being able to recreate it.
+        // Ownership of a real directory at the link path is decided by the
+        // state DB (`skill_link_copies`, or a copy still matching the
+        // canonical row's hash), never by a `.scenery-managed.json` file:
+        // any skill author can ship one. `link_dir` refuses a directory the
+        // DB cannot vouch for, and backs up one it replaces, since a copy
+        // may hold user edits.
         let link_path = resolve_claude_link_dir()?.join(slug);
         let mut outcome = PushOutcome::default();
-        match super::links::link_dir(&skill_dir, &link_path) {
-            Ok(mode) => debug!(slug, ?mode, "pusher: linked skill for Claude Code"),
+        match super::links::link_dir(
+            &skill_dir,
+            &link_path,
+            self.owns_link_copy(&skill_dir, &link_path),
+        ) {
+            Ok(mode) => {
+                self.note_link_mode(&skill_dir, &link_path, mode);
+                debug!(slug, ?mode, "pusher: linked skill for Claude Code")
+            }
             Err(e) => {
                 if self.is_pending_takeover_source(slug, &link_path) {
                     // Expected: takeover removes this real dir and relinks
@@ -521,8 +575,15 @@ impl ManagedPathsPusher {
         // `~/.gemini/config/skills`. Alias there too when Antigravity is
         // installed. Best-effort: a failure never fails the push.
         if let Some(dir) = antigravity_skills_link_dir() {
-            match super::links::link_dir(&skill_dir, &dir.join(slug)) {
-                Ok(mode) => debug!(slug, ?mode, "pusher: linked skill for Antigravity"),
+            match super::links::link_dir(
+                &skill_dir,
+                &dir.join(slug),
+                self.owns_link_copy(&skill_dir, &dir.join(slug)),
+            ) {
+                Ok(mode) => {
+                    self.note_link_mode(&skill_dir, &dir.join(slug), mode);
+                    debug!(slug, ?mode, "pusher: linked skill for Antigravity")
+                }
                 Err(e) => warn!(slug, error = %e, "pusher: failed to link skill for Antigravity"),
             }
         }
@@ -581,16 +642,22 @@ impl ManagedPathsPusher {
         // link to deleted content.
         let link_path = resolve_claude_link_dir()?.join(slug);
         let link_present = link_path.symlink_metadata().is_ok();
-        match super::links::unlink_dir(&link_path) {
-            Ok(()) => removed |= link_present,
+        match super::links::unlink_dir(&link_path, self.owns_link_copy(&skill_dir, &link_path)) {
+            Ok(()) => {
+                self.forget_link_copy(&link_path);
+                removed |= link_present
+            }
             Err(e) => warn!(slug, error = %e, "pusher: failed to unlink skill for Claude Code"),
         }
 
         if let Some(dir) = antigravity_skills_link_dir() {
             let alias = dir.join(slug);
             let present = alias.symlink_metadata().is_ok();
-            match super::links::unlink_dir(&alias) {
-                Ok(()) => removed |= present,
+            match super::links::unlink_dir(&alias, self.owns_link_copy(&skill_dir, &alias)) {
+                Ok(()) => {
+                    self.forget_link_copy(&alias);
+                    removed |= present
+                }
                 Err(e) => warn!(slug, error = %e, "pusher: failed to unlink skill for Antigravity"),
             }
         }
@@ -600,21 +667,14 @@ impl ManagedPathsPusher {
             // Defense-in-depth: never delete Anthropic-native content.
             ownership::ensure_not_native(&skill_dir)?;
             // Same ownership rule as push_skill's guard and `links::unlink_dir`:
-            // a real directory here is removed only when it is ours — it
-            // carries the `.scenery-managed.json` marker, or our own DB row
-            // sits at this exact path (a retry after a crash may find the
-            // marker file already deleted). Without this, a slug collision
-            // that push_skill refused to annex would still be destroyed here.
-            // Refuse rather than delete; the caller already treats
-            // `remove_skill` failures as non-fatal (warn-and-continue).
-            let row_present = {
-                let conn = Connection::open(&self.db_path)
-                    .context("pusher: failed to open state DB for ownership check")?;
-                is_already_marked(&conn, &path_key)
-                    .context("pusher: failed to check managed_path_markers")?
-            };
-            if !skill_dir.is_symlink() && !row_present && !ownership::is_scenery_managed(&skill_dir)
-            {
+            // a real directory here is removed only when our own DB row sits
+            // at this exact path (a retry after a crash may find the marker
+            // file already deleted; a forged marker file proves nothing).
+            // Without this, a slug collision that push_skill refused to annex
+            // would still be destroyed here. A legacy row or no row: refuse
+            // rather than delete; the caller already treats `remove_skill`
+            // failures as non-fatal (warn-and-continue).
+            if !skill_dir.is_symlink() && !self.owns_path(&skill_dir) {
                 // User content that is not ours is not something a teardown
                 // is supposed to remove, so this is not a failure: leave it
                 // and report what we did remove.

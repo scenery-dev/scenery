@@ -1165,6 +1165,14 @@ CREATE TABLE IF NOT EXISTS skill_local_names (
 /// not yet completed). The row is deleted once takeover (source removal)
 /// completes — see `managed_paths::takeover` in the daemon crate.
 const SCHEMA_ADOPT_SQL: &str = r#"
+-- Real directories Scenery materialised at a client's skills path (copy
+-- mode: a symlink could not be made). Ownership of such a directory is this
+-- row, never a marker file inside it (any skill author can ship one).
+CREATE TABLE IF NOT EXISTS skill_link_copies (
+    path        TEXT PRIMARY KEY,
+    canonical   TEXT NOT NULL,
+    recorded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 CREATE TABLE IF NOT EXISTS adopt_pending_takeovers (
     slug        TEXT PRIMARY KEY,
     source_path TEXT NOT NULL,

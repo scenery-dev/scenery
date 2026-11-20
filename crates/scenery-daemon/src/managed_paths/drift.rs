@@ -1026,8 +1026,7 @@ fn remove_path_for(marker: &ManagedPathMarker) -> Result<()> {
 /// 1. A symlink resolving to canonical.
 /// 2. Absent — a surfacing failure the pusher heals on the next reconcile,
 ///    not tampering.
-/// 3. A **real directory** that is Scenery-managed (carries the
-///    `.scenery-managed.json` marker) whose `SKILL.md` hash matches
+/// 3. A **real directory** whose `SKILL.md` hash matches the DB-verified
 ///    `expected_hash` — the legitimate `LinkMode::Copy` steady state on
 ///    hosts where a symlink could not be created (Windows without Developer
 ///    Mode). `link_dir` deliberately leaves this alone rather than
@@ -1045,8 +1044,8 @@ fn remove_path_for(marker: &ManagedPathMarker) -> Result<()> {
 ///    a copy that diverges *only* in some other file (e.g. a bundled
 ///    reference doc) reads as intact here, same as it would for canonical.
 ///
-/// Only a real directory that is *not* ours, or one that is ours but has a
-/// diverged `SKILL.md`, returns `false` — that is the actual tamper signal:
+/// Only a real directory whose `SKILL.md` diverges from canonical's returns
+/// `false` — that is the actual tamper signal:
 /// something outside Scenery is serving content to Claude Code under a
 /// managed slug.
 pub fn check_link_integrity(slug: &str, expected_hash: &str) -> Result<bool> {
@@ -1068,16 +1067,16 @@ pub fn check_link_integrity(slug: &str, expected_hash: &str) -> Result<bool> {
         return Ok(true);
     }
 
-    // A real directory sits where Claude Code expects a link. Match
-    // `current_hash_for`'s single-file granularity: hash the copy's
-    // SKILL.md and compare against canonical's already-known hash, instead
-    // of a full recursive tree compare.
-    if ownership::is_scenery_managed(&link) {
-        let skill_md = link.join("SKILL.md");
-        if let Ok(bytes) = fs::read(&skill_md) {
-            if hex_sha256(&bytes) == expected_hash {
-                return Ok(true);
-            }
+    // A real directory sits where Claude Code expects a link. Canonical is
+    // DB-verified (the caller only gets here from the Clean arm: row at its
+    // exact path, hash matching), so a copy is ours iff its SKILL.md hashes
+    // to that same value. Match `current_hash_for`'s single-file
+    // granularity rather than a full recursive tree compare. The
+    // `.scenery-managed.json` sidecar is not consulted: any skill author can
+    // ship one.
+    if let Ok(bytes) = fs::read(link.join("SKILL.md")) {
+        if hex_sha256(&bytes) == expected_hash {
+            return Ok(true);
         }
     }
 
@@ -1267,7 +1266,7 @@ fn reconciler_disabled() -> bool {
     std::env::var_os(ENV_DISABLE).is_some()
 }
 
-fn hex_sha256(bytes: &[u8]) -> String {
+pub(super) fn hex_sha256(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     hex::encode(hasher.finalize())

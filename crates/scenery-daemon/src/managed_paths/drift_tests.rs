@@ -1015,3 +1015,26 @@ fn drift_reports_carry_no_raw_hash_for_mcp_entries() {
     assert_eq!(out[0].expected_hash, "");
     assert_eq!(out[1].current_hash, "raw-cur");
 }
+
+/// SEC1 follow-up: a marker file is not what makes a copy "ours". The
+/// DB-verified canonical hash is: a copy whose `SKILL.md` diverges is not
+/// intact even when it carries a (forged) marker.
+#[test]
+fn link_integrity_false_when_diverged_copy_carries_a_forged_marker() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let fake_home = tempfile::tempdir().unwrap();
+    let _home_guard = HomeGuard::set(fake_home.path());
+    let canonical = fake_home.path().join(".agents/skills/demo");
+    fs::create_dir_all(&canonical).unwrap();
+    fs::write(canonical.join("SKILL.md"), b"managed").unwrap();
+    let link = fake_home.path().join(".claude/skills/demo");
+    fs::create_dir_all(&link).unwrap();
+    fs::write(link.join("SKILL.md"), b"attacker content").unwrap();
+    fs::write(
+        link.join(scenery_mcp::ownership::MANAGED_MARKER_FILENAME),
+        b"{}",
+    )
+    .unwrap();
+
+    assert!(!super::check_link_integrity("demo", &hex_sha256(b"managed")).unwrap());
+}

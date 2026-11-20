@@ -17,29 +17,12 @@ use rusqlite::Connection;
 /// Build a minimal `ManagedPathsPusher` backed by a temp dir.
 fn make_pusher() -> (ManagedPathsPusher, TempDir) {
     let tmp = tempfile::tempdir().unwrap();
-    let db_path = camino::Utf8PathBuf::from_path_buf(tmp.path().join("state.db")).unwrap();
-
-    // Bootstrap the DB schema (just the managed_path_markers table).
-    let conn = Connection::open(&db_path).unwrap();
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS managed_path_markers (
-            path TEXT NOT NULL,
-            kind TEXT NOT NULL,
-            slug TEXT NOT NULL,
-            installation_id TEXT,
-            source_sha256 TEXT NOT NULL,
-            migrated_at TEXT NOT NULL,
-            PRIMARY KEY (path)
-        )",
+    // The real schema: ownership reads the provenance columns, and a row
+    // without them is a legacy row, which proves nothing.
+    let state = scenery_core::state::AppState::bootstrap_in(
+        camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap(),
     )
     .unwrap();
-    drop(conn);
-
-    let state = scenery_core::state::AppState {
-        root_dir: camino::Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap(),
-        db_path: db_path.clone(),
-        block_third_party_inference: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-    };
     let pusher = ManagedPathsPusher::new(&state);
     (pusher, tmp)
 }
@@ -593,7 +576,7 @@ fn push_skill_replaces_legacy_symlink_with_real_dir() {
 /// replacement through `push_skill`, which is where the ordering between
 /// "write canonical" and "replace the Claude path" actually matters.
 #[test]
-fn push_skill_replaces_real_marked_dir_at_claude_path_with_link() {
+fn push_skill_leaves_a_pre_pivot_marked_dir_at_claude_path_alone() {
     let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let (pusher, _tmp) = make_pusher();
 
@@ -643,24 +626,21 @@ fn push_skill_replaces_real_marked_dir_at_claude_path_with_link() {
         std::env::remove_var("HOME");
     }
 
-    assert!(was_ok, "push_skill must succeed over a real marked dir");
+    assert!(was_ok, "push_skill still succeeds: canonical copy is live");
     assert!(
-        claude_is_symlink,
-        "the old real directory must be gone, replaced by a symlink"
-    );
-    assert!(
-        resolves_to_canonical,
-        "the Claude path must resolve to the canonical ~/.agents/skills dir"
-    );
-    assert!(
-        canonical_is_real_dir,
-        "the canonical path must hold the real directory"
+        !claude_is_symlink,
+        "a real dir no DB row vouches for is user content: left in place"
     );
     assert_eq!(
-        canonical_md.as_deref(),
-        Some(new_content.as_ref()),
-        "the canonical dir must hold the freshly pushed content"
+        fs::read(claude_skill_dir.join("SKILL.md")).unwrap(),
+        b"pre-pivot content"
     );
+    assert!(
+        !resolves_to_canonical,
+        "the Claude path was not repointed over the unproven dir"
+    );
+    assert!(canonical_is_real_dir);
+    assert_eq!(canonical_md.as_deref(), Some(new_content.as_ref()));
 }
 
 /// **Regression (shared-root symlink clobber).**
@@ -736,7 +716,13 @@ fn push_skill_replaces_a_managed_symlink_in_the_shared_root() {
     let managed_target = fake_home.path().join("vh-managed").join("hello-world");
     fs::create_dir_all(&managed_target).unwrap();
     fs::write(managed_target.join("SKILL.md"), b"old managed content").unwrap();
-    fs::write(managed_target.join(".scenery-managed.json"), b"{}").unwrap();
+    // Ownership is the DB row at the target, not a marker file.
+    insert_owned_row(
+        &pusher,
+        &managed_target,
+        "hello-world",
+        b"old managed content",
+    );
 
     let agents_skills = fake_home.path().join(".agents").join("skills");
     fs::create_dir_all(&agents_skills).unwrap();
@@ -1414,7 +1400,7 @@ fn projection_state_intact_for_a_correct_symlink() {
     let dir = canonical_with_marker(home.path(), "demo");
     let links = home.path().join(".claude/skills");
     fs::create_dir_all(&links).unwrap();
-    super::super::links::link_dir(&dir, &links.join("demo")).unwrap();
+    super::super::links::link_dir(&dir, &links.join("demo"), true).unwrap();
     assert_eq!(
         projection_state_in(home.path(), "demo"),
         ProjectionState::Intact
@@ -1830,12 +1816,6 @@ fn adopt_in_place_conversion_writes_bundled_files_and_keeps_a_backup() {
 fn pending_takeover_source_is_recognised_only_for_its_own_slug_and_path() {
     let (pusher, _tmp) = make_pusher();
     let conn = Connection::open(&pusher.db_path).unwrap();
-    conn.execute_batch(
-        "CREATE TABLE adopt_pending_takeovers (
-            slug TEXT PRIMARY KEY, source_path TEXT NOT NULL,
-            recorded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)",
-    )
-    .unwrap();
     let p = std::path::Path::new("/h/.claude/skills/demo");
     assert!(!pusher.is_pending_takeover_source("demo", p));
     conn.execute(
@@ -1846,4 +1826,313 @@ fn pending_takeover_source_is_recognised_only_for_its_own_slug_and_path() {
     assert!(pusher.is_pending_takeover_source("demo", p));
     assert!(!pusher.is_pending_takeover_source("other", p));
     assert!(!pusher.is_pending_takeover_source("demo", std::path::Path::new("/elsewhere")));
+}
+
+// ── SEC1 follow-up: ownership is the DB row, never the marker file ────────────
+
+/// Insert a fully provenanced marker row for `dir` (as a real push does).
+fn insert_owned_row(pusher: &ManagedPathsPusher, dir: &Path, slug: &str, skill_md: &[u8]) {
+    let conn = Connection::open(&pusher.db_path).unwrap();
+    let path = dir.to_string_lossy().to_string();
+    crate::managed_paths::marker::insert_db_marker(
+        &conn,
+        &ManagedPathMarker {
+            path: path.clone(),
+            kind: "skill".into(),
+            slug: slug.into(),
+            installation_id: Some("inst-test".into()),
+            source_sha256: hex_sha256(skill_md),
+            migrated_at: "2026-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+}
+
+const FORGED: &[u8] = br#"{"marker_version":1,"installation_id":"x","source_sha256":"abc","migrated_at":"2026-01-01T00:00:00Z"}"#;
+
+#[test]
+fn push_skill_refuses_a_real_dir_with_a_forged_marker_and_no_row() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let (pusher, _tmp) = make_pusher();
+    let fake_home = tempfile::tempdir().unwrap();
+    let canonical = fake_home.path().join(".agents/skills/pdf");
+    fs::create_dir_all(&canonical).unwrap();
+    fs::write(canonical.join("SKILL.md"), b"third-party skill").unwrap();
+    fs::write(canonical.join(".scenery-managed.json"), FORGED).unwrap();
+
+    let prev_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", fake_home.path());
+    let result = pusher.push_skill("pdf", Some("inst-1"), b"---\nname: pdf\n---\n", &[]);
+    if let Some(v) = prev_home {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+
+    assert!(result.is_err(), "a forged marker must not unlock a write");
+    assert_eq!(
+        fs::read(canonical.join("SKILL.md")).unwrap(),
+        b"third-party skill"
+    );
+}
+
+#[test]
+fn push_skill_refuses_a_legacy_row_with_no_provenance() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let (pusher, _tmp) = make_pusher();
+    let fake_home = tempfile::tempdir().unwrap();
+    let canonical = fake_home.path().join(".agents/skills/pdf");
+    fs::create_dir_all(&canonical).unwrap();
+    fs::write(canonical.join("SKILL.md"), b"someone else's skill").unwrap();
+    let conn = Connection::open(&pusher.db_path).unwrap();
+    crate::managed_paths::marker::insert_db_marker(
+        &conn,
+        &ManagedPathMarker {
+            path: canonical.to_string_lossy().to_string(),
+            kind: "skill".into(),
+            slug: "pdf".into(),
+            installation_id: None,
+            source_sha256: "old".into(),
+            migrated_at: "2026-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+    drop(conn);
+
+    let prev_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", fake_home.path());
+    let result = pusher.push_skill("pdf", Some("inst-1"), b"---\nname: pdf\n---\n", &[]);
+    if let Some(v) = prev_home {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+
+    assert!(result.is_err(), "a legacy row proves nothing: refuse");
+    assert_eq!(
+        fs::read(canonical.join("SKILL.md")).unwrap(),
+        b"someone else's skill"
+    );
+}
+
+#[test]
+fn remove_skill_leaves_a_forged_marker_dir_with_no_row() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let (pusher, _tmp) = make_pusher();
+    let fake_home = tempfile::tempdir().unwrap();
+    let canonical = fake_home.path().join(".agents/skills/pdf");
+    fs::create_dir_all(&canonical).unwrap();
+    fs::write(canonical.join("SKILL.md"), b"third-party skill").unwrap();
+    fs::write(canonical.join(".scenery-managed.json"), FORGED).unwrap();
+
+    let prev_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", fake_home.path());
+    let result = pusher.remove_skill("pdf");
+    if let Some(v) = prev_home {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+
+    result.unwrap();
+    assert!(
+        canonical.join("SKILL.md").exists(),
+        "forged marker must not unlock a delete"
+    );
+}
+
+#[test]
+fn push_skill_replaces_a_copy_at_the_claude_path_that_the_row_vouches_for() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let (pusher, _tmp) = make_pusher();
+    let fake_home = tempfile::tempdir().unwrap();
+    let canonical = fake_home.path().join(".agents/skills/demo");
+    let link = fake_home.path().join(".claude/skills/demo");
+    let md = b"---\nname: demo\n---\nv1\n";
+    fs::create_dir_all(&canonical).unwrap();
+    fs::write(canonical.join("SKILL.md"), md).unwrap();
+    insert_owned_row(&pusher, &canonical, "demo", md);
+    // Copy-mode leftover: same SKILL.md as the row's hash.
+    fs::create_dir_all(&link).unwrap();
+    fs::write(link.join("SKILL.md"), md).unwrap();
+
+    let prev_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", fake_home.path());
+    let result = pusher.push_skill("demo", Some("inst-1"), md, &[]);
+    if let Some(v) = prev_home {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+
+    result.unwrap();
+    assert!(
+        link.is_symlink(),
+        "a copy the DB vouches for heals into a link"
+    );
+}
+
+fn with_home<T>(home: &Path, f: impl FnOnce() -> T) -> T {
+    let prev = std::env::var_os("HOME");
+    std::env::set_var("HOME", home);
+    let out = f();
+    if let Some(v) = prev {
+        std::env::set_var("HOME", v);
+    } else {
+        std::env::remove_var("HOME");
+    }
+    out
+}
+
+/// Copy-mode host: a v1 copy recorded by Scenery must heal when v2 is pushed
+/// (the row and canonical already hold v2 by then, so hash matching alone
+/// would refuse).
+#[test]
+fn push_skill_heals_a_recorded_stale_copy_after_an_upgrade() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let (pusher, _tmp) = make_pusher();
+    let home = tempfile::tempdir().unwrap();
+    let canonical = home.path().join(".agents/skills/demo");
+    let link = home.path().join(".claude/skills/demo");
+    let v1 = b"---\nname: demo\n---\nv1\n";
+    fs::create_dir_all(&canonical).unwrap();
+    fs::write(canonical.join("SKILL.md"), v1).unwrap();
+    insert_owned_row(&pusher, &canonical, "demo", v1);
+    fs::create_dir_all(&link).unwrap();
+    fs::write(link.join("SKILL.md"), v1).unwrap();
+    let conn = Connection::open(&pusher.db_path).unwrap();
+    crate::managed_paths::marker::record_link_copy(&conn, &link, &canonical);
+    drop(conn);
+
+    let v2 = b"---\nname: demo\n---\nv2\n";
+    with_home(home.path(), || {
+        pusher.push_skill("demo", Some("inst-test"), v2, &[])
+    })
+    .unwrap();
+
+    assert!(
+        link.is_symlink(),
+        "the stale recorded copy is replaced by a link"
+    );
+    assert_eq!(fs::read(link.join("SKILL.md")).unwrap(), v2);
+}
+
+/// Revoke must still remove a recorded copy the user edited (backed up first).
+#[test]
+fn remove_skill_removes_an_edited_recorded_copy() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let (pusher, _tmp) = make_pusher();
+    let home = tempfile::tempdir().unwrap();
+    let canonical = home.path().join(".agents/skills/demo");
+    let link = home.path().join(".claude/skills/demo");
+    let v1 = b"---\nname: demo\n---\nv1\n";
+    fs::create_dir_all(&canonical).unwrap();
+    fs::write(canonical.join("SKILL.md"), v1).unwrap();
+    insert_owned_row(&pusher, &canonical, "demo", v1);
+    fs::create_dir_all(&link).unwrap();
+    fs::write(link.join("SKILL.md"), b"edited by the user").unwrap();
+    let conn = Connection::open(&pusher.db_path).unwrap();
+    crate::managed_paths::marker::record_link_copy(&conn, &link, &canonical);
+    drop(conn);
+
+    with_home(home.path(), || pusher.remove_skill("demo")).unwrap();
+
+    assert!(!link.exists(), "revoked skill must leave Claude Code");
+    assert!(!canonical.exists());
+}
+
+/// A crash after the directory was created but before the push finished
+/// leaves a row (written first) the retry recognises as ours.
+#[test]
+fn push_skill_finishes_a_push_that_crashed_after_creating_the_dir() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let (pusher, _tmp) = make_pusher();
+    let home = tempfile::tempdir().unwrap();
+    let canonical = home.path().join(".agents/skills/demo");
+    fs::create_dir_all(&canonical).unwrap();
+    let md = b"---\nname: demo\n---\n";
+    let conn = Connection::open(&pusher.db_path).unwrap();
+    crate::managed_paths::marker::insert_db_marker(
+        &conn,
+        &ManagedPathMarker {
+            path: canonical.to_string_lossy().to_string(),
+            kind: "skill".into(),
+            slug: "demo".into(),
+            installation_id: None,
+            source_sha256: hex_sha256(md),
+            migrated_at: "2026-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+    crate::managed_paths::marker::set_marker_provenance(
+        &conn,
+        &canonical.to_string_lossy(),
+        &Provenance {
+            tree_hash: Some("pending".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    drop(conn);
+
+    with_home(home.path(), || pusher.push_skill("demo", None, md, &[])).unwrap();
+    assert_eq!(fs::read(canonical.join("SKILL.md")).unwrap(), md);
+}
+
+/// The sidecar must not lift a legacy row to ownership.
+#[test]
+fn a_planted_marker_file_does_not_lift_a_legacy_row() {
+    let (pusher, _tmp) = make_pusher();
+    let dir = _tmp.path().join("skills/pdf");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join(".scenery-managed.json"), FORGED).unwrap();
+    let conn = Connection::open(&pusher.db_path).unwrap();
+    crate::managed_paths::marker::insert_db_marker(
+        &conn,
+        &ManagedPathMarker {
+            path: dir.to_string_lossy().to_string(),
+            kind: "skill".into(),
+            slug: "pdf".into(),
+            installation_id: None,
+            source_sha256: "old".into(),
+            migrated_at: "2026-01-01T00:00:00Z".into(),
+        },
+    )
+    .unwrap();
+    assert!(!crate::managed_paths::marker::db_owns_path(
+        &conn, "skill", &dir
+    ));
+}
+
+/// A heal pass re-creating a deleted folder must keep the row's provenance.
+#[test]
+fn push_skill_into_a_missing_dir_keeps_existing_row_provenance() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let (pusher, _tmp) = make_pusher();
+    let home = tempfile::tempdir().unwrap();
+    let canonical = home.path().join(".agents/skills/mine");
+    let md = b"---\nname: mine\n---\n";
+    insert_owned_row(&pusher, &canonical, "mine", md);
+    let key = canonical.to_string_lossy().to_string();
+    let conn = Connection::open(&pusher.db_path).unwrap();
+    crate::managed_paths::marker::set_marker_provenance(
+        &conn,
+        &key,
+        &Provenance {
+            origin: Some(crate::managed_paths::marker::ORIGIN_AUTO_MANAGED.into()),
+            skill_id: Some("sid".into()),
+            skill_uuid: Some("uuid-1".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    drop(conn);
+
+    with_home(home.path(), || pusher.push_skill("mine", None, md, &[])).unwrap();
+
+    let conn = Connection::open(&pusher.db_path).unwrap();
+    let prov = crate::managed_paths::marker::marker_provenance(&conn, &key);
+    assert!(prov.is_auto_managed());
+    assert_eq!(prov.skill_id.as_deref(), Some("sid"));
+    assert_eq!(prov.skill_uuid.as_deref(), Some("uuid-1"));
 }
