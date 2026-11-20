@@ -21,7 +21,6 @@
 //! - `list_mcp_requests(base_url, …)`
 //! - `import_preview(base_url, …)`
 //! - `import_submit(base_url, …)`
-//! - `install_from_registry(base_url, …)` — stubbed with bail!("M1.4")
 
 use crate::{
     aggregator::{sanitize_id, BackendRegistry},

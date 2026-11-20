@@ -117,6 +117,13 @@ fn build_discovery_hint(exposed_tool_names: &[String]) -> String {
     if has_tool("search_skills") {
         clauses.push("search_skills to find more");
     }
+    if has_tool("load_skill") {
+        clauses.push("load_skill to follow one in this conversation");
+    }
+    if has_tool("install_skill") {
+        clauses
+            .push("install_skill (only after the user agrees) to add one for future conversations");
+    }
     if has_tool("scenery_mcp_catalog") {
         clauses.push("scenery_mcp_catalog to browse approved MCP servers");
     }
@@ -344,6 +351,21 @@ mod tests {
         assert!(
             !s.contains("not logged in"),
             "the whole nudge sentence must be omitted, not just the tool name; got: {s}"
+        );
+    }
+
+    #[test]
+    fn exposed_skill_tools_are_described() {
+        let s = build_instructions(
+            None,
+            "daemon",
+            true,
+            &names(&["search_skills", "load_skill", "install_skill"]),
+        );
+        assert!(s.contains("load_skill to follow"), "got: {s}");
+        assert!(
+            s.contains("install_skill (only after the user agrees)"),
+            "got: {s}"
         );
     }
 

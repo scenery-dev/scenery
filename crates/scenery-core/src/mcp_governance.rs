@@ -360,6 +360,19 @@ pub fn import_submit(
         .context("failed to deserialize import submit response")
 }
 
+/// The skills service needs a (valid) sign-in. Callers downcast to this to
+/// decide on a token refresh; its text is [`SKILLS_SIGN_IN_MESSAGE`].
+#[derive(Debug)]
+pub struct SignInRequired;
+
+impl std::fmt::Display for SignInRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(SKILLS_SIGN_IN_MESSAGE)
+    }
+}
+
+impl std::error::Error for SignInRequired {}
+
 /// Call one of the backend's remote skills MCP tools (`search_skills`,
 /// `load_skill`, `install_skill`) over its stateless `POST {base_url}/mcp`
 /// JSON-RPC endpoint and return the MCP tool result object
@@ -376,7 +389,7 @@ pub fn call_remote_skills_tool(
     arguments: &serde_json::Value,
 ) -> Result<serde_json::Value> {
     let Some(token) = auth_token else {
-        anyhow::bail!("{SKILLS_SIGN_IN_MESSAGE}");
+        return Err(anyhow::Error::new(SignInRequired));
     };
     let url = format!("{}/mcp", base_url.trim_end_matches('/'));
     let body = serde_json::json!({
@@ -396,11 +409,14 @@ pub fn call_remote_skills_tool(
         .with_context(|| format!("failed to reach registry at {url}"))?;
 
     if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-        anyhow::bail!("{SKILLS_SIGN_IN_MESSAGE}");
+        return Err(anyhow::Error::new(SignInRequired));
     }
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().unwrap_or_default();
+        if status == reqwest::StatusCode::FORBIDDEN && crate::auth::is_user_revoked_body(&text) {
+            return Err(anyhow::Error::new(crate::auth::UserRevokedError));
+        }
         anyhow::bail!("skills service failed (HTTP {status}): {text}");
     }
 
@@ -420,258 +436,6 @@ pub fn call_remote_skills_tool(
         .context("skills service response had no result")
 }
 
-/// Install a skill from the registry by ID and optional version.
-///
-/// When this device is registered with the daemon (`device_id` sync-state
-/// present) and the user is logged in, the request is routed through the
-/// same governed desired-state pipeline the portal and CLI already use
-/// (`POST /api/installations` → daemon reconciler) — see
-/// [`install_via_desired_state`]. Only when either precondition is missing
-/// does this fall back to the direct/offline registry install, matching the
-/// CLI's `cmd_skill_install` tiering.
-///
-/// Returns the installed version string.
-pub fn install_from_registry(
-    state: &AppState,
-    base_url: &str,
-    skill_id: &str,
-    version: Option<&str>,
-) -> Result<String> {
-    use crate::auth;
-    use crate::registry::RegistryClient;
-    use crate::updater;
-
-    let device_id = state.get_sync_state("device_id").ok().flatten();
-    let tokens = auth::load_tokens(state, base_url).ok().flatten();
-
-    if let (Some(device_id), Some(tokens)) = (&device_id, &tokens) {
-        return install_via_desired_state(
-            state,
-            base_url,
-            skill_id,
-            device_id,
-            &tokens.access_token,
-            version,
-        );
-    }
-
-    let registry = RegistryClient::new(base_url);
-    if let Some(tokens) = &tokens {
-        registry.set_auth(&tokens.access_token);
-    }
-    updater::install_from_registry(state, &registry, skill_id, version)
-}
-
-/// Request a governed skill install via the backend's desired-state API
-/// (`POST /api/installations`) and poll local SQLite for the daemon's
-/// reconciler to confirm the skill landed the same way a portal-driven
-/// install does — i.e. via `push_skill_to_claude` into `~/.claude/skills`
-/// with a `.scenery-managed.json` marker — rather than only in
-/// Scenery's private, Claude-invisible store.
-///
-/// Returns the installed version once the reconciler marks the skill
-/// `active`.
-pub fn install_via_desired_state(
-    state: &AppState,
-    base_url: &str,
-    skill_id: &str,
-    device_id: &str,
-    access_token: &str,
-    version: Option<&str>,
-) -> Result<String> {
-    install_via_desired_state_with_timing(
-        state,
-        base_url,
-        skill_id,
-        device_id,
-        access_token,
-        version,
-        PollTiming::default(),
-    )
-}
-
-/// How long, and how often, to poll for the daemon's reconciler to confirm
-/// an install requested via [`install_via_desired_state`]. The `Default`
-/// impl mirrors the CLI's `REGISTRY_INSTALL_POLL_TIMEOUT_SECS`/`_INTERVAL_MS`
-/// in `scenery-cli/src/main.rs::install_via_desired_state`; tests pass a
-/// much shorter timing so they don't have to wait out the real timeout.
-#[derive(Clone, Copy)]
-struct PollTiming {
-    timeout: std::time::Duration,
-    interval: std::time::Duration,
-}
-
-impl Default for PollTiming {
-    fn default() -> Self {
-        Self {
-            timeout: std::time::Duration::from_secs(120),
-            interval: std::time::Duration::from_millis(500),
-        }
-    }
-}
-
-/// Minimal shape of `POST /api/installations`'s 201 response body — see
-/// `InstallationCreateResponse` in the backend's
-/// `app/schemas/installation.py`. Only `installation_id` is needed here (to
-/// correlate against `GET /api/installations/mine` later); it's optional so
-/// a response missing/renaming the field degrades to local-only polling
-/// instead of failing the request.
-#[derive(Debug, Deserialize)]
-struct InstallationCreatedBody {
-    #[serde(default)]
-    installation_id: Option<String>,
-}
-
-/// One entry of `GET /api/installations/mine`'s response — see
-/// `InstallationResponse` in the backend's `app/schemas/installation.py`.
-/// Only the fields needed to detect a reported error are declared; extra
-/// fields in the real response are ignored by serde.
-#[derive(Debug, Deserialize)]
-struct InstallationMineEntry {
-    installation_id: String,
-    state: String,
-    #[serde(default)]
-    error_message: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct InstallationMineResponse {
-    installations: Vec<InstallationMineEntry>,
-}
-
-/// Every this-many local poll ticks, additionally check
-/// `GET /api/installations/mine` for a backend-reported error on this
-/// installation. At the default 500ms local poll interval that's roughly
-/// every 5 seconds — frequent enough to fail fast, infrequent enough not to
-/// hammer the backend on every tick. Checked on tick 0 too, so an
-/// already-known error surfaces on the very first iteration.
-const REMOTE_CHECK_EVERY_N_TICKS: u64 = 10;
-
-/// Ask the backend whether `installation_id` has moved to `state == "error"`
-/// and, if so, return its `error_message`. Network/parse failures are
-/// swallowed (returns `None`) so a transient hiccup on this best-effort
-/// check never interrupts the primary local-SQLite poll loop.
-fn check_remote_installation_error(
-    base_url: &str,
-    access_token: &str,
-    installation_id: &str,
-) -> Option<String> {
-    let url = format!("{}/api/installations/mine", base_url.trim_end_matches('/'));
-    let client = make_http_client().ok()?;
-    let resp = client
-        .get(&url)
-        .bearer_auth(access_token)
-        .send_tracked()
-        .ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let parsed: InstallationMineResponse = resp.json().ok()?;
-    parsed
-        .installations
-        .into_iter()
-        .find(|entry| entry.installation_id == installation_id && entry.state == "error")
-        .map(|entry| {
-            entry
-                .error_message
-                .unwrap_or_else(|| "install failed".to_string())
-        })
-}
-
-fn install_via_desired_state_with_timing(
-    state: &AppState,
-    base_url: &str,
-    skill_id: &str,
-    device_id: &str,
-    access_token: &str,
-    version: Option<&str>,
-    poll: PollTiming,
-) -> Result<String> {
-    let url = format!("{}/api/installations", base_url.trim_end_matches('/'));
-    let mut body = serde_json::json!({
-        "skill_id": skill_id,
-        "source": "mcp",
-        "device_id": device_id,
-    });
-    if let Some(v) = version {
-        body["version"] = serde_json::Value::String(v.to_string());
-    }
-
-    let client = make_http_client()?;
-    let resp = client
-        .post(&url)
-        .bearer_auth(access_token)
-        .json(&body)
-        .send_tracked()
-        .with_context(|| format!("failed to reach registry at {url}"))?;
-
-    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-        anyhow::bail!("session expired — use scenery_login to re-authenticate");
-    }
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().unwrap_or_default();
-        anyhow::bail!("install request failed (HTTP {status}): {body}");
-    }
-
-    // Best-effort: capture installation_id to correlate against
-    // GET /api/installations/mine in the poll loop below. Missing/unparsable
-    // body just disables the remote fast-fail check.
-    let installation_id = resp
-        .json::<InstallationCreatedBody>()
-        .ok()
-        .and_then(|b| b.installation_id);
-
-    let deadline = std::time::Instant::now() + poll.timeout;
-    let mut tick: u64 = 0;
-    loop {
-        if std::time::Instant::now() >= deadline {
-            anyhow::bail!(
-                "timed out waiting for '{skill_id}' to install — the daemon may not be \
-                 running or reachable. Check `scenery sync status`."
-            );
-        }
-
-        let conn = Connection::open(&state.db_path)?;
-        let row: Option<(String, String)> = conn
-            .query_row(
-                "SELECT current_status, active_version FROM installed_skills WHERE skill_id = ?1",
-                params![skill_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-
-        match row {
-            Some((status, version)) if status == "active" => return Ok(version),
-            Some((status, _)) if status == "error" => {
-                anyhow::bail!(
-                    "install of '{skill_id}' encountered an error — run \
-                     `scenery sync status` for details"
-                );
-            }
-            _ => {
-                // No local row yet (or not-yet-active) — this is the
-                // first-time-install-never-succeeded case where
-                // `installed_skills` may never get a row at all if the
-                // reconciler gives up. Periodically also ask the backend,
-                // which the reconciler already reports to immediately on
-                // failure via PATCH /api/installations/{id}.
-                if let Some(id) = installation_id.as_deref() {
-                    if tick % REMOTE_CHECK_EVERY_N_TICKS == 0 {
-                        if let Some(error_message) =
-                            check_remote_installation_error(base_url, access_token, id)
-                        {
-                            anyhow::bail!("install of '{skill_id}' failed: {error_message}");
-                        }
-                    }
-                }
-                tick += 1;
-                std::thread::sleep(poll.interval);
-            }
-        }
-    }
-}
-
 // ── Logging helpers ───────────────────────────────────────────────────────────
 
 #[allow(dead_code)]
@@ -684,30 +448,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
     use crate::auth;
-    use camino::Utf8PathBuf;
     use mockito::Server;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-    fn temp_root(label: &str) -> Utf8PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        Utf8PathBuf::from_path_buf(
-            std::env::temp_dir().join(format!("mcp-governance-tests-{label}-{nanos}")),
-        )
-        .unwrap()
-    }
-
-    fn insert_installed_skill(state: &AppState, skill_id: &str, version: &str, status: &str) {
-        let conn = Connection::open(&state.db_path).unwrap();
-        conn.execute(
-            "INSERT INTO installed_skills (skill_id, active_version, install_root, current_status) \
-             VALUES (?1, ?2, ?3, ?4)",
-            params![skill_id, version, "/tmp/does-not-matter", status],
-        )
-        .unwrap();
-    }
 
     #[test]
     fn fetch_mcp_catalog_sends_bearer_when_token_given() {
@@ -803,6 +544,25 @@ mod tests {
     }
 
     #[test]
+    fn call_remote_skills_tool_maps_403_user_revoked_to_typed_error() {
+        let mut server = Server::new();
+        let _mock = server
+            .mock("POST", "/mcp")
+            .with_status(403)
+            .with_body(r#"{"detail":{"code":"user_revoked","message":"gone"}}"#)
+            .create();
+        let err = call_remote_skills_tool(
+            &server.url(),
+            Some("t"),
+            None,
+            "search_skills",
+            &serde_json::json!({}),
+        )
+        .unwrap_err();
+        assert!(auth::is_user_revoked_error(&err), "{err:#}");
+    }
+
+    #[test]
     fn call_remote_skills_tool_surfaces_jsonrpc_errors() {
         let mut server = Server::new();
         let _mock = server
@@ -819,280 +579,5 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("skill_id is required"));
-    }
-
-    #[test]
-    fn install_via_desired_state_returns_version_once_reconciler_confirms_active() {
-        let state_root = temp_root("confirmed");
-        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
-
-        let mut server = Server::new();
-        let _mock = server
-            .mock("POST", "/api/installations")
-            .with_status(201)
-            .with_header("content-type", "application/json")
-            .with_body(r#"{"id":"11111111-1111-1111-1111-111111111111"}"#)
-            .create();
-
-        // Simulate the daemon reconciler having already landed the skill —
-        // the row is present before the poll loop starts, so the first
-        // iteration confirms immediately without waiting on the timeout.
-        insert_installed_skill(&state, "test-skill", "1.2.3", "active");
-
-        let result = install_via_desired_state_with_timing(
-            &state,
-            &server.url(),
-            "test-skill",
-            "dev-123",
-            "fake-access",
-            None,
-            PollTiming {
-                timeout: Duration::from_secs(5),
-
-                interval: Duration::from_millis(10),
-            },
-        );
-
-        assert_eq!(result.unwrap(), "1.2.3");
-
-        let _ = std::fs::remove_dir_all(&state_root);
-    }
-
-    #[test]
-    fn install_via_desired_state_errors_when_backend_rejects_request() {
-        let state_root = temp_root("rejected");
-        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
-
-        let mut server = Server::new();
-        let _mock = server
-            .mock("POST", "/api/installations")
-            .with_status(401)
-            .create();
-
-        let result = install_via_desired_state_with_timing(
-            &state,
-            &server.url(),
-            "test-skill",
-            "dev-123",
-            "fake-access",
-            None,
-            PollTiming {
-                timeout: Duration::from_secs(5),
-
-                interval: Duration::from_millis(10),
-            },
-        );
-
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("session expired"),
-            "expected auth error, got: {err}"
-        );
-
-        let _ = std::fs::remove_dir_all(&state_root);
-    }
-
-    #[test]
-    fn install_via_desired_state_times_out_when_reconciler_never_confirms() {
-        let state_root = temp_root("timeout");
-        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
-
-        let mut server = Server::new();
-        let _mock = server
-            .mock("POST", "/api/installations")
-            .with_status(201)
-            .with_header("content-type", "application/json")
-            .with_body(r#"{"id":"11111111-1111-1111-1111-111111111111"}"#)
-            .create();
-
-        // No row is ever inserted into installed_skills, so the poll loop
-        // must give up once the (very short, test-only) timeout elapses.
-        let result = install_via_desired_state_with_timing(
-            &state,
-            &server.url(),
-            "test-skill",
-            "dev-123",
-            "fake-access",
-            None,
-            PollTiming {
-                timeout: Duration::from_millis(30),
-
-                interval: Duration::from_millis(10),
-            },
-        );
-
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("timed out"),
-            "expected timeout error, got: {err}"
-        );
-
-        let _ = std::fs::remove_dir_all(&state_root);
-    }
-
-    #[test]
-    fn install_via_desired_state_includes_requested_version_in_post_body() {
-        let state_root = temp_root("version-included");
-        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
-
-        let mut server = Server::new();
-        let mock = server
-            .mock("POST", "/api/installations")
-            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
-                "skill_id": "test-skill",
-                "version": "1.2.3",
-            })))
-            .with_status(201)
-            .with_header("content-type", "application/json")
-            .with_body(r#"{"id":"11111111-1111-1111-1111-111111111111"}"#)
-            .create();
-
-        insert_installed_skill(&state, "test-skill", "1.2.3", "active");
-
-        let result = install_via_desired_state_with_timing(
-            &state,
-            &server.url(),
-            "test-skill",
-            "dev-123",
-            "fake-access",
-            Some("1.2.3"),
-            PollTiming {
-                timeout: Duration::from_secs(5),
-
-                interval: Duration::from_millis(10),
-            },
-        );
-
-        assert_eq!(result.unwrap(), "1.2.3");
-        mock.assert();
-
-        let _ = std::fs::remove_dir_all(&state_root);
-    }
-
-    #[test]
-    fn install_via_desired_state_omits_version_field_when_none() {
-        let state_root = temp_root("version-omitted");
-        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
-
-        let mut server = Server::new();
-        let mock = server
-            .mock("POST", "/api/installations")
-            .match_body(mockito::Matcher::Json(serde_json::json!({
-                "skill_id": "test-skill",
-                "source": "mcp",
-                "device_id": "dev-123",
-            })))
-            .with_status(201)
-            .with_header("content-type", "application/json")
-            .with_body(r#"{"id":"11111111-1111-1111-1111-111111111111"}"#)
-            .create();
-
-        insert_installed_skill(&state, "test-skill", "9.9.9", "active");
-
-        let result = install_via_desired_state_with_timing(
-            &state,
-            &server.url(),
-            "test-skill",
-            "dev-123",
-            "fake-access",
-            None,
-            PollTiming {
-                timeout: Duration::from_secs(5),
-
-                interval: Duration::from_millis(10),
-            },
-        );
-
-        assert_eq!(result.unwrap(), "9.9.9");
-        mock.assert();
-
-        let _ = std::fs::remove_dir_all(&state_root);
-    }
-
-    #[test]
-    fn install_via_desired_state_surfaces_backend_error_fast_on_first_time_install_failure() {
-        // Regression for the bug where a first-time install that the daemon's
-        // reconciler gives up on (see reconciler::handle_install) never
-        // writes an `installed_skills` row at all — success-only table — so
-        // the local-SQLite-only poll loop spun silently until the full
-        // timeout even though the backend already knew about the error
-        // (reported via PATCH /api/installations/{id} within seconds). The
-        // poll loop must also consult GET /api/installations/mine and fail
-        // fast on a matching `state: "error"` entry.
-        let state_root = temp_root("remote-error-fast");
-        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
-
-        let mut server = Server::new();
-        let _post_mock = server
-            .mock("POST", "/api/installations")
-            .with_status(201)
-            .with_header("content-type", "application/json")
-            .with_body(
-                r#"{"installation_id":"22222222-2222-2222-2222-222222222222","state":"installing","skill_id":"test-skill","version":"1.0.0"}"#,
-            )
-            .create();
-
-        let _mine_mock = server
-            .mock("GET", "/api/installations/mine")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(
-                r#"{"installations":[{"installation_id":"22222222-2222-2222-2222-222222222222","state":"error","error_message":"skill 'test-skill' not found in registry"}]}"#,
-            )
-            .create();
-
-        // No row is ever inserted into installed_skills — simulates the
-        // never-succeeded-once first-time-install-failure case.
-        let result = install_via_desired_state_with_timing(
-            &state,
-            &server.url(),
-            "test-skill",
-            "dev-123",
-            "fake-access",
-            None,
-            PollTiming {
-                timeout: Duration::from_secs(5),
-                interval: Duration::from_millis(10),
-            },
-        );
-
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("skill 'test-skill' not found in registry"),
-            "expected the backend's error_message to surface quickly, got: {err}"
-        );
-
-        let _ = std::fs::remove_dir_all(&state_root);
-    }
-
-    #[test]
-    fn install_from_registry_uses_desired_state_when_device_registered_and_logged_in() {
-        let state_root = temp_root("governed-path");
-        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
-
-        let mut server = Server::new();
-        let url = server.url();
-        state.set_sync_state("device_id", "dev-123").unwrap();
-        auth::save_tokens(&state, &url, "fake-access", "fake-refresh").unwrap();
-
-        let mock = server
-            .mock("POST", "/api/installations")
-            .with_status(201)
-            .with_header("content-type", "application/json")
-            .with_body(r#"{"id":"11111111-1111-1111-1111-111111111111"}"#)
-            .create();
-
-        insert_installed_skill(&state, "test-skill", "1.2.3", "active");
-
-        let result = install_from_registry(&state, &url, "test-skill", None);
-
-        assert_eq!(
-            result.unwrap(),
-            "1.2.3",
-            "should return the version the reconciler confirmed, not attempt a direct download"
-        );
-        mock.assert();
-
-        let _ = std::fs::remove_dir_all(&state_root);
     }
 }

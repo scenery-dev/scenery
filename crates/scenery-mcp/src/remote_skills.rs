@@ -9,7 +9,7 @@
 
 use crate::protocol::{ToolCallResult, ToolDefinition, ToolResultContent};
 use scenery_core::{
-    auth::{self, AuthClient},
+    auth::{self, AuthClient, RefreshError},
     mcp_governance,
     state::AppState,
 };
@@ -105,32 +105,54 @@ pub fn handle(
 
     let mut outcome = call(tokens.as_ref().map(|t| t.access_token.as_str()));
     if let (Err(e), Some(t)) = (&outcome, &tokens) {
-        if e.to_string() == mcp_governance::SKILLS_SIGN_IN_MESSAGE {
+        if e.is::<mcp_governance::SignInRequired>() {
             // The access token may just have expired: refresh once and retry.
-            if let Some(fresh) = refresh(state, url, &t.refresh_token) {
-                outcome = call(Some(&fresh));
+            match refresh(state, url, &t.refresh_token) {
+                Refreshed::Fresh(token) => outcome = call(Some(&token)),
+                Refreshed::SignedOut => {}
+                Refreshed::Unavailable(msg) => return ToolCallResult::error_result(msg),
             }
         }
     }
     match outcome {
         Ok(result) => to_tool_result(&result),
-        Err(e) => ToolCallResult::error_result(e.to_string()),
+        Err(e) => {
+            if auth::is_user_revoked_error(&e) {
+                let _ = auth::handle_user_revoked(state, url);
+            }
+            ToolCallResult::error_result(e.to_string())
+        }
     }
 }
 
-fn refresh(state: &AppState, url: &str, refresh_token: &str) -> Option<String> {
+enum Refreshed {
+    Fresh(String),
+    /// The refresh token is dead (or the user was revoked): tokens cleared.
+    SignedOut,
+    /// A transient failure; the session is kept so a later call can retry.
+    Unavailable(String),
+}
+
+fn refresh(state: &AppState, url: &str, refresh_token: &str) -> Refreshed {
     debug!("skills MCP: access token rejected, attempting refresh");
-    match AuthClient::new(url).refresh(refresh_token) {
+    match AuthClient::new(url).refresh_detailed(refresh_token) {
         Ok(new) => {
             if let Err(e) = auth::save_tokens(state, url, &new.access_token, &new.refresh_token) {
                 debug!("failed to save refreshed tokens: {e}");
             }
-            Some(new.access_token)
+            Refreshed::Fresh(new.access_token)
         }
-        Err(_) => {
-            let _ = auth::clear_tokens(state, url);
-            None
+        Err(RefreshError::AuthFailed { body, .. }) => {
+            if auth::is_user_revoked_body(&body) {
+                let _ = auth::handle_user_revoked(state, url);
+            } else {
+                let _ = auth::clear_tokens(state, url);
+            }
+            Refreshed::SignedOut
         }
+        Err(e) => Refreshed::Unavailable(format!(
+            "Could not reach Scenery to refresh your sign-in, try again shortly: {e}"
+        )),
     }
 }
 
@@ -160,3 +182,7 @@ fn to_tool_result(result: &serde_json::Value) -> ToolCallResult {
         .filter(|e| *e);
     ToolCallResult { content, is_error }
 }
+
+#[cfg(test)]
+#[path = "remote_skills_tests.rs"]
+mod tests;
