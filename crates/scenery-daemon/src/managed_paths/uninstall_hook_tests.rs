@@ -103,3 +103,33 @@ fn uninstall_preserves_unmarked_user_content_at_the_same_slug() {
         );
     });
 }
+
+/// IT deleting a skill from the registry (`uninstall_skill`, not by a user)
+/// is an IT-driven removal: the kill switch wins over a failed edit backup,
+/// and IT is told.
+#[test]
+fn registry_deleted_cleanup_removes_an_edited_skill_when_its_backup_fails() {
+    with_fake_home(|home, state| {
+        install_and_push(state);
+        let canonical = home.join(".agents/skills").join(SLUG);
+        let conn = Connection::open(&state.db_path).unwrap();
+        let key = canonical.to_string_lossy().to_string();
+        let mut prov = super::marker::marker_provenance(&conn, &key);
+        prov.origin = Some("auto_managed".into());
+        super::marker::set_marker_provenance(&conn, &key, &prov).unwrap();
+        std::fs::write(canonical.join("SKILL.md"), b"user edits").unwrap();
+        std::fs::write(state.root_dir.join("restore-backups"), "blocker").unwrap();
+
+        uninstall_skill(state, SLUG).unwrap();
+
+        assert!(!canonical.exists(), "kill switch wins over the backup");
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_events WHERE event_type = 'skill_revoke_backup_failed'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+    });
+}

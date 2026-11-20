@@ -756,9 +756,10 @@ fn main() {
         }
     }
 
-    // `skill uninstall`, the MCP `scenery_uninstall` tool and registry-sync
-    // cleanup all go through `installer::uninstall_skill`, which must also
-    // remove the native-dir projection owned by the daemon crate's pusher.
+    // `skill uninstall` and the MCP `scenery_uninstall` tool go through
+    // `installer::uninstall_skill_by_user`; registry-sync cleanup goes through
+    // `installer::uninstall_skill`. Both must also remove the native-dir
+    // projection owned by the daemon crate's pusher.
     scenery_daemon::managed_paths::register_core_hooks();
 
     // See `logging.rs` for why the daemon gets its own profile (INFO,

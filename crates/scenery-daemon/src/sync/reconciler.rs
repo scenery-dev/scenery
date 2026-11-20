@@ -3732,7 +3732,7 @@ async fn handle_purge(
 /// up first (the kill switch won). Sent through the runner audit pipeline
 /// (`POST /runner/audit` on the next flush). Carries the skill id and a fixed
 /// reason only: the full error, with local paths, stays in the local log.
-fn record_revoke_backup_failure(state: &AppState, skill_id: &str) {
+pub(crate) fn record_revoke_backup_failure(state: &AppState, skill_id: &str) {
     scenery_core::audit::write_audit_event_direct(
         &state.db_path,
         &scenery_core::audit::AuditEvent {

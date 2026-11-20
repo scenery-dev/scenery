@@ -81,15 +81,21 @@ pub use plugin_marketplace::{
 };
 pub use pusher::{push_missing_active_skills, ManagedPathsPusher};
 
-/// Wire the F2 pusher into `scenery_core::installer::uninstall_skill`, so every
-/// uninstall path (CLI, MCP `scenery_uninstall`, registry-sync cleanup) also
-/// removes the native `~/.agents/skills/<slug>` dir and the
+/// Wire the F2 pusher into `scenery_core::installer` uninstalls (user uninstalls
+/// via the user remover, registry-sync cleanup via the projection remover), so
+/// every uninstall path also removes the native `~/.agents/skills/<slug>` dir and the
 /// `~/.claude/skills/<slug>` link. Idempotent; call once at process start.
 pub fn register_core_hooks() {
+    // Not a user uninstall (those use the user remover below): the only
+    // caller is the registry-sync cleanup of a skill IT deleted upstream. That
+    // is an IT-driven removal, so the kill switch wins over a failed edit
+    // backup, and IT is told.
     scenery_core::installer::register_skill_projection_remover(|state, slug| {
-        ManagedPathsPusher::new(state)
-            .remove_skill(slug)
-            .map(|_| ())
+        let out = ManagedPathsPusher::new(state).remove_skill_for_revoke(slug)?;
+        if out.backup_failure.is_some() {
+            crate::sync::reconciler::record_revoke_backup_failure(state, slug);
+        }
+        Ok(())
     });
     scenery_core::installer::register_skill_user_remover(|state, slug| {
         own_uninstall::uninstall_projection_detailed(state, slug).map(|(_, own)| own)
