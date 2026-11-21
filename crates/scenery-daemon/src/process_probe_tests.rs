@@ -116,15 +116,8 @@ fn all_pids_includes_our_own_child() {
 
 #[test]
 fn exe_replaced_or_deleted_is_false_for_our_own_still_running_binary() {
-    // `exe_replaced_or_deleted` compares a pid's backing executable against
-    // `binary_watch::resolve_watch_path()` — the currently-installed
-    // `scenery` binary. That comparison is only meaningful for pids that
-    // already passed the `scenery daemon run` argv check (an unrelated
-    // binary like `sleep` will always "mismatch" our own exe, which is not
-    // a bug — it is simply not this function's intended input domain). The
-    // one case this test can check without spawning a fake `scenery`
-    // process: our own still-running pid must never read back as stale,
-    // since it is by definition running from the path it resolves to.
+    // Only the other process's own exe being deleted counts as stale; our
+    // own live binary never does.
     let our_pid = std::process::id();
     assert_ne!(
         SystemProcessOps.exe_replaced_or_deleted(our_pid),

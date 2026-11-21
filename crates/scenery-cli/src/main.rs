@@ -6204,7 +6204,11 @@ async fn cmd_daemon_run(
     #[cfg(target_os = "macos")]
     if scenery_core::pkg_mode::is_pkg_managed() {
         match tokio::task::spawn_blocking(install::macos::stand_down_user_agents).await {
-            Ok(Ok(labels)) => tracing::info!(?labels, "stood down per-user launchd agents"),
+            Ok(Ok(labels)) => tracing::info!(
+                booted_out = ?labels,
+                "stand-down: pkg-managed daemon checked per-user launchd agents \
+                 (com.scenery.agent, sh.brew.scenery, homebrew.mxcl.scenery)"
+            ),
             Ok(Err(e)) => tracing::warn!("failed to stand down per-user agents: {e:#}"),
             Err(e) => tracing::warn!("stand-down task panicked: {e}"),
         }

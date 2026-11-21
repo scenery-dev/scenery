@@ -126,7 +126,7 @@ pub fn uninstall() -> Result<()> {
 }
 
 /// Stop and deregister `brew services`' own unit for this formula
-/// (`homebrew.mxcl.scenery` / `sh.brew.scenery.service`), which
+/// (`sh.brew.scenery` / `homebrew.mxcl.scenery` on macOS, `sh.brew.scenery.service` on Linux), which
 /// [`uninstall`] does not touch. Returns whether there was anything to stop.
 pub fn stop_brew_service() -> Result<bool> {
     #[cfg(target_os = "macos")]

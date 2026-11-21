@@ -160,7 +160,10 @@ pub(crate) fn refuse_uninstall(pkg_managed: bool, local_only: bool) -> bool {
 
 /// Entry point wired from `main.rs`.
 pub async fn run(opts: UninstallOpts) -> Result<()> {
-    if refuse_uninstall(scenery_core::pkg_mode::is_pkg_managed(), opts.local_only) {
+    // Unit tests must not depend on whether the host Mac has the pkg installed;
+    // the decision itself is covered by `refuse_uninstall`'s own tests.
+    let pkg_managed = !cfg!(test) && scenery_core::pkg_mode::is_pkg_managed();
+    if refuse_uninstall(pkg_managed, opts.local_only) {
         anyhow::bail!(PKG_MANAGED_UNINSTALL_MSG);
     }
     let mut report = RestoreReport::default();

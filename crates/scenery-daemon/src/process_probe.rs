@@ -135,17 +135,14 @@ mod platform {
             .filter(|b| !b.is_empty())
     }
 
-    /// Mirrors `crate::install`-equivalent logic (the CLI's `exe_is_stale`),
-    /// applied to an arbitrary pid instead of only the systemd `MainPID`.
+    /// True only when the other process's own executable file was deleted
+    /// from disk since it started (`/proc/<pid>/exe` ends in " (deleted)").
+    /// A healthy daemon running an intact but different binary path (e.g.
+    /// brew's vs. the pkg's) is NOT stale; the version check decides then.
     pub(super) fn exe_replaced_or_deleted(pid: u32) -> Option<bool> {
         let link = fs::read_link(format!("/proc/{pid}/exe")).ok()?;
         let exe_target = link.to_str()?;
-        if exe_target.ends_with(" (deleted)") {
-            return Some(true);
-        }
-        let current = crate::binary_watch::resolve_watch_path().ok()?;
-        let canonical_current = fs::canonicalize(&current).ok()?;
-        Some(canonical_current.to_str() != Some(exe_target))
+        Some(exe_target.ends_with(" (deleted)"))
     }
 
     pub(super) fn all_pids() -> Vec<u32> {
@@ -262,15 +259,12 @@ mod platform {
         }
     }
 
+    /// True only when the file backing the other process's own executable
+    /// is gone (brew upgrade removes the old Cellar dir). Never compares
+    /// against our own exe path: a different intact binary is not stale.
     pub(super) fn exe_replaced_or_deleted(pid: u32) -> Option<bool> {
         let running_path = proc_pidpath(pid)?;
-        if std::fs::metadata(&running_path).is_err() {
-            return Some(true); // the file backing the running exe is gone
-        }
-        let current = crate::binary_watch::resolve_watch_path().ok()?;
-        let canonical_current = std::fs::canonicalize(&current).ok()?;
-        let canonical_running = std::fs::canonicalize(&running_path).ok()?;
-        Some(canonical_current != canonical_running)
+        Some(std::fs::metadata(&running_path).is_err())
     }
 
     /// `proc_pidpath(3)` — libproc, part of libSystem (always linked on

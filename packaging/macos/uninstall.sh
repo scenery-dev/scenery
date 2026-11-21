@@ -59,7 +59,7 @@ local_uids() {
 }
 all_uids="$( { local_uids; gui_uids; } | /usr/bin/sort -un)"
 for uid in $all_uids; do
-  for agent in com.scenery.agent homebrew.mxcl.scenery; do
+  for agent in com.scenery.agent sh.brew.scenery homebrew.mxcl.scenery; do
     /bin/launchctl enable "gui/$uid/$agent" >/dev/null 2>&1 || true
   done
 done

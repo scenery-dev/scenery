@@ -35,12 +35,13 @@ use super::{
 const LABEL: &str = "com.scenery.agent";
 const PLIST_FILENAME: &str = "com.scenery.agent.plist";
 
-/// `brew services`' launchd label for this formula — `homebrew.mxcl.<name>`
-/// is Homebrew's fixed naming convention, not something we control.
-const BREW_SERVICE_LABEL: &str = "homebrew.mxcl.scenery";
-/// `brew services`' plist filename, written to the same
-/// `~/Library/LaunchAgents/` directory as our own agent.
-const BREW_PLIST_FILENAME: &str = "homebrew.mxcl.scenery.plist";
+/// `brew services`' launchd labels for this formula. Modern Homebrew uses
+/// `sh.brew.<name>`; older versions used `homebrew.mxcl.<name>`. Not
+/// something we control, so every code path handles both (preferred first).
+const BREW_SERVICE_LABELS: [&str; 2] = ["sh.brew.scenery", "homebrew.mxcl.scenery"];
+/// The matching plist filenames (same order as [`BREW_SERVICE_LABELS`]),
+/// written to the same `~/Library/LaunchAgents/` directory as our own agent.
+const BREW_PLIST_FILENAMES: [&str; 2] = ["sh.brew.scenery.plist", "homebrew.mxcl.scenery.plist"];
 
 /// Return `~/Library/LaunchAgents/com.scenery.agent.plist`.
 fn plist_path() -> Result<std::path::PathBuf> {
@@ -287,8 +288,8 @@ fn service_is_loaded(uid: u32) -> bool {
 // ── Competing-service-manager detection (brew services) ─────────────────────
 //
 // `brew services` loads its own LaunchAgent for this formula
-// (`homebrew.mxcl.scenery`, plist at
-// `~/Library/LaunchAgents/homebrew.mxcl.scenery.plist`) — a completely
+// (`sh.brew.scenery` or legacy `homebrew.mxcl.scenery`, plist at
+// `~/Library/LaunchAgents/<label>.plist`) — a completely
 // separate launchd job from ours (`com.scenery.agent`). Both carry
 // `KeepAlive: true` against the same single-instance socket lock
 // (`daemon.lock`): whichever loses the race can never acquire it, exits
@@ -297,20 +298,29 @@ fn service_is_loaded(uid: u32) -> bool {
 // healthy brew-managed daemon and skip installing/enabling our own agent
 // entirely, rather than relying on bootout/bootstrap races to sort it out.
 
-/// Return `~/Library/LaunchAgents/homebrew.mxcl.scenery.plist`.
-fn brew_plist_path() -> Result<std::path::PathBuf> {
+/// Pure: pick the brew label whose plist exists, preferring the first
+/// (`sh.brew.scenery`). `exists` is asked once per plist filename.
+fn pick_brew_label<F: Fn(&str) -> bool>(exists: F) -> Option<(&'static str, &'static str)> {
+    BREW_SERVICE_LABELS
+        .iter()
+        .zip(BREW_PLIST_FILENAMES.iter())
+        .find(|(_, plist)| exists(plist))
+        .map(|(label, plist)| (*label, *plist))
+}
+
+/// The brew service whose plist exists in `~/Library/LaunchAgents/`:
+/// `(label, plist path)`. `None` when brew does not manage the daemon.
+fn brew_active_service() -> Result<Option<(&'static str, std::path::PathBuf)>> {
     let home = dirs::home_dir().context("failed to resolve HOME directory")?;
-    Ok(home
-        .join("Library")
-        .join("LaunchAgents")
-        .join(BREW_PLIST_FILENAME))
+    let dir = home.join("Library").join("LaunchAgents");
+    Ok(pick_brew_label(|f| dir.join(f).exists()).map(|(label, f)| (label, dir.join(f))))
 }
 
 /// Check whether `brew services`' launchd job is currently loaded, via
-/// `launchctl print gui/<uid>/homebrew.mxcl.scenery`.
-fn brew_service_is_loaded(uid: u32) -> bool {
+/// `launchctl print gui/<uid>/<label>`.
+fn brew_service_is_loaded(uid: u32, label: &str) -> bool {
     Command::new("launchctl")
-        .args(["print", &format!("gui/{uid}/{BREW_SERVICE_LABEL}")])
+        .args(["print", &format!("gui/{uid}/{label}")])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
@@ -381,6 +391,7 @@ pub(crate) fn brew_recovery_action(loaded: bool, socket_reachable: bool) -> Brew
 pub(crate) fn brew_recovery_argv(
     action: BrewRecoveryAction,
     uid: u32,
+    label: &str,
     brew_plist_str: &str,
 ) -> Option<Vec<String>> {
     match action {
@@ -389,10 +400,9 @@ pub(crate) fn brew_recovery_argv(
             domain_target(uid),
             brew_plist_str.to_string(),
         ]),
-        BrewRecoveryAction::Kickstart => Some(vec![
-            "kickstart".to_string(),
-            format!("gui/{uid}/{BREW_SERVICE_LABEL}"),
-        ]),
+        BrewRecoveryAction::Kickstart => {
+            Some(vec!["kickstart".to_string(), format!("gui/{uid}/{label}")])
+        }
         BrewRecoveryAction::None => None,
     }
 }
@@ -409,43 +419,46 @@ pub(crate) fn brew_recovery_argv(
 pub(super) fn reconcile_competing_manager() -> Result<bool> {
     let plist = plist_path().context("failed to resolve plist path")?;
     let uid = current_uid();
-    let brew_plist = brew_plist_path().context("failed to resolve brew plist path")?;
+    let active = brew_active_service().context("failed to resolve brew plist path")?;
+    let Some((brew_label, brew_plist)) = active else {
+        return Ok(false);
+    };
     if !brew_service_is_managing(brew_plist.exists()) {
         return Ok(false);
     }
     println!(
-        "Scenery daemon is managed by Homebrew services ({BREW_SERVICE_LABEL}); \
+        "Scenery daemon is managed by Homebrew services ({brew_label}); \
          not installing {LABEL}."
     );
     self_heal_remove_our_agent(&plist, uid)?;
 
-    let loaded = brew_service_is_loaded(uid);
+    let loaded = brew_service_is_loaded(uid, brew_label);
     let socket_reachable = socket_is_reachable(&daemon_socket_path(), 200);
     let action = brew_recovery_action(loaded, socket_reachable);
     let brew_plist_str = brew_plist
         .to_str()
         .context("brew plist path is not valid UTF-8")?;
-    if let Some(argv) = brew_recovery_argv(action, uid, brew_plist_str) {
+    if let Some(argv) = brew_recovery_argv(action, uid, brew_label, brew_plist_str) {
         let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
         match action {
             BrewRecoveryAction::Bootstrap => {
-                println!("{BREW_SERVICE_LABEL} is not loaded — bootstrapping it.");
+                println!("{brew_label} is not loaded — bootstrapping it.");
             }
             BrewRecoveryAction::Kickstart => {
                 println!(
-                    "{BREW_SERVICE_LABEL} is loaded but the daemon socket is not reachable \
+                    "{brew_label} is loaded but the daemon socket is not reachable \
                      — kickstarting it."
                 );
             }
             BrewRecoveryAction::None => {}
         }
         if let Err(e) = launchctl(&argv_refs) {
-            println!("warning: failed to recover {BREW_SERVICE_LABEL}: {e:#}");
+            println!("warning: failed to recover {brew_label}: {e:#}");
         } else if wait_for_socket(&daemon_socket_path(), std::time::Duration::from_secs(10)) {
-            println!("{BREW_SERVICE_LABEL} is now running and the daemon socket is reachable.");
+            println!("{brew_label} is now running and the daemon socket is reachable.");
         } else {
             println!(
-                "Recovered {BREW_SERVICE_LABEL}, but the daemon socket did not become \
+                "Recovered {brew_label}, but the daemon socket did not become \
                  reachable within 10s."
             );
         }
@@ -460,10 +473,11 @@ pub(super) fn reconcile_competing_manager() -> Result<bool> {
 pub const PKG_MANAGED_INSTALL_MSG: &str = "Scenery is managed by your IT department on this Mac (installed system-wide). Nothing to install.";
 
 /// `launchctl` argv (pure) that unloads and disables both per-user agents so
-/// the system agent (`dev.scenery.agent`) is the only daemon manager.
+/// the system agent (`dev.scenery.agent`) is the only daemon manager
+/// (ours plus both brew labels).
 /// For each label: `bootout` first, then `disable` (so it stays off at login).
 pub(crate) fn stand_down_argv(uid: u32) -> Vec<Vec<String>> {
-    [LABEL, BREW_SERVICE_LABEL]
+    [LABEL, BREW_SERVICE_LABELS[0], BREW_SERVICE_LABELS[1]]
         .iter()
         .flat_map(|label| {
             ["bootout", "disable"].map(|verb| {
@@ -707,28 +721,26 @@ pub fn uninstall() -> Result<()> {
 /// PATH. Returns whether there was anything to stop.
 pub fn stop_brew_service() -> Result<bool> {
     let home = dirs::home_dir().context("failed to resolve HOME directory")?;
-    let plist = home
-        .join("Library")
-        .join("LaunchAgents")
-        .join(BREW_PLIST_FILENAME);
-    let target = format!("{}/{BREW_SERVICE_LABEL}", domain_target(current_uid()));
-    let loaded = Command::new("launchctl")
-        .args(["print", &target])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-
-    if !loaded && !plist.exists() {
-        return Ok(false);
+    let dir = home.join("Library").join("LaunchAgents");
+    let mut stopped = false;
+    for (label, file) in BREW_SERVICE_LABELS.iter().zip(BREW_PLIST_FILENAMES.iter()) {
+        let plist = dir.join(file);
+        let target = format!("{}/{label}", domain_target(current_uid()));
+        let loaded = brew_service_is_loaded(current_uid(), label);
+        if !loaded && !plist.exists() {
+            continue;
+        }
+        if loaded {
+            launchctl(&["bootout", &target])
+                .context("failed to bootout the brew services agent")?;
+        }
+        if plist.exists() {
+            fs::remove_file(&plist)
+                .with_context(|| format!("failed to remove plist: {}", plist.display()))?;
+        }
+        stopped = true;
     }
-    if loaded {
-        launchctl(&["bootout", &target]).context("failed to bootout the brew services agent")?;
-    }
-    if plist.exists() {
-        fs::remove_file(&plist)
-            .with_context(|| format!("failed to remove plist: {}", plist.display()))?;
-    }
-    Ok(true)
+    Ok(stopped)
 }
 
 /// Stop and start the LaunchAgent in place.
@@ -773,8 +785,8 @@ pub fn status() -> Result<InstallStatus> {
 mod tests {
     use super::{
         brew_recovery_action, brew_recovery_argv, brew_service_is_managing,
-        launchctl_failure_is_benign, render_plist, resolve_registry_url_env, stand_down_argv,
-        BrewRecoveryAction,
+        launchctl_failure_is_benign, pick_brew_label, render_plist, resolve_registry_url_env,
+        stand_down_argv, BrewRecoveryAction,
     };
     use std::path::Path;
 
@@ -803,8 +815,12 @@ mod tests {
     #[test]
     fn stand_down_targets_both_user_labels() {
         let argv = stand_down_argv(501);
-        assert_eq!(argv.len(), 4);
-        for label in ["com.scenery.agent", "homebrew.mxcl.scenery"] {
+        assert_eq!(argv.len(), 6);
+        for label in [
+            "com.scenery.agent",
+            "sh.brew.scenery",
+            "homebrew.mxcl.scenery",
+        ] {
             let target = format!("gui/501/{label}");
             let pos = |verb: &str| {
                 argv.iter()
@@ -892,26 +908,45 @@ mod tests {
         let argv = brew_recovery_argv(
             BrewRecoveryAction::Bootstrap,
             501,
-            "/Users/testhost/Library/LaunchAgents/homebrew.mxcl.scenery.plist",
+            "sh.brew.scenery",
+            "/Users/testhost/Library/LaunchAgents/sh.brew.scenery.plist",
         );
         assert_eq!(
             argv,
             Some(vec![
                 "bootstrap".to_string(),
                 "gui/501".to_string(),
-                "/Users/testhost/Library/LaunchAgents/homebrew.mxcl.scenery.plist".to_string(),
+                "/Users/testhost/Library/LaunchAgents/sh.brew.scenery.plist".to_string(),
             ])
         );
     }
 
     #[test]
+    fn pick_brew_label_prefers_modern_then_legacy() {
+        assert_eq!(
+            pick_brew_label(|_| true),
+            Some(("sh.brew.scenery", "sh.brew.scenery.plist"))
+        );
+        assert_eq!(
+            pick_brew_label(|f| f == "homebrew.mxcl.scenery.plist"),
+            Some(("homebrew.mxcl.scenery", "homebrew.mxcl.scenery.plist"))
+        );
+        assert_eq!(pick_brew_label(|_| false), None);
+    }
+
+    #[test]
     fn kickstart_argv_targets_the_brew_service_label_not_the_plist() {
-        let argv = brew_recovery_argv(BrewRecoveryAction::Kickstart, 501, "/ignored");
+        let argv = brew_recovery_argv(
+            BrewRecoveryAction::Kickstart,
+            501,
+            "sh.brew.scenery",
+            "/ignored",
+        );
         assert_eq!(
             argv,
             Some(vec![
                 "kickstart".to_string(),
-                "gui/501/homebrew.mxcl.scenery".to_string(),
+                "gui/501/sh.brew.scenery".to_string(),
             ])
         );
     }
@@ -919,7 +954,7 @@ mod tests {
     #[test]
     fn none_action_produces_no_argv() {
         assert_eq!(
-            brew_recovery_argv(BrewRecoveryAction::None, 501, "/ignored"),
+            brew_recovery_argv(BrewRecoveryAction::None, 501, "sh.brew.scenery", "/ignored"),
             None
         );
     }

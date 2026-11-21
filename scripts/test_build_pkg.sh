@@ -51,7 +51,8 @@ done
 check "package identifier dev.scenery.runner" grep -q 'identifier="dev.scenery.runner"' "$COMP/PackageInfo"
 
 check "uninstall.sh re-enables com.scenery.agent" grep -q 'launchctl" enable\|launchctl enable' "$ROOT/packaging/macos/uninstall.sh"
-check "uninstall.sh re-enables brew agent" grep -q 'homebrew.mxcl.scenery' "$ROOT/packaging/macos/uninstall.sh"
+check "uninstall.sh re-enables brew agent (legacy label)" grep -q 'homebrew.mxcl.scenery' "$ROOT/packaging/macos/uninstall.sh"
+check "uninstall.sh re-enables brew agent (sh.brew label)" grep -q 'sh.brew.scenery' "$ROOT/packaging/macos/uninstall.sh"
 check "uninstall.sh enables per local uid" grep -q 'dscl . -list /Users UniqueID' "$ROOT/packaging/macos/uninstall.sh"
 check "postinstall retries bootstrap once" grep -q '/bin/sleep 1' "$ROOT/packaging/macos/scripts/postinstall"
 check "pkgbuild pins --compression legacy" test "$(grep -c 'pkgbuild --compression legacy' "$ROOT/scripts/build-pkg.sh")" = 3

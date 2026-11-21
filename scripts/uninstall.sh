@@ -37,6 +37,7 @@ if [[ "$(uname)" == "Darwin" ]]; then
   LOGS="$HOME/Library/Logs/Scenery"
   PLIST="$HOME/Library/LaunchAgents/com.scenery.agent.plist"
   BREW_PLIST="$HOME/Library/LaunchAgents/homebrew.mxcl.scenery.plist"
+  BREW_PLIST2="$HOME/Library/LaunchAgents/sh.brew.scenery.plist"
 else
   # The runner uses dirs::data_dir()/Scenery; Linux paths are
   # case-sensitive. Fall back to the lowercase spelling older copies of this
@@ -299,10 +300,10 @@ done
 # configs and re-saves refreshed tokens. That includes the `brew services`
 # one, which is what Homebrew installs actually run.
 if [[ "$(uname)" == "Darwin" ]]; then
-  for label in com.scenery.agent homebrew.mxcl.scenery; do
+  for label in com.scenery.agent sh.brew.scenery homebrew.mxcl.scenery; do
     launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
   done
-  rm -f "$PLIST" "$BREW_PLIST"
+  rm -f "$PLIST" "$BREW_PLIST" "$BREW_PLIST2"
 else
   for svc in scenery.service sh.brew.scenery.service; do
     systemctl --user disable --now "$svc" 2>/dev/null || true

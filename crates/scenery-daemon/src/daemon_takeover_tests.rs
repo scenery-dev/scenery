@@ -126,6 +126,17 @@ fn newer_version_refuses() {
     assert!(matches!(verdict, Verdict::Refuse(_)));
 }
 
+#[test]
+fn intact_different_binary_same_version_refuses() {
+    // A healthy daemon running an intact (different-path) binary of the same
+    // version is not stale: Refuse, never a takeover loop.
+    let inspector = FakeInspector::default()
+        .daemon_run(100)
+        .with_exe_stale(100, Some(false));
+    let verdict = verify_pid(&inspector, 100, 1, &v("2.0.0"), Some(v("2.0.0")));
+    assert!(matches!(verdict, Verdict::Refuse(_)));
+}
+
 // ── verify_pid: argv mismatch → refuse ──────────────────────────────────
 
 #[test]
