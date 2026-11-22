@@ -1249,6 +1249,43 @@ async fn caps_count_attempts_so_a_failing_backend_gets_at_most_five_calls_per_ti
     let s = process_response(&env.ctx(true), response(ds), &items).await;
     m.assert();
     assert_eq!(s.failed, MAX_CONVERSIONS_PER_TICK, "{s:?}");
+    assert_eq!(s.capped, 9 - MAX_CONVERSIONS_PER_TICK, "{s:?}");
+    assert!(!s.settled());
+}
+
+#[tokio::test]
+async fn an_identical_skip_is_not_rewritten_every_tick() {
+    let env = Env::new().await;
+    let dir = env.user_skill(&env.agents(), "skipped-one");
+    let items = env.scan();
+    let mut d = directive(&dir, "skip");
+    d.reason = Some("already_managed".into());
+    let s = process_response(&env.ctx(true), response(vec![d.clone()]), &items).await;
+    assert!(s.settled(), "a skip leaves nothing to do: {s:?}");
+    let conn = Connection::open(&env.state.db_path).unwrap();
+    conn.execute(
+        "UPDATE auto_manage_attempts SET last_try = '2000-01-01T00:00:00+00:00'",
+        [],
+    )
+    .unwrap();
+    process_response(&env.ctx(true), response(vec![d.clone()]), &items).await;
+    let last: String = conn
+        .query_row("SELECT last_try FROM auto_manage_attempts", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        last, "2000-01-01T00:00:00+00:00",
+        "same answer, same tree: no write"
+    );
+
+    // A different answer is recorded.
+    d.reason = Some("scan_rejected".into());
+    process_response(&env.ctx(true), response(vec![d]), &items).await;
+    let reason: String = conn
+        .query_row("SELECT reason FROM auto_manage_attempts", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(reason, "scan_rejected");
 }
 
 #[tokio::test]

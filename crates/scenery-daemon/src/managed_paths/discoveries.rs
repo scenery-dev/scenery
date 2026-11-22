@@ -54,7 +54,7 @@ use rusqlite::Connection;
 use scenery_core::http::AsyncSendTrackedExt;
 use scenery_core::{auth::load_all_tokens, state::AppState};
 use scenery_mcp::setup::ClientConfig;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
@@ -120,6 +120,8 @@ pub struct DiscoveriesScanner {
     state: Arc<AppState>,
     registry_url: String,
     kick: Arc<Notify>,
+    /// Built once: building a client per tick re-parsed the TLS root store.
+    http_client: Option<reqwest::Client>,
 }
 
 impl DiscoveriesScanner {
@@ -128,12 +130,16 @@ impl DiscoveriesScanner {
             state,
             registry_url,
             kick,
+            http_client: build_http_client(),
         }
     }
 
     /// Run discovery once. Delegates to the free function.
     pub async fn run_once(&self) -> Result<usize> {
-        run_once(Arc::clone(&self.state), self.registry_url.clone()).await
+        match &self.http_client {
+            Some(c) => run_once_with(Arc::clone(&self.state), self.registry_url.clone(), c).await,
+            None => run_once(Arc::clone(&self.state), self.registry_url.clone()).await,
+        }
     }
 
     /// Spawn the discoveries loop on the current tokio runtime.
@@ -214,12 +220,55 @@ pub fn should_skip_debounced_kick(trigger_is_kick: bool, elapsed: Duration) -> b
 
 // ── Free-function entry point (testable) ──────────────────────────────────────
 
+fn build_http_client() -> Option<reqwest::Client> {
+    match scenery_core::http::async_client_builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+    {
+        Ok(c) => Some(c),
+        Err(e) => {
+            warn!(error = %e, "discoveries: failed to build HTTP client — skipping POST");
+            None
+        }
+    }
+}
+
 /// Scan extra roots and every detected AI client, filter already-managed
-/// slugs/entries, POST the merged batch (skills + MCP).
+/// slugs/entries, POST the merged batch (skills + MCP) when it changed.
 ///
-/// Returns the count of items reported (0 when no new discoveries or when
-/// killswitch is active).
+/// Returns the count of items the backend saw for the FIRST time (0 when
+/// nothing was uploaded, nothing was new, or the killswitch is active).
 pub async fn run_once(state: Arc<AppState>, registry_url: String) -> Result<usize> {
+    let Some(client) = build_http_client() else {
+        return Ok(0);
+    };
+    run_once_with(state, registry_url, &client).await
+}
+
+/// [`run_once`] with a caller-owned (reused) HTTP client.
+///
+/// # Upload only on change
+///
+/// An unchanged machine used to re-upload its whole discovery set every tick
+/// (and on every client connect). The upload is now skipped while the batch's
+/// fingerprint ([`batch_fingerprint`]: every reported field, the local
+/// verdicts, device, registry, signed-in user and runner version) equals the
+/// last upload that left nothing to do ([`UploadMemo`], kept in `sync_state`
+/// so a restart does not force a re-upload). It still happens:
+/// - when anything in the batch changed (a skill added, edited, removed, or
+///   settling out of its "recently modified" window; an MCP entry changed);
+/// - after a failed or refused upload (no memo is written), every tick;
+/// - while auto-manage has work left (an action taken, deferred, failed,
+///   capped or refused: see [`super::auto_manage::TickSummary::settled`]);
+/// - when a failed auto-manage attempt's backoff expires;
+/// - at least every [`refresh_secs`] (default 1 h): the org's auto-manage
+///   toggles are not pushed to runners, they arrive as directives on the next
+///   upload, so this bounds how late a toggle takes effect on a quiet machine.
+pub async fn run_once_with(
+    state: Arc<AppState>,
+    registry_url: String,
+    http_client: &reqwest::Client,
+) -> Result<usize> {
     if reconciler_disabled() {
         debug!("discoveries: SCENERY_DISABLE_FILESYSTEM_RECONCILER set — skipping");
         return Ok(0);
@@ -255,32 +304,47 @@ pub async fn run_once(state: Arc<AppState>, registry_url: String) -> Result<usiz
         return Ok(0);
     }
 
-    let count = items.len();
     // Held skills are surfaced to the user whatever the backend says.
     super::auto_manage::note_local_holds(&state, &items);
-    let http_client = match scenery_core::http::async_client_builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            warn!(error = %e, "discoveries: failed to build HTTP client — skipping POST");
-            return Ok(0);
-        }
-    };
 
     // ONE token read per tick (the OS keychain is read once, not once per
     // skill); the same token serves the upload and every auto-manage call.
     let token = access_token_for(&state, &registry_url).await;
-    let Some(response) =
-        post_discoveries(&items, &state, &registry_url, &http_client, &token).await
+    if token.is_empty() {
+        debug!("discoveries: no auth token — skipping POST (will try again next tick)");
+        return Ok(0);
+    }
+    let device_id = state.get_sync_state("device_id").ok().flatten();
+    let fingerprint = batch_fingerprint(
+        &items,
+        device_id.as_deref(),
+        &registry_url,
+        scenery_core::auth::decode_jwt_sub(&token).as_deref(),
+    );
+    let now = scenery_core::timefmt::now_unix();
+    if !upload_due(&state, &fingerprint, now) {
+        debug!(
+            count = items.len(),
+            "discoveries: unchanged since the last upload — not re-sent"
+        );
+        return Ok(0);
+    }
+
+    let Some(posted) = post_discoveries(
+        &items,
+        device_id.clone(),
+        &registry_url,
+        http_client,
+        &token,
+    )
+    .await
     else {
-        return Ok(count);
+        // Not memoised: the next tick uploads again.
+        return Ok(0);
     };
 
-    let device_id = state.get_sync_state("device_id").ok().flatten();
-    match device_id {
-        Some(device_id) if !token.is_empty() => {
+    let settled = match device_id {
+        Some(device_id) => {
             let ctx = super::auto_manage::TickCtx {
                 state: Arc::clone(&state),
                 registry_url: registry_url.clone(),
@@ -288,12 +352,132 @@ pub async fn run_once(state: Arc<AppState>, registry_url: String) -> Result<usiz
                 device_id,
                 classify: ClassifyContext::from_env(),
             };
-            super::auto_manage::process_response(&ctx, response, &items).await;
+            super::auto_manage::process_response(&ctx, posted.response, &items)
+                .await
+                .settled()
         }
-        _ => debug!("discoveries: no device id or token — auto-manage skipped this tick"),
+        None => {
+            debug!("discoveries: no device id — auto-manage skipped this tick");
+            true
+        }
+    };
+    if settled {
+        let retry_at = super::auto_manage::earliest_failed_retry(&state);
+        record_upload(&state, &fingerprint, now, retry_at);
+    } else {
+        // Work is left: upload again next tick for fresh directives.
+        clear_upload_memo(&state);
     }
 
-    Ok(count)
+    Ok(posted.new_items)
+}
+
+// ── Upload memo (skip unchanged uploads) ─────────────────────────────────────
+
+/// `sync_state` key holding the [`UploadMemo`] JSON.
+pub const UPLOAD_MEMO_KEY: &str = "discoveries_upload_memo";
+const ENV_REFRESH: &str = "SCENERY_DISCOVERIES_REFRESH_SECS";
+const DEFAULT_REFRESH_SECS: i64 = 3600;
+
+/// The last upload that left nothing to do.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UploadMemo {
+    pub fingerprint: String,
+    pub uploaded_at: i64,
+    /// When a failed auto-manage attempt's backoff ends (re-upload then).
+    #[serde(default)]
+    pub retry_at: Option<i64>,
+}
+
+/// How long an unchanged batch may go without being re-uploaded
+/// (`SCENERY_DISCOVERIES_REFRESH_SECS`, default 3600).
+pub fn refresh_secs() -> i64 {
+    std::env::var(ENV_REFRESH)
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_REFRESH_SECS)
+}
+
+/// SHA-256 over everything that makes one upload differ from another: each
+/// item's wire form, its local verdict (treatment, tree hash, "recently
+/// modified"), the device, the registry, the signed-in user and the runner
+/// version.
+pub fn batch_fingerprint(
+    items: &[DiscoveryItem],
+    device_id: Option<&str>,
+    registry_url: &str,
+    user: Option<&str>,
+) -> String {
+    let mut h = Sha256::new();
+    for part in [
+        scenery_core::http::RUNNER_VERSION,
+        registry_url,
+        device_id.unwrap_or(""),
+        user.unwrap_or(""),
+    ] {
+        h.update(part.as_bytes());
+        h.update([0u8]);
+    }
+    // Per-item digests, sorted: directory listing order is not guaranteed
+    // stable between scans and must not read as a change.
+    let mut per_item: Vec<[u8; 32]> = items
+        .iter()
+        .map(|item| {
+            let mut ih = Sha256::new();
+            ih.update(serde_json::to_vec(item).unwrap_or_default());
+            if let Some(l) = &item.local {
+                ih.update(format!(
+                    "{:?}|{}|{}",
+                    l.treatment, l.tree_hash, l.recently_modified
+                ));
+            }
+            ih.finalize().into()
+        })
+        .collect();
+    per_item.sort_unstable();
+    for d in &per_item {
+        h.update(d);
+    }
+    hex::encode(h.finalize())
+}
+
+pub fn load_upload_memo(state: &AppState) -> Option<UploadMemo> {
+    state
+        .get_sync_state(UPLOAD_MEMO_KEY)
+        .ok()
+        .flatten()
+        .and_then(|j| serde_json::from_str(&j).ok())
+}
+
+/// Must a batch with this fingerprint be uploaded at `now`?
+pub fn upload_due(state: &AppState, fingerprint: &str, now: i64) -> bool {
+    let Some(m) = load_upload_memo(state) else {
+        return true;
+    };
+    m.fingerprint != fingerprint
+        || now.saturating_sub(m.uploaded_at) >= refresh_secs()
+        || now < m.uploaded_at
+        || m.retry_at.is_some_and(|t| now >= t)
+}
+
+fn record_upload(state: &AppState, fingerprint: &str, now: i64, retry_at: Option<i64>) {
+    let memo = UploadMemo {
+        fingerprint: fingerprint.to_string(),
+        uploaded_at: now,
+        retry_at,
+    };
+    let json = serde_json::to_string(&memo).unwrap_or_default();
+    if let Err(e) = state.set_sync_state(UPLOAD_MEMO_KEY, &json) {
+        warn!(error = %e, "discoveries: could not record the upload (next tick re-sends)");
+    }
+}
+
+/// Forget the last upload, so the next scan uploads whatever it finds. Called
+/// when auto-manage has work left, and by anything that changes what the
+/// backend would answer for the same batch.
+pub fn clear_upload_memo(state: &AppState) {
+    let _ = state.delete_sync_state(UPLOAD_MEMO_KEY);
 }
 
 // ── Root resolution ───────────────────────────────────────────────────────────
@@ -635,10 +819,17 @@ struct DiscoveriesBody {
     items: Vec<DiscoveryItem>,
 }
 
+/// A successful upload: the per-item directives/policy and how many items
+/// the backend saw for the first time (`accepted`; re-sightings are
+/// `deduped`).
+struct Posted {
+    response: super::auto_manage::DiscoveryResponse,
+    new_items: usize,
+}
+
 /// POST the batch to the backend. Logs warnings on failure but never returns
-/// an error — this function is best-effort. Returns the parsed response (the
-/// per-item `directives` and the org `policy`) on success; `None` when nothing
-/// was sent or the backend refused.
+/// an error — this function is best-effort. `None` when the backend refused
+/// or could not be reached.
 ///
 /// `X-Scenery-Runner-Version` is sent explicitly (it is also a default header
 /// of every runner client): the backend only answers with directives to a
@@ -646,18 +837,11 @@ struct DiscoveriesBody {
 /// token.
 async fn post_discoveries(
     items: &[DiscoveryItem],
-    state: &AppState,
+    device_id: Option<String>,
     registry_url: &str,
     http_client: &reqwest::Client,
     token: &str,
-) -> Option<super::auto_manage::DiscoveryResponse> {
-    if token.is_empty() {
-        debug!("discoveries: no auth token — skipping POST (will try again next daemon start)");
-        return None;
-    }
-
-    let device_id = state.get_sync_state("device_id").ok().flatten();
-
+) -> Option<Posted> {
     let body = DiscoveriesBody {
         device_id,
         items: items.to_vec(),
@@ -680,7 +864,7 @@ async fn post_discoveries(
     {
         Ok(r) => r,
         Err(e) => {
-            warn!(error = %e, "discoveries: POST failed — will retry on next daemon start");
+            warn!(error = %e, "discoveries: POST failed — will retry next tick");
             return None;
         }
     };
@@ -692,13 +876,22 @@ async fn post_discoveries(
         return None;
     }
 
-    info!(
-        count = items.len(),
-        "discoveries: batch reported to backend"
-    );
     // Older backends return a body without `directives`/`policy`, or none at
     // all: both parse as "no directives".
-    Some(resp.json().await.unwrap_or_default())
+    let value: serde_json::Value = resp.json().await.unwrap_or_default();
+    let new_items = value
+        .get("accepted")
+        .and_then(|a| a.as_array())
+        .map_or(0, Vec::len);
+    info!(
+        count = items.len(),
+        new = new_items,
+        "discoveries: batch reported to backend"
+    );
+    Some(Posted {
+        response: serde_json::from_value(value).unwrap_or_default(),
+        new_items,
+    })
 }
 
 // ── Auth helper ───────────────────────────────────────────────────────────────

@@ -306,7 +306,39 @@ pub struct TickSummary {
     pub deferred: usize,
     pub skipped: usize,
     pub failed: usize,
+    /// `manage`/`track` directives left for a later tick by the per-tick caps.
+    pub capped: usize,
     pub unauthorized: bool,
+}
+
+impl TickSummary {
+    /// Nothing is left for a later tick: no action was taken (which changes
+    /// local or server state the next upload should reflect), nothing was
+    /// deferred, failed, capped or refused. Only then may an unchanged
+    /// discovery set skip its next upload.
+    pub fn settled(&self) -> bool {
+        self.managed == 0
+            && self.tracked == 0
+            && self.blocked == 0
+            && self.deferred == 0
+            && self.failed == 0
+            && self.capped == 0
+            && !self.unauthorized
+    }
+}
+
+/// The earliest `next_try_at` of a failed attempt still backing off, if any:
+/// the moment an unchanged discovery set must be uploaded again so the backend
+/// re-sends the directive that retries it.
+pub fn earliest_failed_retry(state: &AppState) -> Option<i64> {
+    let conn = open(state).ok()?;
+    conn.query_row(
+        "SELECT MIN(next_try_at) FROM auto_manage_attempts WHERE status = 'failed'",
+        [],
+        |r| r.get::<_, Option<i64>>(0),
+    )
+    .ok()
+    .flatten()
 }
 
 /// Everything directive processing needs. `token` is the already-loaded
@@ -394,6 +426,7 @@ async fn process_directives(
                     || wants_track && tracked_uploads >= MAX_TRACKED_UPLOADS_PER_TICK
                 {
                     debug!(slug = %item.slug, "auto-manage: per-tick cap reached — next tick");
+                    summary.capped += 1;
                     continue;
                 }
                 match act_on(ctx, item, &d, wants_track).await {
@@ -478,6 +511,16 @@ fn record_skip(state: &AppState, item: &DiscoveryItem, hash: &str, reason: Optio
         } else {
             AttemptStatus::Skipped
         };
+        // The same answer for the same tree is already recorded: rewriting it
+        // every tick was one SQLite write per skipped skill per scan.
+        let same = get_attempt(state, &item.slug, &item.source_path).is_some_and(|a| {
+            a.status == status.as_str()
+                && a.last_hash.as_deref() == Some(hash)
+                && a.reason.as_deref() == reason
+        });
+        if same {
+            return;
+        }
         record_attempt(state, &item.slug, &item.source_path, hash, status, reason);
     }
 }

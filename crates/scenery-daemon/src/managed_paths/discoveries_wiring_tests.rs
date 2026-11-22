@@ -174,9 +174,10 @@ async fn the_upload_sends_the_runner_version_and_parses_directives_and_policy() 
         )
         .create();
     let http = reqwest::Client::new();
-    let resp = post_discoveries(&items, &env.state, &server.url(), &http, "tok")
+    let resp = post_discoveries(&items, None, &server.url(), &http, "tok")
         .await
-        .unwrap();
+        .unwrap()
+        .response;
     m.assert();
     let dirs = resp.directives.unwrap();
     assert_eq!(dirs.len(), 2);
@@ -201,15 +202,10 @@ async fn an_old_backend_body_with_no_directives_parses_to_nothing_to_do() {
         .with_status(200)
         .with_body(r#"{"items": [], "upserted": 1}"#)
         .create();
-    let resp = post_discoveries(
-        &items,
-        &env.state,
-        &server.url(),
-        &reqwest::Client::new(),
-        "tok",
-    )
-    .await
-    .unwrap();
+    let resp = post_discoveries(&items, None, &server.url(), &reqwest::Client::new(), "tok")
+        .await
+        .unwrap()
+        .response;
     assert!(resp.directives.is_none() && resp.policy.is_none());
 }
 
@@ -245,6 +241,7 @@ async fn run_once_scans_reports_and_converts_from_the_directive() {
         .with_header("content-type", "application/json")
         .with_body(
             serde_json::json!({
+                "accepted": [{"id": "d1", "kind": "skill", "slug": "e2e-plain"}],
                 "directives": [{"discovery_id": "d1", "source_path": src, "action": "manage", "reason": "ok"}],
                 "policy": {"auto_manage_skills": true, "auto_submit_mcp": true}
             })
@@ -272,7 +269,7 @@ async fn run_once_scans_reports_and_converts_from_the_directive() {
     let n = run_once(Arc::clone(&env.state), server.url())
         .await
         .unwrap();
-    assert_eq!(n, 1);
+    assert_eq!(n, 1, "one item the backend saw for the first time");
     disc.assert();
     am.assert();
     let body = fs::read_to_string(dir.join("SKILL.md")).unwrap();
@@ -289,4 +286,199 @@ async fn run_once_scans_reports_and_converts_from_the_directive() {
             .map(|p| p.auto_manage_skills),
         Some(true)
     );
+}
+
+// ── Upload only on change ────────────────────────────────────────────────────
+
+/// A paired env with one old (settled) skill and a token for `url`.
+fn paired_with_skill(env: &Env, url: &str, slug: &str) -> PathBuf {
+    let dir = env.skill(&env.agents(), slug);
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3 * 3600);
+    for p in [dir.join("SKILL.md"), dir.clone()] {
+        fs::File::open(&p).unwrap().set_modified(old).unwrap();
+    }
+    env.state.set_sync_state("device_id", "dev-1").unwrap();
+    scenery_core::auth::save_tokens(&env.state, url, "tok", "refresh").unwrap();
+    dir
+}
+
+/// A discovery endpoint answering "skip" for every skill: nothing left to do.
+fn skip_all(server: &mut mockito::ServerGuard, src: &str, hits: usize) -> mockito::Mock {
+    server
+        .mock("POST", "/portal/managed-paths/discoveries")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            serde_json::json!({
+                "accepted": [], "deduped": [{"id": "d1", "kind": "skill", "slug": "s"}],
+                "directives": [{"discovery_id": "d1", "source_path": src, "action": "skip", "reason": "dev_skill"}],
+                "policy": {"auto_manage_skills": true, "auto_submit_mcp": true}
+            })
+            .to_string(),
+        )
+        .expect(hits)
+        .create()
+}
+
+#[tokio::test]
+async fn an_unchanged_batch_is_uploaded_once_and_a_restart_does_not_resend_it() {
+    let env = Env::new();
+    let mut server = Server::new_async().await;
+    let dir = paired_with_skill(&env, &server.url(), "quiet");
+    let m = skip_all(&mut server, &dir.to_string_lossy(), 1);
+
+    for _ in 0..3 {
+        let n = run_once(Arc::clone(&env.state), server.url())
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "a re-sighting is not a new item");
+    }
+    // A daemon restart: a fresh state handle on the same state dir.
+    let again = Arc::new(AppState::bootstrap_in(env.state.root_dir.clone()).unwrap());
+    run_once(again, server.url()).await.unwrap();
+    m.assert();
+    assert!(load_upload_memo(&env.state).is_some());
+}
+
+#[tokio::test]
+async fn an_edit_or_a_new_skill_is_uploaded_on_the_next_tick() {
+    let env = Env::new();
+    let mut server = Server::new_async().await;
+    let dir = paired_with_skill(&env, &server.url(), "edited");
+    let m = skip_all(&mut server, &dir.to_string_lossy(), 3);
+
+    run_once(Arc::clone(&env.state), server.url())
+        .await
+        .unwrap();
+    fs::write(dir.join("SKILL.md"), "---\nname: edited\n---\nnew body\n").unwrap();
+    run_once(Arc::clone(&env.state), server.url())
+        .await
+        .unwrap();
+    env.skill(&env.agents(), "brand-new");
+    run_once(Arc::clone(&env.state), server.url())
+        .await
+        .unwrap();
+    m.assert();
+}
+
+#[tokio::test]
+async fn a_failed_upload_is_retried_every_tick_until_it_succeeds() {
+    let env = Env::new();
+    let mut server = Server::new_async().await;
+    let dir = paired_with_skill(&env, &server.url(), "retry");
+    let down = server
+        .mock("POST", "/portal/managed-paths/discoveries")
+        .with_status(503)
+        .expect(2)
+        .create();
+    run_once(Arc::clone(&env.state), server.url())
+        .await
+        .unwrap();
+    run_once(Arc::clone(&env.state), server.url())
+        .await
+        .unwrap();
+    down.assert();
+    assert!(
+        load_upload_memo(&env.state).is_none(),
+        "a failure is never memoised"
+    );
+    down.remove();
+
+    let up = skip_all(&mut server, &dir.to_string_lossy(), 1);
+    run_once(Arc::clone(&env.state), server.url())
+        .await
+        .unwrap();
+    run_once(Arc::clone(&env.state), server.url())
+        .await
+        .unwrap();
+    up.assert();
+}
+
+#[tokio::test]
+async fn an_unchanged_batch_is_re_sent_once_the_refresh_interval_passed() {
+    let env = Env::new();
+    let mut server = Server::new_async().await;
+    let dir = paired_with_skill(&env, &server.url(), "stale");
+    let m = skip_all(&mut server, &dir.to_string_lossy(), 2);
+    run_once(Arc::clone(&env.state), server.url())
+        .await
+        .unwrap();
+    let mut memo = load_upload_memo(&env.state).unwrap();
+    memo.uploaded_at -= refresh_secs();
+    env.state
+        .set_sync_state(UPLOAD_MEMO_KEY, &serde_json::to_string(&memo).unwrap())
+        .unwrap();
+    run_once(Arc::clone(&env.state), server.url())
+        .await
+        .unwrap();
+    run_once(Arc::clone(&env.state), server.url())
+        .await
+        .unwrap();
+    m.assert();
+}
+
+#[tokio::test]
+async fn work_left_for_auto_manage_keeps_the_batch_uploading() {
+    let env = Env::new();
+    let mut server = Server::new_async().await;
+    let dir = paired_with_skill(&env, &server.url(), "pending");
+    // "manage", but the auto-manage upload fails: the attempt backs off, the
+    // tick is not settled, and the memo is not written.
+    let disc = server
+        .mock("POST", "/portal/managed-paths/discoveries")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            serde_json::json!({
+                "directives": [{"discovery_id": "d1", "source_path": dir.to_string_lossy(), "action": "manage"}],
+                "policy": {"auto_manage_skills": true, "auto_submit_mcp": true}
+            })
+            .to_string(),
+        )
+        .expect(2)
+        .create();
+    let am = server
+        .mock("POST", "/runner/skills/auto-manage")
+        .with_status(500)
+        .expect_at_least(1)
+        .create();
+    run_once(Arc::clone(&env.state), server.url())
+        .await
+        .unwrap();
+    assert!(load_upload_memo(&env.state).is_none());
+    // Next tick re-sends (fresh directives); the failed attempt is backing
+    // off, so it is skipped and that tick settles with a retry time.
+    run_once(Arc::clone(&env.state), server.url())
+        .await
+        .unwrap();
+    disc.assert();
+    am.assert();
+    let memo = load_upload_memo(&env.state).unwrap();
+    let retry = memo.retry_at.expect("the backoff end is remembered");
+    assert!(!upload_due(&env.state, &memo.fingerprint, retry - 1));
+    assert!(upload_due(&env.state, &memo.fingerprint, retry));
+}
+
+#[test]
+fn the_fingerprint_ignores_listing_order_but_not_content_or_identity() {
+    let item = |slug: &str, hash: &str| DiscoveryItem {
+        kind: "skill".into(),
+        slug: slug.into(),
+        source_path: format!("/h/.agents/skills/{slug}"),
+        canonical_hash: hash.into(),
+        detail: None,
+        local: None,
+    };
+    let a = vec![item("a", "1"), item("b", "2")];
+    let b = vec![item("b", "2"), item("a", "1")];
+    let fp = |v: &[DiscoveryItem], dev: &str, user: &str| {
+        batch_fingerprint(v, Some(dev), "https://r", Some(user))
+    };
+    assert_eq!(fp(&a, "d", "u"), fp(&b, "d", "u"));
+    assert_ne!(
+        fp(&a, "d", "u"),
+        fp(&[item("a", "1"), item("b", "3")], "d", "u")
+    );
+    assert_ne!(fp(&a, "d", "u"), fp(&a, "d2", "u"));
+    assert_ne!(fp(&a, "d", "u"), fp(&a, "d", "u2"));
 }
