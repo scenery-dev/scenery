@@ -185,3 +185,32 @@ fn enforce_ignores_baseline() {
     assert!(!mem.baseline_done());
     let _ = fs::remove_dir_all(&home);
 }
+
+#[test]
+fn the_entry_check_memo_never_hides_a_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("mcp.json");
+    let with = r#"{"mcpServers":{"scenery":{"command":"scenery","args":["mcp","serve"]}}}"#;
+    let without = r#"{"mcpServers":{"other":{"command":"x"}}}"#;
+    let fmt = crate::setup::ConfigFormat::Json;
+    let check = || entry_present_memo(&cfg, "mcpServers", fmt);
+
+    fs::write(&cfg, with).unwrap();
+    assert!(check());
+    // A fresh file is not memoised: an immediate same-size rewrite is seen.
+    fs::write(&cfg, without.replace("other", "othe2")).unwrap();
+    assert!(!check());
+    fs::write(&cfg, with).unwrap();
+    assert!(check());
+
+    // Settled: memoised, and still correct after a removal and a re-add.
+    std::thread::sleep(std::time::Duration::from_millis(2_100));
+    assert!(check());
+    assert!(check());
+    fs::write(&cfg, without).unwrap();
+    assert!(!check());
+    fs::remove_file(&cfg).unwrap();
+    assert!(!check());
+    fs::write(&cfg, with).unwrap();
+    assert!(check());
+}
