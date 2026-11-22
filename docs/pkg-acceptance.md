@@ -19,7 +19,25 @@ Built 2026-11-20 from the macos-pkg worktree. Verified on the dev Mac without ro
 - **Poll wiring of a new Cursor config (VERIFIED at runtime, 2026-11-20, brew-mode `FirstTimeOnly` policy):** release binary, `HOME=/tmp/scn.JOlc`, `SCENERY_REGISTRY_URL=https://127.0.0.1:9`. The first tick (baseline, 12:22:55) wired nothing (no clients). At 12:23:02 I created `$HOME/.cursor/mcp.json` = `{}`; read back at 12:24:17 it held a `mcpServers.scenery` entry (`command` = the release binary, `args` = `[mcp, serve]`). The daemon log shows `wired Scenery MCP entry into AI clients clients=["Cursor"]` at 17:23:55Z, about 53 s after the file was created, inside the 60 s poll. The earlier note that it stayed `{}` was wrong: a client created after the baseline IS wired on the next tick. Idle RSS at ~100 s: 20,064 kB. Still to confirm on a real pkg install (`Enforce` policy).
 - The measured daemon was stopped by PID. The brew daemon was untouched. `target/` is gitignored.
 
+## Admin Mac run (2026-11-21, real install, signed in to prod)
+
+Installed the prod pkg on the admin Mac with brew's `sh.brew.scenery` service present.
+
+- **Bug found, fixed in `12959b8`:** modern Homebrew labels its service `sh.brew.scenery`, but stand-down only knew `homebrew.mxcl.scenery`. So brew was never stood down. The pkg and brew daemons (both 2.7.0) took each other over every ~10 s (`daemon takeover ... reason=ExeReplacedOrDeleted`), and each restart raised a fresh keychain prompt. Fix: both labels everywhere. Takeover now counts a daemon as stale only when its own executable file is gone, so two daemons on the same version refuse each other instead of fighting.
+- **(f) Brew coexistence: PASS** with `scenery-0.0.1-dev-macos.pkg` (binary 2.7.1). The log shows `booted_out=["sh.brew.scenery"]`. A single pkg daemon ran, with no takeovers or restarts afterward.
+- **(e) Upgrade: PASS.** Installing over the 2.7.0 pkg swapped the running binary to 2.7.1 with no logout.
+- **(b) Client wiring: PARTIAL.** The Claude Code entry pointed at `/Library/Application Support/Scenery/bin/scenery`, but in the stdio form. A cold first `claude --version` took 2.3 s, past the 1.5 s probe limit, so it fell back to stdio. Fixed in `4065be1` (5 s limit). Still to re-verify that a fresh pkg install writes the HTTP+OAuth entry.
+- **(g) Uninstall: PASS.** `uninstall.sh` removed the pkg, receipt, system agent and `/usr/local/bin` links, leaving brew as the only daemon. Claude Code was back on HTTP+OAuth after `brew services start scenery && scenery mcp setup`.
+- **(h) Resource budget: memory PASS, CPU FAIL.** Pkg daemon (2.7.0), paired to prod, 10 min idle:
+  - RSS 14–27 MB, phys_footprint peak 24 MB.
+  - CPU time 0.77 s → 2.75 s, which is 1.98 s / 600 s = 0.33% (budget < 0.6 s).
+  - Almost all of that was two ~0.85 s bursts ~5 min apart (the 300 s discovery and drift scans), at ~0.08% in between.
+  - Not pkg-specific: brew 2.7.0's lifetime average is ~0.1%.
+  - Tracked on the board card "Runner: 5-min discovery/drift scans exceed idle CPU budget (release gate)". It blocks shipping the pkg.
+
 ## PENDING — user (needs sudo/VM)
+
+Items (e), (f) and (g) passed on the admin Mac (above). Repeat them on the VM. Still not run anywhere: the dev-flavor Customize screen, the managed-pref override, a second user, sign-in across a reboot, re-adding a deleted entry, and (h) after the CPU fix.
 
 Setup: fresh macOS VM (UTM/Tart) with two local users; `cd scenery-backend && ./devbox.sh start`. Copy both pkgs in.
 
@@ -34,7 +52,7 @@ Setup: fresh macOS VM (UTM/Tart) with two local users; `cd scenery-backend && ./
 4. **(b)** `~/.claude.json` has the Scenery HTTP entry with Claude Code installed. Install Claude Code afterward and the entry must appear within 60 s. Also create `~/.cursor/mcp.json` = `{}` and confirm it is wired within 60 s (verified in brew mode above; repeat under the pkg).
 5. **(c)** Authenticate in Claude Code (`/mcp`), reboot, and it must still be signed in.
 6. **(d)** Delete the Scenery entry from `~/.claude.json`; it must return within 60 s.
-7. **(e) Upgrade:** rebuild with version `0.0.1-dev`, then run `sudo installer -pkg scenery-0.0.1-dev-macos.pkg -target /`. Then `ps -o command= -p $(pgrep -f "scenery daemon run")` must show the new binary, and `scenery --version` must report `0.0.1-dev`. Confirm only one daemon is running.
+7. **(e) Upgrade:** rebuild with version `0.0.1-dev`, then run `sudo installer -pkg scenery-0.0.1-dev-macos.pkg -target /`. Then `ps -o command= -p $(pgrep -f "scenery daemon run")` must show the new binary, and `scenery --version` must report `0.0.1-dev` (wrong: it reports the Cargo version, e.g. `2.7.1`; the pkg version is only the label). Confirm only one daemon is running.
 8. **(f) Brew coexistence:** on a VM with `brew install scenery-dev/tap/scenery` run first, install the pkg. Only `dev.scenery.agent` should be running (`ps aux | grep "daemon run"`, `brew services list`), and client entries must point at `/Library/Application Support/Scenery/bin/scenery`.
 9. **(g) Uninstall:** `sudo "/Library/Application Support/Scenery/uninstall.sh"`. The agent, binary, `/usr/local/bin/{scenery,scn}` symlinks and install root are gone, client configs are restored, and the portal still shows the device as paired. Check for no leftover `._*` files.
 10. **(h) Resource budget on the real pkg daemon (hard gate):** after 10 idle minutes, with the pkg-managed daemon PID from `launchctl print`, `ps -o rss=,time= -p <pid>` at start and end must show RSS < 50 MB and a CPU-time delta < 0.6 s. Do this once signed in and paired (a live registry session), because the measurement above ran with an unreachable registry.
