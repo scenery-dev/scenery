@@ -871,7 +871,7 @@ fn classify_skill(state: &AppState, conn: &Connection, marker: &ManagedPathMarke
             super::local_edits::Authorship::Catalog => mk(DriftStatus::EditedCatalog, current),
         }
     };
-    let survey = match scenery_core::skill_tree::survey(&dir) {
+    let survey = match scenery_core::skill_tree_cache::survey_cached(&dir) {
         Ok(s) => s,
         Err(e) => {
             // Not clean: a tree that cannot be hashed (size cap) cannot be

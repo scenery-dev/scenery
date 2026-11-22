@@ -17,7 +17,7 @@
 //! The classifier is a pure function of the filesystem plus the canonical
 //! root, so it is tested with plain temp directories.
 
-use scenery_core::skill_tree::{self, TreeSurvey};
+use scenery_core::skill_tree::TreeSurvey;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -112,7 +112,7 @@ impl ClassifyContext {
 /// Classify the skill at `dir` (`slug` is its folder name).
 pub fn classify_skill(dir: &Path, slug: &str, ctx: &ClassifyContext) -> Classification {
     let now = ctx.now.unwrap_or_else(SystemTime::now);
-    let survey = match skill_tree::survey(dir) {
+    let survey = match scenery_core::skill_tree_cache::survey_cached(dir) {
         Ok(s) => s,
         Err(e) => {
             // A walk that cannot finish (a hard cap, an unreadable file) is
@@ -139,7 +139,7 @@ fn decide(dir: &Path, slug: &str, ctx: &ClassifyContext, survey: &TreeSurvey) ->
     if !survey.secret_files.is_empty() {
         return Treatment::Hold("secrets_detected".into());
     }
-    match skill_tree::scan_secrets(dir) {
+    match scenery_core::skill_tree_cache::scan_secrets_cached(dir) {
         Ok(hits) if !hits.is_empty() => return Treatment::Hold("secrets_detected".into()),
         Ok(_) => {}
         // Unreadable means unverifiable: do not upload what cannot be checked.

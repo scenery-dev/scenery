@@ -257,6 +257,12 @@ async fn run_loop(
     Ok(())
 }
 
+/// Is this request the takeover/install version probe
+/// ([`crate::peer_handshake::PROBE_REQUEST_ID`]) rather than a real client?
+pub(crate) fn is_version_probe(id: &Option<serde_json::Value>) -> bool {
+    id.as_ref().and_then(|v| v.as_str()) == Some(crate::peer_handshake::PROBE_REQUEST_ID)
+}
+
 /// Dispatch one JSON-RPC request and return a response.
 pub(crate) async fn dispatch(ctx: &DaemonContext, request: JsonRpcRequest) -> JsonRpcResponse {
     let id = request.id.clone();
@@ -264,8 +270,12 @@ pub(crate) async fn dispatch(ctx: &DaemonContext, request: JsonRpcRequest) -> Js
     match request.method.as_str() {
         "initialize" => match ctx.backend.initialize(request.params).await {
             Ok(result) => {
-                info!("discoveries: shim initialize → kicking scan");
-                ctx.discoveries_kick.notify_one();
+                if is_version_probe(&request.id) {
+                    debug!("initialize from a daemon version probe — no discoveries kick");
+                } else {
+                    info!("discoveries: shim initialize → kicking scan");
+                    ctx.discoveries_kick.notify_one();
+                }
                 let v = serde_json::to_value(result).unwrap_or_default();
                 JsonRpcResponse::success(id, v)
             }

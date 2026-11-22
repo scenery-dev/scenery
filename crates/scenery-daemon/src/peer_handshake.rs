@@ -31,6 +31,12 @@ use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
+/// JSON-RPC id of the version probe [`query_version`] sends. The daemon
+/// answers it like any `initialize` but does not treat it as a client
+/// connecting (no discoveries kick): a second daemon started by a competing
+/// service manager probes every few seconds, and each kick was a full scan.
+pub const PROBE_REQUEST_ID: &str = "vh-takeover-probe";
+
 /// Kernel-reported identity of the process on the other end of a connected
 /// `AF_UNIX` socket. Either field may be `None` if the platform call
 /// failed — never treat `None` as "verified absent."
@@ -112,7 +118,7 @@ pub fn query_version(stream: &mut UnixStream, timeout: Duration) -> Option<semve
 
     let request = serde_json::json!({
         "jsonrpc": "2.0",
-        "id": "vh-takeover-probe",
+        "id": PROBE_REQUEST_ID,
         "method": "initialize",
         "params": {},
     });

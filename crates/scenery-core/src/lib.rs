@@ -44,6 +44,7 @@ pub mod safe_unpack;
 pub mod secret_file;
 pub mod signed;
 pub mod skill_tree;
+pub mod skill_tree_cache;
 pub mod state;
 pub mod timefmt;
 pub mod trust;

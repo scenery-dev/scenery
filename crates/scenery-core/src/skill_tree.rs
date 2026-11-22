@@ -265,10 +265,18 @@ fn walk(
 /// text; a multi-megabyte blob is data and is covered by the size caps).
 const SECRET_SCAN_MAX_FILE: u64 = 1024 * 1024;
 
+/// Shortest token any shape in [`looks_like_secret_token`] can match.
+const MIN_SECRET_TOKEN_LEN: usize = 14;
+
 /// Does `token` (a maximal run of `[A-Za-z0-9_.\-]`) look like a credential?
 /// Shape-based: known issuer prefixes with a plausible tail, never a
 /// denylist of values. Shared with the MCP argument redactor.
 pub fn looks_like_secret_token(token: &str) -> bool {
+    // The shortest shape below (a Slack `xox?-` token) is 14 bytes; the
+    // secret scan calls this for every word of every file, so bail early.
+    if token.len() < MIN_SECRET_TOKEN_LEN {
+        return false;
+    }
     let tail_ok = |t: &str, min: usize| {
         t.len() >= min
             && t.bytes()

@@ -260,3 +260,30 @@ async fn dispatch_initialize_fires_kick() {
         .await
         .expect("discoveries_kick was not notified within 100 ms after initialize");
 }
+
+/// A second daemon's version probe (the takeover / competing-manager
+/// handshake) is answered but must not kick a discoveries scan: a launchd
+/// KeepAlive loop probes every ~10 s, and each kick was a full tree scan.
+#[tokio::test]
+async fn version_probe_initialize_does_not_kick() {
+    let ctx = make_ctx();
+    let kick = Arc::clone(&ctx.discoveries_kick);
+    let notified = kick.notified();
+    tokio::pin!(notified);
+
+    let mut req = make_request("initialize", serde_json::json!({}));
+    req.id = Some(serde_json::json!(crate::peer_handshake::PROBE_REQUEST_ID));
+    let resp = dispatch(&ctx, req).await;
+    assert!(resp.error.is_none(), "probe initialize should succeed");
+    assert!(
+        resp.result.unwrap()["serverInfo"]["version"].is_string(),
+        "the probe still needs the version"
+    );
+
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut notified)
+            .await
+            .is_err(),
+        "a version probe must not kick a discoveries scan"
+    );
+}
