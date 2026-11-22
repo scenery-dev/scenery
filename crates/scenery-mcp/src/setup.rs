@@ -303,7 +303,10 @@ fn detect_claude_code_version() -> Option<(u32, u32, u32)> {
         .spawn()
         .ok()?;
 
-    let timeout = std::time::Duration::from_millis(1500);
+    // A cold first run of the native `claude` binary took 2.3 s on a Mac right
+    // after a pkg install (warm runs: ~10 ms). 1.5 s timed out there and
+    // silently fell back to the stdio entry. Callers run off the async runtime.
+    let timeout = std::time::Duration::from_secs(5);
     let start = std::time::Instant::now();
     loop {
         match child.try_wait() {
