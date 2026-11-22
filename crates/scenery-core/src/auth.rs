@@ -567,7 +567,7 @@ struct KeychainBlob<'a> {
     refresh_token: &'a str,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct OwnedKeychainBlob {
     access_token: String,
     refresh_token: String,
@@ -681,6 +681,81 @@ fn token_secret_name(registry_url: &str) -> String {
     format!("token-{}.json", &digest[..32])
 }
 
+// ── In-process secrets memo ──────────────────────────────────────────────────
+//
+// The daemon reads its token every minute (refresh check, gateway token
+// handle) and on every sync tick; on macOS each read was a Keychain query.
+// The secrets are remembered per (state db, registry) together with the
+// `auth_tokens.saved_at` the row had when they were read: every save
+// (`save_tokens`, from this process or another one, e.g. `scenery auth pair`)
+// rewrites `saved_at`, and a logout deletes the row. A save from this process
+// also drops the memo directly, and an entry is trusted for at most
+// SECRETS_MEMO_TTL, so a missed change heals by itself.
+
+const SECRETS_MEMO_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+struct MemoEntry {
+    saved_at: String,
+    read_at: std::time::Instant,
+    blob: OwnedKeychainBlob,
+}
+
+type SecretsMemo = std::sync::Mutex<std::collections::HashMap<(String, String), MemoEntry>>;
+
+fn secrets_memo() -> &'static SecretsMemo {
+    static MEMO: std::sync::OnceLock<SecretsMemo> = std::sync::OnceLock::new();
+    MEMO.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn memo_key(state: &AppState, registry_url: &str) -> (String, String) {
+    (state.db_path.to_string(), registry_url.to_string())
+}
+
+fn forget_secrets(state: &AppState, registry_url: &str) {
+    if let Ok(mut m) = secrets_memo().lock() {
+        m.remove(&memo_key(state, registry_url));
+    }
+}
+
+/// [`secrets_get`], answered from the memo while the row's `saved_at` is the
+/// one the secrets were read under (and the entry is fresh).
+fn secrets_get_memo(
+    state: &AppState,
+    registry_url: &str,
+    saved_at: Option<&str>,
+) -> Result<Option<OwnedKeychainBlob>> {
+    let Some(saved_at) = saved_at else {
+        return secrets_get(state, registry_url);
+    };
+    let key = memo_key(state, registry_url);
+    if let Ok(m) = secrets_memo().lock() {
+        if let Some(e) = m.get(&key) {
+            if e.saved_at == saved_at && e.read_at.elapsed() < SECRETS_MEMO_TTL {
+                return Ok(Some(e.blob.clone()));
+            }
+        }
+    }
+    let fresh = secrets_get(state, registry_url)?;
+    if let Ok(mut m) = secrets_memo().lock() {
+        match &fresh {
+            Some(blob) => {
+                m.insert(
+                    key,
+                    MemoEntry {
+                        saved_at: saved_at.to_string(),
+                        read_at: std::time::Instant::now(),
+                        blob: blob.clone(),
+                    },
+                );
+            }
+            None => {
+                m.remove(&key);
+            }
+        }
+    }
+    Ok(fresh)
+}
+
 /// A registry's secrets: the keychain's copy when it has one, else the
 /// secrets file's.
 fn secrets_get(state: &AppState, registry_url: &str) -> Result<Option<OwnedKeychainBlob>> {
@@ -704,6 +779,7 @@ fn secrets_set(
     access_token: &str,
     refresh_token: &str,
 ) -> Result<()> {
+    forget_secrets(state, registry_url);
     let root = state.root_dir.as_std_path();
     let name = token_secret_name(registry_url);
     if keychain_set(registry_url, access_token, refresh_token)? {
@@ -780,7 +856,14 @@ pub fn record_refresh_failure(
 /// `(legacy access_token, legacy refresh_token, refresh_failures,
 ///   next_refresh_attempt_at, last_refresh_status)`. The token columns are
 /// empty except on a database `move_legacy_secrets` hasn't processed yet.
-type SqliteAuthRow = (String, String, u32, Option<i64>, Option<String>);
+type SqliteAuthRow = (
+    String,
+    String,
+    u32,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+);
 
 /// Load tokens for a single registry: secrets from the keychain or secrets
 /// file, backoff state from SQLite.
@@ -791,7 +874,8 @@ pub fn load_tokens(state: &AppState, registry_url: &str) -> Result<Option<Stored
             "SELECT access_token, refresh_token,
                     COALESCE(refresh_failures, 0),
                     next_refresh_attempt_at,
-                    last_refresh_status
+                    last_refresh_status,
+                    saved_at
              FROM auth_tokens WHERE registry_url = ?1",
             [registry_url],
             |row| {
@@ -801,22 +885,27 @@ pub fn load_tokens(state: &AppState, registry_url: &str) -> Result<Option<Stored
                     row.get::<_, i64>(2)? as u32,
                     row.get(3)?,
                     row.get(4)?,
+                    row.get(5)?,
                 ))
             },
         )
         .optional()?;
     drop(conn);
 
-    let (access_token, refresh_token) = match secrets_get(state, registry_url)? {
-        Some(blob) => (blob.access_token, blob.refresh_token),
-        // Not moved out of state.db yet (the move retries on every start).
-        None => match &sqlite_row {
-            Some(row) if !row.0.is_empty() && !row.1.is_empty() => (row.0.clone(), row.1.clone()),
-            _ => return Ok(None),
-        },
-    };
+    let saved_at = sqlite_row.as_ref().and_then(|r| r.5.clone());
+    let (access_token, refresh_token) =
+        match secrets_get_memo(state, registry_url, saved_at.as_deref())? {
+            Some(blob) => (blob.access_token, blob.refresh_token),
+            // Not moved out of state.db yet (the move retries on every start).
+            None => match &sqlite_row {
+                Some(row) if !row.0.is_empty() && !row.1.is_empty() => {
+                    (row.0.clone(), row.1.clone())
+                }
+                _ => return Ok(None),
+            },
+        };
 
-    let meta = sqlite_row.unwrap_or((String::new(), String::new(), 0, None, None));
+    let meta = sqlite_row.unwrap_or((String::new(), String::new(), 0, None, None, None));
     Ok(Some(StoredTokens {
         access_token,
         refresh_token,
@@ -891,6 +980,7 @@ pub fn load_all_tokens(state: &AppState) -> Result<Vec<StoredTokens>> {
 /// Clear tokens for a single registry. Removes the keychain entry, the
 /// secrets file and the SQLite row.
 pub fn clear_tokens(state: &AppState, registry_url: &str) -> Result<()> {
+    forget_secrets(state, registry_url);
     keychain_delete(registry_url);
     secret_file::remove(
         state.root_dir.as_std_path(),
@@ -1551,3 +1641,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 }
+
+#[cfg(test)]
+#[path = "auth_memo_tests.rs"]
+mod memo_tests;
