@@ -566,16 +566,20 @@ fn gap06_unmanaged_server_buffered_as_audit_event() {
     let audit_buf = SqliteAuditBuffer::new(Arc::new(RegistryClient::new(&registry_url)), &state);
     let cache = empty_cache();
 
-    run_sync_tick(
-        &registry,
-        &audit_buf,
-        &state.db_path,
-        &state.root_dir,
-        &cache,
-        None,
-        &Arc::new(std::sync::atomic::AtomicBool::new(false)),
-    )
-    .unwrap();
+    // Two ticks on an unchanged machine: the server is reported once, not
+    // once per tick (the audit upload fails here, so nothing is drained).
+    for _ in 0..2 {
+        run_sync_tick(
+            &registry,
+            &audit_buf,
+            &state.db_path,
+            &state.root_dir,
+            &cache,
+            None,
+            &Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .unwrap();
+    }
 
     // Restore HOME before any assertions that might panic.
     if let Some(h) = original_home {
@@ -594,9 +598,9 @@ fn gap06_unmanaged_server_buffered_as_audit_event() {
         )
         .unwrap();
 
-    assert!(
-        count >= 1,
-        "expected at least one unmanaged_server_detected event, got {count}"
+    assert_eq!(
+        count, 1,
+        "expected exactly one unmanaged_server_detected event over two ticks"
     );
 
     // Verify the payload contains the expected server name.

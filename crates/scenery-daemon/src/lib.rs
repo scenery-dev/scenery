@@ -2872,43 +2872,47 @@ fn flush_ratings_and_scan(
 
     // ── 7. Unmanaged MCP server scan ──────────────────────────────────────────
     // Scan AI client config files for non-scenery MCP servers and buffer an
-    // audit event for each one. IT admins can use this stream to detect shadow
-    // MCP installations that bypass governance.
+    // audit event for each one that is NEW since the last report (see
+    // `unmanaged_audit`): IT admins use this stream to detect shadow MCP
+    // installations that bypass governance, and an unchanged machine must not
+    // re-send the same events every tick.
     let unmanaged = detect_unmanaged_servers();
-    for server in &unmanaged {
-        let event = AuditEvent {
-            event_type: "unmanaged_server_detected".to_string(),
-            payload: serde_json::json!({
-                "server_name": server.server_name,
-                "config_path": server.config_path,
-                "client_name": server.client_name,
-            }),
-        };
-        // Write directly to SQLite (we're already in spawn_blocking).
-        let conn = match rusqlite::Connection::open(&state.db_path) {
-            Ok(c) => c,
-            Err(e) => {
-                warn!(error = %e, server = %server.server_name, "sync: cannot open DB for unmanaged audit event");
-                continue;
+    let fresh = unmanaged_audit::newly_seen(state, &unmanaged);
+    if !fresh.is_empty() {
+        match rusqlite::Connection::open(&state.db_path) {
+            Ok(conn) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                for server in &fresh {
+                    let event = AuditEvent {
+                        event_type: "unmanaged_server_detected".to_string(),
+                        payload: serde_json::json!({
+                            "server_name": server.server_name,
+                            "config_path": server.config_path,
+                            "client_name": server.client_name,
+                        }),
+                    };
+                    let payload_json = serde_json::to_string(&event.payload).unwrap_or_default();
+                    // Write directly to SQLite (we're already in spawn_blocking).
+                    if let Err(e) = conn.execute(
+                        "INSERT INTO audit_events (event_type, payload, created_at, uploaded) VALUES (?1, ?2, ?3, 0)",
+                        rusqlite::params![event.event_type, payload_json, now],
+                    ) {
+                        warn!(error = %e, server = %server.server_name, "sync: failed to buffer unmanaged audit event");
+                    }
+                }
+                info!(
+                    count = fresh.len(),
+                    total = unmanaged.len(),
+                    "sync: new unmanaged MCP servers detected — audit events buffered"
+                );
             }
-        };
-        let payload_json = serde_json::to_string(&event.payload).unwrap_or_default();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        if let Err(e) = conn.execute(
-            "INSERT INTO audit_events (event_type, payload, created_at, uploaded) VALUES (?1, ?2, ?3, 0)",
-            rusqlite::params![event.event_type, payload_json, now],
-        ) {
-            warn!(error = %e, server = %server.server_name, "sync: failed to buffer unmanaged audit event");
+            Err(e) => {
+                warn!(error = %e, "sync: cannot open DB for unmanaged audit events");
+            }
         }
-    }
-    if !unmanaged.is_empty() {
-        info!(
-            count = unmanaged.len(),
-            "sync: unmanaged MCP servers detected — audit events buffered"
-        );
     }
 
     Ok(())
@@ -3336,6 +3340,8 @@ mod sync_tick_tests;
 
 #[cfg(test)]
 mod idle_cost_bench;
+
+mod unmanaged_audit;
 
 #[cfg(test)]
 #[path = "sync_controller_hook_tests.rs"]
