@@ -204,11 +204,17 @@ impl DriftScanner {
         };
 
         let mut to_report: Vec<DriftReportItem> = Vec::new();
+        // Read once: deleting the (almost always absent) flag of every clean
+        // skill was one SQLite write transaction per skill per tick.
+        let blocked: std::collections::HashSet<String> =
+            super::local_edits::update_blocked_slugs(&self.state)
+                .into_iter()
+                .collect();
 
         for outcome in outcomes {
             match outcome.status {
                 DriftStatus::Clean => {
-                    if outcome.kind == "skill" {
+                    if outcome.kind == "skill" && blocked.contains(&outcome.slug) {
                         super::local_edits::clear_update_blocked(&self.state, &outcome.slug);
                     }
                     // Content is intact, but Claude Code's link may have been
@@ -916,10 +922,10 @@ pub fn current_hash_for(marker: &ManagedPathMarker) -> Result<Option<String>> {
             if !skill_md.exists() {
                 return Ok(None);
             }
-            let bytes = fs::read(&skill_md).with_context(|| {
-                format!("drift: failed to read skill at {}", skill_md.display())
-            })?;
-            Ok(Some(hex_sha256(&bytes)))
+            let hash = scenery_core::skill_tree_cache::sha256_file_cached(&skill_md).with_context(
+                || format!("drift: failed to read skill at {}", skill_md.display()),
+            )?;
+            Ok(Some(hash))
         }
         "plugin" => {
             let manifest = PathBuf::from(&marker.path)

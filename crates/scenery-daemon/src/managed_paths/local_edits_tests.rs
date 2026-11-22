@@ -947,3 +947,20 @@ async fn the_strict_not_uploaded_warning_fires_once_per_skill_per_grace_window()
         .unwrap();
     assert!(should_warn_not_uploaded(state, "/p/b"));
 }
+
+#[tokio::test]
+async fn a_clean_scan_clears_a_stale_update_blocked_flag_and_only_that_one() {
+    let f = Fx::new().await;
+    f.push("cat", false);
+    f.push("other", false);
+    f.state.set_sync_state("update_blocked:cat", "1").unwrap();
+    f.state
+        .set_sync_state("update_blocked:not-installed", "1")
+        .unwrap();
+    f.cycle().await;
+    assert_eq!(
+        crate::managed_paths::local_edits::update_blocked_slugs(&f.state),
+        vec!["not-installed".to_string()],
+        "the clean skill's flag is cleared; a flag for a skill not scanned stays"
+    );
+}

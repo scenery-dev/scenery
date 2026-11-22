@@ -656,7 +656,7 @@ pub fn collect_discoveries(roots: &[PathBuf], state: &AppState) -> Vec<Discovery
 /// index: every directory then reads as untracked (fail-open towards
 /// reporting, never towards hiding), as a failed per-item lookup did.
 fn load_marker_index(conn: &Connection) -> MarkerIndex {
-    MarkerIndex::load(conn, "skill").unwrap_or_else(|e| {
+    MarkerIndex::for_scan(conn, "skill").unwrap_or_else(|e| {
         warn!(error = %e, "discoveries: marker lookup failed — treating skills as untracked");
         MarkerIndex::empty()
     })
@@ -776,15 +776,15 @@ fn scan_root(root: &Path, real_dirs_only: bool) -> Result<Vec<DiscoveryItem>> {
             continue;
         }
 
-        let skill_md_bytes = match fs::read(&skill_md) {
-            Ok(b) => b,
+        // Memoised against the file's stamp: an unchanged SKILL.md is not
+        // re-read and re-hashed every tick.
+        let canonical_hash = match scenery_core::skill_tree_cache::sha256_file_cached(&skill_md) {
+            Ok(h) => h,
             Err(e) => {
                 warn!(slug = %slug, error = %e, "discoveries: cannot read SKILL.md — skipping");
                 continue;
             }
         };
-
-        let canonical_hash = hex_sha256(&skill_md_bytes);
         // Deliberately NOT `~`-masked, unlike `mcp_discovery`'s
         // `McpDiscoveryItem::source_path`. Investigated per the brief's note
         // to mask every uploaded source_path uniformly; confirmed (review
@@ -914,12 +914,9 @@ async fn access_token_for(state: &AppState, registry_url: &str) -> String {
     .unwrap_or_default()
 }
 
-// ── SHA-256 helper ────────────────────────────────────────────────────────────
-
+#[cfg(test)]
 fn hex_sha256(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hex::encode(hasher.finalize())
+    hex::encode(Sha256::digest(bytes))
 }
 
 /// Parse the scan interval from `SCENERY_DISCOVERIES_INTERVAL_SECS`.

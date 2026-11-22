@@ -96,6 +96,7 @@ impl Env {
                 now: future_clock
                     .then(|| std::time::SystemTime::now() + Duration::from_secs(86_400)),
                 canonical_index: None,
+                scan_facts: None,
             },
         }
     }

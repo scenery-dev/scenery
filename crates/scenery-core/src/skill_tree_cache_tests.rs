@@ -159,3 +159,22 @@ fn one_shared_stamp_serves_survey_and_secret_scan_and_sees_edits() {
         survey_cached(tmp.path()).unwrap().tree_hash
     );
 }
+
+#[test]
+fn the_file_hash_memo_never_hides_an_edit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("SKILL.md");
+    let digest = |b: &[u8]| hex::encode(Sha256::digest(b));
+    fs::write(&f, "one").unwrap();
+    assert_eq!(sha256_file_cached(&f).unwrap(), digest(b"one"));
+    // Fresh (inside the racy window): not memoised, a same-size edit is seen.
+    fs::write(&f, "two").unwrap();
+    assert_eq!(sha256_file_cached(&f).unwrap(), digest(b"two"));
+    std::thread::sleep(RACY_WINDOW + Duration::from_millis(100));
+    assert_eq!(sha256_file_cached(&f).unwrap(), digest(b"two"));
+    assert_eq!(sha256_file_cached(&f).unwrap(), digest(b"two"));
+    fs::write(&f, "six").unwrap();
+    assert_eq!(sha256_file_cached(&f).unwrap(), digest(b"six"));
+    fs::remove_file(&f).unwrap();
+    assert!(sha256_file_cached(&f).is_err());
+}

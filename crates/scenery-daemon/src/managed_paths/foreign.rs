@@ -103,6 +103,77 @@ pub struct ClassifyContext {
     /// [`ClassifyContext::for_scan`]). `None`: each classification lists the
     /// root itself.
     pub canonical_index: Option<Arc<HashMap<String, Vec<PathBuf>>>>,
+    /// Home- and parent-level facts shared by every skill of one scan (see
+    /// [`ScanFacts`]). `None`: each classification looks them up itself.
+    pub scan_facts: Option<Arc<ScanFacts>>,
+}
+
+/// What every skill of one scan would otherwise look up again: which bare
+/// dotfiles repositories exist, the `npx skills` lock, the chezmoi source,
+/// and per parent folder its ancestor checks. Same answers as the per-skill
+/// lookups, taken once per scan (the filesystem is assumed not to change
+/// within one scan, as with the canonical-root index).
+#[derive(Debug, Default)]
+pub struct ScanFacts {
+    bare_repos: Vec<PathBuf>,
+    npx_lock: Option<std::collections::HashSet<String>>,
+    chezmoi_present: bool,
+    parents: Mutex<HashMap<PathBuf, ParentFacts>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ParentFacts {
+    /// `.git` in the parent or any of its ancestors.
+    git_above: bool,
+    /// `.git` in the canonical parent's ancestry (when it differs).
+    git_above_resolved: bool,
+    /// The canonical parent differs from the parent.
+    parent_resolves_elsewhere: bool,
+    /// A symlinked ancestor below `home` (excluding the skill dir itself).
+    symlinked_below_home: bool,
+}
+
+impl ScanFacts {
+    fn gather(home: Option<&Path>) -> Self {
+        let Some(home) = home else {
+            return Self::default();
+        };
+        Self {
+            bare_repos: bare_repo_candidates(home)
+                .into_iter()
+                .filter(|r| r.join("HEAD").is_file() && r.join("objects").is_dir())
+                .collect(),
+            npx_lock: npx_lock_names(home),
+            chezmoi_present: chezmoi_source(home).is_dir(),
+            parents: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn parent(&self, dir: &Path, home: Option<&Path>) -> Option<ParentFacts> {
+        let parent = dir.parent()?;
+        if let Ok(m) = self.parents.lock() {
+            if let Some(f) = m.get(parent) {
+                return Some(*f);
+            }
+        }
+        let has_git = |start: &Path| {
+            start
+                .ancestors()
+                .any(|a| fs::symlink_metadata(a.join(".git")).is_ok())
+        };
+        let resolved = fs::canonicalize(parent).ok();
+        let elsewhere = resolved.as_deref().is_some_and(|r| r != parent);
+        let f = ParentFacts {
+            git_above: has_git(parent),
+            git_above_resolved: elsewhere && resolved.as_deref().is_some_and(has_git),
+            parent_resolves_elsewhere: elsewhere,
+            symlinked_below_home: home.is_some_and(|h| symlinked_ancestor_below(dir, h)),
+        };
+        if let Ok(mut m) = self.parents.lock() {
+            m.insert(parent.to_path_buf(), f);
+        }
+        Some(f)
+    }
 }
 
 impl ClassifyContext {
@@ -112,6 +183,7 @@ impl ClassifyContext {
             home: dirs::home_dir(),
             now: None,
             canonical_index: None,
+            scan_facts: None,
         }
     }
 
@@ -123,6 +195,7 @@ impl ClassifyContext {
             .canonical_root
             .as_deref()
             .map(|root| Arc::new(index_root(root)));
+        self.scan_facts = Some(Arc::new(ScanFacts::gather(self.home.as_deref())));
         self
     }
 }
@@ -198,14 +271,35 @@ fn decide(
     {
         return Treatment::Track("dev_symlink".into());
     }
-    if in_git_work_tree(dir) {
+    let facts = ctx.scan_facts.as_deref();
+    let parent = facts.and_then(|f| f.parent(dir, ctx.home.as_deref()));
+    let in_git = match parent {
+        // `dir` is not a symlink here (checked above), so it resolves to the
+        // resolved parent joined with its own name: `in_git_work_tree`'s
+        // answer, from the parent-level facts.
+        Some(p) => {
+            fs::symlink_metadata(dir.join(".git")).is_ok()
+                || p.git_above
+                || (p.parent_resolves_elsewhere && p.git_above_resolved)
+        }
+        None => in_git_work_tree(dir),
+    };
+    if in_git {
         return Treatment::Track("git_tracked".into());
     }
     if let Some(home) = &ctx.home {
-        if symlinked_ancestor_below(dir, home) {
+        let symlinked = match parent {
+            Some(p) => p.symlinked_below_home,
+            None => symlinked_ancestor_below(dir, home),
+        };
+        if symlinked {
             return Treatment::Track("dotfiles_managed:symlinked_ancestor".into());
         }
-        if bare_dotfiles_repo_tracks(dir, home) {
+        let bare = match facts {
+            Some(f) => bare_repos_track(&f.bare_repos, dir, home),
+            None => bare_dotfiles_repo_tracks(dir, home),
+        };
+        if bare {
             return Treatment::Track("git_tracked:dotfiles_repo".into());
         }
     }
@@ -215,10 +309,21 @@ fn decide(
         }
     }
     if let Some(home) = &ctx.home {
-        if npx_skills_lock_lists(home, slug) {
+        let npx = match facts {
+            Some(f) => f
+                .npx_lock
+                .as_ref()
+                .is_some_and(|names| names.contains(&fold_slug(slug))),
+            None => npx_skills_lock_lists(home, slug),
+        };
+        if npx {
             return Treatment::Track("foreign_installer:npx_skills_lock".into());
         }
-        if chezmoi_manages(home, slug) {
+        let chezmoi = match facts {
+            Some(f) => f.chezmoi_present && chezmoi_manages(home, slug),
+            None => chezmoi_manages(home, slug),
+        };
+        if chezmoi {
             return Treatment::Track("dotfiles_managed:chezmoi".into());
         }
     }
@@ -335,9 +440,15 @@ pub fn symlinked_ancestor_below(dir: &Path, home: &Path) -> bool {
 /// `GIT_DIR`; each is asked `git ls-files` for this exact path. Best effort: no
 /// `git` on the machine, or no candidate, means `false`.
 pub fn bare_dotfiles_repo_tracks(dir: &Path, home: &Path) -> bool {
-    let Ok(rel) = dir.strip_prefix(home) else {
-        return false;
-    };
+    let repos: Vec<PathBuf> = bare_repo_candidates(home)
+        .into_iter()
+        .filter(|r| r.join("HEAD").is_file() && r.join("objects").is_dir())
+        .collect();
+    bare_repos_track(&repos, dir, home)
+}
+
+/// The well-known bare dotfiles repository locations plus `GIT_DIR`.
+fn bare_repo_candidates(home: &Path) -> Vec<PathBuf> {
     let mut candidates: Vec<PathBuf> = vec![
         home.join(".local/share/yadm/repo.git"),
         home.join(".config/yadm/repo.git"),
@@ -351,14 +462,18 @@ pub fn bare_dotfiles_repo_tracks(dir: &Path, home: &Path) -> bool {
     if let Some(g) = std::env::var_os("GIT_DIR") {
         candidates.push(PathBuf::from(g));
     }
-    for repo in candidates {
-        // A bare git directory has HEAD and objects/.
-        if !(repo.join("HEAD").is_file() && repo.join("objects").is_dir()) {
-            continue;
-        }
+    candidates
+}
+
+/// Does any of `repos` (existing bare git directories) track `dir`?
+fn bare_repos_track(repos: &[PathBuf], dir: &Path, home: &Path) -> bool {
+    let Ok(rel) = dir.strip_prefix(home) else {
+        return false;
+    };
+    for repo in repos {
         let tracked = std::process::Command::new("git")
             .arg("--git-dir")
-            .arg(&repo)
+            .arg(repo)
             .arg("--work-tree")
             .arg(home)
             .args(["ls-files", "--error-unmatch", "--"])
@@ -381,16 +496,27 @@ pub fn bare_dotfiles_repo_tracks(dir: &Path, home: &Path) -> bool {
 /// `{"skills": {"<name>": {...}}}`. A missing or differently shaped file
 /// simply never matches.
 fn npx_skills_lock_lists(home: &Path, slug: &str) -> bool {
-    let Ok(text) = fs::read_to_string(home.join(".agents").join(".skill-lock.json")) else {
-        return false;
-    };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return false;
-    };
-    let folded = fold_slug(slug);
-    v.get("skills")
-        .and_then(|s| s.as_object())
-        .is_some_and(|m| m.keys().any(|k| fold_slug(k) == folded))
+    npx_lock_names(home).is_some_and(|names| names.contains(&fold_slug(slug)))
+}
+
+/// The folded skill names in the `npx skills` lock, `None` without one.
+fn npx_lock_names(home: &Path) -> Option<std::collections::HashSet<String>> {
+    let text = fs::read_to_string(home.join(".agents").join(".skill-lock.json")).ok()?;
+    let v = serde_json::from_str::<serde_json::Value>(&text).ok()?;
+    Some(
+        v.get("skills")
+            .and_then(|s| s.as_object())
+            .map(|m| m.keys().map(|k| fold_slug(k)).collect())
+            .unwrap_or_default(),
+    )
+}
+
+/// The chezmoi source directory (`$CHEZMOI_SOURCE_DIR` or
+/// `~/.local/share/chezmoi`).
+fn chezmoi_source(home: &Path) -> PathBuf {
+    std::env::var_os("CHEZMOI_SOURCE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".local").join("share").join("chezmoi"))
 }
 
 /// Is there a chezmoi source entry for a skill folder named `slug`? The
@@ -398,9 +524,7 @@ fn npx_skills_lock_lists(home: &Path, slug: &str) -> bool {
 /// names with attribute prefixes (`dot_`, `private_`, `exact_`...), which are
 /// stripped before comparing. Bounded depth; best effort.
 fn chezmoi_manages(home: &Path, slug: &str) -> bool {
-    let src = std::env::var_os("CHEZMOI_SOURCE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".local").join("share").join("chezmoi"));
+    let src = chezmoi_source(home);
     if !src.is_dir() {
         return false;
     }

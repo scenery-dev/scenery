@@ -458,6 +458,13 @@ pub struct MarkerIndex {
     rows: Vec<ManagedPathMarker>,
     by_raw: std::collections::HashMap<String, usize>,
     by_canonical: std::collections::HashMap<std::path::PathBuf, usize>,
+    /// Canonical form of each parent folder looked up so far: the skills of
+    /// one root share it, so a non-symlink directory needs no `realpath`.
+    /// Only for [`MarkerIndex::for_scan`], whose directories come straight
+    /// from a directory listing (on-disk spelling of the last component).
+    memo_parents: bool,
+    parents:
+        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Option<std::path::PathBuf>>>,
 }
 
 impl MarkerIndex {
@@ -494,7 +501,17 @@ impl MarkerIndex {
             rows,
             by_raw,
             by_canonical,
+            memo_parents: false,
+            parents: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
+    }
+
+    /// [`MarkerIndex::load`] for a scan over listed directories: parents are
+    /// resolved once each instead of one `realpath` per directory.
+    pub fn for_scan(conn: &Connection, kind: &str) -> Result<Self> {
+        let mut idx = Self::load(conn, kind)?;
+        idx.memo_parents = true;
+        Ok(idx)
     }
 
     /// An index with no rows.
@@ -503,6 +520,8 @@ impl MarkerIndex {
             rows: Vec::new(),
             by_raw: std::collections::HashMap::new(),
             by_canonical: std::collections::HashMap::new(),
+            memo_parents: false,
+            parents: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -512,10 +531,31 @@ impl MarkerIndex {
         if let Some(&i) = self.by_raw.get(raw.as_ref()) {
             return self.rows.get(i).cloned();
         }
-        let canonical = std::fs::canonicalize(dir).ok()?;
+        if self.by_canonical.is_empty() {
+            return None;
+        }
+        let canonical = self.canonical(dir)?;
         self.by_canonical
             .get(&canonical)
             .and_then(|&i| self.rows.get(i).cloned())
+    }
+
+    /// `canonicalize(dir)`: for a directory that is not itself a symlink,
+    /// its canonical parent (memoised) joined with its name.
+    fn canonical(&self, dir: &Path) -> Option<std::path::PathBuf> {
+        let plain_dir = self.memo_parents
+            && std::fs::symlink_metadata(dir)
+                .map(|m| m.file_type().is_dir())
+                .unwrap_or(false);
+        let (Some(parent), Some(name), true) = (dir.parent(), dir.file_name(), plain_dir) else {
+            return std::fs::canonicalize(dir).ok();
+        };
+        let mut memo = self.parents.lock().unwrap_or_else(|e| e.into_inner());
+        let canon_parent = memo
+            .entry(parent.to_path_buf())
+            .or_insert_with(|| std::fs::canonicalize(parent).ok())
+            .clone()?;
+        Some(canon_parent.join(name))
     }
 }
 

@@ -245,6 +245,7 @@ async fn auto_manage_never_uploads_it_whatever_the_directive() {
             home: Some(env.home.clone()),
             now: None,
             canonical_index: None,
+            scan_facts: None,
         },
     };
     for action in ["manage", "track"] {

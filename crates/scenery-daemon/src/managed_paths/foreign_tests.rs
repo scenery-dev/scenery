@@ -24,11 +24,25 @@ fn old_ctx(canonical_root: Option<&Path>, home: Option<&Path>) -> ClassifyContex
         // Far in the future: every file is "old".
         now: Some(SystemTime::now() + Duration::from_secs(86_400)),
         canonical_index: None,
+        scan_facts: None,
     }
 }
 
+/// The treatment, asserting that a per-scan context (`for_scan`: canonical
+/// root index and shared home/parent facts) answers exactly like a plain one,
+/// so every scenario below checks both paths.
 fn treat(dir: &Path, slug: &str, ctx: &ClassifyContext) -> Treatment {
-    classify_skill(dir, slug, ctx).treatment
+    let plain = classify_skill(dir, slug, ctx).treatment;
+    if ctx.canonical_index.is_none() && ctx.scan_facts.is_none() {
+        let scan = classify_skill(dir, slug, &ctx.clone().for_scan()).treatment;
+        assert_eq!(
+            scan,
+            plain,
+            "per-scan context disagrees for {}",
+            dir.display()
+        );
+    }
+    plain
 }
 
 #[test]
@@ -271,6 +285,7 @@ fn a_recent_edit_defers_and_swap_files_count_as_activity() {
         home: Some(tmp.path().to_path_buf()),
         now: None, // real clock: files were just written
         canonical_index: None,
+        scan_facts: None,
     };
     assert!(classify_skill(&d, "busy", &ctx).recently_modified);
     assert!(!classify_skill(&d, "busy", &old_ctx(Some(&root), Some(tmp.path()))).recently_modified);

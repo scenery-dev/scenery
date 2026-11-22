@@ -87,6 +87,58 @@ pub fn survey_cached(dir: &Path) -> Result<TreeSurvey> {
     global().survey(dir)
 }
 
+/// SHA-256 (hex) of one file's bytes, memoised against the file's metadata
+/// stamp (same fields and racy-clean rule as a tree stamp). The scanners hash
+/// every skill's `SKILL.md` on every tick; an unchanged file is not re-read.
+/// Errors (missing, unreadable) are never memoised.
+pub fn sha256_file_cached(path: &Path) -> std::io::Result<String> {
+    type Memo = Mutex<HashMap<PathBuf, ([u8; 32], String)>>;
+    static MEMO: OnceLock<Memo> = OnceLock::new();
+    let memo = MEMO.get_or_init(|| Mutex::new(HashMap::new()));
+    let stamp = file_stamp(path);
+    if let Some((s, _)) = &stamp {
+        if let Some((cs, h)) = memo.lock().unwrap_or_else(|e| e.into_inner()).get(path) {
+            if cs == s {
+                return Ok(h.clone());
+            }
+        }
+    }
+    let bytes = fs::read(path)?;
+    let hash = hex::encode(Sha256::digest(&bytes));
+    if let Some((s, newest)) = stamp {
+        let settled = newest.is_some_and(|t| {
+            SystemTime::now()
+                .duration_since(t)
+                .map(|age| age >= RACY_WINDOW)
+                .unwrap_or(false)
+        });
+        if settled {
+            let mut m = memo.lock().unwrap_or_else(|e| e.into_inner());
+            if m.len() >= MAX_DIRS * 2 && !m.contains_key(path) {
+                m.clear();
+            }
+            m.insert(path.to_path_buf(), (s, hash.clone()));
+        }
+    }
+    Ok(hash)
+}
+
+/// One file's metadata digest plus its newest timestamp (`None` if it cannot
+/// be statted or is not a regular file).
+fn file_stamp(path: &Path) -> Option<([u8; 32], Option<SystemTime>)> {
+    let meta = fs::metadata(path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let mut walker = StampWalk {
+        hasher: Sha256::new(),
+        newest: None,
+        count: 0,
+    };
+    walker.add("", &meta);
+    Some((walker.hasher.finalize().into(), walker.newest))
+}
+
 /// A tree's stamp, taken once and shared by the survey and the secret scan of
 /// one classification (each used to walk the tree's metadata on its own).
 /// Taken BEFORE either read, so the racy-clean rule still holds.

@@ -215,8 +215,18 @@ fn the_marker_index_finds_rows_by_exact_and_by_canonical_path() {
     std::os::unix::fs::symlink(&canon, &link).unwrap();
 
     let idx = MarkerIndex::load(&conn, "skill").unwrap();
+    let scan = MarkerIndex::for_scan(&conn, "skill").unwrap();
     for (probe, want) in [(&canon, true), (&link, true), (&other, false)] {
         let via_index = idx.lookup(probe).map(|r| r.path);
+        // Twice: the second answer comes from the memoised parent.
+        for _ in 0..2 {
+            assert_eq!(
+                scan.lookup(probe).map(|r| r.path),
+                via_index,
+                "{}",
+                probe.display()
+            );
+        }
         let one_shot = tracked_marker_for_path(&conn, "skill", probe)
             .unwrap()
             .map(|r| r.path);
