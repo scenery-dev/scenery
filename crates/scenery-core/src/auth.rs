@@ -869,27 +869,34 @@ type SqliteAuthRow = (
 /// file, backoff state from SQLite.
 pub fn load_tokens(state: &AppState, registry_url: &str) -> Result<Option<StoredTokens>> {
     let conn = Connection::open(&state.db_path).context("failed to open state DB")?;
-    let sqlite_row: Option<SqliteAuthRow> = conn
-        .query_row(
+    let row_query = |with_saved_at: bool| {
+        let sql = format!(
             "SELECT access_token, refresh_token,
                     COALESCE(refresh_failures, 0),
                     next_refresh_attempt_at,
                     last_refresh_status,
-                    saved_at
+                    {}
              FROM auth_tokens WHERE registry_url = ?1",
-            [registry_url],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get::<_, i64>(2)? as u32,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                ))
-            },
-        )
-        .optional()?;
+            if with_saved_at { "saved_at" } else { "NULL" }
+        );
+        conn.query_row(&sql, [registry_url], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get::<_, i64>(2)? as u32,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        })
+        .optional()
+    };
+    // A table without `saved_at` (never created by this schema, but cheap to
+    // tolerate) just bypasses the memo instead of losing the token.
+    let sqlite_row: Option<SqliteAuthRow> = match row_query(true) {
+        Ok(r) => r,
+        Err(_) => row_query(false)?,
+    };
     drop(conn);
 
     let saved_at = sqlite_row.as_ref().and_then(|r| r.5.clone());
