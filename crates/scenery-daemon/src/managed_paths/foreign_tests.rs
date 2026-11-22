@@ -23,6 +23,7 @@ fn old_ctx(canonical_root: Option<&Path>, home: Option<&Path>) -> ClassifyContex
         home: home.map(Path::to_path_buf),
         // Far in the future: every file is "old".
         now: Some(SystemTime::now() + Duration::from_secs(86_400)),
+        canonical_index: None,
     }
 }
 
@@ -269,6 +270,7 @@ fn a_recent_edit_defers_and_swap_files_count_as_activity() {
         canonical_root: Some(root.clone()),
         home: Some(tmp.path().to_path_buf()),
         now: None, // real clock: files were just written
+        canonical_index: None,
     };
     assert!(classify_skill(&d, "busy", &ctx).recently_modified);
     assert!(!classify_skill(&d, "busy", &old_ctx(Some(&root), Some(tmp.path()))).recently_modified);
@@ -357,5 +359,55 @@ fn a_bare_dotfiles_repo_with_home_as_worktree_tracks_the_skill() {
             &old_ctx(Some(&root), Some(home.path()))
         ),
         Treatment::Convert
+    );
+}
+
+#[test]
+fn the_per_scan_index_gives_the_same_collision_verdicts_as_listing_the_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let canonical = tmp.path().join("agents-skills");
+    let own = skill(&canonical, "pdf");
+    skill(&canonical, "caf\u{e9}");
+    let pi = tmp.path().join("pi-skills");
+    let other = skill(&pi, "PDF");
+    let nfd = pi.join("cafe\u{301}");
+    fs::create_dir_all(&nfd).unwrap();
+    fs::write(nfd.join("SKILL.md"), "---\nname: cafe\n---\n").unwrap();
+    let free = skill(&pi, "free");
+
+    let plain = old_ctx(Some(&canonical), Some(tmp.path()));
+    let scan = plain.clone().for_scan();
+    assert!(scan.canonical_index.is_some());
+    for (d, slug) in [
+        (&own, "pdf"),
+        (&other, "PDF"),
+        (&nfd, "cafe\u{301}"),
+        (&free, "free"),
+    ] {
+        assert_eq!(treat(d, slug, &scan), treat(d, slug, &plain), "{slug}");
+    }
+    assert_eq!(
+        treat(&other, "PDF", &scan),
+        Treatment::Hold("slug_collision".into())
+    );
+    assert_eq!(treat(&own, "pdf", &scan), Treatment::Convert);
+}
+
+#[test]
+fn renaming_the_frontmatter_is_seen_on_the_next_classification_despite_the_memo() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("skills");
+    let d = skill(&root, "renamed");
+    let ctx = old_ctx(Some(&root), Some(tmp.path()));
+    assert_eq!(treat(&d, "renamed", &ctx), Treatment::Convert);
+    assert_eq!(treat(&d, "renamed", &ctx), Treatment::Convert);
+    fs::write(
+        d.join("SKILL.md"),
+        "---\nname: Something Else\ndescription: demo\n---\nbody\n",
+    )
+    .unwrap();
+    assert_eq!(
+        treat(&d, "renamed", &ctx),
+        Treatment::Track("name_differs_from_folder".into())
     );
 }

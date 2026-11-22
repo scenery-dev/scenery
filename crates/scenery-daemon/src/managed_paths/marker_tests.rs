@@ -198,3 +198,34 @@ fn db_owns_link_copy_requires_an_owned_canonical_and_a_matching_copy() {
     std::fs::write(link.join("SKILL.md"), b"mine").unwrap();
     assert!(!db_owns_link_copy(&conn, &canonical, &link));
 }
+
+#[cfg(unix)]
+#[test]
+fn the_marker_index_finds_rows_by_exact_and_by_canonical_path() {
+    let (conn, dir) = temp_db();
+    let canon = dir.path().join("agents/demo");
+    std::fs::create_dir_all(&canon).unwrap();
+    let other = dir.path().join("agents/other");
+    std::fs::create_dir_all(&other).unwrap();
+    skill_row(&conn, &canon, "h1", Some("inst-1"));
+    // A link elsewhere resolves to the same row (the Claude Code link case).
+    let links = dir.path().join("claude");
+    std::fs::create_dir_all(&links).unwrap();
+    let link = links.join("demo");
+    std::os::unix::fs::symlink(&canon, &link).unwrap();
+
+    let idx = MarkerIndex::load(&conn, "skill").unwrap();
+    for (probe, want) in [(&canon, true), (&link, true), (&other, false)] {
+        let via_index = idx.lookup(probe).map(|r| r.path);
+        let one_shot = tracked_marker_for_path(&conn, "skill", probe)
+            .unwrap()
+            .map(|r| r.path);
+        assert_eq!(via_index, one_shot, "{}", probe.display());
+        assert_eq!(via_index.is_some(), want, "{}", probe.display());
+    }
+    assert!(MarkerIndex::load(&conn, "plugin")
+        .unwrap()
+        .lookup(&canon)
+        .is_none());
+    assert!(MarkerIndex::empty().lookup(&canon).is_none());
+}

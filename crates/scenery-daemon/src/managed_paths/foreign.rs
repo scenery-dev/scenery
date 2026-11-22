@@ -19,8 +19,10 @@
 
 use scenery_core::skill_tree::TreeSurvey;
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, SystemTime},
 };
 use unicode_normalization::UnicodeNormalization;
@@ -97,6 +99,10 @@ pub struct ClassifyContext {
     pub home: Option<PathBuf>,
     /// Clock, injectable for tests.
     pub now: Option<SystemTime>,
+    /// `canonical_root`'s entries by folded name, read once per scan (see
+    /// [`ClassifyContext::for_scan`]). `None`: each classification lists the
+    /// root itself.
+    pub canonical_index: Option<Arc<HashMap<String, Vec<PathBuf>>>>,
 }
 
 impl ClassifyContext {
@@ -105,14 +111,44 @@ impl ClassifyContext {
             canonical_root: super::paths::agents_skills_dir(),
             home: dirs::home_dir(),
             now: None,
+            canonical_index: None,
         }
     }
+
+    /// The context for one scan over many skills: the canonical root is listed
+    /// (and every name folded) once here, instead of once per skill, which
+    /// made a scan quadratic in the number of skills.
+    pub fn for_scan(mut self) -> Self {
+        self.canonical_index = self
+            .canonical_root
+            .as_deref()
+            .map(|root| Arc::new(index_root(root)));
+        self
+    }
+}
+
+/// `root`'s non-hidden entries keyed by folded name.
+fn index_root(root: &Path) -> HashMap<String, Vec<PathBuf>> {
+    let mut idx: HashMap<String, Vec<PathBuf>> = HashMap::new();
+    let Ok(rd) = fs::read_dir(root) else {
+        return idx;
+    };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        idx.entry(fold_slug(&name)).or_default().push(e.path());
+    }
+    idx
 }
 
 /// Classify the skill at `dir` (`slug` is its folder name).
 pub fn classify_skill(dir: &Path, slug: &str, ctx: &ClassifyContext) -> Classification {
     let now = ctx.now.unwrap_or_else(SystemTime::now);
-    let survey = match scenery_core::skill_tree_cache::survey_cached(dir) {
+    // One stamp walk serves both the survey and the secret scan.
+    let settled = scenery_core::skill_tree_cache::settle(dir);
+    let survey = match scenery_core::skill_tree_cache::survey_at(dir, &settled) {
         Ok(s) => s,
         Err(e) => {
             // A walk that cannot finish (a hard cap, an unreadable file) is
@@ -126,7 +162,7 @@ pub fn classify_skill(dir: &Path, slug: &str, ctx: &ClassifyContext) -> Classifi
         }
     };
     let recently_modified = survey.modified_within(now, QUIESCENCE);
-    let treatment = decide(dir, slug, ctx, &survey);
+    let treatment = decide(dir, slug, ctx, &survey, &settled);
     Classification {
         treatment,
         tree_hash: survey.tree_hash,
@@ -134,12 +170,18 @@ pub fn classify_skill(dir: &Path, slug: &str, ctx: &ClassifyContext) -> Classifi
     }
 }
 
-fn decide(dir: &Path, slug: &str, ctx: &ClassifyContext, survey: &TreeSurvey) -> Treatment {
+fn decide(
+    dir: &Path,
+    slug: &str,
+    ctx: &ClassifyContext,
+    survey: &TreeSurvey,
+    settled: &scenery_core::skill_tree_cache::Settled,
+) -> Treatment {
     // ── Hold: never touched, shown to the user ───────────────────────────
     if !survey.secret_files.is_empty() {
         return Treatment::Hold("secrets_detected".into());
     }
-    match scenery_core::skill_tree_cache::scan_secrets_cached(dir) {
+    match scenery_core::skill_tree_cache::scan_secrets_at(dir, settled) {
         Ok(hits) if !hits.is_empty() => return Treatment::Hold("secrets_detected".into()),
         Ok(_) => {}
         // Unreadable means unverifiable: do not upload what cannot be checked.
@@ -191,11 +233,41 @@ fn decide(dir: &Path, slug: &str, ctx: &ClassifyContext, survey: &TreeSurvey) ->
         // dot-directory, node_modules) would vanish from a converted copy.
         return Treatment::Track(format!("excluded_content:{first}"));
     }
-    if name_differs_from_folder(dir, slug) {
+    if name_differs_cached(dir, slug, &survey.tree_hash) {
         return Treatment::Track("name_differs_from_folder".into());
     }
 
     Treatment::Convert
+}
+
+/// [`name_differs_from_folder`], memoised by tree hash (the answer only
+/// depends on the tree's `SKILL.md`): parsing every skill's manifest on every
+/// scan tick was a steady idle cost. Bounded like the tree cache.
+fn name_differs_cached(dir: &Path, slug: &str, tree_hash: &str) -> bool {
+    type Memo = Mutex<HashMap<PathBuf, (String, String, bool)>>;
+    static MEMO: OnceLock<Memo> = OnceLock::new();
+    if tree_hash.is_empty() {
+        return name_differs_from_folder(dir, slug);
+    }
+    let memo = MEMO.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(map) = memo.lock() {
+        if let Some((h, s, v)) = map.get(dir) {
+            if h == tree_hash && s == slug {
+                return *v;
+            }
+        }
+    }
+    let v = name_differs_from_folder(dir, slug);
+    if let Ok(mut map) = memo.lock() {
+        if map.len() >= 1024 && !map.contains_key(dir) {
+            map.clear();
+        }
+        map.insert(
+            dir.to_path_buf(),
+            (tree_hash.to_string(), slug.to_string(), v),
+        );
+    }
+    v
 }
 
 /// The skill's registry-facing id (derived from the frontmatter `name`) is not
@@ -392,18 +464,24 @@ fn chezmoi_manages(home: &Path, slug: &str) -> bool {
 fn slug_collision(dir: &Path, slug: &str, ctx: &ClassifyContext) -> Option<String> {
     let root = ctx.canonical_root.as_ref()?;
     let folded = fold_slug(slug);
-    let own = fs::canonicalize(dir).ok();
-    let rd = fs::read_dir(root).ok()?;
-    for e in rd.flatten() {
-        let name = e.file_name().to_string_lossy().to_string();
-        if name.starts_with('.') || fold_slug(&name) != folded {
-            continue;
+    let listed;
+    let candidates: &[PathBuf] = match &ctx.canonical_index {
+        Some(idx) => idx.get(&folded).map(Vec::as_slice).unwrap_or(&[]),
+        None => {
+            listed = index_root(root).remove(&folded).unwrap_or_default();
+            &listed
         }
-        let other = e.path();
+    };
+    let own = if candidates.is_empty() {
+        None
+    } else {
+        fs::canonicalize(dir).ok()
+    };
+    for other in candidates {
         if other == dir {
             continue;
         }
-        let same = match (&own, fs::canonicalize(&other).ok()) {
+        let same = match (&own, fs::canonicalize(other).ok()) {
             (Some(a), Some(b)) => *a == b,
             _ => false,
         };

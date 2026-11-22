@@ -437,57 +437,113 @@ pub fn drop_legacy_row(conn: &Connection, row_path: &str, skill_dir: &Path, scan
 /// a symlink (e.g. `~/.claude/skills/<slug>` -> `~/.agents/skills/<slug>`) or
 /// a `/var` vs `/private/var` spelling resolves to the same row. Slug is never
 /// used as the key.
+///
+/// One call reads every row and canonicalises each one: a scan that looks up
+/// many directories builds a [`MarkerIndex`] once instead.
 pub fn tracked_marker_for_path(
     conn: &Connection,
     kind: &str,
     dir: &Path,
 ) -> Result<Option<ManagedPathMarker>> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT path, kind, slug, installation_id, source_sha256, migrated_at \
-             FROM managed_path_markers WHERE kind = ?1",
-        )
-        .context("failed to prepare managed_path_markers lookup")?;
-    let rows = stmt
-        .query_map([kind], |row| {
-            Ok(ManagedPathMarker {
-                path: row.get(0)?,
-                kind: row.get(1)?,
-                slug: row.get(2)?,
-                installation_id: row.get(3)?,
-                source_sha256: row.get(4)?,
-                migrated_at: row.get(5)?,
-            })
-        })
-        .context("failed to query managed_path_markers")?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .context("failed to read managed_path_markers rows")?;
+    Ok(MarkerIndex::load(conn, kind)?.lookup(dir))
+}
 
-    let raw = dir.to_string_lossy();
-    if let Some(row) = rows.iter().find(|r| r.path == raw) {
-        return Ok(Some(row.clone()));
+/// Every `kind` row with its canonical path, resolved once. A periodic scan
+/// asks "which row is this directory?" for every skill on the machine; with
+/// [`tracked_marker_for_path`] that canonicalised every row per question
+/// (O(skills x rows) `realpath` calls, ~3.6 s per tick at 1000 skills). The
+/// answers are identical: exact path first, then the first row whose
+/// canonical path equals the directory's.
+pub struct MarkerIndex {
+    rows: Vec<ManagedPathMarker>,
+    by_raw: std::collections::HashMap<String, usize>,
+    by_canonical: std::collections::HashMap<std::path::PathBuf, usize>,
+}
+
+impl MarkerIndex {
+    pub fn load(conn: &Connection, kind: &str) -> Result<Self> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT path, kind, slug, installation_id, source_sha256, migrated_at \
+                 FROM managed_path_markers WHERE kind = ?1",
+            )
+            .context("failed to prepare managed_path_markers lookup")?;
+        let rows = stmt
+            .query_map([kind], |row| {
+                Ok(ManagedPathMarker {
+                    path: row.get(0)?,
+                    kind: row.get(1)?,
+                    slug: row.get(2)?,
+                    installation_id: row.get(3)?,
+                    source_sha256: row.get(4)?,
+                    migrated_at: row.get(5)?,
+                })
+            })
+            .context("failed to query managed_path_markers")?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to read managed_path_markers rows")?;
+        let mut by_raw = std::collections::HashMap::new();
+        let mut by_canonical = std::collections::HashMap::new();
+        for (i, r) in rows.iter().enumerate() {
+            by_raw.entry(r.path.clone()).or_insert(i);
+            if let Ok(c) = std::fs::canonicalize(&r.path) {
+                by_canonical.entry(c).or_insert(i);
+            }
+        }
+        Ok(Self {
+            rows,
+            by_raw,
+            by_canonical,
+        })
     }
-    let Ok(canonical) = std::fs::canonicalize(dir) else {
-        return Ok(None);
-    };
-    Ok(rows.into_iter().find(|r| {
-        std::fs::canonicalize(&r.path)
-            .map(|p| p == canonical)
-            .unwrap_or(false)
-    }))
+
+    /// An index with no rows.
+    pub fn empty() -> Self {
+        Self {
+            rows: Vec::new(),
+            by_raw: std::collections::HashMap::new(),
+            by_canonical: std::collections::HashMap::new(),
+        }
+    }
+
+    /// The row for `dir`: see [`tracked_marker_for_path`].
+    pub fn lookup(&self, dir: &Path) -> Option<ManagedPathMarker> {
+        let raw = dir.to_string_lossy();
+        if let Some(&i) = self.by_raw.get(raw.as_ref()) {
+            return self.rows.get(i).cloned();
+        }
+        let canonical = std::fs::canonicalize(dir).ok()?;
+        self.by_canonical
+            .get(&canonical)
+            .and_then(|&i| self.rows.get(i).cloned())
+    }
+}
+
+/// [`is_builtin_path`] against a prebuilt [`MarkerIndex`] of skill rows.
+pub fn is_builtin_path_in(conn: &Connection, idx: &MarkerIndex, dir: &Path) -> bool {
+    match idx.lookup(dir) {
+        Some(row) => marker_provenance(conn, &row.path).is_builtin(),
+        None => false,
+    }
 }
 
 /// Classify `dir` against `managed_path_markers` — see [`DbOwnership`].
 /// A DB error is treated as [`DbOwnership::Untracked`] (fail-open towards
 /// reporting/adopting, never towards hiding).
 pub fn db_ownership(conn: &Connection, kind: &str, dir: &Path) -> DbOwnership {
-    let row = match tracked_marker_for_path(conn, kind, dir) {
-        Ok(Some(row)) => row,
-        Ok(None) => return DbOwnership::Untracked,
+    match MarkerIndex::load(conn, kind) {
+        Ok(idx) => db_ownership_in(conn, &idx, dir),
         Err(e) => {
             warn!(path = %dir.display(), error = %e, "managed_paths/marker: ownership lookup failed");
-            return DbOwnership::Untracked;
+            DbOwnership::Untracked
         }
+    }
+}
+
+/// [`db_ownership`] against a prebuilt [`MarkerIndex`] (rows of one kind).
+pub fn db_ownership_in(conn: &Connection, idx: &MarkerIndex, dir: &Path) -> DbOwnership {
+    let Some(row) = idx.lookup(dir) else {
+        return DbOwnership::Untracked;
     };
     if is_legacy_row(conn, &row, dir) {
         return DbOwnership::Legacy { row_path: row.path };

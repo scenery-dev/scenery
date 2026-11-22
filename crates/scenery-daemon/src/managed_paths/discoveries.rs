@@ -66,7 +66,7 @@ use tokio::{sync::Notify, time::interval};
 use tracing::{debug, info, warn};
 
 use super::foreign::{self, ClassifyContext, Treatment};
-use super::marker::{db_ownership, drop_legacy_row, DbOwnership};
+use super::marker::{db_ownership_in, drop_legacy_row, DbOwnership, MarkerIndex};
 use super::mcp_discovery;
 
 const ENV_DISABLE: &str = "SCENERY_DISABLE_FILESYSTEM_RECONCILER";
@@ -374,7 +374,10 @@ pub fn collect_discoveries(roots: &[PathBuf], state: &AppState) -> Vec<Discovery
         }
     };
 
-    let classify_ctx = ClassifyContext::from_env();
+    // Built once per scan: looking each directory up row-by-row canonicalised
+    // every marker row per skill (quadratic in the skill count).
+    let mut markers = load_marker_index(&conn);
+    let classify_ctx = ClassifyContext::from_env().for_scan();
     for root in roots {
         if !root.exists() {
             debug!(root = %root.display(), "discoveries: root does not exist — skipping");
@@ -388,11 +391,11 @@ pub fn collect_discoveries(roots: &[PathBuf], state: &AppState) -> Vec<Discovery
                     // Scenery's own built-in skill is never discovered, whatever
                     // its content hash says (a modified copy is rewritten, not
                     // reported as suspicious).
-                    if super::marker::is_builtin_path(&conn, path) {
+                    if super::marker::is_builtin_path_in(&conn, &markers, path) {
                         debug!(slug = %item.slug, "discoveries: built-in skill — skipping");
                         continue;
                     }
-                    let reason = match db_ownership(&conn, "skill", path) {
+                    let reason = match db_ownership_in(&conn, &markers, path) {
                         DbOwnership::Verified => {
                             debug!(slug = %item.slug, "discoveries: verified managed — skipping");
                             continue;
@@ -404,6 +407,7 @@ pub fn collect_discoveries(roots: &[PathBuf], state: &AppState) -> Vec<Discovery
                         DbOwnership::Legacy { row_path } => {
                             debug!(slug = %item.slug, "discoveries: legacy marker row proves nothing — dropping it and classifying normally");
                             drop_legacy_row(&conn, &row_path, path, root);
+                            markers = load_marker_index(&conn);
                             None
                         }
                         DbOwnership::HashMismatch => Some("managed_hash_mismatch"),
@@ -462,6 +466,16 @@ pub fn collect_discoveries(roots: &[PathBuf], state: &AppState) -> Vec<Discovery
     }
 
     items
+}
+
+/// The skill marker rows, indexed once per scan. A DB error yields an empty
+/// index: every directory then reads as untracked (fail-open towards
+/// reporting, never towards hiding), as a failed per-item lookup did.
+fn load_marker_index(conn: &Connection) -> MarkerIndex {
+    MarkerIndex::load(conn, "skill").unwrap_or_else(|e| {
+        warn!(error = %e, "discoveries: marker lookup failed — treating skills as untracked");
+        MarkerIndex::empty()
+    })
 }
 
 /// Merge skill discoveries (scanned from `roots`, via [`collect_discoveries`])

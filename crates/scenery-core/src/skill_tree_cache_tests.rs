@@ -125,3 +125,37 @@ fn missing_dir_is_an_error_not_a_hit() {
     let cache = TreeCache::new(Duration::ZERO);
     assert!(cache.survey(&tmp.path().join("nope")).is_err());
 }
+
+#[test]
+fn one_shared_stamp_serves_survey_and_secret_scan_and_sees_edits() {
+    let tmp = tempfile::tempdir().unwrap();
+    skill(tmp.path());
+    let cache = TreeCache::new(Duration::ZERO);
+    let st = cache.settled_stamp(tmp.path());
+    assert!(st.is_some());
+    let a = cache.survey_with(tmp.path(), st).unwrap();
+    let s = cache.scan_secrets_with(tmp.path(), st).unwrap();
+    assert_eq!(cache.reads(), 2);
+    let st2 = cache.settled_stamp(tmp.path());
+    assert_eq!(
+        cache.survey_with(tmp.path(), st2).unwrap().tree_hash,
+        a.tree_hash
+    );
+    assert_eq!(cache.scan_secrets_with(tmp.path(), st2).unwrap(), s);
+    assert_eq!(cache.reads(), 2, "a shared stamp still hits the memo");
+
+    tick();
+    fs::write(tmp.path().join("references/a.md"), "BETA!").unwrap();
+    let st3 = cache.settled_stamp(tmp.path());
+    assert_ne!(
+        cache.survey_with(tmp.path(), st3).unwrap().tree_hash,
+        a.tree_hash
+    );
+
+    // The global wrappers agree with the plain cached calls.
+    let g = settle(tmp.path());
+    assert_eq!(
+        survey_at(tmp.path(), &g).unwrap().tree_hash,
+        survey_cached(tmp.path()).unwrap().tree_hash
+    );
+}

@@ -3335,6 +3335,9 @@ mod refresh_loop_tests;
 mod sync_tick_tests;
 
 #[cfg(test)]
+mod idle_cost_bench;
+
+#[cfg(test)]
 #[path = "sync_controller_hook_tests.rs"]
 mod sync_controller_hook_tests;
 

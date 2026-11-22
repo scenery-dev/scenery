@@ -244,6 +244,7 @@ async fn auto_manage_never_uploads_it_whatever_the_directive() {
             canonical_root: Some(env.home.join(".agents/skills")),
             home: Some(env.home.clone()),
             now: None,
+            canonical_index: None,
         },
     };
     for action in ["manage", "track"] {

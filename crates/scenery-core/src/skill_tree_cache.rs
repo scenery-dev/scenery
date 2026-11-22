@@ -87,6 +87,26 @@ pub fn survey_cached(dir: &Path) -> Result<TreeSurvey> {
     global().survey(dir)
 }
 
+/// A tree's stamp, taken once and shared by the survey and the secret scan of
+/// one classification (each used to walk the tree's metadata on its own).
+/// Taken BEFORE either read, so the racy-clean rule still holds.
+pub struct Settled(Option<[u8; 32]>);
+
+/// Stamp `dir` once for [`survey_at`] / [`scan_secrets_at`].
+pub fn settle(dir: &Path) -> Settled {
+    Settled(global().settled_stamp(dir))
+}
+
+/// [`survey_cached`] with a stamp from [`settle`].
+pub fn survey_at(dir: &Path, settled: &Settled) -> Result<TreeSurvey> {
+    global().survey_with(dir, settled.0)
+}
+
+/// [`scan_secrets_cached`] with a stamp from [`settle`].
+pub fn scan_secrets_at(dir: &Path, settled: &Settled) -> Result<Vec<String>> {
+    global().scan_secrets_with(dir, settled.0)
+}
+
 /// [`skill_tree::scan_secrets`], memoised in the [`global`] cache.
 pub fn scan_secrets_cached(dir: &Path) -> Result<Vec<String>> {
     global().scan_secrets(dir)
@@ -108,7 +128,10 @@ impl TreeCache {
 
     /// [`skill_tree::survey`], skipped when the tree's stamp is unchanged.
     pub fn survey(&self, dir: &Path) -> Result<TreeSurvey> {
-        let stamp = self.settled_stamp(dir);
+        self.survey_with(dir, self.settled_stamp(dir))
+    }
+
+    fn survey_with(&self, dir: &Path, stamp: Option<[u8; 32]>) -> Result<TreeSurvey> {
         if let Some(s) = &stamp {
             if let Some(hit) = self.lookup(dir, s, |e| e.survey.clone()) {
                 return Ok(hit);
@@ -124,7 +147,10 @@ impl TreeCache {
 
     /// [`skill_tree::scan_secrets`], skipped when the tree's stamp is unchanged.
     pub fn scan_secrets(&self, dir: &Path) -> Result<Vec<String>> {
-        let stamp = self.settled_stamp(dir);
+        self.scan_secrets_with(dir, self.settled_stamp(dir))
+    }
+
+    fn scan_secrets_with(&self, dir: &Path, stamp: Option<[u8; 32]>) -> Result<Vec<String>> {
         if let Some(s) = &stamp {
             if let Some(hit) = self.lookup(dir, s, |e| e.secrets.clone()) {
                 return Ok(hit);
