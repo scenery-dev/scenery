@@ -78,7 +78,12 @@ fn write_skill(dir: &Path, slug: &str, i: usize) {
         .map(|l| format!("def step_{l}(x):\n    return x + {l}\n"))
         .collect();
     fs::write(dir.join("scripts/helper.py"), py).unwrap();
-    let guide = "Reference notes for the skill. ".repeat(160);
+    // SCENERY_BENCH_BIG_KB: one big reference per skill (memory high-water).
+    let big_kb: usize = std::env::var("SCENERY_BENCH_BIG_KB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let guide = "Reference notes for the skill. ".repeat(160 + big_kb * 33);
     fs::write(dir.join("references/guide.md"), guide).unwrap();
     fs::write(
         dir.join("template.json"),
@@ -436,12 +441,28 @@ fn idle_cost_scaling() {
         let w = build_world(n);
         // The racy-clean guard memoises only trees older than 2 s.
         std::thread::sleep(Duration::from_millis(2_200));
+        let rss_before = rss_mb();
         let first = one_round(&w, &rt);
+        if std::env::var("SCENERY_BENCH_RSS_TRACE").is_ok() {
+            println!(
+                "  N={n} RSS before first tick {rss_before:.1} MB, after {:.1} MB",
+                rss_mb()
+            );
+        }
         let mut steady = Vec::new();
         for _ in 0..rounds {
             steady.push(one_round(&w, &rt));
         }
         let s = avg(&steady);
+        if std::env::var("SCENERY_BENCH_RSS_TRACE").is_ok() {
+            // RSS over many steady rounds: growth here would be a leak.
+            for r in 0..60 {
+                one_round(&w, &rt);
+                if r % 10 == 9 {
+                    println!("  N={n} round {:>3}: RSS {:.1} MB", r + 1, rss_mb());
+                }
+            }
+        }
         // One edit, then the next tick (the edited tree is re-read).
         let mut text = fs::read_to_string(&w.edit_target).unwrap();
         text.push_str("\nAn edit.\n");
@@ -472,4 +493,66 @@ fn idle_cost_scaling() {
         );
         drop(w);
     }
+}
+
+/// The whole daemon (`run_daemon`) idling in a temp HOME against the local
+/// mock registry, paired, with the 300 s scans shortened
+/// (`SCENERY_BENCH_SCAN_SECS`, default 5): RSS sampled every 10 s for
+/// `SCENERY_BENCH_DAEMON_SECS` (default 180). A leak grows without bound; a
+/// warm-up high-water mark plateaus.
+#[test]
+#[ignore = "measurement harness; run explicitly with --release --ignored --nocapture"]
+fn idle_rss_daemon() {
+    let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let n: usize = std::env::var("SCENERY_BENCH_SIZES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(60);
+    let secs: u64 = std::env::var("SCENERY_BENCH_DAEMON_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(180);
+    let scan = std::env::var("SCENERY_BENCH_SCAN_SECS").unwrap_or_else(|_| "5".into());
+    let w = build_world(n);
+    // Hard guard: the daemon's own state dir must be inside the temp HOME.
+    let root = AppState::resolve_root_dir().unwrap();
+    assert!(
+        root.as_std_path().starts_with(&w.home),
+        "refusing to run: state dir {root} is not under the temp HOME"
+    );
+    let state = AppState::bootstrap_in(root).unwrap();
+    let url = w.server.url();
+    crate::test_support::pair_device(&state, &url);
+    state.set_sync_state("device_id", "dev-1").unwrap();
+    scenery_core::auth::save_tokens(&state, &url, &jwt_far_future(), "refresh").unwrap();
+    std::env::set_var("SCENERY_DISCOVERIES_INTERVAL_SECS", &scan);
+    std::env::set_var("SCENERY_DRIFT_SCAN_INTERVAL_SECS", &scan);
+    std::env::set_var("SCENERY_REGISTRY_URL", &url);
+
+    let sock = camino::Utf8PathBuf::from_path_buf(w.home.join("bench.sock")).unwrap();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _ = rt.block_on(crate::run_daemon(crate::DaemonOpts {
+            registry_url: Some(url),
+            socket_path_override: Some(sock),
+            ollama_url: Some("http://127.0.0.1:9".into()),
+            ollama_model: None,
+        }));
+    });
+    let t0 = std::time::Instant::now();
+    let c0 = cpu_ms();
+    while t0.elapsed().as_secs() < secs {
+        std::thread::sleep(Duration::from_secs(10));
+        println!(
+            "  t={:>4}s RSS {:>5.1} MB  cpu {:>7.0} ms",
+            t0.elapsed().as_secs(),
+            rss_mb(),
+            cpu_ms() - c0
+        );
+    }
+    // The daemon thread is left running; the test process exits.
+    std::process::exit(0);
 }
