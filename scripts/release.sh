@@ -154,8 +154,9 @@ if should_run formula; then
   "$GH" release download "$TAG" -R "$REPO" --pattern SHA256SUMS --dir "$tmp" --clobber || die "cannot download SHA256SUMS"
   [ -s "$tmp/SHA256SUMS" ] || die "SHA256SUMS missing or empty"
   grep -q "^  version \"$VERSION\"\$" "$FORMULA" || die "formula version is not $VERSION"
-  while read -r sum _; do
+  while read -r sum name; do
     [ -n "$sum" ] || continue
+    case "$name" in *.tar.gz) ;; *) continue ;; esac  # the .pkg is not a formula asset
     grep -q "sha256 \"$sum\"" "$FORMULA" || die "formula is missing sha256 $sum from SHA256SUMS (run sign-release.sh --apply-formula logic or edit the formula)"
   done < "$tmp/SHA256SUMS"
   # Every sha256 in the formula must come from this release (no stale lines).

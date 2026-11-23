@@ -41,7 +41,7 @@ T
 sed 's/9.9.9/9.9.8/' "$ROOT/formula.good" > "$ROOT/formula.old"
 cp "$ROOT/formula.old" "$ROOT/tap/Formula/scenery.rb"
 ( cd "$ROOT/tap" && G add -A && G commit -qm formula && git push -q origin main )
-echo "$S1  scenery-9.9.9-a.tar.gz" > "$ROOT/SUMS"; echo "$S2  scenery-9.9.9-b.tar.gz" >> "$ROOT/SUMS"
+echo "$S1  scenery-9.9.9-a.tar.gz" > "$ROOT/SUMS"; echo "$S2  scenery-9.9.9-b.tar.gz" >> "$ROOT/SUMS"; echo "1fa81fba5ad9adeffc7f3cdab3c43c01ffd45710258559d16a6e9025ca8cf323  scenery-9.9.9-macos.pkg" >> "$ROOT/SUMS"  # pkg is not a formula asset
 
 BIN="$ROOT/bin"; LOG="$ROOT/calls.log"; mkdir -p "$BIN"
 cat > "$BIN/gh" <<'S'
