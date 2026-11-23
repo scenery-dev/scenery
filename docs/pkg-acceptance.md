@@ -34,6 +34,7 @@ Installed the prod pkg on the admin Mac with brew's `sh.brew.scenery` service pr
   - Almost all of that was two ~0.85 s bursts ~5 min apart (the 300 s discovery and drift scans), at ~0.08% in between.
   - Not pkg-specific: brew 2.7.0's lifetime average is ~0.1%.
   - Tracked on the board card "Runner: 5-min discovery/drift scans exceed idle CPU budget (release gate)". It blocks shipping the pkg.
+  - **Re-measured 2026-11-22 (2.7.2 release build, real state, paired to prod, brew stopped): PASS.** CPU 0.24 s → 0.64 s = 0.40 s / 600 s; RSS 18–35 MB, footprint 23 → 12 MB (no climb). The 300 s scans now cost ~0.11–0.14 s, and an unchanged discovery batch is not re-uploaded. Synthetic scale (`idle_cost_bench.rs`): ~16 ms per scan at 100 skills, ~121 ms at 1000. Still to repeat under the pkg-managed daemon (item h below).
 
 ## PENDING — user (needs sudo/VM)
 
