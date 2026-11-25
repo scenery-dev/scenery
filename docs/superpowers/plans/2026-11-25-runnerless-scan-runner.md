@@ -10,7 +10,7 @@
 
 **Spec:** `/Users/shadowduck/code/scenery/context/2026-11-21-runnerless-pilot-design.md`. The backend wire contract and the rulings on the builder-left items are in `/Users/shadowduck/code/scenery/scenery-backend/docs/superpowers/plans/2026-11-25-runnerless-scan.md`, "Rulings" and Task 4. Read both.
 
-**Execution order:** Start after backend Tasks 1–7 are deployed to dev. Portal Tasks 8–9 follow this plan.
+**Execution order:** Start after backend Tasks 1–8 are deployed to dev. Portal Tasks 9–10 follow this plan.
 
 ## Global Constraints
 
@@ -187,4 +187,4 @@
 - [ ] **Step 3: Write `scan.sh`, and update deploy.sh and .gitignore in the backend.** Check on the dev box that Caddy's `install.*` site serves `/scan.sh` from `/srv/install` (the box Caddyfile is not in rsync). If it only rewrites `/` to `install.sh`, add a `file_server` for `/scan.sh` by hand on each box and record that in the backend deploy notes.
 - [ ] **Step 4: Run them to verify they pass.** Then run the full suite: `cargo test && cargo clippy && cargo fmt --check`. Expected: PASS.
 - [ ] **Step 5: Run the release gate on a release build.** Run `cargo build --release`, then `cargo test -p scenery-daemon --release --lib idle_cost -- --ignored --nocapture --test-threads=1` and `scripts/measure_daemon_rss.sh`. Expected: idle CPU under 0.6 s per 10 min, and RSS under 50 MB. Then run `/usr/bin/time -l target/release/scenery scan --once --dry-run` on the Mac. Record the peak RSS in the commit message (informational). Afterwards, `pgrep -f 'scenery scan'` is empty. Block the release on any failure.
-- [ ] **Step 6: Commit, tag, release.** Run `git commit -m "Release 2.8.0: scenery scan --once (runnerless inventory)"`, then `git tag v2.8.0 && git push origin main v2.8.0`, then `SCENERY_MINISIGN_KEY=~/.ssh/scenery-release.key scripts/release.sh v2.8.0` in the owner's terminal, since it prompts for the minisign password. Before that, the backend from backend plan Tasks 1–7 must be live on prod (`./train.sh`), because older backends answer 404 on `/scan/*`. Afterwards, `brew upgrade scenery` on spaceghost and the Mac, then restart the daemons as the root CLAUDE.md says. Confirm with the acceptance-tester that the spaceghost daemon re-registers with `scan_identity` and still syncs.
+- [ ] **Step 6: Commit, tag, release.** Run `git commit -m "Release 2.8.0: scenery scan --once (runnerless inventory)"`, then `git tag v2.8.0 && git push origin main v2.8.0`, then `SCENERY_MINISIGN_KEY=~/.ssh/scenery-release.key scripts/release.sh v2.8.0` in the owner's terminal, since it prompts for the minisign password. Before that, the backend from backend plan Tasks 1–8 must be live on prod (`./train.sh`), because older backends answer 404 on `/scan/*`. Afterwards, `brew upgrade scenery` on spaceghost and the Mac, then restart the daemons as the root CLAUDE.md says. Confirm with the acceptance-tester that the spaceghost daemon re-registers with `scan_identity` and still syncs.
