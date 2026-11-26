@@ -71,6 +71,7 @@ impl Fixture {
             // Tests never open a real browser.
             open_browser: |_| false,
             login_timeout: Duration::from_secs(10),
+            watch_signals: false,
         }
     }
 }

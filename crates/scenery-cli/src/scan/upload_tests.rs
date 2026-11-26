@@ -409,3 +409,24 @@ fn from_file_redacts_args_again() {
     assert!(v["items"][1]["detail"].get("args").is_none());
     assert_eq!(v["items"][2]["detail"]["args"][0], "untouched");
 }
+
+#[test]
+fn failed_out_save_falls_back_to_temp_dir() {
+    let fx = Fixture::new();
+    let mut s = Server::new();
+    let _sess = mock_session(&mut s, false, 5000);
+    let _post = s
+        .mock("POST", "/api/scan/reports")
+        .with_status(500)
+        .expect(3)
+        .create();
+    // The parent dir does not exist, so the --out save fails.
+    let target = fx.tmpdir.join("missing-dir").join("mine.json");
+    let mut a = upload_args(&s);
+    a.out = Some(target.clone());
+    let (code, text) = run_upload(&fx, a);
+    assert_eq!(code, 3, "{text}");
+    assert!(text.contains("could not save --out"), "{text}");
+    assert!(!target.exists());
+    assert_saved_private(&fx);
+}

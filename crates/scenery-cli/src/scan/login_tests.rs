@@ -252,13 +252,41 @@ fn snapshot(dir: &Path, out: &mut Snapshot) {
     }
 }
 
+/// Sets `SCENERY_DISABLE_KEYCHAIN=1`; restores the old value on drop, even
+/// when an assertion panics. Taken after `Fixture` (which holds the env lock).
+struct KeychainOff(Option<std::ffi::OsString>);
+
+impl KeychainOff {
+    fn new() -> Self {
+        let prev = std::env::var_os("SCENERY_DISABLE_KEYCHAIN");
+        std::env::set_var("SCENERY_DISABLE_KEYCHAIN", "1");
+        Self(prev)
+    }
+}
+
+impl Drop for KeychainOff {
+    fn drop(&mut self) {
+        match &self.0 {
+            Some(v) => std::env::set_var("SCENERY_DISABLE_KEYCHAIN", v),
+            None => std::env::remove_var("SCENERY_DISABLE_KEYCHAIN"),
+        }
+    }
+}
+
+#[test]
+fn wait_message_follows_timeout() {
+    assert_eq!(super::wait_text(super::SIGN_IN_TIMEOUT), "5 minutes");
+    assert_eq!(super::wait_text(Duration::from_secs(60)), "1 minute");
+    assert_eq!(super::wait_text(Duration::from_secs(1)), "1 second");
+    assert_eq!(super::wait_text(Duration::from_secs(90)), "90 seconds");
+}
+
 /// With the keychain disabled, any token save would land in the secret file
 /// under the state dir in this HOME, so an unchanged HOME proves none happened.
 #[test]
 fn login_writes_no_tokens() {
     let fx = Fixture::new();
-    let prev = std::env::var_os("SCENERY_DISABLE_KEYCHAIN");
-    std::env::set_var("SCENERY_DISABLE_KEYCHAIN", "1");
+    let _keychain = KeychainOff::new();
     let mut s = Server::new();
     let _token = mock_token(&mut s);
     let _sess = mock_session(&mut s);
@@ -272,10 +300,6 @@ fn login_writes_no_tokens() {
     let (code, text) = run_login(&env, login_args(&s));
     let mut after = Snapshot::new();
     snapshot(&root, &mut after);
-    match prev {
-        Some(v) => std::env::set_var("SCENERY_DISABLE_KEYCHAIN", v),
-        None => std::env::remove_var("SCENERY_DISABLE_KEYCHAIN"),
-    }
     assert_eq!(code, 0, "{text}");
     assert_eq!(
         before, after,

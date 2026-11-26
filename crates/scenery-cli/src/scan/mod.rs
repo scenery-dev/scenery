@@ -22,6 +22,8 @@ pub struct ScanArgs {
     #[arg(long, required = true)]
     pub once: bool,
     /// Sign in as yourself in a browser instead of using an org scan token.
+    /// The session is never saved and is revoked when the scan exits. Set
+    /// SCENERY_NO_BROWSER=1 to print the sign-in URL instead of opening it.
     #[arg(long, conflicts_with = "token_file")]
     pub login: bool,
     /// File holding the org scan token (the token is never taken from argv).
@@ -62,6 +64,9 @@ pub(crate) struct ScanEnv {
     pub open_browser: fn(&str) -> bool,
     /// How long `--login` waits for the browser sign-in.
     pub login_timeout: Duration,
+    /// Revoke a `--login` session on SIGINT/SIGTERM/SIGHUP (off in unit
+    /// tests: the handlers would stay installed in the test process).
+    pub watch_signals: bool,
 }
 
 fn real_euid() -> u32 {
@@ -85,7 +90,12 @@ pub async fn run(args: ScanArgs) -> Result<i32> {
         save_dir: std::env::temp_dir(),
         token: std::env::var("SCENERY_SCAN_TOKEN").ok(),
         backoff: upload::DEFAULT_BACKOFF.to_vec(),
-        open_browser: crate::try_open_browser,
+        open_browser: if std::env::var_os("SCENERY_NO_BROWSER").is_some() {
+            |_| false
+        } else {
+            crate::try_open_browser
+        },
+        watch_signals: true,
         login_timeout: login::SIGN_IN_TIMEOUT,
     };
     run_to(args, &env, &mut std::io::stdout()).await

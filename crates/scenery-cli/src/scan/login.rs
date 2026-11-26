@@ -22,6 +22,7 @@ pub(crate) const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(300);
 pub(crate) const TIMED_OUT: &str = "Sign-in timed out.";
 
 /// A signed-in session, held in memory only.
+#[derive(Clone)]
 pub struct LoginSession {
     pub access_token: String,
     pub refresh_token: String,
@@ -80,21 +81,22 @@ where
             .context("sign-in task failed")??;
     let rx = hub.subscribe(init.state.clone()).await?;
     let url = init.auth_url.clone();
-    let wait = async move {
-        let shown = url.clone();
-        let opened = spawn_blocking(move || open_browser(&url))
-            .await
-            .unwrap_or(false);
-        if !opened {
-            eprintln!("Open this URL in your browser to sign in:\n  {shown}\n");
+    // Detached: a slow or hung opener never delays the callback. Its answer
+    // only decides whether the URL is printed.
+    drop(spawn_blocking(move || {
+        if !open_browser(&url) {
+            eprintln!("Open this URL in your browser to sign in:\n  {url}\n");
             eprintln!(
                 "Over SSH, first forward the callback port from your computer: \
                  ssh -L {port}:localhost:{port} <this machine>"
             );
         }
-        eprintln!("Waiting for you to sign in (up to 5 minutes)...");
-        rx.await.map_err(|_| anyhow!("sign-in was cancelled"))
-    };
+    }));
+    eprintln!(
+        "Waiting for you to sign in (up to {})...",
+        wait_text(timeout)
+    );
+    let wait = async move { rx.await.map_err(|_| anyhow!("sign-in was cancelled")) };
     let (code, _state) = tokio::time::timeout(timeout, wait)
         .await
         .map_err(|_| anyhow!(TIMED_OUT))??;
@@ -109,6 +111,73 @@ where
         access_token: tokens.access_token,
         refresh_token: tokens.refresh_token,
     })
+}
+
+/// "5 minutes", "1 minute", or "30 seconds" for the wait message.
+pub(crate) fn wait_text(timeout: Duration) -> String {
+    let secs = timeout.as_secs();
+    match (secs / 60, secs % 60) {
+        (1, 0) => "1 minute".to_string(),
+        (m, 0) if m > 1 => format!("{m} minutes"),
+        _ if secs == 1 => "1 second".to_string(),
+        _ => format!("{secs} seconds"),
+    }
+}
+
+/// Signal watchers that revoke the session if the process is interrupted
+/// (SIGINT, SIGTERM, SIGHUP; Ctrl-C on Windows) and then exit 130. Call
+/// [`SignalGuard::disarm`] after the normal [`sign_out`].
+pub struct SignalGuard {
+    tasks: Vec<JoinHandle<()>>,
+}
+
+impl SignalGuard {
+    pub fn disarm(self) {
+        for task in self.tasks {
+            task.abort();
+        }
+    }
+}
+
+/// Install the watchers. The handlers are registered before this returns,
+/// so a signal that arrives right after it is caught.
+pub fn revoke_on_signal(base: &str, session: &LoginSession) -> Result<SignalGuard> {
+    let mut tasks = Vec::new();
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        for kind in [
+            SignalKind::interrupt(),
+            SignalKind::terminate(),
+            SignalKind::hangup(),
+        ] {
+            let mut sig = signal(kind).context("installing a signal handler")?;
+            let base = base.to_string();
+            let session = session.clone();
+            tasks.push(tokio::spawn(async move {
+                if sig.recv().await.is_some() {
+                    revoke_and_exit(&base, &session).await;
+                }
+            }));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let base = base.to_string();
+        let session = session.clone();
+        tasks.push(tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                revoke_and_exit(&base, &session).await;
+            }
+        }));
+    }
+    Ok(SignalGuard { tasks })
+}
+
+async fn revoke_and_exit(base: &str, session: &LoginSession) {
+    eprintln!("Interrupted; signing out the scan session.");
+    sign_out(base, session).await;
+    std::process::exit(130);
 }
 
 /// Revoke the session (`POST /portal/auth/revoke`, scope `family`: this
