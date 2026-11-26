@@ -24,6 +24,8 @@ on:
       - 'rust-toolchain.toml'
       - 'deny.toml'
       - '.github/workflows/ci.yml'
+      - 'scripts/scan.sh'
+      - 'scripts/test_scan_sh.sh'
   pull_request:
     paths:
       - 'crates/**'
@@ -32,6 +34,8 @@ on:
       - 'rust-toolchain.toml'
       - 'deny.toml'
       - '.github/workflows/ci.yml'
+      - 'scripts/scan.sh'
+      - 'scripts/test_scan_sh.sh'
 
 permissions:
   contents: read
