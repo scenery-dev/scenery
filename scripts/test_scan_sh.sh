@@ -49,7 +49,7 @@ done
 # Controlled PATH: symlinks to the tools scan.sh needs, and no minisign/gh.
 TOOLS="${ROOT}/tools"; mkdir -p "${TOOLS}"
 for t in sh curl tar awk head tr find mktemp uname chmod rm mkdir cat sed grep python3 env dirname \
-         sha256sum shasum openssl cksum; do
+         sha256sum shasum openssl cksum gzip gunzip xz bzip2 sleep sort ls; do
     p="$(command -v "$t" 2>/dev/null)" && [ -x "${p}" ] && ln -sf "${p}" "${TOOLS}/${t}"
 done
 mkdir -p "${ROOT}/stub-ok" "${ROOT}/stub-bad"
