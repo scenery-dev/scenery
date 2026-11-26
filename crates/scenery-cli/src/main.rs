@@ -42,6 +42,11 @@ mod install;
 mod logging;
 mod pair;
 mod rotating_file;
+mod scan;
+
+/// Serializes every test in this crate that mutates the process-global `HOME`.
+#[cfg(test)]
+pub(crate) static HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 mod skill_edits;
 mod token_input;
 mod uninstall;
@@ -62,6 +67,8 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Scan this machine for skills, MCP servers and plugins (no runner needed).
+    Scan(scan::ScanArgs),
     /// Print health status: daemon reachability, state directory, versions.
     Doctor {
         /// Registry URL to probe for reachability check.
@@ -801,6 +808,13 @@ fn main() {
 
 async fn run(cli: Cli) -> Result<()> {
     match cli.command {
+        Command::Scan(args) => {
+            let code = scan::run(args)?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
         Command::Doctor { registry_url } => cmd_doctor(registry_url.as_deref()).await,
 
         Command::Skill(SkillCommand::List) => cmd_skill_list().await,

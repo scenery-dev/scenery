@@ -30,7 +30,7 @@ clap.workspace = true
 camino.workspace = true
 reqwest = { workspace = true, features = ["rustls-tls", "json"] }
 rusqlite.workspace = true
-time.workspace = true
+time = { workspace = true, features = ["formatting"] }
 dirs.workspace = true
 libc.workspace = true
 tar = "0.4"

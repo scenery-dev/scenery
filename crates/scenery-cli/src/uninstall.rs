@@ -1611,7 +1611,7 @@ mod tests {
 
     /// Serializes every test in this module that mutates the process-global
     /// `HOME` env var.
-    pub(super) static HOME_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(super) use crate::HOME_ENV_LOCK as HOME_MUTEX;
 
     pub(super) fn temp_dir(label: &str) -> PathBuf {
         let nanos = SystemTime::now()
