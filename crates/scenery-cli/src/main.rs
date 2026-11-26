@@ -809,7 +809,7 @@ fn main() {
 async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Scan(args) => {
-            let code = scan::run(args)?;
+            let code = scan::run(args).await?;
             if code != 0 {
                 std::process::exit(code);
             }

@@ -6,22 +6,25 @@ use std::fs;
 
 use crate::HOME_ENV_LOCK as ENV_MUTEX;
 
-struct Fixture {
+pub(crate) struct Fixture {
     _tmp: tempfile::TempDir,
-    home: PathBuf,
+    pub(crate) home: PathBuf,
+    pub(crate) tmpdir: PathBuf,
     prev_home: Option<std::ffi::OsString>,
     prev_xdg: Option<std::ffi::OsString>,
     _lock: std::sync::MutexGuard<'static, ()>,
 }
 
 impl Fixture {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
         fs::create_dir_all(&home).unwrap();
         let prev_home = std::env::var_os("HOME");
         let prev_xdg = std::env::var_os("XDG_DATA_HOME");
+        let tmpdir = tmp.path().join("tmpdir");
+        fs::create_dir_all(&tmpdir).unwrap();
         std::env::set_var("HOME", &home);
         std::env::remove_var("XDG_DATA_HOME");
         for name in ["notes", "deploy"] {
@@ -50,17 +53,21 @@ impl Fixture {
         Self {
             _tmp: tmp,
             home,
+            tmpdir,
             prev_home,
             prev_xdg,
             _lock: lock,
         }
     }
 
-    fn env(&self, euid: u32) -> ScanEnv {
+    pub(crate) fn env(&self, euid: u32) -> ScanEnv {
         ScanEnv {
             euid,
             home: self.home.clone(),
             now: OffsetDateTime::now_utc(),
+            token: None,
+            save_dir: self.tmpdir.clone(),
+            backoff: vec![Duration::from_millis(1), Duration::from_millis(1)],
         }
     }
 }
@@ -78,7 +85,16 @@ impl Drop for Fixture {
     }
 }
 
-fn args(dry_run: bool, json: bool) -> ScanArgs {
+/// Drive the async scan from a sync test that holds the env lock.
+pub(crate) fn block<F: std::future::Future>(f: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(f)
+}
+
+pub(crate) fn args(dry_run: bool, json: bool) -> ScanArgs {
     ScanArgs {
         once: true,
         login: false,
@@ -92,7 +108,7 @@ fn args(dry_run: bool, json: bool) -> ScanArgs {
     }
 }
 
-fn item(kind: &str, slug: &str) -> DiscoveryItem {
+pub(crate) fn item(kind: &str, slug: &str) -> DiscoveryItem {
     DiscoveryItem {
         kind: kind.to_string(),
         slug: slug.to_string(),
@@ -107,7 +123,7 @@ fn item(kind: &str, slug: &str) -> DiscoveryItem {
 fn scan_refuses_root() {
     let fx = Fixture::new();
     let mut out = Vec::new();
-    let code = run_to(args(true, false), &fx.env(0), &mut out).unwrap();
+    let code = block(run_to(args(true, false), &fx.env(0), &mut out)).unwrap();
     assert_eq!(code, 2);
     assert!(out.is_empty());
     assert!(!scenery_core::state::AppState::resolve_root_dir()
@@ -121,19 +137,31 @@ fn scan_skips_when_runner_present() {
     let root = scenery_core::state::AppState::resolve_root_dir().unwrap();
     fs::create_dir_all(&root).unwrap();
     fs::write(root.join("state.db"), b"").unwrap();
+    let mut server = mockito::Server::new();
+    let session = server.mock("GET", mockito::Matcher::Any).expect(0).create();
+    let reports = server
+        .mock("POST", mockito::Matcher::Any)
+        .expect(0)
+        .create();
+    let mut a = args(false, false);
+    a.registry_url = server.url();
+    let mut env = fx.env(501);
+    env.token = Some("scn_scan_abcdef".to_string());
     let mut out = Vec::new();
-    let code = run_to(args(true, false), &fx.env(501), &mut out).unwrap();
+    let code = block(run_to(a, &env, &mut out)).unwrap();
     assert_eq!(code, 0);
     assert!(String::from_utf8(out)
         .unwrap()
         .contains("already installed"));
+    session.assert();
+    reports.assert();
 }
 
 #[test]
 fn dry_run_prints_summary() {
     let fx = Fixture::new();
     let mut out = Vec::new();
-    let code = run_to(args(true, false), &fx.env(501), &mut out).unwrap();
+    let code = block(run_to(args(true, false), &fx.env(501), &mut out)).unwrap();
     assert_eq!(code, 0);
     let text = String::from_utf8(out).unwrap();
     let mut lines = text.lines();
@@ -164,7 +192,7 @@ fn summary_truncates_at_50() {
 fn json_matches_wire_shape() {
     let fx = Fixture::new();
     let mut out = Vec::new();
-    let code = run_to(args(true, true), &fx.env(501), &mut out).unwrap();
+    let code = block(run_to(args(true, true), &fx.env(501), &mut out)).unwrap();
     assert_eq!(code, 0);
     let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
     assert_eq!(v["format"], "scenery-scan-report/1");
