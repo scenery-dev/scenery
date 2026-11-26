@@ -4,8 +4,6 @@
 //! The hash is computed only here. The backend validates `^[0-9a-f]{64}$` and
 //! never recomputes it, so the exact input text below is canonical.
 
-use std::process::Command;
-
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -68,7 +66,7 @@ pub(crate) fn parse_ioreg(output: &str) -> Option<String> {
 #[cfg(target_os = "macos")]
 fn hardware_id() -> Option<String> {
     // `output()` waits for the child, so nothing is left running.
-    let out = Command::new("/usr/sbin/ioreg")
+    let out = std::process::Command::new("/usr/sbin/ioreg")
         .args(["-rd1", "-c", "IOPlatformExpertDevice"])
         .output()
         .ok()?;
@@ -93,7 +91,6 @@ fn hardware_id() -> Option<String> {
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn hardware_id() -> Option<String> {
-    let _ = Command::new("true");
     None
 }
 
@@ -112,22 +109,46 @@ pub fn os_username() -> String {
 
 #[cfg(unix)]
 fn passwd_name() -> Option<String> {
-    // SAFETY: getpwuid returns a pointer into libc-owned static storage (or
-    // null); we copy the name out immediately, before any other libc call.
-    unsafe {
-        let pw = libc::getpwuid(libc::geteuid());
-        if pw.is_null() || (*pw).pw_name.is_null() {
-            return None;
-        }
-        let name = std::ffi::CStr::from_ptr((*pw).pw_name)
-            .to_string_lossy()
-            .into_owned();
-        if name.is_empty() {
-            None
-        } else {
-            Some(name)
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buf = vec![0u8; 4096];
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: all pointers refer to live locals; buf length is passed; the
+    // reentrant variant is thread-safe. The name is copied before return.
+    let rc = unsafe {
+        libc::getpwuid_r(
+            libc::geteuid(),
+            &mut pwd,
+            buf.as_mut_ptr() as *mut libc::c_char,
+            buf.len(),
+            &mut result,
+        )
+    };
+    if rc != 0 || result.is_null() || pwd.pw_name.is_null() {
+        return None;
+    }
+    let name = unsafe { std::ffi::CStr::from_ptr(pwd.pw_name) }
+        .to_string_lossy()
+        .into_owned();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+/// Kernel hostname via `gethostname`, never `$HOSTNAME`, so a shell scan and
+/// the launchd daemon hash the same value.
+fn syscall_hostname() -> String {
+    #[cfg(unix)]
+    {
+        let mut buf = vec![0u8; 256];
+        // SAFETY: buf is valid for buf.len() bytes.
+        if unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) } == 0 {
+            let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+            return String::from_utf8_lossy(&buf[..end]).into_owned();
         }
     }
+    "unknown".to_string()
 }
 
 /// Hostname as reported to the backend on register: `$HOSTNAME`, then
@@ -149,7 +170,7 @@ pub fn hostname() -> String {
 
 /// Derive this machine's scan identity. May spawn `ioreg` on macOS (waited on).
 pub fn derive() -> ScanIdentity {
-    let hostname = hostname();
+    let hostname = syscall_hostname();
     let os_username = os_username();
     let (hash, basis) = hash_identity(hardware_id().as_deref(), &hostname, &os_username);
     ScanIdentity {

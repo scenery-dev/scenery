@@ -54,3 +54,17 @@ fn basis_serializes_lowercase() {
         "\"hostname\""
     );
 }
+
+#[test]
+fn derive_shape() {
+    let id = derive();
+    assert_eq!(id.hash.len(), 64);
+    assert!(id
+        .hash
+        .bytes()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+    assert!(matches!(
+        id.basis,
+        IdentityBasis::Hardware | IdentityBasis::Hostname
+    ));
+}
