@@ -211,12 +211,25 @@ pub fn collect_mcp_discoveries(
         }
     };
 
-    let mut items = Vec::new();
     // Redacted args leave the machine only after the backend has told us (in
     // an upload response) that the org auto-submits MCP servers.
     let include_args = state
         .cached_auto_manage_policy()
         .is_some_and(|p| p.auto_submit_mcp);
+    collect_mcp_discoveries_in(&conn, clients, registry_url, include_args)
+}
+
+/// [`collect_mcp_discoveries`] over an already-open connection, with the
+/// args decision made by the caller (the daemon reads its cached policy;
+/// `scenery scan` uses the `GET /scan/session` answer). Same rules, same
+/// redaction, same hash.
+pub fn collect_mcp_discoveries_in(
+    conn: &Connection,
+    clients: &[ClientConfig],
+    registry_url: &str,
+    include_args: bool,
+) -> Vec<McpDiscoveryItem> {
+    let mut items = Vec::new();
 
     for client in clients {
         if !client.config_path.exists() {
@@ -232,7 +245,7 @@ pub fn collect_mcp_discoveries(
             }
 
             let virtual_path = format!("{}:{}", client.config_path.display(), entry.key);
-            if is_already_managed(&conn, &virtual_path) {
+            if is_already_managed(conn, &virtual_path) {
                 continue;
             }
 
@@ -470,7 +483,7 @@ fn command_basename_of(command: &str) -> String {
 /// the local username (`/Users/<username>/...`), which the allowlist policy
 /// (module docs) treats the same as any other locally-identifying detail:
 /// mask it rather than transmit it.
-pub(super) fn mask_home_dir(value: &str) -> String {
+pub(crate) fn mask_home_dir(value: &str) -> String {
     if let Some(home) = dirs::home_dir().and_then(|h| h.to_str().map(str::to_string)) {
         if !home.is_empty() && value.contains(&home) {
             return value.replacen(&home, "~", 1);

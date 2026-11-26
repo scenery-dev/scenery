@@ -50,6 +50,7 @@ pub mod plugin_marketplace;
 pub mod projection_outcome;
 pub mod pusher;
 pub mod rollback;
+pub mod scan_collect;
 pub mod scanner;
 pub mod skill_merge;
 pub mod takeover;

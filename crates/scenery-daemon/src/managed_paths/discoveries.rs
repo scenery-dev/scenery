@@ -548,19 +548,25 @@ pub fn extra_roots() -> Vec<PathBuf> {
 /// - `"unverified_managed_marker"` — carries a marker file but has no row.
 /// - `"managed_hash_mismatch"` — has a row, but its content does not match.
 pub fn collect_discoveries(roots: &[PathBuf], state: &AppState) -> Vec<DiscoveryItem> {
-    let mut items: Vec<DiscoveryItem> = Vec::new();
-
-    let conn = match Connection::open(&state.db_path) {
-        Ok(c) => c,
+    match Connection::open(&state.db_path) {
+        Ok(conn) => collect_discoveries_in(&conn, roots),
         Err(e) => {
             warn!(error = %e, "discoveries: cannot open state DB — reporting nothing");
-            return items;
+            Vec::new()
         }
-    };
+    }
+}
+
+/// [`collect_discoveries`] over an already-open connection. The daemon passes
+/// `state.db`; `scenery scan --once` passes an in-memory schema
+/// ([`scenery_core::state::ephemeral_schema_connection`]), so no marker row
+/// exists and nothing touches disk.
+pub fn collect_discoveries_in(conn: &Connection, roots: &[PathBuf]) -> Vec<DiscoveryItem> {
+    let mut items: Vec<DiscoveryItem> = Vec::new();
 
     // Built once per scan: looking each directory up row-by-row canonicalised
     // every marker row per skill (quadratic in the skill count).
-    let mut markers = load_marker_index(&conn);
+    let mut markers = load_marker_index(conn);
     let classify_ctx = ClassifyContext::from_env().for_scan();
     for root in roots {
         if !root.exists() {
@@ -575,11 +581,11 @@ pub fn collect_discoveries(roots: &[PathBuf], state: &AppState) -> Vec<Discovery
                     // Scenery's own built-in skill is never discovered, whatever
                     // its content hash says (a modified copy is rewritten, not
                     // reported as suspicious).
-                    if super::marker::is_builtin_path_in(&conn, &markers, path) {
+                    if super::marker::is_builtin_path_in(conn, &markers, path) {
                         debug!(slug = %item.slug, "discoveries: built-in skill — skipping");
                         continue;
                     }
-                    let reason = match db_ownership_in(&conn, &markers, path) {
+                    let reason = match db_ownership_in(conn, &markers, path) {
                         DbOwnership::Verified => {
                             debug!(slug = %item.slug, "discoveries: verified managed — skipping");
                             continue;
@@ -590,8 +596,8 @@ pub fn collect_discoveries(roots: &[PathBuf], state: &AppState) -> Vec<Discovery
                         }
                         DbOwnership::Legacy { row_path } => {
                             debug!(slug = %item.slug, "discoveries: legacy marker row proves nothing — dropping it and classifying normally");
-                            drop_legacy_row(&conn, &row_path, path, root);
-                            markers = load_marker_index(&conn);
+                            drop_legacy_row(conn, &row_path, path, root);
+                            markers = load_marker_index(conn);
                             None
                         }
                         DbOwnership::HashMismatch => Some("managed_hash_mismatch"),
@@ -692,7 +698,7 @@ pub fn collect_all_discoveries(
 /// and JSON-serializes the already-allowlisted `detail` struct into
 /// `DiscoveryItem.detail` — never re-derives anything from raw args/commands/
 /// URLs/env here.
-fn mcp_item_to_discovery_item(item: mcp_discovery::McpDiscoveryItem) -> DiscoveryItem {
+pub(crate) fn mcp_item_to_discovery_item(item: mcp_discovery::McpDiscoveryItem) -> DiscoveryItem {
     let detail = serde_json::to_value(&item.detail).ok();
     DiscoveryItem {
         kind: item.kind,

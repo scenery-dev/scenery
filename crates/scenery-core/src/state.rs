@@ -120,121 +120,7 @@ impl AppState {
         let db_path = root_dir.join("state.db");
         let conn = Connection::open(&db_path)
             .with_context(|| format!("failed to open SQLite at {db_path}"))?;
-        conn.execute_batch(SCHEMA_SQL)
-            .context("failed to apply database schema")?;
-
-        // Idempotent column additions — these fail silently if the column
-        // already exists (SQLITE_ERROR extended code 1 from the "duplicate column"
-        // error). Any other error is a real problem and propagates.
-        //
-        // Legacy tables retired with the local-DB shrink:
-        //   - execution_history: per-run telemetry, never uploaded
-        //   - policy_cache:      moved to <root>/policy-cache.json
-        // Opportunistically dropped here so upgraded daemons free the disk
-        // space; brand-new installs never see them since they're not in
-        // SCHEMA_SQL anymore.
-        let _ = conn.execute_batch("DROP TABLE IF EXISTS execution_history");
-        let _ = conn.execute_batch("DROP TABLE IF EXISTS policy_cache");
-
-        // RUN2: desired-state reconciler columns on installed_skills.
-        add_column_if_missing(
-            &conn,
-            "ALTER TABLE installed_skills ADD COLUMN installation_id TEXT",
-        )?;
-        add_column_if_missing(
-            &conn,
-            "ALTER TABLE installed_skills ADD COLUMN source TEXT DEFAULT 'local'",
-        )?;
-        add_column_if_missing(
-            &conn,
-            "ALTER TABLE installed_skills ADD COLUMN deactivated INTEGER DEFAULT 0",
-        )?;
-        add_column_if_missing(
-            &conn,
-            "ALTER TABLE installed_skills ADD COLUMN deactivated_at TEXT",
-        )?;
-
-        // RUN2: SSE resume state and device registration.
-        conn.execute_batch(SCHEMA_RUN2_SQL)
-            .context("failed to apply RUN2 schema additions")?;
-
-        // AUTH-BACKOFF: track refresh-token failure backoff state per registry.
-        // When the daemon repeatedly hits 401 on /portal/auth/refresh (e.g.
-        // user revoked their session), we escalate the retry interval instead
-        // of hammering the endpoint every 60s. Columns are nullable so any
-        // legacy row is treated as "fresh, no backoff".
-        add_column_if_missing(
-            &conn,
-            "ALTER TABLE auth_tokens ADD COLUMN refresh_failures INTEGER NOT NULL DEFAULT 0",
-        )?;
-        add_column_if_missing(
-            &conn,
-            "ALTER TABLE auth_tokens ADD COLUMN next_refresh_attempt_at INTEGER",
-        )?;
-        add_column_if_missing(
-            &conn,
-            "ALTER TABLE auth_tokens ADD COLUMN last_refresh_status TEXT",
-        )?;
-
-        // G3: MCP installation desired-state table.
-        conn.execute_batch(SCHEMA_G3_SQL)
-            .context("failed to apply G3 schema additions")?;
-        // Gateway-brokered remote servers: proxy URL the daemon connects to
-        // with its own portal JWT. Nullable → legacy rows route via server_config.
-        add_column_if_missing(
-            &conn,
-            "ALTER TABLE mcp_installations ADD COLUMN gateway_url TEXT",
-        )?;
-
-        // Runner signing (2.2.0): trust pins, device stdio approvals, per-subject
-        // sequence high-water marks, and the approval/envelope columns on
-        // mcp_installations. All additive.
-        conn.execute_batch(SCHEMA_SIGNING_SQL)
-            .context("failed to apply signing schema additions")?;
-        add_column_if_missing(
-            &conn,
-            "ALTER TABLE mcp_installations ADD COLUMN approval_hash TEXT",
-        )?;
-        add_column_if_missing(
-            &conn,
-            "ALTER TABLE mcp_installations ADD COLUMN approval_state TEXT",
-        )?;
-        add_column_if_missing(
-            &conn,
-            "ALTER TABLE mcp_installations ADD COLUMN signed_envelope TEXT",
-        )?;
-
-        // F1: managed-paths reconciler marker table.
-        conn.execute_batch(SCHEMA_F1_SQL)
-            .context("failed to apply F1 schema additions")?;
-
-        // Adopt-publish auto-upload takeover tracking.
-        conn.execute_batch(SCHEMA_ADOPT_SQL)
-            .context("failed to apply adopt-takeover schema additions")?;
-
-        // Auto-manage (2.3.0): provenance on markers and pending takeovers,
-        // tracked-in-place skills, neutralization ledger, attempt backoff.
-        // All additive; rows written by older runners read as `origin = NULL`
-        // (legacy), which every consumer treats as "not auto-managed".
-        for sql in [
-            "ALTER TABLE managed_path_markers ADD COLUMN origin TEXT",
-            "ALTER TABLE managed_path_markers ADD COLUMN skill_id TEXT",
-            "ALTER TABLE managed_path_markers ADD COLUMN skill_uuid TEXT",
-            "ALTER TABLE managed_path_markers ADD COLUMN tree_hash TEXT",
-            "ALTER TABLE managed_path_markers ADD COLUMN hash_version INTEGER",
-            "ALTER TABLE adopt_pending_takeovers ADD COLUMN origin TEXT",
-            "ALTER TABLE adopt_pending_takeovers ADD COLUMN skill_id TEXT",
-            "ALTER TABLE adopt_pending_takeovers ADD COLUMN skill_uuid TEXT",
-        ] {
-            add_column_if_missing(&conn, sql)?;
-        }
-        conn.execute_batch(SCHEMA_AUTO_MANAGE_SQL)
-            .context("failed to apply auto-manage schema additions")?;
-
-        // Broadcast-model artifact revocation: durable local cache of the
-        // backend's revocation list, reconciled on every snapshot/connect.
-        conn.execute_batch(SCHEMA_REVOKE_SQL)
-            .context("failed to apply artifact-revocation schema additions")?;
+        apply_schema(&conn)?;
         drop(conn);
 
         restrict_to_owner(&root_dir, &db_path);
@@ -1013,6 +899,137 @@ impl AppState {
         .context("failed to delete adopt_pending_takeovers row")?;
         Ok(())
     }
+}
+
+/// Apply the full schema (base tables plus every additive migration) to
+/// `conn`. Shared by [`AppState::bootstrap_in`] and
+/// [`ephemeral_schema_connection`] so both see the same tables.
+fn apply_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(SCHEMA_SQL)
+        .context("failed to apply database schema")?;
+
+    // Idempotent column additions — these fail silently if the column
+    // already exists (SQLITE_ERROR extended code 1 from the "duplicate column"
+    // error). Any other error is a real problem and propagates.
+    //
+    // Legacy tables retired with the local-DB shrink:
+    //   - execution_history: per-run telemetry, never uploaded
+    //   - policy_cache:      moved to <root>/policy-cache.json
+    // Opportunistically dropped here so upgraded daemons free the disk
+    // space; brand-new installs never see them since they're not in
+    // SCHEMA_SQL anymore.
+    let _ = conn.execute_batch("DROP TABLE IF EXISTS execution_history");
+    let _ = conn.execute_batch("DROP TABLE IF EXISTS policy_cache");
+
+    // RUN2: desired-state reconciler columns on installed_skills.
+    add_column_if_missing(
+        conn,
+        "ALTER TABLE installed_skills ADD COLUMN installation_id TEXT",
+    )?;
+    add_column_if_missing(
+        conn,
+        "ALTER TABLE installed_skills ADD COLUMN source TEXT DEFAULT 'local'",
+    )?;
+    add_column_if_missing(
+        conn,
+        "ALTER TABLE installed_skills ADD COLUMN deactivated INTEGER DEFAULT 0",
+    )?;
+    add_column_if_missing(
+        conn,
+        "ALTER TABLE installed_skills ADD COLUMN deactivated_at TEXT",
+    )?;
+
+    // RUN2: SSE resume state and device registration.
+    conn.execute_batch(SCHEMA_RUN2_SQL)
+        .context("failed to apply RUN2 schema additions")?;
+
+    // AUTH-BACKOFF: track refresh-token failure backoff state per registry.
+    // When the daemon repeatedly hits 401 on /portal/auth/refresh (e.g.
+    // user revoked their session), we escalate the retry interval instead
+    // of hammering the endpoint every 60s. Columns are nullable so any
+    // legacy row is treated as "fresh, no backoff".
+    add_column_if_missing(
+        conn,
+        "ALTER TABLE auth_tokens ADD COLUMN refresh_failures INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(
+        conn,
+        "ALTER TABLE auth_tokens ADD COLUMN next_refresh_attempt_at INTEGER",
+    )?;
+    add_column_if_missing(
+        conn,
+        "ALTER TABLE auth_tokens ADD COLUMN last_refresh_status TEXT",
+    )?;
+
+    // G3: MCP installation desired-state table.
+    conn.execute_batch(SCHEMA_G3_SQL)
+        .context("failed to apply G3 schema additions")?;
+    // Gateway-brokered remote servers: proxy URL the daemon connects to
+    // with its own portal JWT. Nullable → legacy rows route via server_config.
+    add_column_if_missing(
+        conn,
+        "ALTER TABLE mcp_installations ADD COLUMN gateway_url TEXT",
+    )?;
+
+    // Runner signing (2.2.0): trust pins, device stdio approvals, per-subject
+    // sequence high-water marks, and the approval/envelope columns on
+    // mcp_installations. All additive.
+    conn.execute_batch(SCHEMA_SIGNING_SQL)
+        .context("failed to apply signing schema additions")?;
+    add_column_if_missing(
+        conn,
+        "ALTER TABLE mcp_installations ADD COLUMN approval_hash TEXT",
+    )?;
+    add_column_if_missing(
+        conn,
+        "ALTER TABLE mcp_installations ADD COLUMN approval_state TEXT",
+    )?;
+    add_column_if_missing(
+        conn,
+        "ALTER TABLE mcp_installations ADD COLUMN signed_envelope TEXT",
+    )?;
+
+    // F1: managed-paths reconciler marker table.
+    conn.execute_batch(SCHEMA_F1_SQL)
+        .context("failed to apply F1 schema additions")?;
+
+    // Adopt-publish auto-upload takeover tracking.
+    conn.execute_batch(SCHEMA_ADOPT_SQL)
+        .context("failed to apply adopt-takeover schema additions")?;
+
+    // Auto-manage (2.3.0): provenance on markers and pending takeovers,
+    // tracked-in-place skills, neutralization ledger, attempt backoff.
+    // All additive; rows written by older runners read as `origin = NULL`
+    // (legacy), which every consumer treats as "not auto-managed".
+    for sql in [
+        "ALTER TABLE managed_path_markers ADD COLUMN origin TEXT",
+        "ALTER TABLE managed_path_markers ADD COLUMN skill_id TEXT",
+        "ALTER TABLE managed_path_markers ADD COLUMN skill_uuid TEXT",
+        "ALTER TABLE managed_path_markers ADD COLUMN tree_hash TEXT",
+        "ALTER TABLE managed_path_markers ADD COLUMN hash_version INTEGER",
+        "ALTER TABLE adopt_pending_takeovers ADD COLUMN origin TEXT",
+        "ALTER TABLE adopt_pending_takeovers ADD COLUMN skill_id TEXT",
+        "ALTER TABLE adopt_pending_takeovers ADD COLUMN skill_uuid TEXT",
+    ] {
+        add_column_if_missing(conn, sql)?;
+    }
+    conn.execute_batch(SCHEMA_AUTO_MANAGE_SQL)
+        .context("failed to apply auto-manage schema additions")?;
+
+    // Broadcast-model artifact revocation: durable local cache of the
+    // backend's revocation list, reconciled on every snapshot/connect.
+    conn.execute_batch(SCHEMA_REVOKE_SQL)
+        .context("failed to apply artifact-revocation schema additions")?;
+    Ok(())
+}
+
+/// An in-memory SQLite connection carrying the full state schema and no
+/// rows. For `scenery scan --once`, which runs the discovery collectors
+/// without a state dir: nothing is ever written to disk.
+pub fn ephemeral_schema_connection() -> Result<Connection> {
+    let conn = Connection::open_in_memory().context("failed to open in-memory SQLite")?;
+    apply_schema(&conn)?;
+    Ok(conn)
 }
 
 // ── Schema helpers ────────────────────────────────────────────────────────────
