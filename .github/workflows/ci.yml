@@ -26,6 +26,8 @@ on:
       - '.github/workflows/ci.yml'
       - 'scripts/scan.sh'
       - 'scripts/test_scan_sh.sh'
+      - 'scripts/scan-mdm.sh'
+      - 'scripts/test_scan_mdm.sh'
   pull_request:
     paths:
       - 'crates/**'
@@ -36,6 +38,8 @@ on:
       - '.github/workflows/ci.yml'
       - 'scripts/scan.sh'
       - 'scripts/test_scan_sh.sh'
+      - 'scripts/scan-mdm.sh'
+      - 'scripts/test_scan_mdm.sh'
 
 permissions:
   contents: read
@@ -77,6 +81,9 @@ jobs:
 
       - name: scan.sh tests
         run: sh scripts/test_scan_sh.sh
+
+      - name: scan-mdm.sh tests
+        run: sh scripts/test_scan_mdm.sh
 
   audit:
     name: cargo audit
