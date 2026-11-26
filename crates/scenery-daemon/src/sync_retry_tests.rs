@@ -176,3 +176,27 @@ async fn revoked_user_gets_no_retries() {
     assert!(sc.event_sender().await.is_none());
     register.assert_async().await;
 }
+
+/// Register carries the scan identity: 64 lowercase hex chars.
+#[tokio::test]
+async fn register_sends_scan_identity() {
+    disable_keychain();
+    let (state, _tmp) = bootstrap_state();
+    let mut server = mockito::Server::new_async().await;
+    let url = server.url();
+    let register = server
+        .mock("POST", "/api/devices/register")
+        .match_body(mockito::Matcher::Regex(
+            r#""scan_identity":"[0-9a-f]{64}""#.to_string(),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"device_id":"dev-si"}"#)
+        .expect(1)
+        .create_async()
+        .await;
+
+    let id = super::super::register_with_backend(&url, "tok", "uuid-1", Arc::clone(&state)).await;
+    assert_eq!(id.unwrap(), "dev-si");
+    register.assert_async().await;
+}

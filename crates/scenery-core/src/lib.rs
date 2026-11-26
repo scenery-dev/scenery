@@ -41,6 +41,7 @@ pub mod revocation;
 pub mod safe_copy;
 pub mod safe_path;
 pub mod safe_unpack;
+pub mod scan_identity;
 pub mod secret_file;
 pub mod signed;
 pub mod skill_tree;

@@ -2249,20 +2249,10 @@ async fn register_with_backend(
         registry_url.trim_end_matches('/')
     );
 
-    // Prefer HOSTNAME env var (set by most shells); fall back to gethostname
-    // via the `libc` crate already in the workspace.
-    let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| {
-        // Try gethostname via libc on Unix.
-        #[cfg(unix)]
-        {
-            let mut buf = vec![0u8; 256];
-            if unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) } == 0 {
-                let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-                return String::from_utf8_lossy(&buf[..end]).into_owned();
-            }
-        }
-        "unknown".to_string()
-    });
+    let hostname = scenery_core::scan_identity::hostname();
+    // Linking key for runnerless scans. May spawn `ioreg` once (waited on);
+    // registration runs once per daemon start, so no idle cost.
+    let scan_identity = scenery_core::scan_identity::derive().hash;
 
     let payload = serde_json::json!({
         "device_uuid": device_uuid,
@@ -2270,6 +2260,7 @@ async fn register_with_backend(
         "platform": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
         "agent_version": env!("CARGO_PKG_VERSION"),
+        "scan_identity": scan_identity,
     });
 
     let client = scenery_core::http::async_client_builder()
