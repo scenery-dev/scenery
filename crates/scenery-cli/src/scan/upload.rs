@@ -4,6 +4,7 @@
 //! request. It is never logged, printed, put in an error or saved.
 
 use super::report::ScanReport;
+use reqwest::header::HeaderValue;
 use serde::Deserialize;
 use std::fmt;
 use std::time::Duration;
@@ -15,15 +16,20 @@ pub enum ScanAuth {
     /// Org scan token (`scn_scan_...`).
     Token(String),
     /// A signed-in user's access token (`scenery scan --once --login`).
-    #[allow(dead_code)] // constructed by the `--login` flow (R5)
     Bearer(String),
 }
 
 impl ScanAuth {
-    pub fn header(&self) -> String {
-        match self {
-            ScanAuth::Token(t) | ScanAuth::Bearer(t) => format!("Bearer {t}"),
-        }
+    /// The `Authorization` value, marked sensitive so hyper and reqwest
+    /// never print it (Debug output, HPACK indexing).
+    pub fn header_value(&self) -> Result<HeaderValue, UploadError> {
+        let token = match self {
+            ScanAuth::Token(t) | ScanAuth::Bearer(t) => t,
+        };
+        let mut value = HeaderValue::from_str(&format!("Bearer {token}"))
+            .map_err(|_| UploadError::BadCredential)?;
+        value.set_sensitive(true);
+        Ok(value)
     }
 }
 
@@ -39,7 +45,6 @@ pub struct ScanSession {
     pub org_name: String,
     #[allow(dead_code)]
     pub attribution: String,
-    #[allow(dead_code)]
     pub user_email: Option<String>,
     pub auto_submit_mcp: bool,
     pub max_items: usize,
@@ -67,6 +72,8 @@ pub struct ScanReceipt {
 #[derive(Debug)]
 pub enum UploadError {
     Auth(String),
+    /// The credential has characters an HTTP header cannot carry.
+    BadCredential,
     TooOld,
     RunnerPresent,
     Limit(String),
@@ -83,6 +90,9 @@ impl fmt::Display for UploadError {
                 "scan_token_invalid" => write!(f, "The scan token was not recognised."),
                 _ => write!(f, "The server refused the credentials ({code})."),
             },
+            UploadError::BadCredential => {
+                write!(f, "The credential contains characters that cannot be sent.")
+            }
             UploadError::TooOld => write!(
                 f,
                 "This scanner is too old for your Scenery server. Install the latest scenery."
@@ -123,6 +133,13 @@ fn url(base: &str, path: &str) -> String {
     format!("{}/api/scan/{path}", base.trim_end_matches('/'))
 }
 
+/// Where and as whom a report goes.
+pub struct Uplink<'a> {
+    pub client: &'a reqwest::Client,
+    pub base: &'a str,
+    pub auth: &'a ScanAuth,
+}
+
 pub fn client() -> Result<reqwest::Client, UploadError> {
     scenery_core::http::async_client_builder()
         .connect_timeout(Duration::from_secs(5))
@@ -133,10 +150,10 @@ pub fn client() -> Result<reqwest::Client, UploadError> {
 
 async fn send_once(
     req: reqwest::RequestBuilder,
-    auth: &ScanAuth,
+    auth: &HeaderValue,
 ) -> Result<(u16, Vec<u8>), reqwest::Error> {
     let resp = req
-        .header(reqwest::header::AUTHORIZATION, auth.header())
+        .header(reqwest::header::AUTHORIZATION, auth.clone())
         .send()
         .await?;
     let status = resp.status().as_u16();
@@ -144,13 +161,10 @@ async fn send_once(
     Ok((status, body))
 }
 
-pub async fn session(
-    client: &reqwest::Client,
-    base: &str,
-    auth: &ScanAuth,
-) -> Result<ScanSession, UploadError> {
-    let req = client.get(url(base, "session"));
-    let (status, body) = send_once(req, auth)
+pub async fn session(link: &Uplink<'_>) -> Result<ScanSession, UploadError> {
+    let header = link.auth.header_value()?;
+    let req = link.client.get(url(link.base, "session"));
+    let (status, body) = send_once(req, &header)
         .await
         .map_err(|e| UploadError::Network(e.without_url().to_string()))?;
     if status != 200 {
@@ -160,31 +174,29 @@ pub async fn session(
 }
 
 pub async fn post_report(
-    client: &reqwest::Client,
-    base: &str,
-    auth: &ScanAuth,
+    link: &Uplink<'_>,
     report: &ScanReport,
     backoff: &[Duration],
 ) -> Result<ScanReceipt, UploadError> {
     let body = serde_json::to_vec(report).map_err(|_| UploadError::Server(0))?;
-    post_body(client, base, auth, body, backoff).await
+    post_body(link, body, backoff).await
 }
 
 /// Post an already-serialized report (used as is by `--from-file`).
 pub async fn post_body(
-    client: &reqwest::Client,
-    base: &str,
-    auth: &ScanAuth,
+    link: &Uplink<'_>,
     body: Vec<u8>,
     backoff: &[Duration],
 ) -> Result<ScanReceipt, UploadError> {
+    let header = link.auth.header_value()?;
     let mut attempt = 0;
     loop {
-        let req = client
-            .post(url(base, "reports"))
+        let req = link
+            .client
+            .post(url(link.base, "reports"))
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body.clone());
-        let retry = match send_once(req, auth).await {
+        let retry = match send_once(req, &header).await {
             Ok((200, resp)) => {
                 return serde_json::from_slice(&resp).map_err(|_| UploadError::Server(200));
             }

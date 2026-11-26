@@ -287,3 +287,125 @@ fn no_auth_exits_two() {
         .unwrap()
         .contains("SCENERY_SCAN_TOKEN"));
 }
+
+#[test]
+fn auth_header_is_sensitive() {
+    for auth in [
+        super::ScanAuth::Token(TOKEN.to_string()),
+        super::ScanAuth::Bearer("jwt.value".to_string()),
+    ] {
+        let v = auth.header_value().unwrap();
+        assert!(v.is_sensitive());
+        assert!(!format!("{v:?}").contains("SECRET"));
+    }
+    assert!(super::ScanAuth::Token("bad\nvalue".to_string())
+        .header_value()
+        .is_err());
+}
+
+#[test]
+fn temp_save_name_has_random_suffix() {
+    let fx = Fixture::new();
+    let now = fx.env(501).now;
+    let a = report::fresh_path(&fx.tmpdir, now);
+    let b = report::fresh_path(&fx.tmpdir, now);
+    assert_ne!(a, b);
+    let name = a.file_name().unwrap().to_str().unwrap().to_string();
+    let rest = name
+        .strip_prefix(&format!("scenery-scan-{}-", now.unix_timestamp()))
+        .unwrap();
+    let hex = rest.strip_suffix(".json").unwrap();
+    assert_eq!(hex.len(), 32);
+    assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
+}
+
+#[test]
+fn existing_out_path_is_a_clear_error_before_upload() {
+    let fx = Fixture::new();
+    let mut s = Server::new();
+    let sess = s.mock("GET", "/api/scan/session").expect(0).create();
+    let existing = fx.tmpdir.join("already.json");
+    fs::write(&existing, b"keep me").unwrap();
+    let mut a = upload_args(&s);
+    a.out = Some(existing.clone());
+    let (code, text) = run_upload(&fx, a);
+    assert_eq!(code, 2, "{text}");
+    assert!(text.contains("already exists"), "{text}");
+    assert_eq!(fs::read(&existing).unwrap(), b"keep me");
+    sess.assert();
+}
+
+#[test]
+fn out_with_upload_failure_writes_one_copy() {
+    let fx = Fixture::new();
+    let mut s = Server::new();
+    let _sess = mock_session(&mut s, false, 5000);
+    let _post = s
+        .mock("POST", "/api/scan/reports")
+        .with_status(500)
+        .expect(3)
+        .create();
+    let target = fx.tmpdir.join("mine.json");
+    let mut a = upload_args(&s);
+    a.out = Some(target.clone());
+    let (code, text) = run_upload(&fx, a);
+    assert_eq!(code, 3, "{text}");
+    assert_eq!(temp_files(&fx), vec![target.clone()]);
+    assert!(
+        text.contains(&format!("--from-file {}", target.display())),
+        "{text}"
+    );
+}
+
+#[test]
+fn out_with_session_failure_saves_to_out_path() {
+    let fx = Fixture::new();
+    let mut s = Server::new();
+    let _sess = s.mock("GET", "/api/scan/session").with_status(503).create();
+    let target = fx.tmpdir.join("mine.json");
+    let mut a = upload_args(&s);
+    a.out = Some(target.clone());
+    let (code, text) = run_upload(&fx, a);
+    assert_eq!(code, 3, "{text}");
+    assert_eq!(temp_files(&fx), vec![target]);
+}
+
+#[test]
+fn from_file_redacts_args_again() {
+    let fx = Fixture::new();
+    let saved = serde_json::json!({
+        "format": "scenery-scan-report/1",
+        "items": [
+            {"kind": "mcp", "slug": "gh", "detail": {"command_basename": "npx",
+              "args": ["-y", "@x/gh", "--tok", "ghp_abcdefghijklmnopqrstuvwxyz0123456789"]}},
+            {"kind": "mcp", "slug": "odd", "detail": {
+              "args": ["ghp_abcdefghijklmnopqrstuvwxyz0123456789"]}},
+            {"kind": "skill", "slug": "s", "detail": {"args": ["untouched"]}}
+        ]
+    });
+    let path = fx.tmpdir.join("saved.json");
+    fs::write(&path, saved.to_string()).unwrap();
+    let mut s = Server::new();
+    let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = captured.clone();
+    let post = s
+        .mock("POST", "/api/scan/reports")
+        .with_status(200)
+        .with_body_from_request(move |req| {
+            *sink.lock().unwrap() = req.body().unwrap().clone();
+            RECEIPT.as_bytes().to_vec()
+        })
+        .expect(1)
+        .create();
+    let mut a = upload_args(&s);
+    a.from_file = Some(path);
+    let (code, text) = run_upload(&fx, a);
+    assert_eq!(code, 0, "{text}");
+    post.assert();
+    let body = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+    assert!(!body.contains("ghp_"), "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["items"][0]["detail"]["args"][1], "@x/gh");
+    assert!(v["items"][1]["detail"].get("args").is_none());
+    assert_eq!(v["items"][2]["detail"]["args"][0], "untouched");
+}

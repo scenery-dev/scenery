@@ -74,7 +74,7 @@ pub mod launch_gate;
 pub mod legacy_pending;
 pub mod managed_paths;
 mod mcp_http;
-mod oauth_listener;
+pub mod oauth_listener;
 mod oauth_state;
 pub mod peer_handshake;
 pub mod process_probe;

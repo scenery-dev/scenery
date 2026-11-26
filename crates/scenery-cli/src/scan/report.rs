@@ -50,14 +50,20 @@ pub fn build(items: Vec<DiscoveryItem>, now: OffsetDateTime) -> Result<ScanRepor
     })
 }
 
+/// A new report file name in `dir`. The random suffix makes the name
+/// unguessable, so another local user cannot pre-create it in a shared
+/// temp dir (the `create_new` open would then fail instead of saving).
+pub fn fresh_path(dir: &Path, now: OffsetDateTime) -> PathBuf {
+    let ts = now.unix_timestamp();
+    let suffix = uuid::Uuid::new_v4().simple();
+    dir.join(format!("scenery-scan-{ts}-{suffix}.json"))
+}
+
 /// Write the report with `create_new` and mode 0600. Never overwrites.
 pub fn save(report: &ScanReport, out: Option<&Path>) -> Result<PathBuf> {
     let path = match out {
         Some(p) => p.to_path_buf(),
-        None => {
-            let ts = OffsetDateTime::now_utc().unix_timestamp();
-            std::env::temp_dir().join(format!("scenery-scan-{ts}.json"))
-        }
+        None => fresh_path(&std::env::temp_dir(), OffsetDateTime::now_utc()),
     };
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);

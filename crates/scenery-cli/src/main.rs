@@ -4928,7 +4928,7 @@ async fn cmd_auth_login(registry_url: &str) -> Result<()> {
 ///
 /// On macOS `open` is a reliable synchronous launcher: we wait for it and check
 /// the exit code.
-fn try_open_browser(url: &str) -> bool {
+pub(crate) fn try_open_browser(url: &str) -> bool {
     #[cfg(target_os = "macos")]
     {
         // `open` on macOS exits with 0 on success and 1 when the URL cannot
