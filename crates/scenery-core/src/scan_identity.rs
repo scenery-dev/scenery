@@ -49,6 +49,7 @@ pub fn hash_identity(
 }
 
 /// Extract `IOPlatformUUID` from `ioreg -rd1 -c IOPlatformExpertDevice` output.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn parse_ioreg(output: &str) -> Option<String> {
     for line in output.lines() {
         if !line.contains("\"IOPlatformUUID\"") {
