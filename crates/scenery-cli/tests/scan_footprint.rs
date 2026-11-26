@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -48,38 +49,49 @@ fn build_home(home: &Path) {
     .unwrap();
 }
 
-fn children_of_test() -> String {
+/// Live members of process group `pgid` (the scan ran in its own group, so
+/// anything it spawned and left behind shows up here after it exits).
+fn group_members(pgid: u32) -> String {
     let out = Command::new("pgrep")
-        .args(["-P", &std::process::id().to_string()])
+        .args(["-g", &pgid.to_string()])
         .output()
         .unwrap();
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-fn run_scan(home: &Path, tmpdir: &Path, registry: &str, dry_run: bool) -> i32 {
+/// Runs the scan in its own process group; returns the group id.
+fn run_scan(home: &Path, tmpdir: &Path, registry: &str, dry_run: bool) -> u32 {
+    let out_path = tmpdir.join("scan.stdout");
+    let err_path = tmpdir.join("scan.stderr");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_scenery"));
     cmd.args(["scan", "--once", "--registry-url", registry]);
     if dry_run {
         cmd.arg("--dry-run");
     }
-    let output = cmd
+    let mut child = cmd
+        .process_group(0)
+        // Files, not pipes: a leftover child holding a pipe would make the
+        // wait block until it exits and hide it from the group check.
+        .stdout(fs::File::create(&out_path).unwrap())
+        .stderr(fs::File::create(&err_path).unwrap())
         .env("HOME", home)
         .env("TMPDIR", tmpdir)
         .env("SCENERY_DISABLE_KEYCHAIN", "1")
         .env("SCENERY_SCAN_TOKEN", TOKEN)
         .env_remove("XDG_DATA_HOME")
         .env_remove("XDG_CONFIG_HOME")
-        .output()
+        .spawn()
         .unwrap();
-    let code = output.status.code().unwrap();
+    let pgid = child.id(); // process_group(0): the child leads its own group
+    let status = child.wait().unwrap();
     assert_eq!(
-        code,
-        0,
+        status.code(),
+        Some(0),
         "stdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        fs::read_to_string(&out_path).unwrap_or_default(),
+        fs::read_to_string(&err_path).unwrap_or_default()
     );
-    code
+    pgid
 }
 
 #[test]
@@ -113,11 +125,14 @@ fn scan_leaves_no_footprint() {
         .expect(1)
         .create();
 
-    run_scan(&home, &tmpdir, &server.url(), true);
+    let pgid = run_scan(&home, &tmpdir, &server.url(), true);
     assert_eq!(snapshot(&home), before, "HOME changed after --dry-run");
-    assert!(children_of_test().is_empty(), "child left after --dry-run");
+    assert!(
+        group_members(pgid).is_empty(),
+        "process left after --dry-run"
+    );
 
-    run_scan(&home, &tmpdir, &server.url(), false);
+    let pgid = run_scan(&home, &tmpdir, &server.url(), false);
     post.assert();
     assert_eq!(snapshot(&home), before, "HOME changed after upload");
     assert!(
@@ -126,5 +141,24 @@ fn scan_leaves_no_footprint() {
             .any(|p| p.components().any(|c| c.as_os_str() == "Scenery")),
         "a Scenery data dir was created"
     );
-    assert!(children_of_test().is_empty(), "child left after upload");
+    assert!(group_members(pgid).is_empty(), "process left after upload");
+}
+
+/// The leftover check is not vacuous: a background child that outlives its
+/// parent (same group) is seen by `group_members`.
+#[test]
+fn group_check_detects_a_leftover_child() {
+    let child = Command::new("sh")
+        .args(["-c", "sleep 30 & exit 0"])
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let pgid = child.id();
+    let mut child = child;
+    child.wait().unwrap();
+    let seen = group_members(pgid);
+    let _ = Command::new("pkill")
+        .args(["-g", &pgid.to_string()])
+        .status();
+    assert!(!seen.is_empty(), "orphaned sleep was not detected");
 }

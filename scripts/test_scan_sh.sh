@@ -1,6 +1,7 @@
 #!/bin/sh
 # Tests for scripts/scan.sh against a local fake release server.
-# Run: sh scripts/test_scan_sh.sh
+# Signature verification is exercised through stub `minisign` binaries on a
+# controlled PATH (no skip variable). Run: sh scripts/test_scan_sh.sh
 set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -11,7 +12,7 @@ cleanup() { [ -n "${SRV_PID}" ] && kill "${SRV_PID}" 2>/dev/null; rm -rf "${ROOT
 trap cleanup EXIT
 
 FAILS=0
-check() { # name, condition-exit-code
+check() { # name, exit-code (0 = pass)
     if [ "$2" = "0" ]; then echo "ok   - $1"; else echo "FAIL - $1"; FAILS=$((FAILS+1)); fi
 }
 
@@ -33,51 +34,92 @@ printf '#!/bin/sh\necho "ARGV: $*"\nexit ${FAKE_EXIT:-0}\n' > "${ROOT}/pkg/scene
 chmod 755 "${ROOT}/pkg/scenery"
 tar -czf "${REL}/${TARBALL}" -C "${ROOT}/pkg" scenery
 printf '%s  %s\n' "$(sha "${REL}/${TARBALL}")" "${TARBALL}" > "${REL}/SHA256SUMS"
+printf 'stub-signature\n' > "${REL}/SHA256SUMS.minisig"
+cp "${REL}/${TARBALL}" "${ROOT}/good.tgz"
 
 PORT=$((20000 + $$ % 20000))
 ( cd "${ROOT}/srv" && exec python3 -m http.server "${PORT}" --bind 127.0.0.1 >/dev/null 2>&1 ) &
 SRV_PID=$!
-sleep 1
+_i=0
+until curl -fs -o /dev/null "http://127.0.0.1:${PORT}/v9.9.9/SHA256SUMS"; do
+    _i=$((_i+1)); [ "${_i}" -gt 100 ] && { echo "server did not start"; exit 1; }
+    sleep 0.1
+done
+
+# Controlled PATH: symlinks to the tools scan.sh needs, and no minisign/gh.
+TOOLS="${ROOT}/tools"; mkdir -p "${TOOLS}"
+for t in sh curl tar awk head tr find mktemp uname chmod rm mkdir cat sed grep python3 env dirname \
+         sha256sum shasum openssl cksum; do
+    p="$(command -v "$t" 2>/dev/null)" && [ -x "${p}" ] && ln -sf "${p}" "${TOOLS}/${t}"
+done
+mkdir -p "${ROOT}/stub-ok" "${ROOT}/stub-bad"
+printf '#!/bin/sh\nexit 0\n' > "${ROOT}/stub-ok/minisign"
+printf '#!/bin/sh\nexit 1\n' > "${ROOT}/stub-bad/minisign"
+chmod 755 "${ROOT}/stub-ok/minisign" "${ROOT}/stub-bad/minisign"
 
 HOME_DIR="${ROOT}/home"; TMP_DIR="${ROOT}/tmp"
 mkdir -p "${HOME_DIR}" "${TMP_DIR}"
 touch "${HOME_DIR}/.zshrc"
-snap() { (cd "${HOME_DIR}" && find . -exec ls -ldT {} + 2>/dev/null || find . | sort); }
+# Portable listing: names, then a checksum of each file's content and its mode.
+snap() { (cd "${HOME_DIR}" && find . | sort | while read -r f; do
+    if [ -f "$f" ]; then printf '%s %s\n' "$f" "$(cksum < "$f")"; else printf '%s\n' "$f"; fi
+done; ls -ld "${HOME_DIR}/.zshrc" | awk '{print $1}'); }
 
-run() { # extra env assignments via "$@" before sh
-    env -i PATH="${PATH}" HOME="${HOME_DIR}" TMPDIR="${TMP_DIR}" \
+# run STUBDIR [VAR=val ...] -- sh scan.sh args...: STUBDIR is "" for none.
+run() {
+    _stub="$1"; shift
+    _path="${TOOLS}"; [ -n "${_stub}" ] && _path="${_stub}:${TOOLS}"
+    env -i PATH="${_path}" HOME="${HOME_DIR}" TMPDIR="${TMP_DIR}" \
         SCENERY_SCAN_BASE_URL="http://127.0.0.1:${PORT}" \
-        SCENERY_SCAN_VERSION=v9.9.9 SCENERY_INSTALL_SKIP_SIG=1 "$@"
+        SCENERY_SCAN_VERSION=v9.9.9 "$@"
 }
+tmp_empty() { [ -z "$(ls -A "${TMP_DIR}")" ]; }
 
 BEFORE="$(snap)"
 
-# 1. Good tarball, no token: --login.
-OUT="$(run sh "${SCAN_SH}" --dry-run 2>&1)"; RC=$?
-check "good tarball exits 0" "${RC}"
+# 1. Good tarball + passing minisign stub, no token: --login.
+OUT="$(run "${ROOT}/stub-ok" sh "${SCAN_SH}" --dry-run 2>&1)"; RC=$?
+check "good tarball + minisign ok exits 0" "${RC}"
 echo "${OUT}" | grep -q 'ARGV: scan --once --login --dry-run'; check "no token passes --login" $?
-[ -z "$(ls -A "${TMP_DIR}")" ]; check "temp dir removed after login run" $?
+tmp_empty; check "temp dir removed after login run" $?
 
 # 2. With token: no --login.
-OUT="$(run SCENERY_SCAN_TOKEN=scn_scan_x sh "${SCAN_SH}" 2>&1)"; RC=$?
+OUT="$(run "${ROOT}/stub-ok" SCENERY_SCAN_TOKEN=scn_scan_x sh "${SCAN_SH}" 2>&1)"; RC=$?
 check "token run exits 0" "${RC}"
 echo "${OUT}" | grep -q 'ARGV: scan --once$'; check "token run omits --login" $?
 echo "${OUT}" | grep -q 'scn_scan_x'; [ $? -ne 0 ]; check "token not in output or argv" $?
-[ -z "$(ls -A "${TMP_DIR}")" ]; check "temp dir removed after token run" $?
+tmp_empty; check "temp dir removed after token run" $?
 
 # 3. Scan exit code is propagated.
-run FAKE_EXIT=3 sh "${SCAN_SH}" >/dev/null 2>&1; RC=$?
+run "${ROOT}/stub-ok" FAKE_EXIT=3 sh "${SCAN_SH}" >/dev/null 2>&1; RC=$?
 [ "${RC}" = "3" ]; check "scan exit code propagated" $?
 
-# 4. Tampered tarball: refuse.
+# 4. minisign stub fails: refuse, binary never runs.
+OUT="$(run "${ROOT}/stub-bad" sh "${SCAN_SH}" 2>&1)"; RC=$?
+[ "${RC}" != "0" ]; check "failing minisign exits non-zero" $?
+echo "${OUT}" | grep -q 'refusing'; check "failing minisign says refusing" $?
+echo "${OUT}" | grep -q 'ARGV'; [ $? -ne 0 ]; check "failing minisign: binary never ran" $?
+tmp_empty; check "temp dir removed after minisign failure" $?
+
+# 5. Neither minisign nor gh: refuse.
+OUT="$(run "" sh "${SCAN_SH}" 2>&1)"; RC=$?
+[ "${RC}" != "0" ]; check "no verifier exits non-zero" $?
+echo "${OUT}" | grep -qi 'cannot verify'; check "no verifier is refused with a message" $?
+echo "${OUT}" | grep -q 'ARGV'; [ $? -ne 0 ]; check "no verifier: binary never ran" $?
+
+# 6. Bad version string.
+OUT="$(run "${ROOT}/stub-ok" SCENERY_SCAN_VERSION='../evil' sh "${SCAN_SH}" 2>&1)"; RC=$?
+[ "${RC}" != "0" ]; check "malformed SCENERY_SCAN_VERSION rejected" $?
+
+# 7. Tampered tarball (minisign passes): checksum refuses.
 printf 'tampered' >> "${REL}/${TARBALL}"
-OUT="$(run sh "${SCAN_SH}" 2>&1)"; RC=$?
+OUT="$(run "${ROOT}/stub-ok" sh "${SCAN_SH}" 2>&1)"; RC=$?
 [ "${RC}" != "0" ]; check "tampered tarball exits non-zero" $?
 echo "${OUT}" | grep -q 'refusing'; check "tampered tarball says refusing" $?
 echo "${OUT}" | grep -q 'ARGV'; [ $? -ne 0 ]; check "tampered binary never ran" $?
-[ -z "$(ls -A "${TMP_DIR}")" ]; check "temp dir removed after refusal" $?
+tmp_empty; check "temp dir removed after refusal" $?
 
-# 5. HOME untouched.
+# 8. HOME untouched.
 AFTER="$(snap)"
 [ "${BEFORE}" = "${AFTER}" ]; check "HOME unchanged" $?
 
