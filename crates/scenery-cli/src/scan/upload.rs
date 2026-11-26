@@ -76,6 +76,8 @@ pub enum UploadError {
     BadCredential,
     TooOld,
     RunnerPresent,
+    /// 409 `device_claimed`: a token report cannot update a device a user owns.
+    DeviceClaimed,
     Limit(String),
     Network(String),
     Server(u16),
@@ -101,6 +103,11 @@ impl fmt::Display for UploadError {
                 f,
                 "The Scenery runner is already installed on this machine, so no scan is needed."
             ),
+            UploadError::DeviceClaimed => write!(
+                f,
+                "This machine is already linked to a Scenery user, so a scan token cannot \
+                 update it. Sign in as that user with --login instead"
+            ),
             UploadError::Limit(why) => write!(f, "{why}"),
             UploadError::Network(why) => write!(f, "Could not reach the server: {why}."),
             UploadError::Server(n) => write!(f, "The server answered with an error (HTTP {n})."),
@@ -120,6 +127,7 @@ fn classify(status: u16, body: &[u8]) -> UploadError {
     match (status, code.as_deref()) {
         (426, _) => UploadError::TooOld,
         (409, Some("runner_present")) => UploadError::RunnerPresent,
+        (409, Some("device_claimed")) => UploadError::DeviceClaimed,
         (401, Some(c)) => UploadError::Auth(c.to_string()),
         (413, _) => UploadError::Limit("The report is too large for the server.".to_string()),
         (422, Some("too_many_items")) => {

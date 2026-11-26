@@ -213,6 +213,28 @@ fn runner_present_409_exits_zero() {
 }
 
 #[test]
+fn device_claimed_409_plain_message_saves_report() {
+    let fx = Fixture::new();
+    let mut s = Server::new();
+    let _sess = mock_session(&mut s, false, 5000);
+    let post = s
+        .mock("POST", "/api/scan/reports")
+        .with_status(409)
+        .with_body(r#"{"detail":{"code":"device_claimed"}}"#)
+        .expect(1)
+        .create();
+    let (code, text) = run_upload(&fx, upload_args(&s));
+    assert_eq!(code, 3, "{text}");
+    assert!(
+        text.contains("This machine is already linked to a Scenery user"),
+        "{text}"
+    );
+    assert!(!text.contains("HTTP 409"), "{text}");
+    assert_saved_private(&fx);
+    post.assert();
+}
+
+#[test]
 fn too_old_426_reads_top_level_code() {
     let fx = Fixture::new();
     let mut s = Server::new();

@@ -16,33 +16,43 @@ On the device, the wrapper never puts the token on a command line. It writes it 
 
 1. Finds the console user (`stat -f%Su /dev/console` on macOS, an active graphical `loginctl` session on Linux).
 2. If nobody is logged in, or the user is `root`, `loginwindow` or `_mbsetupuser`, prints `no user logged in; nothing scanned` and exits 0. A headless Linux machine (no graphical session) also exits 0 without scanning. The next scheduled run tries again.
-3. Downloads `scan.sh` over HTTPS and runs it as that user (`launchctl asuser <uid> sudo -u <user>` on macOS). The scan refuses to run as root and needs the user's own home folder.
-4. Returns the scan's exit code.
+3. Downloads `scan.sh` from the GitHub release for `SCENERY_SCAN_VERSION` (for example `v2.8.0`; default: the latest release). It checks `scan.sh` against that release's `SHA256SUMS` and verifies the `SHA256SUMS` signature with `minisign`, or with `gh attestation verify` when minisign is missing. If the download, the signature or the checksum fails, it refuses to run and exits 1.
+4. Runs `scan.sh` as that user (`launchctl asuser <uid> sudo -H -u <user>` on macOS). The scan refuses to run as root and needs the user's own home folder. The scan uses the binary from the same release tag.
+5. Returns the scan's exit code.
 
 Extra arguments go to the scan, so `scan-mdm.sh --dry-run` shows what would be reported without sending it.
+
+Requirements on the device: `curl`, and `minisign` or an authenticated `gh` on root's `PATH`. MDM scripts often run with a minimal `PATH` that leaves out Homebrew, so set it in the script body, for example `PATH=/opt/homebrew/bin:/usr/local/bin:$PATH`.
+
+`sudo -H` resets the environment. The wrapper forwards `SCENERY_SCAN_VERSION` and `SCENERY_REGISTRY_URL` to the scan explicitly (neither is a secret), so setting them in the wrapper's environment works. You can also pass the backend as an argument: `scan-mdm.sh --registry-url https://dev.scenery.dev`. Use one of these for any target other than production. Other variables do not reach the scan.
 
 ## Installing the wrapper (no `curl | sh` as root)
 
 Do not pipe a download into a root shell. Use one of these:
 
-- Paste the contents of `scan-mdm.sh` from the release you have reviewed into the MDM script body. This pins the version.
-- Or download the script and verify it against the release's SHA256SUMS before running. For example, in the MDM script body:
+- Paste the contents of `scan-mdm.sh` from the release you have reviewed into the MDM script body, and set `SCENERY_SCAN_VERSION` to that release's tag so `scan.sh` and the scan binary come from the same release.
+- Or download the script and verify it before running. Each release from v2.8.0 publishes `scan.sh`, `scan-mdm.sh`, `SHA256SUMS` (which lists both) and `SHA256SUMS.minisig`. Verify the signature on `SHA256SUMS`, then the checksum of `scan-mdm.sh`. For example, in the MDM script body:
 
 ```sh
 #!/bin/sh
 set -eu
+PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
 TAG=v2.8.0
 BASE="https://github.com/scenery-dev/scenery/releases/download/${TAG}"
+PUBKEY="RWREIYd8cL30cy+6WHSsE+0oVDsfoPu/1BmCGX4rb0Fgs4+ZC3jjW/gp"
 D="$(mktemp -d)"; trap 'rm -rf "$D"' EXIT
-curl --proto '=https' --tlsv1.2 -fsSL -o "$D/scan-mdm.sh" "${BASE}/scan-mdm.sh"
-curl --proto '=https' --tlsv1.2 -fsSL -o "$D/SHA256SUMS" "${BASE}/SHA256SUMS"
+for f in scan-mdm.sh SHA256SUMS SHA256SUMS.minisig; do
+  curl --proto '=https' --tlsv1.2 -fsSL -o "$D/$f" "${BASE}/$f"
+done
+minisign -Vm "$D/SHA256SUMS" -x "$D/SHA256SUMS.minisig" -P "$PUBKEY" >/dev/null \
+  || { echo "SHA256SUMS signature check failed" >&2; exit 1; }
 want="$(awk '$2=="scan-mdm.sh"{print $1}' "$D/SHA256SUMS")"
 got="$(shasum -a 256 "$D/scan-mdm.sh" | awk '{print $1}')"
 [ -n "$want" ] && [ "$want" = "$got" ] || { echo "scan-mdm.sh checksum mismatch" >&2; exit 1; }
-SCENERY_SCAN_TOKEN="$4" sh "$D/scan-mdm.sh"
+SCENERY_SCAN_VERSION="$TAG" SCENERY_SCAN_TOKEN="$4" sh "$D/scan-mdm.sh"
 ```
 
-(Replace `"$4"` with however your MDM supplies the token.) The release must publish `scan-mdm.sh` next to SHA256SUMS; check this before relying on the form above.
+(Replace `"$4"` with however your MDM supplies the token.) `SCENERY_SCAN_VERSION="$TAG"` makes the wrapper fetch `scan.sh` and the scan binary from the same release you verified. The public key is the release signing key (minisign key id `73F4BD707C872144`), the same one `install.sh` and `scan.sh` use.
 
 ## Schedule
 
@@ -54,7 +64,7 @@ SCENERY_SCAN_TOKEN="$4" sh "$D/scan-mdm.sh"
 | Code | Meaning |
 |------|---------|
 | 0 | Scan uploaded, or nothing to do (nobody logged in, headless Linux, or the Scenery runner is already installed). |
-| 1 | `scan.sh` could not be downloaded, or the scan itself failed to start (for example an unsupported platform). |
+| 1 | `scan.sh` could not be downloaded or verified (signature, checksum, or no minisign/gh), or the scan itself failed to start (for example an unsupported platform). |
 | 2 | Refused or not authorised: no token, bad or revoked token, or run as root. |
 | 3 | The upload failed. The report was saved to a file; see below. |
 | 130 | Interrupted (interactive sign-in only; not used with a token). |
