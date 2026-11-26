@@ -89,6 +89,9 @@ check "token run exits 0" "${RC}"
 echo "${OUT}" | grep -q 'ARGV: scan --once$'; check "token run omits --login" $?
 echo "${OUT}" | grep -q 'scn_scan_x'; [ $? -ne 0 ]; check "token not in output or argv" $?
 tmp_empty; check "temp dir removed after token run" $?
+# 2b. --token-file in args: no --login either.
+OUT="$(run "${ROOT}/stub-ok" sh "${SCAN_SH}" --token-file /x/tok 2>&1)"
+echo "${OUT}" | grep -q 'ARGV: scan --once --token-file /x/tok$'; check "--token-file omits --login" $?
 
 # 3. Scan exit code is propagated.
 run "${ROOT}/stub-ok" FAKE_EXIT=3 sh "${SCAN_SH}" >/dev/null 2>&1; RC=$?

@@ -7,12 +7,16 @@
 # MDM owns the schedule (see docs/scan-mdm.md).
 #
 #   SCENERY_SCAN_TOKEN   required. Org scan token. It is read from this
-#                        script's environment and handed on through the
-#                        environment only, never through any command line.
+#                        script's environment, written to a 0600 file owned by
+#                        the console user, and handed to the scan as
+#                        --token-file <path>. The token is never in any
+#                        command line; only the file path is. The file is
+#                        removed when the script exits.
 #   Arguments            passed through to scan.sh (for example --dry-run).
 #
 # Exit code: the scan's own exit code (0 ok, 2 refused or not signed in,
 # 3 upload failed and a report was saved). 0 when nobody is logged in.
+# 1 when scan.sh could not be downloaded.
 
 set -eu
 
@@ -53,9 +57,6 @@ main() {
         log_error "SCENERY_SCAN_TOKEN is not set. Pass the org scan token in the environment."
         exit 2
     fi
-    # Exported so sudo can preserve it by name; it never appears in argv.
-    export SCENERY_SCAN_TOKEN
-
     USER_NAME="$(console_user)"
     case "${USER_NAME}" in
         ""|root|loginwindow|_mbsetupuser)
@@ -65,9 +66,11 @@ main() {
     esac
     USER_ID="$(id -u "${USER_NAME}")"
 
-    WORK="$(mktemp -d)"
+    # /var/tmp, not root's private $TMPDIR: the console user must be able to
+    # reach scan.sh and the token file.
+    WORK="$(mktemp -d /var/tmp/scenery-scan-mdm.XXXXXX)"
     trap 'rm -rf "${WORK}"' EXIT
-    chmod 755 "${WORK}"
+    chmod 711 "${WORK}"
     curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 2 \
         -o "${WORK}/scan.sh" "https://install.scenery.dev/scan.sh" || {
         log_error "Could not download scan.sh."
@@ -75,15 +78,21 @@ main() {
     }
     chmod 644 "${WORK}/scan.sh"
 
-    # No `exec`: the EXIT trap must remove the downloaded script.
+    # Token file: created 0600 by root, then handed to the console user.
+    ( umask 077; printf '%s\n' "${SCENERY_SCAN_TOKEN}" > "${WORK}/token" )
+    unset SCENERY_SCAN_TOKEN
+    chmod 600 "${WORK}/token"
+    chown "${USER_NAME}" "${WORK}/token"
+
+    # No `exec`: the EXIT trap must remove the downloaded script and token.
     _RC=0
     if [ "$(uname -s)" = "Darwin" ]; then
         launchctl asuser "${USER_ID}" \
-            sudo --preserve-env=SCENERY_SCAN_TOKEN -H -u "${USER_NAME}" \
-            sh "${WORK}/scan.sh" "$@" || _RC=$?
+            sudo -H -u "${USER_NAME}" \
+            sh "${WORK}/scan.sh" --token-file "${WORK}/token" "$@" || _RC=$?
     else
-        sudo --preserve-env=SCENERY_SCAN_TOKEN -H -u "${USER_NAME}" \
-            sh "${WORK}/scan.sh" "$@" || _RC=$?
+        sudo -H -u "${USER_NAME}" \
+            sh "${WORK}/scan.sh" --token-file "${WORK}/token" "$@" || _RC=$?
     fi
     exit "${_RC}"
 }

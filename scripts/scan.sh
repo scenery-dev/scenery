@@ -8,8 +8,8 @@
 # dir. It installs nothing: it never writes outside its temp dir and never
 # touches PATH, shell rc files or ~/.local/bin.
 #
-#   SCENERY_SCAN_TOKEN     org scan token (non-interactive). Without it the
-#                          scan signs you in with --login.
+#   SCENERY_SCAN_TOKEN     org scan token (non-interactive). Without it (and
+#                          without --token-file) the scan signs you in with --login.
 #   SCENERY_SCAN_VERSION   pin a release tag (default: the latest release).
 
 set -eu
@@ -165,7 +165,11 @@ main() {
 
     # The scan must not be exec'd: the EXIT trap has to run afterwards.
     _RC=0
-    if [ -n "${SCENERY_SCAN_TOKEN:-}" ]; then
+    _HAS_TOKEN_FILE=0
+    for _a in "$@"; do
+        case "${_a}" in --token-file|--token-file=*) _HAS_TOKEN_FILE=1 ;; esac
+    done
+    if [ -n "${SCENERY_SCAN_TOKEN:-}" ] || [ "${_HAS_TOKEN_FILE}" = 1 ]; then
         "${BIN}" scan --once "$@" </dev/null || _RC=$?
     else
         "${BIN}" scan --once --login "$@" </dev/null || _RC=$?
