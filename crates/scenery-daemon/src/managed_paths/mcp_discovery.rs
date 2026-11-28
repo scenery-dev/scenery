@@ -477,19 +477,27 @@ fn command_basename_of(command: &str) -> String {
     }
 }
 
-/// Replace the current user's `$HOME` (if it occurs in `value`) with `~`.
+/// Replace the current user's `$HOME` with `~` when `value` is exactly home or
+/// a path under it (whole-component prefix).
 /// Used both as [`command_basename_of`]'s last-resort fallback and directly
 /// on [`McpDiscoveryItem::source_path`] — a raw absolute config path embeds
 /// the local username (`/Users/<username>/...`), which the allowlist policy
 /// (module docs) treats the same as any other locally-identifying detail:
 /// mask it rather than transmit it.
 pub(crate) fn mask_home_dir(value: &str) -> String {
-    if let Some(home) = dirs::home_dir().and_then(|h| h.to_str().map(str::to_string)) {
-        if !home.is_empty() && value.contains(&home) {
-            return value.replacen(&home, "~", 1);
-        }
+    let Some(home) = dirs::home_dir() else {
+        return value.to_string();
+    };
+    if home.as_os_str().is_empty() {
+        return value.to_string();
     }
-    value.to_string()
+    // Component-wise, so a sibling such as `/Users/al` never matches
+    // `/Users/alice/...`.
+    match std::path::Path::new(value).strip_prefix(&home) {
+        Ok(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Ok(rest) => format!("~/{}", rest.to_string_lossy()),
+        Err(_) => value.to_string(),
+    }
 }
 
 /// Derive a public package/image identifier from a closed set of well-known
@@ -2079,6 +2087,26 @@ mod tests {
         }
 
         assert_eq!(masked, "~/.cursor/mcp.json");
+    }
+
+    #[test]
+    fn mask_home_dir_ignores_sibling_home_prefix() {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let original_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", "/Users/al");
+
+        let sibling = mask_home_dir("/Users/alice/.cursor/mcp.json");
+        let exact = mask_home_dir("/Users/al");
+        let under = mask_home_dir("/Users/al/x/y");
+
+        match original_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert_eq!(sibling, "/Users/alice/.cursor/mcp.json");
+        assert_eq!(exact, "~");
+        assert_eq!(under, "~/x/y");
     }
 
     // ── Review round 3: unknown flags must fail closed, not fall through ──────
