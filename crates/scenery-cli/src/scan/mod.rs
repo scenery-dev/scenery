@@ -60,6 +60,8 @@ pub(crate) struct ScanEnv {
     pub save_dir: PathBuf,
     /// Waits between upload retries.
     pub backoff: Vec<Duration>,
+    /// Divides the wait after a 429 (1 in production; tests shrink it).
+    pub rate_wait_divisor: u32,
     /// Opens the sign-in URL; returns whether a browser opened (`--login`).
     pub open_browser: fn(&str) -> bool,
     /// How long `--login` waits for the browser sign-in.
@@ -90,6 +92,7 @@ pub async fn run(args: ScanArgs) -> Result<i32> {
         save_dir: std::env::temp_dir(),
         token: std::env::var("SCENERY_SCAN_TOKEN").ok(),
         backoff: upload::DEFAULT_BACKOFF.to_vec(),
+        rate_wait_divisor: 1,
         open_browser: if std::env::var_os("SCENERY_NO_BROWSER").is_some() {
             |_| false
         } else {

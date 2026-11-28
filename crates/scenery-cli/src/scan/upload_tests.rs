@@ -452,3 +452,134 @@ fn failed_out_save_falls_back_to_temp_dir() {
     assert!(!target.exists());
     assert_saved_private(&fx);
 }
+
+fn rate_limited(s: &mut ServerGuard, retry_after: Option<&str>, hits: usize) -> mockito::Mock {
+    let mut m = s
+        .mock("POST", "/api/scan/reports")
+        .with_status(429)
+        .with_body(r#"{"detail":{"code":"scan_rate_limited"}}"#);
+    if let Some(v) = retry_after {
+        m = m.with_header("retry-after", v);
+    }
+    m.expect(hits).create()
+}
+
+#[test]
+fn rate_limited_then_success_retries_once() {
+    let fx = Fixture::new();
+    let mut s = Server::new();
+    let _sess = mock_session(&mut s, false, 5000);
+    let limited = rate_limited(&mut s, Some("2"), 1);
+    let ok = s
+        .mock("POST", "/api/scan/reports")
+        .with_status(200)
+        .with_body(RECEIPT)
+        .expect(1)
+        .create();
+    let (code, text) = run_upload(&fx, upload_args(&s));
+    assert_eq!(code, 0, "{text}");
+    assert!(text.contains("Uploaded to Acme"));
+    assert!(temp_files(&fx).is_empty());
+    limited.assert();
+    ok.assert();
+}
+
+#[test]
+fn rate_limited_twice_saves_report_with_busy_message() {
+    let fx = Fixture::new();
+    let mut s = Server::new();
+    let _sess = mock_session(&mut s, false, 5000);
+    let limited = rate_limited(&mut s, Some("1"), 2);
+    let (code, text) = run_upload(&fx, upload_args(&s));
+    assert_eq!(code, 3, "{text}");
+    assert!(
+        text.contains("Scenery is busy (rate limit for this scan token); the report was saved to ")
+    );
+    assert!(text.contains("Run the scan again in a few minutes."));
+    assert!(!text.contains("HTTP 429"));
+    assert_saved_private(&fx);
+    limited.assert();
+}
+
+#[test]
+fn rate_limited_without_retry_after_still_retries() {
+    let fx = Fixture::new();
+    let mut s = Server::new();
+    let _sess = mock_session(&mut s, false, 5000);
+    let limited = rate_limited(&mut s, None, 1);
+    let ok = s
+        .mock("POST", "/api/scan/reports")
+        .with_status(200)
+        .with_body(RECEIPT)
+        .expect(1)
+        .create();
+    let (code, text) = run_upload(&fx, upload_args(&s));
+    assert_eq!(code, 0, "{text}");
+    limited.assert();
+    ok.assert();
+}
+
+#[test]
+fn retry_after_is_clamped_with_default() {
+    use super::super::upload::retry_after_secs;
+    assert_eq!(retry_after_secs(None), 5);
+    assert_eq!(retry_after_secs(Some("soon")), 5);
+    assert_eq!(retry_after_secs(Some("-3")), 5);
+    assert_eq!(retry_after_secs(Some("0")), 1);
+    assert_eq!(retry_after_secs(Some("17")), 17);
+    assert_eq!(retry_after_secs(Some(" 30 ")), 30);
+    assert_eq!(retry_after_secs(Some("999")), 60);
+}
+
+#[test]
+fn device_cap_409_saves_report_without_retry() {
+    let fx = Fixture::new();
+    let mut s = Server::new();
+    let _sess = mock_session(&mut s, false, 5000);
+    let post = s
+        .mock("POST", "/api/scan/reports")
+        .with_status(409)
+        .with_body(r#"{"detail":{"code":"scan_device_cap"}}"#)
+        .expect(1)
+        .create();
+    let (code, text) = run_upload(&fx, upload_args(&s));
+    assert_eq!(code, 3, "{text}");
+    assert!(text.contains(
+        "This scan token has reached its device limit. Ask your Scenery admin for a new scan \
+         token with a higher device cap. The report was saved to "
+    ));
+    assert!(!text.contains("HTTP 409"));
+    assert_saved_private(&fx);
+    post.assert();
+}
+
+#[cfg(unix)]
+#[test]
+fn token_file_warning_only_for_group_or_other_access() {
+    use super::super::flow::token_file_warning;
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("token");
+    fs::write(&path, "scn_scan_x\n").unwrap();
+    for (mode, warns) in [
+        (0o600, false),
+        (0o400, false),
+        (0o640, true),
+        (0o604, true),
+        (0o660, true),
+    ] {
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+        let w = token_file_warning(&path);
+        assert_eq!(w.is_some(), warns, "mode {mode:o}");
+        if let Some(w) = w {
+            let p = path.display();
+            assert_eq!(
+                w,
+                format!(
+                    "warning: {p} can be read by other users on this machine; run: chmod 600 {p}"
+                )
+            );
+        }
+    }
+    assert!(token_file_warning(&dir.path().join("missing")).is_none());
+}

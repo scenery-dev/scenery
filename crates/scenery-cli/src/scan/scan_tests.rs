@@ -68,6 +68,7 @@ impl Fixture {
             token: None,
             save_dir: self.tmpdir.clone(),
             backoff: vec![Duration::from_millis(1), Duration::from_millis(1)],
+            rate_wait_divisor: 1000,
             // Tests never open a real browser.
             open_browser: |_| false,
             login_timeout: Duration::from_secs(10),

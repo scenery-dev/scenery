@@ -5,17 +5,16 @@
 
 use super::flow::{print_receipt, runner_present};
 use super::report;
-use super::upload::{self, Uplink, UploadError};
+use super::upload::{self, Pacing, Uplink, UploadError};
 use anyhow::Result;
 use scenery_daemon::managed_paths::mcp_args::redact_args;
 use serde_json::{Map, Value};
 use std::path::Path;
-use std::time::Duration;
 
 pub(super) async fn run(
     path: &Path,
     link: &Uplink<'_>,
-    backoff: &[Duration],
+    pacing: &Pacing<'_>,
     out: &mut dyn std::io::Write,
 ) -> Result<i32> {
     let body = match std::fs::read(path) {
@@ -43,13 +42,17 @@ pub(super) async fn run(
     };
     redact_items(&mut value);
     let body = serde_json::to_vec(&value)?;
-    match upload::post_body(link, body, backoff).await {
+    match upload::post_body(link, body, pacing).await {
         Ok(receipt) => {
             print_receipt("your org", &receipt, out)?;
             Ok(0)
         }
         Err(UploadError::RunnerPresent) => runner_present(out),
         Err(e) => {
+            if let Some(line) = e.saved_line(path) {
+                writeln!(out, "{line}")?;
+                return Ok(3);
+            }
             writeln!(
                 out,
                 "Upload failed: {e}. Report kept at {p} — send it to IT, or retry with: \

@@ -2,16 +2,38 @@
 //! token, or a `--login` session revoked before returning), read the scan
 //! session, collect, post, and save the report when the upload fails.
 
-use super::upload::{self, ScanAuth, Uplink, UploadError};
+use super::upload::{self, Pacing, ScanAuth, Uplink, UploadError};
 use super::{from_file, login, report, summary, ScanArgs, ScanEnv};
 use anyhow::Result;
 use std::path::PathBuf;
+
+/// A warning when group or others can read or write the token file (unix).
+/// It is advice only: the scan goes on.
+pub(super) fn token_file_warning(path: &std::path::Path) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path).ok()?.permissions().mode();
+        if mode & 0o077 != 0 {
+            let p = path.display();
+            return Some(format!(
+                "warning: {p} can be read by other users on this machine; run: chmod 600 {p}"
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    None
+}
 
 /// Resolve the org scan token: the environment, else `--token-file`.
 fn resolve_token(args: &ScanArgs, env: &ScanEnv) -> Result<Option<String>, String> {
     let raw = match (&env.token, &args.token_file) {
         (Some(t), _) => t.trim().to_string(),
         (None, Some(path)) => {
+            if let Some(w) = token_file_warning(path) {
+                eprintln!("{w}");
+            }
             let text = std::fs::read_to_string(path)
                 .map_err(|e| format!("could not read the token file: {}", e.kind()))?;
             text.lines().next().unwrap_or("").trim().to_string()
@@ -22,6 +44,13 @@ fn resolve_token(args: &ScanArgs, env: &ScanEnv) -> Result<Option<String>, Strin
         Ok(Some(raw))
     } else {
         Err("the scan token must start with scn_scan_".to_string())
+    }
+}
+
+fn pacing(env: &ScanEnv) -> Pacing<'_> {
+    Pacing {
+        backoff: &env.backoff,
+        rate_wait_divisor: env.rate_wait_divisor.max(1),
     }
 }
 
@@ -61,20 +90,26 @@ fn save_and_fail(
     dest: Dest,
     report: &report::ScanReport,
     why: &str,
+    err: Option<&UploadError>,
     out: &mut dyn std::io::Write,
 ) -> Result<i32> {
     let saved = match dest {
         Dest::Written(p) => Ok(p),
         Dest::New(p) => report::save(report, Some(&p)),
     };
-    match saved {
-        Ok(path) => writeln!(
+    let custom = saved
+        .as_ref()
+        .ok()
+        .and_then(|p| err.and_then(|e| e.saved_line(p)));
+    match (saved, custom) {
+        (Ok(_), Some(line)) => writeln!(out, "{line}")?,
+        (Ok(path), None) => writeln!(
             out,
             "Upload failed: {why} Report saved to {p} — send it to IT, or retry with: \
              scenery scan --once --from-file {p}",
             p = path.display()
         )?,
-        Err(e) => writeln!(
+        (Err(e), _) => writeln!(
             out,
             "Upload failed: {why} The report could not be saved: {e:#}"
         )?,
@@ -159,7 +194,7 @@ async fn upload_with(
     out: &mut dyn std::io::Write,
 ) -> Result<i32> {
     if let Some(path) = &args.from_file {
-        return from_file::run(path, link, &env.backoff, out).await;
+        return from_file::run(path, link, &pacing(env), out).await;
     }
     let session = match upload::session(link).await {
         Ok(s) => s,
@@ -171,6 +206,7 @@ async fn upload_with(
                 dest(args, env, OutCopy::Pending),
                 &report,
                 &format!("{e}."),
+                Some(&e),
                 out,
             );
         }
@@ -186,7 +222,7 @@ async fn upload_with(
             "{found} items is over this org's limit of {}.",
             session.max_items
         );
-        return save_and_fail(dest(args, env, OutCopy::Pending), &report, &why, out);
+        return save_and_fail(dest(args, env, OutCopy::Pending), &report, &why, None, out);
     }
     // Re-apply the collector's caps (args, byte budget) with the session's limit.
     scenery_daemon::managed_paths::scan_collect::enforce_limits(
@@ -196,14 +232,20 @@ async fn upload_with(
     );
     let report = report::build(items, env.now)?;
     let written = save_out(args, &report, out)?;
-    match upload::post_report(link, &report, &env.backoff).await {
+    match upload::post_report(link, &report, &pacing(env)).await {
         Ok(receipt) => {
             write!(out, "{}", summary::render(&report.items, args.quiet))?;
             print_receipt(&session.org_name, &receipt, out)?;
             Ok(0)
         }
         Err(UploadError::RunnerPresent) => runner_present(out),
-        Err(e) => save_and_fail(dest(args, env, written), &report, &format!("{e}."), out),
+        Err(e) => save_and_fail(
+            dest(args, env, written),
+            &report,
+            &format!("{e}."),
+            Some(&e),
+            out,
+        ),
     }
 }
 
