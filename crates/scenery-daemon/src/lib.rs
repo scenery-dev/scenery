@@ -135,7 +135,11 @@ impl scenery_mcp::oauth::OAuthSubscriber for OAuthStateSubscriber {
                 }
             };
             match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx).await {
-                Ok(Ok((code, _state))) => Some(code),
+                Ok(Ok(Ok((code, _state)))) => Some(code),
+                Ok(Ok(Err(reason))) => {
+                    warn!(%reason, "OAuthStateSubscriber: sign-in denied or failed");
+                    None
+                }
                 Ok(Err(_)) => None, // channel closed — daemon shutting down
                 Err(_) => None,     // timeout elapsed
             }

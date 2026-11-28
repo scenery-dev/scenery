@@ -19,7 +19,8 @@ async fn subscribe_and_notify_roundtrip() {
     let (code, returned_state) = timeout(Duration::from_millis(100), rx)
         .await
         .expect("should not time out")
-        .expect("channel should not be closed");
+        .expect("channel should not be closed")
+        .unwrap();
 
     assert_eq!(code, "code-xyz");
     assert_eq!(returned_state, "state-abc");
@@ -42,10 +43,12 @@ async fn two_concurrent_waiters_are_independent() {
     let (c1, _) = timeout(Duration::from_millis(100), rx1)
         .await
         .expect("rx1 should not time out")
+        .unwrap()
         .unwrap();
     let (c2, _) = timeout(Duration::from_millis(100), rx2)
         .await
         .expect("rx2 should not time out")
+        .unwrap()
         .unwrap();
 
     assert_eq!(c1, "code-A");
@@ -115,4 +118,18 @@ async fn subscribe_allowed_after_notify_consumed_entry() {
         rx2.is_ok(),
         "subscribe should succeed after the previous entry was consumed"
     );
+}
+
+#[tokio::test]
+async fn notify_error_delivers_error_to_waiter() {
+    let hub = OAuthState::new();
+    let rx = hub.subscribe("s".to_string()).await.unwrap();
+    hub.notify_error("s".to_string(), "access_denied".to_string())
+        .await
+        .unwrap();
+    assert_eq!(rx.await.unwrap(), Err("access_denied".to_string()));
+    assert!(matches!(
+        hub.notify_error("s".to_string(), "x".to_string()).await,
+        Err(OAuthStateError::NoSubscriber(_))
+    ));
 }

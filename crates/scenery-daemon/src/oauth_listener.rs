@@ -64,6 +64,18 @@ async fn handle_callback(
     // clear HTML page; still return 200 so the browser renders nicely.
     if let Some(err) = params.error {
         warn!(oauth_error = %err, "OAuth callback received an error response");
+        // Wake the waiting CLI at once. An unknown or missing state keeps the
+        // old behaviour (page only), so a stray request cannot abort a login.
+        if let Some(state) = params.state {
+            if app
+                .oauth_state
+                .notify_error(state, err.clone())
+                .await
+                .is_err()
+            {
+                warn!("error callback had no matching subscriber");
+            }
+        }
         return Html(build_error_page(&err)).into_response();
     }
 

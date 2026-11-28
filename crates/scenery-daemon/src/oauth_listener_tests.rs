@@ -49,7 +49,8 @@ async fn callback_returns_200_html_and_notifies_oauth_state() {
     let (code, state) = tokio::time::timeout(std::time::Duration::from_millis(500), rx)
         .await
         .expect("notify should arrive within 500 ms")
-        .expect("channel should not be closed");
+        .expect("channel should not be closed")
+        .expect("callback should carry a code");
 
     assert_eq!(code, "test-code");
     assert_eq!(state, "test-state-1");
@@ -179,6 +180,57 @@ async fn callback_oauth_error_param_is_html_escaped() {
         body.contains("&lt;script&gt;alert(&#x27;x&#x27;)&lt;/script&gt;&amp;&quot;"),
         "error value should be rendered HTML-escaped; got: {body}"
     );
+
+    handle.abort();
+}
+
+/// `?error=` with a known state must wake the waiter at once with the error.
+#[tokio::test]
+async fn callback_error_notifies_subscriber_with_error() {
+    let oauth_state = Arc::new(OAuthState::new());
+    let rx = oauth_state
+        .subscribe("err-state".to_string())
+        .await
+        .unwrap();
+
+    let (addr, handle) = start_listener(Arc::clone(&oauth_state))
+        .await
+        .unwrap()
+        .expect("listener should bind");
+
+    let url = format!(
+        "http://127.0.0.1:{}/oauth/cli/callback?error=access_denied&state=err-state",
+        addr.port()
+    );
+    let resp = reqwest::get(&url).await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let got = tokio::time::timeout(std::time::Duration::from_millis(500), rx)
+        .await
+        .expect("subscriber must be woken promptly")
+        .expect("channel should not be closed");
+    assert_eq!(got, Err("access_denied".to_string()));
+
+    handle.abort();
+}
+
+/// An error callback for an unknown state must not disturb other waiters.
+#[tokio::test]
+async fn callback_error_with_unknown_state_leaves_other_waiters() {
+    let oauth_state = Arc::new(OAuthState::new());
+    let mut rx = oauth_state.subscribe("real".to_string()).await.unwrap();
+
+    let (addr, handle) = start_listener(Arc::clone(&oauth_state))
+        .await
+        .unwrap()
+        .expect("listener should bind");
+
+    for q in ["error=x&state=other", "error=x"] {
+        let url = format!("http://127.0.0.1:{}/oauth/cli/callback?{q}", addr.port());
+        let resp = reqwest::get(&url).await.unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+    assert!(rx.try_recv().is_err(), "waiter must still be pending");
 
     handle.abort();
 }

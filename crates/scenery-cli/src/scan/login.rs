@@ -97,9 +97,11 @@ where
         wait_text(timeout)
     );
     let wait = async move { rx.await.map_err(|_| anyhow!("sign-in was cancelled")) };
-    let (code, _state) = tokio::time::timeout(timeout, wait)
+    let outcome = tokio::time::timeout(timeout, wait)
         .await
         .map_err(|_| anyhow!(TIMED_OUT))??;
+    let (code, _state) =
+        outcome.map_err(|reason| anyhow!("Sign-in was denied or failed: {reason}"))?;
     let owned = base.to_string();
     let verifier = init.code_verifier;
     let tokens =

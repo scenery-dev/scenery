@@ -4876,6 +4876,9 @@ async fn cmd_auth_login(registry_url: &str) -> Result<()> {
             .get("message")
             .and_then(|m| m.as_str())
             .unwrap_or("unknown error");
+        if msg.starts_with("Sign-in was denied or failed") {
+            anyhow::bail!("{msg}");
+        }
         anyhow::bail!("auth/wait_for_callback failed: {msg}");
     }
 

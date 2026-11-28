@@ -37,9 +37,13 @@ pub enum OAuthStateError {
     NoSubscriber(String),
 }
 
+/// What a waiter receives: `Ok((code, state))` for a successful callback, or
+/// `Err(message)` when the provider redirected back with `?error=...`.
+pub type CallbackResult = Result<(String, String), String>;
+
 /// Daemon-wide OAuth callback notification hub.
 pub struct OAuthState {
-    waiters: Mutex<HashMap<String, oneshot::Sender<(String, String)>>>,
+    waiters: Mutex<HashMap<String, oneshot::Sender<CallbackResult>>>,
 }
 
 impl OAuthState {
@@ -64,7 +68,7 @@ impl OAuthState {
     pub async fn subscribe(
         &self,
         state: String,
-    ) -> Result<oneshot::Receiver<(String, String)>, OAuthStateError> {
+    ) -> Result<oneshot::Receiver<CallbackResult>, OAuthStateError> {
         let mut map = self.waiters.lock().await;
         if map.contains_key(&state) {
             return Err(OAuthStateError::DuplicateSubscriber(state));
@@ -89,13 +93,29 @@ impl OAuthState {
         match map.remove(&state) {
             Some(tx) => {
                 // Receiver may have been dropped (timeout); ignore send errors.
-                let _ = tx.send((code, state));
+                let _ = tx.send(Ok((code, state)));
                 Ok(())
             }
             None => {
                 warn!(state = %state, "notify: no subscriber registered for state");
                 Err(OAuthStateError::NoSubscriber(state))
             }
+        }
+    }
+
+    /// Notify the waiter for `state` that the sign-in failed or was denied.
+    ///
+    /// # Errors
+    ///
+    /// Returns `OAuthStateError::NoSubscriber` if no waiter is registered.
+    pub async fn notify_error(&self, state: String, error: String) -> Result<(), OAuthStateError> {
+        let mut map = self.waiters.lock().await;
+        match map.remove(&state) {
+            Some(tx) => {
+                let _ = tx.send(Err(error));
+                Ok(())
+            }
+            None => Err(OAuthStateError::NoSubscriber(state)),
         }
     }
 

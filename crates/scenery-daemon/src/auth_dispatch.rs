@@ -123,7 +123,12 @@ pub async fn handle_wait_for_callback(
     let duration = std::time::Duration::from_secs(parsed.timeout_secs);
 
     match tokio::time::timeout(duration, rx).await {
-        Ok(Ok((code, _state))) => {
+        Ok(Ok(Err(reason))) => JsonRpcResponse::error(
+            id,
+            INTERNAL_ERROR,
+            format!("Sign-in was denied or failed: {reason}"),
+        ),
+        Ok(Ok(Ok((code, _state)))) => {
             debug!(state = %parsed.state, "auth/wait_for_callback delivered code");
             JsonRpcResponse::success(id, serde_json::json!({ "code": code }))
         }
