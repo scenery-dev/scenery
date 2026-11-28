@@ -88,7 +88,7 @@ fi
 echo "AC1+AC2: shim emits daemon-required error when daemon is down ..."
 
 # Make absolutely sure no daemon is running so the test is deterministic.
-pkill -x scenery >/dev/null 2>&1 || true
+true  # never pkill by name: it would hit the user's own daemon
 sleep 0.3
 
 # Find a temp HOME so the shim can compute a socket path and find it absent.

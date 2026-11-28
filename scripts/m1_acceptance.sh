@@ -50,7 +50,7 @@ case "$(uname -s)" in
     Linux)  _M1_INIT_SOCK="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/scenery/agent.sock" ;;
     *)      _M1_INIT_SOCK="${HOME}/.local/share/scenery/agent.sock" ;;
 esac
-pkill -x scenery 2>/dev/null || true
+true  # never pkill by name: it would hit the user's own daemon
 rm -f "${_M1_INIT_SOCK}" 2>/dev/null || true
 unset _M1_INIT_SOCK
 
@@ -255,7 +255,7 @@ esac
 
 # Idle RSS: spawn daemon, wait, measure.
 if pgrep -x scenery >/dev/null 2>&1; then
-    pkill -x scenery 2>/dev/null || true
+    true  # never pkill by name: it would hit the user's own daemon
     sleep 1
 fi
 rm -f "${SOCKET_PATH}"

@@ -26,7 +26,7 @@ MAX_UNDER_LOAD_MB=100
 
 if pgrep -x scenery > /dev/null 2>&1; then
     echo "INFO: killing stale scenery daemon process(es) before test"
-    pkill -x scenery || true
+    true  # never pkill by name: it would hit the user's own daemon
     sleep 1
 fi
 

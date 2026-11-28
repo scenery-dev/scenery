@@ -96,7 +96,7 @@ case "$(uname -s)" in
     Linux)  _M3_INIT_SOCK="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/scenery/agent.sock" ;;
     *)      _M3_INIT_SOCK="${HOME}/.local/share/scenery/agent.sock" ;;
 esac
-pkill -x scenery 2>/dev/null || true
+true  # never pkill by name: it would hit the user's own daemon
 rm -f "${_M3_INIT_SOCK}" 2>/dev/null || true
 unset _M3_INIT_SOCK
 
@@ -280,7 +280,7 @@ fi
 # ── Kill any stale daemon from previous runs ──────────────────────────────────
 
 if pgrep -x scenery >/dev/null 2>&1; then
-    pkill -x scenery 2>/dev/null || true
+    true  # never pkill by name: it would hit the user's own daemon
     sleep 0.5
 fi
 

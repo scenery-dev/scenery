@@ -45,7 +45,7 @@ case "$(uname -s)" in
     Linux)  _M0_INIT_SOCK="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/scenery/agent.sock" ;;
     *)      _M0_INIT_SOCK="${HOME}/.local/share/scenery/agent.sock" ;;
 esac
-pkill -x scenery 2>/dev/null || true
+true  # never pkill by name: it would hit the user's own daemon
 rm -f "${_M0_INIT_SOCK}" 2>/dev/null || true
 unset _M0_INIT_SOCK
 

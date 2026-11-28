@@ -30,13 +30,26 @@ if [[ ! -x "${DAEMON_BIN}" ]]; then
     exit 1
 fi
 
-# ── Kill any stale daemon from a previous run ─────────────────────────────────
+# ── Cleanup: stop only the daemon this script started ────────────────────────
+# Never signal by process name: that would also stop the user's own daemon.
 
-if pgrep -x scenery > /dev/null 2>&1; then
-    echo "INFO: killing stale scenery daemon process(es) before measurement"
-    pkill -x scenery || true
-    sleep 1
-fi
+DAEMON_PID=""
+
+stop_own_daemon() {
+    if [[ -n "${DAEMON_PID}" ]] && kill -0 "${DAEMON_PID}" 2>/dev/null; then
+        kill -TERM "${DAEMON_PID}" 2>/dev/null || true
+        for _ in $(seq 1 10); do
+            kill -0 "${DAEMON_PID}" 2>/dev/null || break
+            sleep 0.5
+        done
+        if kill -0 "${DAEMON_PID}" 2>/dev/null; then
+            kill -KILL "${DAEMON_PID}" 2>/dev/null || true
+        fi
+        wait "${DAEMON_PID}" 2>/dev/null || true
+    fi
+    DAEMON_PID=""
+}
+trap stop_own_daemon EXIT INT TERM
 
 # ── Spawn daemon in background ─────────────────────────────────────────────────
 
