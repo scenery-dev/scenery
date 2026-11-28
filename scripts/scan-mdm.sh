@@ -20,16 +20,25 @@
 #                        forwarded to scan.sh explicitly (neither is secret).
 #   Arguments            passed through to scan.sh (for example --dry-run).
 #
-# scan.sh is downloaded from the GitHub release for the tag and checked
-# against that release's SHA256SUMS, whose signature is verified with
-# minisign (or `gh attestation verify` when minisign is missing), as scan.sh
-# and install.sh do. Any failure refuses to run.
+# scan.sh is downloaded from the GitHub release for the tag. The copy of this
+# wrapper published with a release is STAMPED (block below) with its tag and
+# the SHA-256 of that release's scan.sh, so it verifies scan.sh with
+# shasum/sha256sum alone and needs no minisign or gh; when minisign or a
+# signed-in gh is present it also checks scan.sh against the release's signed
+# SHA256SUMS. The unstamped repo copy, or a stamped copy asked for another
+# SCENERY_SCAN_VERSION, requires minisign or gh. Any failure refuses to run.
 #
 # Exit code: the scan's own exit code (0 ok, 2 refused or not signed in,
 # 3 upload failed and a report was saved). 0 when nobody is logged in.
 # 1 when scan.sh could not be downloaded or verified.
 
 set -eu
+
+# >>> scenery release stamp >>>
+# Filled in by scripts/stamp-release-scripts.sh at release time; empty here.
+STAMP_TAG=""
+STAMP_SCAN_SHA256=""
+# <<< scenery release stamp <<<
 
 log()       { printf '%s\n' "$*" >&2; }
 log_error() { printf 'error: %s\n' "$*" >&2; }
@@ -90,6 +99,10 @@ resolve_tag() {
         esac
         return 0
     fi
+    if [ -n "${STAMP_TAG}" ]; then
+        TAG="${STAMP_TAG}"
+        return 0
+    fi
     _JSON="$(fetch "https://api.github.com/repos/scenery-dev/scenery/releases/latest")" || {
         log_error "Could not look up the latest release. Set SCENERY_SCAN_VERSION=vX.Y.Z."
         exit 1
@@ -107,18 +120,48 @@ resolve_tag() {
 # Downloads scan.sh for TAG into WORK and verifies it. Exits 1 on any failure.
 fetch_verified_scan() {
     _BASE="https://github.com/scenery-dev/scenery/releases/download/${TAG}"
+    # Release signing key (minisign key id 73F4BD707C872144); same as scan.sh.
+    _PUBKEY="RWREIYd8cL30cy+6WHSsE+0oVDsfoPu/1BmCGX4rb0Fgs4+ZC3jjW/gp"
+
+    _PIN=""
+    if [ -n "${STAMP_TAG}" ] && [ "${TAG}" = "${STAMP_TAG}" ]; then
+        _PIN="${STAMP_SCAN_SHA256}"
+        [ -n "${_PIN}" ] || { log_error "No pinned scan.sh checksum in this wrapper — refusing to run."; exit 1; }
+    fi
+    _VERIFIER=""
+    if command -v minisign >/dev/null 2>&1; then
+        _VERIFIER=minisign
+    elif command -v gh >/dev/null 2>&1; then
+        # With a pin, gh is used only when signed in (it cannot verify otherwise).
+        if [ -z "${_PIN}" ] || XDG_CACHE_HOME="${WORK}/cache" gh auth status >/dev/null 2>&1; then
+            _VERIFIER=gh
+        fi
+    fi
+    if [ -z "${_VERIFIER}" ] && [ -z "${_PIN}" ]; then
+        log_error "Cannot verify the release signature: neither minisign nor gh is available — refusing to run."
+        log_error "Use the scan-mdm.sh published with the release (it pins scan.sh), or install minisign."
+        exit 1
+    fi
+
     fetch -o "${WORK}/scan.sh" "${_BASE}/scan.sh" || {
         log_error "Could not download scan.sh for ${TAG} — refusing to run."
         exit 1
     }
+    _ACTUAL="$(sha256_of "${WORK}/scan.sh" | tr '[:upper:]' '[:lower:]')" || {
+        log_error "No SHA-256 tool (sha256sum, shasum, or openssl) found — refusing to run."
+        exit 1
+    }
+    if [ -n "${_PIN}" ] && [ "${_ACTUAL}" != "${_PIN}" ]; then
+        log_error "Checksum mismatch for scan.sh against the hash pinned in this wrapper — refusing to run."
+        exit 1
+    fi
+    [ -n "${_VERIFIER}" ] || return 0
+
     fetch -o "${WORK}/SHA256SUMS" "${_BASE}/SHA256SUMS" || {
         log_error "Could not download SHA256SUMS for ${TAG} — refusing to run."
         exit 1
     }
-
-    # Release signing key (minisign key id 73F4BD707C872144); same as scan.sh.
-    _PUBKEY="RWREIYd8cL30cy+6WHSsE+0oVDsfoPu/1BmCGX4rb0Fgs4+ZC3jjW/gp"
-    if command -v minisign >/dev/null 2>&1; then
+    if [ "${_VERIFIER}" = minisign ]; then
         fetch -o "${WORK}/SHA256SUMS.minisig" "${_BASE}/SHA256SUMS.minisig" || {
             log_error "Could not download SHA256SUMS.minisig — refusing to run."
             exit 1
@@ -127,22 +170,15 @@ fetch_verified_scan() {
             log_error "minisign signature verification FAILED for SHA256SUMS — refusing to run."
             exit 1
         fi
-    elif command -v gh >/dev/null 2>&1; then
+    else
         if ! XDG_CACHE_HOME="${WORK}/cache" gh attestation verify "${WORK}/SHA256SUMS" --repo scenery-dev/scenery >/dev/null 2>&1; then
             log_error "gh attestation verification FAILED for SHA256SUMS — refusing to run."
             exit 1
         fi
-    else
-        log_error "Cannot verify the release signature: neither minisign nor gh is available — refusing to run."
-        exit 1
     fi
 
     _EXPECTED="$(awk '$2=="scan.sh" || $2=="*scan.sh" {print $1}' "${WORK}/SHA256SUMS" | head -n 1 | tr '[:upper:]' '[:lower:]')"
     [ -n "${_EXPECTED}" ] || { log_error "scan.sh is not listed in SHA256SUMS for ${TAG} — refusing to run."; exit 1; }
-    _ACTUAL="$(sha256_of "${WORK}/scan.sh" | tr '[:upper:]' '[:lower:]')" || {
-        log_error "No SHA-256 tool (sha256sum, shasum, or openssl) found — refusing to run."
-        exit 1
-    }
     if [ "${_ACTUAL}" != "${_EXPECTED}" ]; then
         log_error "Checksum mismatch for scan.sh — refusing to run."
         exit 1

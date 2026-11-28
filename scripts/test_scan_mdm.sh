@@ -72,7 +72,7 @@ while [ $# -gt 0 ]; do
 done
 exec "$@"'
 
-run() { : > "${LOG}"; env -i PATH="${BIN}" LOG="${LOG}" FAKE_SCAN="${FAKE_SCAN}" SUMS="${SUMS}" "$@" /bin/sh "${MDM}" ${MDM_ARGS:-}; }
+run() { : > "${LOG}"; env -i PATH="${BIN}" LOG="${LOG}" FAKE_SCAN="${FAKE_SCAN}" SUMS="${SUMS}" "$@" /bin/sh "${MDM_FILE:-${MDM}}" ${MDM_ARGS:-}; }
 export LOG
 
 # 1. No token: exit 2.
@@ -164,5 +164,29 @@ out="$(run SCENERY_SCAN_TOKEN="${TOKEN}" FAKE_CONSOLE=alice 'SCENERY_SCAN_VERSIO
 # 8. SCENERY_REGISTRY_URL survives sudo -H (forwarded explicitly).
 run SCENERY_SCAN_TOKEN="${TOKEN}" FAKE_CONSOLE=alice SCENERY_REGISTRY_URL=https://dev.scenery.dev >/dev/null 2>&1
 grep -q 'SCAN_RAN .* registry=https://dev.scenery.dev ' "${LOG}"; check "SCENERY_REGISTRY_URL forwarded to scan.sh" $?
+
+# 9. Stamped wrapper (what a release publishes): pins scan.sh's hash, so it
+# runs with no minisign or gh on PATH.
+MDM_FILE="${ROOT}/scan-mdm-stamped.sh"
+sed -e 's/^STAMP_TAG=""$/STAMP_TAG="v9.9.9"/' -e "s/^STAMP_SCAN_SHA256=\"\"\$/STAMP_SCAN_SHA256=\"${_sum}\"/" "${MDM}" > "${MDM_FILE}"
+grep -q "^STAMP_SCAN_SHA256=\"${_sum}\"$" "${MDM_FILE}"; check "stamped fixture has the pin" $?
+mv "${BIN}/minisign" "${ROOT}/minisign.off"
+run SCENERY_SCAN_TOKEN="${TOKEN}" FAKE_CONSOLE=alice >/dev/null 2>&1; rc=$?
+[ "${rc}" = 0 ] && grep -q 'SCAN_RAN user=alice .* version=v9.9.9 ' "${LOG}"
+check "stamped, no minisign/gh: scan.sh verified by pin and ran" $?
+! grep -q 'releases/latest' "${LOG}" && ! grep -q 'SHA256SUMS' "${LOG}"
+check "stamped: no latest lookup, no SHA256SUMS needed" $?
+refuses "stamped, tampered scan.sh" FAKE_TAMPER=1
+refuses "stamped, other tag without minisign/gh" SCENERY_SCAN_VERSION=v2.8.1
+stub gh 'echo "gh $*" >> "${LOG}"; exit 1'
+run SCENERY_SCAN_TOKEN="${TOKEN}" FAKE_CONSOLE=alice >/dev/null 2>&1; rc=$?
+[ "${rc}" = 0 ] && grep -q SCAN_RAN "${LOG}" && ! grep -q 'gh attestation' "${LOG}"
+check "stamped, gh not signed in: pin alone, scan ran" $?
+rm -f "${BIN}/gh"; mv "${ROOT}/minisign.off" "${BIN}/minisign"
+refuses "stamped, minisign present and failing" FAKE_MINISIGN_RC=1
+run SCENERY_SCAN_TOKEN="${TOKEN}" FAKE_CONSOLE=alice >/dev/null 2>&1; rc=$?
+[ "${rc}" = 0 ] && grep -q '^minisign -Vm' "${LOG}" && grep -q SCAN_RAN "${LOG}"
+check "stamped, minisign present: also checks the signature" $?
+MDM_FILE=""
 
 [ "${FAILS}" = 0 ] && echo "all passed" || { echo "${FAILS} failed"; exit 1; }

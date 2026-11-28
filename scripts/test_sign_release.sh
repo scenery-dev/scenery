@@ -35,14 +35,17 @@ chmod +x "$BIN"/*
 touch "$ROOT/fake.key"
 export PATH="$BIN:$PATH" CALLS="$ROOT/calls.log" SCENERY_MINISIGN_KEY="$ROOT/fake.key"
 
-# fixture <dir> <pkgname|""> : two tarballs, the two scan scripts, optional
-# pkg, matching SHA256SUMS
+HERE="$(cd "$(dirname "$0")" && pwd)"
+# fixture <dir> <pkgname|""> [unstamped]: three tarballs, the three shell
+# scripts stamped for v9.9.9 (or the unstamped repo copies), optional pkg,
+# matching SHA256SUMS
 fixture() {
   FIX="$ROOT/$1"; rm -rf "$FIX"; mkdir -p "$FIX"; export FIX
   echo a > "$FIX/scenery-9.9.9-aarch64-apple-darwin.tar.gz"
   echo b > "$FIX/scenery-9.9.9-x86_64-apple-darwin.tar.gz"
-  echo s > "$FIX/scan.sh"
-  echo m > "$FIX/scan-mdm.sh"
+  echo c > "$FIX/scenery-9.9.9-x86_64-unknown-linux-gnu.tar.gz"
+  if [ "${3:-}" = unstamped ]; then cp "$HERE/scan.sh" "$HERE/install.sh" "$HERE/scan-mdm.sh" "$FIX/"
+  else sh "$HERE/stamp-release-scripts.sh" v9.9.9 "$HERE" "$FIX" >/dev/null; fi
   [ -n "$2" ] && echo p > "$FIX/$2"
   ( cd "$FIX" && for f in *; do echo "$(sha "$f")  $f"; done > "$ROOT/sums.tmp" ) && mv "$ROOT/sums.tmp" "$FIX/SHA256SUMS"
 }
@@ -52,12 +55,12 @@ fixture f1 ""
 run; rc=$?
 check "no pkg: succeeds" "[ $rc = 0 ]"
 check "no pkg: signs and publishes" "grep -q 'release edit.*--draft=false' $CALLS && grep -q MINISIGN $CALLS"
-check "no pkg: attests tarballs, scan scripts + sums" "[ \$(grep -c 'attestation verify' $CALLS) = 5 ] && grep -q 'attestation verify.*/scan-mdm.sh' $CALLS"
+check "no pkg: attests tarballs, scripts + sums" "[ \$(grep -c 'attestation verify' $CALLS) = 7 ] && grep -q 'attestation verify.*/scan-mdm.sh' $CALLS && grep -q 'attestation verify.*/install.sh' $CALLS"
 
 fixture f2 scenery-9.9.9-macos.pkg
 run; rc=$?
 check "with pkg: succeeds" "[ $rc = 0 ]"
-check "with pkg: attests pkg too" "[ \$(grep -c 'attestation verify' $CALLS) = 6 ] && grep -q 'attestation verify.*macos.pkg' $CALLS"
+check "with pkg: attests pkg too" "[ \$(grep -c 'attestation verify' $CALLS) = 8 ] && grep -q 'attestation verify.*macos.pkg' $CALLS"
 check "with pkg: published" "grep -q 'release edit.*--draft=false' $CALLS"
 
 fixture f3 scenery-9.9.9-macos-dev.pkg
@@ -92,6 +95,16 @@ fixture f8 ""
 sed -i.bak '/ scan.sh$/d' "$FIX/SHA256SUMS"; rm -f "$FIX/SHA256SUMS.bak"
 run; rc=$?
 check "scan.sh missing from SHA256SUMS: refused" "[ $rc != 0 ] && grep -q 'scan.sh missing from SHA256SUMS' $ROOT/out.log"
+
+fixture f9 "" unstamped
+run; rc=$?
+check "unstamped scripts: refused" "[ $rc != 0 ] && grep -q 'not stamped for v9.9.9' $ROOT/out.log"
+check "unstamped scripts: nothing signed or published" "! grep -q MINISIGN $CALLS && ! grep -q 'release edit' $CALLS"
+
+fixture f10 ""
+rm -f "$FIX/install.sh"; sed -i.bak '/ install.sh$/d' "$FIX/SHA256SUMS"; rm -f "$FIX/SHA256SUMS.bak"
+run; rc=$?
+check "install.sh missing from draft: refused" "[ $rc != 0 ] && grep -q 'install.sh is not in the draft' $ROOT/out.log"
 
 echo "---- $PASS passed, $FAIL failed"
 [ "$FAIL" = 0 ]

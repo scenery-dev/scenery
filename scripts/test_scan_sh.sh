@@ -122,6 +122,50 @@ echo "${OUT}" | grep -q 'refusing'; check "tampered tarball says refusing" $?
 echo "${OUT}" | grep -q 'ARGV'; [ $? -ne 0 ]; check "tampered binary never ran" $?
 tmp_empty; check "temp dir removed after refusal" $?
 
+# 9. Stamped copy (what a release publishes): the tarball hash is pinned in
+# the script, so it runs with no minisign or gh on PATH.
+cp "${ROOT}/good.tgz" "${REL}/${TARBALL}"
+SREL="${ROOT}/stamp"; mkdir -p "${SREL}"
+for t in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu; do
+    if [ "${t}" = "${TRIPLE}" ]; then cp "${ROOT}/good.tgz" "${SREL}/scenery-9.9.9-${t}.tar.gz"
+    else echo "other ${t}" > "${SREL}/scenery-9.9.9-${t}.tar.gz"; fi
+done
+sh "${HERE}/stamp-release-scripts.sh" v9.9.9 "${HERE}" "${SREL}" >/dev/null || { echo "stamping failed"; exit 1; }
+STAMPED="${SREL}/scan.sh"
+mkdir -p "${ROOT}/gh-noauth" "${ROOT}/gh-bad"
+printf '#!/bin/sh
+exit 1
+' > "${ROOT}/gh-noauth/gh"
+printf '#!/bin/sh
+[ "$1" = auth ] && exit 0
+exit 1
+' > "${ROOT}/gh-bad/gh"
+chmod 755 "${ROOT}/gh-noauth/gh" "${ROOT}/gh-bad/gh"
+
+OUT="$(run "" sh "${STAMPED}" --dry-run 2>&1)"; RC=$?
+check "stamped, no minisign/gh: good tarball exits 0" "${RC}"
+echo "${OUT}" | grep -q 'ARGV: scan --once --login --dry-run'; check "stamped, no minisign/gh: scan ran" $?
+tmp_empty; check "stamped: temp dir removed" $?
+OUT="$(env -i PATH="${TOOLS}" HOME="${HOME_DIR}" TMPDIR="${TMP_DIR}" SCENERY_SCAN_BASE_URL="http://127.0.0.1:${PORT}" \
+    sh "${STAMPED}" --dry-run 2>&1)"; RC=$?
+[ "${RC}" = 0 ] && echo "${OUT}" | grep -q 'ARGV:'; check "stamped, no SCENERY_SCAN_VERSION: runs the stamped tag" $?
+OUT="$(run "${ROOT}/gh-noauth" sh "${STAMPED}" 2>&1)"; RC=$?
+[ "${RC}" = 0 ] && echo "${OUT}" | grep -q 'ARGV:'; check "stamped, gh not signed in: pin alone, scan ran" $?
+OUT="$(run "${ROOT}/gh-bad" sh "${STAMPED}" 2>&1)"; RC=$?
+[ "${RC}" != 0 ] && ! echo "${OUT}" | grep -q 'ARGV'; check "stamped, signed-in gh fails attestation: refused" $?
+OUT="$(run "${ROOT}/stub-bad" sh "${STAMPED}" 2>&1)"; RC=$?
+[ "${RC}" != 0 ] && ! echo "${OUT}" | grep -q 'ARGV'; check "stamped, minisign present and failing: refused" $?
+OUT="$(run "${ROOT}/stub-ok" sh "${STAMPED}" 2>&1)"; RC=$?
+[ "${RC}" = 0 ] && echo "${OUT}" | grep -q 'ARGV:'; check "stamped, minisign ok: scan ran" $?
+OUT="$(run "" SCENERY_SCAN_VERSION=v9.9.8 sh "${STAMPED}" 2>&1)"; RC=$?
+[ "${RC}" != 0 ] && echo "${OUT}" | grep -qi 'cannot verify'; check "stamped, other tag, no minisign/gh: refused" $?
+printf 'tampered' >> "${REL}/${TARBALL}"
+OUT="$(run "" sh "${STAMPED}" 2>&1)"; RC=$?
+[ "${RC}" != 0 ]; check "stamped, tampered tarball, no minisign/gh: exits non-zero" $?
+echo "${OUT}" | grep -q 'pinned in scan.sh — refusing'; check "stamped, tampered tarball: says pinned mismatch" $?
+echo "${OUT}" | grep -q 'ARGV'; [ $? -ne 0 ]; check "stamped, tampered binary never ran" $?
+tmp_empty; check "stamped: temp dir removed after refusal" $?
+
 # 8. HOME untouched.
 AFTER="$(snap)"
 [ "${BEFORE}" = "${AFTER}" ]; check "HOME unchanged" $?

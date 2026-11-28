@@ -68,6 +68,12 @@ echo "SIGN $* formula=$SCENERY_FORMULA" >> "$CALLS"
 cp "$GOOD" "$SCENERY_FORMULA"   # what --apply-formula would do
 exit 0
 S
+cat > "$BIN/stamp" <<'S'
+#!/bin/bash
+echo "STAMP $*" >> "$CALLS"
+[ -n "${FAKE_STAMP_FAIL:-}" ] && exit 1
+exit 0
+S
 cat > "$BIN/stage" <<'S'
 #!/bin/bash
 echo "STAGE $*" >> "$CALLS"
@@ -76,11 +82,11 @@ S
 chmod +x "$BIN"/*
 touch "$ROOT/fake.key"
 export CALLS="$LOG" SUMS="$ROOT/SUMS" GOOD="$ROOT/formula.good" \
-  REL_GH="$BIN/gh" REL_SIGN="$BIN/sign" REL_STAGE="$BIN/stage" REL_REPO=o/r \
+  REL_GH="$BIN/gh" REL_SIGN="$BIN/sign" REL_STAGE="$BIN/stage" REL_STAMP="$BIN/stamp" REL_REPO=o/r \
   REL_RUNNER_DIR="$ROOT/runner" REL_TAP_DIR="$ROOT/tap" REL_BACKEND_DIR="$ROOT/backend" \
   REL_NOW="6 12" REL_POLL_SLEEP=0 REL_POLL_TRIES=2 SCENERY_MINISIGN_KEY="$ROOT/fake.key"
 
-reset() { : > "$LOG"; unset FAKE_RUN FAKE_ASSETS FAKE_SIGN_FAIL FAKE_DRAFT
+reset() { : > "$LOG"; unset FAKE_RUN FAKE_ASSETS FAKE_SIGN_FAIL FAKE_DRAFT FAKE_STAMP_FAIL
   ( cd "$ROOT/tap" && git checkout -q main && git reset -q --hard origin/main ); }
 run() { "$SRC" "$@" >"$ROOT/out" 2>&1; echo $? >"$ROOT/rc"; }
 rc() { cat "$ROOT/rc"; }
@@ -133,6 +139,13 @@ check "stage called with the tag" 'grep -qx "STAGE v9.9.9" "$LOG"'
 check "tap committed as 'scenery 9.9.9' and pushed" '[ "$(tap_head)" = "scenery 9.9.9" ] && [ "$(origin_head)" = "scenery 9.9.9" ]'
 check "summary + brew upgrade reminder" 'grep -q "summary" "$ROOT/out" && grep -q "brew upgrade scenery" "$ROOT/out"'
 check "key path never printed" '! grep -q "fake.key" "$ROOT/out"'
+
+check "stamped scripts checked for the tag before the formula commit" 'grep -q "^STAMP --check v9.9.9 " "$LOG" && grep -q "GH release download.*--pattern install.sh" "$LOG" && [ "$(line "^STAMP")" -lt "$(line "^STAGE")" ]'
+check "summary prints the stamped-scripts deploy" 'grep -q "SCENERY_RUNNER_TAG=v9.9.9 ./deploy.sh" "$ROOT/out"'
+reset; cp "$ROOT/formula.old" "$ROOT/tap/Formula/scenery.rb"; ( cd "$ROOT/tap" && G commit -qam rollback-stamp && git push -q origin main )
+FAKE_STAMP_FAIL=1 run v9.9.9
+check "unstamped release scripts: fails at formula, nothing pushed, stage not run" '[ "$(rc)" = 1 ] && grep -q "not stamped for v9.9.9" "$ROOT/out" && [ "$(origin_head)" = "rollback-stamp" ] && ! grep -q "^STAGE" "$LOG"'
+reset; run v9.9.9
 
 # 5. already signed: skip sign
 reset; run v9.9.9

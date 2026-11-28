@@ -11,8 +11,10 @@
 #   wait       wait for the release workflow run for the tag to succeed
 #   sign       run scripts/sign-release.sh --apply-formula (skipped when the
 #              release already has a SHA256SUMS.minisig asset)
-#   formula    verify the formula (version + sha256s match the published
-#              SHA256SUMS), commit "scenery X.Y.Z" and push homebrew-tap.
+#   formula    verify the published release: scan.sh, install.sh and
+#              scan-mdm.sh are stamped for the tag (stamp-release-scripts.sh
+#              --check against the signed SHA256SUMS) and the formula (version
+#              + sha256s) matches SHA256SUMS; commit "scenery X.Y.Z" and push homebrew-tap.
 #              Refuses weekdays 9am-5pm ET unless --force-hours.
 #   stage      run scenery-backend/demo/host/stage-runner-artifacts.sh <tag>
 #   summary    always printed at the end (includes the spaceghost reminder)
@@ -22,7 +24,8 @@
 #   REL_RUNNER_DIR        runner repo (default: parent of this script's dir)
 #   REL_TAP_DIR           homebrew-tap checkout (default: ../homebrew-tap next to the runner repo)
 #   REL_BACKEND_DIR       scenery-backend checkout (default: ../scenery-backend)
-#   REL_GH, REL_SIGN, REL_STAGE   override gh / sign-release.sh / stage-runner-artifacts.sh
+#   REL_GH, REL_SIGN, REL_STAGE, REL_STAMP   override gh / sign-release.sh /
+#                         stage-runner-artifacts.sh / stamp-release-scripts.sh
 #   REL_REPO              GitHub repo (default scenery-dev/scenery)
 #   REL_NOW               override the clock as "<ISO weekday 1-7> <hour 00-23>" in ET (tests)
 #   REL_POLL_SLEEP, REL_POLL_TRIES   workflow polling (default 20s x 360)
@@ -53,6 +56,7 @@ BACKEND="${REL_BACKEND_DIR:-$RUNNER/../scenery-backend}"
 GH="${REL_GH:-gh}"
 SIGN="${REL_SIGN:-$HERE/sign-release.sh}"
 STAGE="${REL_STAGE:-$BACKEND/demo/host/stage-runner-artifacts.sh}"
+STAMP="${REL_STAMP:-$HERE/stamp-release-scripts.sh}"
 REPO="${REL_REPO:-scenery-dev/scenery}"
 FORMULA="$TAP/Formula/scenery.rb"
 POLL_SLEEP="${REL_POLL_SLEEP:-20}"
@@ -151,8 +155,11 @@ if should_run formula; then
   say "Verifying formula against the published SHA256SUMS"
   [ -f "$FORMULA" ] || die "formula not found at $FORMULA"
   tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
-  "$GH" release download "$TAG" -R "$REPO" --pattern SHA256SUMS --dir "$tmp" --clobber || die "cannot download SHA256SUMS"
+  "$GH" release download "$TAG" -R "$REPO" --pattern SHA256SUMS --pattern scan.sh --pattern install.sh \
+    --pattern scan-mdm.sh --dir "$tmp" --clobber || die "cannot download SHA256SUMS and the release scripts"
   [ -s "$tmp/SHA256SUMS" ] || die "SHA256SUMS missing or empty"
+  # The backend serves these stamped copies (deploy.sh SCENERY_RUNNER_TAG=$TAG).
+  "$STAMP" --check "$TAG" "$tmp" || die "release scripts are not stamped for $TAG"
   grep -q "^  version \"$VERSION\"\$" "$FORMULA" || die "formula version is not $VERSION"
   while read -r sum name; do
     [ -n "$sum" ] || continue
@@ -173,7 +180,7 @@ if should_run formula; then
     say "Formula already committed; nothing to commit"
   fi
   git -C "$TAP" push -q origin main || die "git push failed (homebrew-tap)"
-  note "formula: verified, committed and pushed homebrew-tap (scenery $VERSION)"
+  note "formula: scripts stamped; formula verified, committed and pushed homebrew-tap (scenery $VERSION)"
 else note "formula: skipped"; fi
 
 if should_run stage; then
@@ -188,4 +195,6 @@ printf '%s' "$SUMMARY"
 echo
 echo "Next: on spaceghost run"
 echo "  ssh spaceghost@pop-os.local 'eval \"\$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)\"; brew upgrade scenery && systemctl --user restart sh.brew.scenery.service'"
+echo "Then serve the stamped install.sh/scan.sh/scan-mdm.sh from this release (dev, then prod):"
+echo "  cd $BACKEND && SCENERY_RUNNER_TAG=$TAG ./deploy.sh dev && SCENERY_RUNNER_TAG=$TAG ./deploy.sh"
 echo "Also: backend must already be live on prod for $VERSION; consider the demo-sync agent if user-visible."

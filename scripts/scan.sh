@@ -10,9 +10,26 @@
 #
 #   SCENERY_SCAN_TOKEN     org scan token (non-interactive). Without it (and
 #                          without --token-file) the scan signs you in with --login.
-#   SCENERY_SCAN_VERSION   pin a release tag (default: the latest release).
+#   SCENERY_SCAN_VERSION   pin a release tag (default: the latest release, or
+#                          the stamped tag for a release copy).
+#
+# Verification. The copy published with a release (and served at
+# install.scenery.dev) is STAMPED: the block below holds its tag and the
+# SHA-256 of every tarball it may download, so it verifies the download with
+# shasum/sha256sum alone; when minisign or an authenticated gh is present it
+# also checks the release signature. The unstamped repo copy, or a stamped
+# copy asked for a different tag, requires minisign or gh and refuses
+# otherwise. Any mismatch refuses to run.
 
 set -eu
+
+# >>> scenery release stamp >>>
+# Filled in by scripts/stamp-release-scripts.sh at release time; empty here.
+STAMP_TAG=""
+STAMP_SHA256_aarch64_apple_darwin=""
+STAMP_SHA256_x86_64_apple_darwin=""
+STAMP_SHA256_x86_64_unknown_linux_gnu=""
+# <<< scenery release stamp <<<
 
 log()       { printf '%s\n' "$*" >&2; }
 log_error() { printf 'error: %s\n' "$*" >&2; }
@@ -71,6 +88,8 @@ main() {
         case "${TAG}" in
             *[!A-Za-z0-9._-]*) log_error "SCENERY_SCAN_VERSION contains unexpected characters."; exit 1 ;;
         esac
+    elif [ -n "${STAMP_TAG}" ]; then
+        TAG="${STAMP_TAG}"
     else
         _JSON="$(fetch_stdout "https://api.github.com/repos/scenery-dev/scenery/releases/latest")" || {
             log_error "Could not look up the latest release from the GitHub API."
@@ -94,64 +113,86 @@ main() {
     trap 'rm -rf "${WORK}"' EXIT
     trap 'exit 130' INT TERM HUP
 
+    # Release signing key (minisign key id 73F4BD707C872144); same as install.sh.
+    MINISIGN_PUBKEY="RWREIYd8cL30cy+6WHSsE+0oVDsfoPu/1BmCGX4rb0Fgs4+ZC3jjW/gp"
+    GH_REPO="scenery-dev/scenery"
+
+    # The pinned hash, when this is a stamped copy running its own tag.
+    _PIN=""
+    if [ -n "${STAMP_TAG}" ] && [ "${TAG}" = "${STAMP_TAG}" ]; then
+        case "${TRIPLE}" in
+            aarch64-apple-darwin)     _PIN="${STAMP_SHA256_aarch64_apple_darwin}" ;;
+            x86_64-apple-darwin)      _PIN="${STAMP_SHA256_x86_64_apple_darwin}" ;;
+            x86_64-unknown-linux-gnu) _PIN="${STAMP_SHA256_x86_64_unknown_linux_gnu}" ;;
+        esac
+        [ -n "${_PIN}" ] || { log_error "No pinned checksum for ${TRIPLE} in this scan.sh — refusing to run."; exit 1; }
+    fi
+
+    # Signature verifier: minisign, else gh. With a pin, gh is used only when
+    # it is signed in (an unauthenticated gh cannot verify attestations).
+    _VERIFIER=""
+    if command -v minisign >/dev/null 2>&1; then
+        _VERIFIER=minisign
+    elif command -v gh >/dev/null 2>&1; then
+        if [ -z "${_PIN}" ] || XDG_CACHE_HOME="${WORK}/cache" gh auth status >/dev/null 2>&1; then
+            _VERIFIER=gh
+        fi
+    fi
+    if [ -z "${_VERIFIER}" ] && [ -z "${_PIN}" ]; then
+        log_error "Cannot verify the release signature: neither minisign nor gh is available — refusing to run."
+        log_error "Install one (brew install minisign, or https://cli.github.com), or use the scan.sh"
+        log_error "published with the release: curl -fsSL https://install.scenery.dev/scan.sh | sh"
+        exit 1
+    fi
+
     log "Downloading scenery ${VERSION} for ${TRIPLE}..."
     download_url "${TARBALL_URL}" "${WORK}/${TARBALL}" || {
         log_error "Could not download ${TARBALL_URL}"
         exit 1
     }
-    download_url "${SUMS_URL}" "${WORK}/SHA256SUMS" || {
-        log_error "Could not download SHA256SUMS for ${TAG} — refusing to run."
-        exit 1
-    }
-
-    # Release signing key (minisign key id 73F4BD707C872144); same as install.sh.
-    MINISIGN_PUBKEY="RWREIYd8cL30cy+6WHSsE+0oVDsfoPu/1BmCGX4rb0Fgs4+ZC3jjW/gp"
-    GH_REPO="scenery-dev/scenery"
-
-    _SIG_OK=0
-    if command -v minisign >/dev/null 2>&1; then
-        download_url "${SUMS_URL}.minisig" "${WORK}/SHA256SUMS.minisig" || {
-            log_error "Could not download SHA256SUMS.minisig — refusing to run."
-            exit 1
-        }
-        if ! minisign -Vm "${WORK}/SHA256SUMS" -x "${WORK}/SHA256SUMS.minisig" -P "${MINISIGN_PUBKEY}" >/dev/null 2>&1; then
-            log_error "minisign signature verification FAILED for SHA256SUMS — refusing to run."
-            exit 1
-        fi
-        _SIG_OK=1
-    elif command -v gh >/dev/null 2>&1; then
-        if ! XDG_CACHE_HOME="${WORK}/cache" gh attestation verify "${WORK}/SHA256SUMS" --repo "${GH_REPO}" >/dev/null 2>&1; then
-            log_error "gh attestation verification FAILED for SHA256SUMS — refusing to run."
-            log_error "(gh must be authenticated: run 'gh auth login'.)"
-            exit 1
-        fi
-        _SIG_OK=1
-    fi
-
-    if [ "${_SIG_OK}" = "0" ]; then
-        if [ "${SCENERY_INSTALL_SKIP_SIG:-0}" = "1" ]; then
-            log "WARNING: skipping signature verification (SCENERY_INSTALL_SKIP_SIG=1)."
-        else
-            log_error "Cannot verify the release signature: neither minisign nor gh is available."
-            log_error "Install one (brew install minisign, or https://cli.github.com) and retry."
-            exit 1
-        fi
-    fi
-
-    _EXPECTED="$(awk -v f="${TARBALL}" '$2==f || $2=="*" f {print $1}' "${WORK}/SHA256SUMS" | head -1 | tr '[:upper:]' '[:lower:]')"
-    if [ -z "${_EXPECTED}" ]; then
-        log_error "${TARBALL} is not listed in SHA256SUMS — refusing to run."
-        exit 1
-    fi
     _ACTUAL="$(sha256_of "${WORK}/${TARBALL}" | tr '[:upper:]' '[:lower:]')" || {
         log_error "No SHA-256 tool (sha256sum, shasum, or openssl) found — cannot verify the download."
         exit 1
     }
-    if [ "${_ACTUAL}" != "${_EXPECTED}" ]; then
-        log_error "Checksum mismatch for ${TARBALL} — refusing to run."
-        log_error "  expected: ${_EXPECTED}"
+    if [ -n "${_PIN}" ] && [ "${_ACTUAL}" != "${_PIN}" ]; then
+        log_error "Checksum mismatch for ${TARBALL} against the hash pinned in scan.sh — refusing to run."
+        log_error "  expected: ${_PIN}"
         log_error "  actual:   ${_ACTUAL}"
         exit 1
+    fi
+
+    if [ -n "${_VERIFIER}" ]; then
+        download_url "${SUMS_URL}" "${WORK}/SHA256SUMS" || {
+            log_error "Could not download SHA256SUMS for ${TAG} — refusing to run."
+            exit 1
+        }
+        if [ "${_VERIFIER}" = minisign ]; then
+            download_url "${SUMS_URL}.minisig" "${WORK}/SHA256SUMS.minisig" || {
+                log_error "Could not download SHA256SUMS.minisig — refusing to run."
+                exit 1
+            }
+            if ! minisign -Vm "${WORK}/SHA256SUMS" -x "${WORK}/SHA256SUMS.minisig" -P "${MINISIGN_PUBKEY}" >/dev/null 2>&1; then
+                log_error "minisign signature verification FAILED for SHA256SUMS — refusing to run."
+                exit 1
+            fi
+        else
+            if ! XDG_CACHE_HOME="${WORK}/cache" gh attestation verify "${WORK}/SHA256SUMS" --repo "${GH_REPO}" >/dev/null 2>&1; then
+                log_error "gh attestation verification FAILED for SHA256SUMS — refusing to run."
+                log_error "(gh must be authenticated: run 'gh auth login'.)"
+                exit 1
+            fi
+        fi
+        _EXPECTED="$(awk -v f="${TARBALL}" '$2==f || $2=="*" f {print $1}' "${WORK}/SHA256SUMS" | head -1 | tr '[:upper:]' '[:lower:]')"
+        if [ -z "${_EXPECTED}" ]; then
+            log_error "${TARBALL} is not listed in SHA256SUMS — refusing to run."
+            exit 1
+        fi
+        if [ "${_ACTUAL}" != "${_EXPECTED}" ]; then
+            log_error "Checksum mismatch for ${TARBALL} — refusing to run."
+            log_error "  expected: ${_EXPECTED}"
+            log_error "  actual:   ${_ACTUAL}"
+            exit 1
+        fi
     fi
 
     mkdir "${WORK}/x"

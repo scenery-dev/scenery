@@ -250,13 +250,15 @@ jobs:
       attestations: write
     steps:
       # Checkout first: it cleans the workspace, so it must run before the
-      # artifacts are downloaded. Only the two scan scripts are needed.
+      # artifacts are downloaded. Only the shell scripts are needed.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
           sparse-checkout: |
             scripts/scan.sh
             scripts/scan-mdm.sh
+            scripts/install.sh
+            scripts/stamp-release-scripts.sh
           sparse-checkout-cone-mode: false
 
       - name: download all artifacts
@@ -265,18 +267,24 @@ jobs:
           path: artifacts/
           merge-multiple: true
 
-      # scan.sh and scan-mdm.sh are release assets listed in SHA256SUMS (which
-      # sign-release.sh minisign-signs): scan-mdm.sh fetches scan.sh by tag and
-      # verifies it, and MDM admins verify scan-mdm.sh the same way.
-      - name: add scan scripts
-        run: cp scripts/scan.sh scripts/scan-mdm.sh artifacts/
+      # scan.sh, install.sh and scan-mdm.sh are release assets listed in
+      # SHA256SUMS (which sign-release.sh minisign-signs). They are STAMPED
+      # with the tag and the hashes they verify against: scan.sh and
+      # install.sh pin every tarball, then scan-mdm.sh pins the stamped
+      # scan.sh, so they work on a machine with no minisign or gh. The backend
+      # serves these stamped copies (deploy.sh with SCENERY_RUNNER_TAG).
+      - name: stamp release scripts
+        run: sh scripts/stamp-release-scripts.sh "${GITHUB_REF_NAME}" scripts artifacts
 
       - name: SHA256SUMS
         working-directory: artifacts
         run: |
-          sha256sum -- *.tar.gz *.pkg scan.sh scan-mdm.sh > SHA256SUMS
+          sha256sum -- *.tar.gz *.pkg scan.sh install.sh scan-mdm.sh > SHA256SUMS
           cat SHA256SUMS
           find . -type f | sort
+
+      - name: check stamps
+        run: sh scripts/stamp-release-scripts.sh --check "${GITHUB_REF_NAME}" artifacts
 
       - name: attest build provenance
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
@@ -286,6 +294,7 @@ jobs:
             artifacts/*.pkg
             artifacts/scan.sh
             artifacts/scan-mdm.sh
+            artifacts/install.sh
             artifacts/SHA256SUMS
 
       # Draft only. Publishing happens in scripts/sign-release.sh after the
@@ -298,4 +307,4 @@ jobs:
           flags=""
           case "${GITHUB_REF_NAME}" in *-*) flags="--prerelease" ;; esac
           gh release create "${GITHUB_REF_NAME}" --draft --generate-notes --verify-tag ${flags} \
-            artifacts/*.tar.gz artifacts/*.pkg artifacts/scan.sh artifacts/scan-mdm.sh artifacts/SHA256SUMS
+            artifacts/*.tar.gz artifacts/*.pkg artifacts/scan.sh artifacts/scan-mdm.sh artifacts/install.sh artifacts/SHA256SUMS

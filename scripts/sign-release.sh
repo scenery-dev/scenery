@@ -2,9 +2,10 @@
 # sign-release.sh vX.Y.Z [--apply-formula]
 #
 # Run on the owner's Mac after release.yml has built a DRAFT release.
-#   1. downloads the draft's tarballs, scan.sh, scan-mdm.sh + SHA256SUMS
+#   1. downloads the draft's tarballs, scan.sh, install.sh, scan-mdm.sh + SHA256SUMS
 #   2. `gh attestation verify` each of them and SHA256SUMS (build provenance)
-#   3. checks them against SHA256SUMS (which must list nothing else)
+#   3. checks them against SHA256SUMS (which must list nothing else), and that
+#      the three scripts are stamped for this tag (stamp-release-scripts.sh --check)
 #   4. minisign-signs SHA256SUMS with the OFFLINE key
 #   5. uploads SHA256SUMS.minisig and publishes the draft
 #   6. prints the sha256 lines for homebrew-tap/Formula/scenery.rb
@@ -47,7 +48,7 @@ IS_DRAFT="$(gh release view "$TAG" --repo "$REPO" --json isDraft -q .isDraft)"
 
 echo "==> Downloading assets"
 gh release download "$TAG" --repo "$REPO" --dir "$WORK" --pattern '*.tar.gz' --pattern 'scenery-*-macos.pkg' \
-  --pattern scan.sh --pattern scan-mdm.sh --pattern SHA256SUMS
+  --pattern scan.sh --pattern scan-mdm.sh --pattern install.sh --pattern SHA256SUMS
 
 TARBALLS="$(cd "$WORK" && ls ./*.tar.gz | sed 's|^\./||')"
 [ -n "$TARBALLS" ] || { echo "error: no tarballs in draft" >&2; exit 1; }
@@ -62,9 +63,9 @@ if [ "$PKG_COUNT" != "0" ]; then
   PKG="scenery-${VERSION}-macos.pkg"
 fi
 
-# The scan scripts are release assets: scan-mdm.sh fetches scan.sh by tag and
-# checks it against this (signed) SHA256SUMS. Both are required.
-SCRIPTS="scan.sh scan-mdm.sh"
+# The shell scripts are release assets, stamped by release.yml with the hashes
+# they verify against (scan-mdm.sh pins scan.sh). All three are required.
+SCRIPTS="scan.sh scan-mdm.sh install.sh"
 for f in $SCRIPTS; do
   [ -f "$WORK/$f" ] || { echo "error: $f is not in the draft release" >&2; exit 1; }
 done
@@ -76,7 +77,7 @@ for f in $TARBALLS $PKG $SCRIPTS SHA256SUMS; do
   echo "    ok  $f"
 done
 
-echo "==> Checking tarballs${PKG:+, pkg} and scan scripts against SHA256SUMS"
+echo "==> Checking tarballs${PKG:+, pkg} and scripts against SHA256SUMS"
 for f in $TARBALLS $PKG $SCRIPTS; do
   want="$(awk -v f="$f" '$2==f || $2=="*"f {print $1}' "$WORK/SHA256SUMS")"
   [ -n "$want" ] || { echo "error: $f missing from SHA256SUMS" >&2; exit 1; }
@@ -84,6 +85,10 @@ for f in $TARBALLS $PKG $SCRIPTS; do
 done
 [ "$(wc -l < "$WORK/SHA256SUMS" | tr -d ' ')" = "$(echo "$TARBALLS $PKG $SCRIPTS" | wc -w | tr -d ' ')" ] \
   || { echo "error: SHA256SUMS has unexpected entries" >&2; exit 1; }
+
+echo "==> Checking the scripts are stamped for ${TAG}"
+sh "$HERE/stamp-release-scripts.sh" --check "$TAG" "$WORK" \
+  || { echo "error: release scripts are not stamped for ${TAG}; refusing to sign" >&2; exit 1; }
 
 echo "==> Signing SHA256SUMS with minisign (you will be prompted for the key password)"
 minisign -S -s "$SCENERY_MINISIGN_KEY" -t "scenery ${TAG}" -m "$WORK/SHA256SUMS" -x "$WORK/SHA256SUMS.minisig"

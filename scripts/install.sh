@@ -2,8 +2,24 @@
 # Scenery runner installer
 # Run with:  curl -fsSL https://install.scenery.dev | sh
 # Or read first: curl -fsSL https://install.scenery.dev | less
+#
+# Verification. The copy published with a release (and served at
+# install.scenery.dev) is STAMPED: the block below holds its tag and the
+# SHA-256 of every tarball it may download, so it verifies the download with
+# shasum/sha256sum alone; when minisign or an authenticated gh is present it
+# also checks the release signature. The unstamped repo copy, or a stamped
+# copy asked for a different SCENERY_VERSION, requires minisign or gh and
+# refuses otherwise. Any mismatch refuses to install.
 
 set -eu
+
+# >>> scenery release stamp >>>
+# Filled in by scripts/stamp-release-scripts.sh at release time; empty here.
+STAMP_TAG=""
+STAMP_SHA256_aarch64_apple_darwin=""
+STAMP_SHA256_x86_64_apple_darwin=""
+STAMP_SHA256_x86_64_unknown_linux_gnu=""
+# <<< scenery release stamp <<<
 
 # ---------------------------------------------------------------------------
 # Flags
@@ -62,11 +78,17 @@ esac
 # Downloader
 # ---------------------------------------------------------------------------
 
+# SCENERY_INSTALL_BASE_URL is test-only: it replaces the GitHub release origin
+# and allows plain http so a local server can stand in. Verification is the
+# same either way (pinned hash or signature).
+BASE_URL="${SCENERY_INSTALL_BASE_URL:-https://github.com/scenery-dev/scenery/releases/download}"
+if [ -n "${SCENERY_INSTALL_BASE_URL:-}" ]; then _PROTO='=http,https'; else _PROTO='=https'; fi
+
 if command -v curl >/dev/null 2>&1; then
     # --proto '=https' --tlsv1.2: refuse any non-HTTPS URL (including on
     # redirects) and floor the TLS version, so a hijacked redirect can't
     # downgrade the transport.
-    download_url() { curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 2 -o "$2" "$1"; }
+    download_url() { curl --proto "${_PROTO}" --tlsv1.2 -fsSL --retry 3 --retry-delay 2 -o "$2" "$1"; }
     fetch_stdout() { curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 2 "$1"; }
 elif command -v wget >/dev/null 2>&1; then
     download_url() { wget --https-only -q --tries=3 --waitretry=2 -O "$2" "$1"; }
@@ -103,6 +125,9 @@ GITHUB_API="https://api.github.com/repos/scenery-dev/scenery/releases/latest"
 if [ -n "${SCENERY_VERSION:-}" ]; then
     TAG="${SCENERY_VERSION}"
     VERSION="${TAG#v}"
+elif [ -n "${STAMP_TAG}" ]; then
+    TAG="${STAMP_TAG}"
+    VERSION="${TAG#v}"
 else
     log "Fetching latest release..."
     _JSON="$(fetch_stdout "${GITHUB_API}")"
@@ -120,7 +145,7 @@ fi
 log_verbose "Version: ${TAG} (${VERSION})"
 
 TARBALL="scenery-${VERSION}-${TRIPLE}.tar.gz"
-TARBALL_URL="https://github.com/scenery-dev/scenery/releases/download/${TAG}/${TARBALL}"
+TARBALL_URL="${BASE_URL}/${TAG}/${TARBALL}"
 
 # ---------------------------------------------------------------------------
 # Install location
@@ -162,81 +187,55 @@ fi
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "${TMPDIR}"' EXIT INT TERM
 
-log "Downloading scenery ${VERSION} for ${TRIPLE}..."
-download_url "${TARBALL_URL}" "${TMPDIR}/${TARBALL}"
-
 # ---------------------------------------------------------------------------
 # Verify authenticity + integrity BEFORE extracting or running anything.
 #
-# Order:
-#   1. minisign present  -> verify SHA256SUMS.minisig against the embedded key
-#   2. else gh present   -> `gh attestation verify` (GitHub build provenance)
-#   3. else              -> fail, unless SCENERY_INSTALL_SKIP_SIG=1
-# Then the tarball is checked against the (verified) SHA256SUMS. A signature
-# failure never falls through to a weaker method.
+#   stamped copy, own tag -> tarball must match the hash pinned above; then,
+#                            if minisign or a signed-in gh is present, also
+#                            the signature check below
+#   otherwise             -> signature check required:
+#     1. minisign present -> verify SHA256SUMS.minisig against the embedded key
+#     2. else gh present  -> `gh attestation verify` (GitHub build provenance)
+#     3. else             -> refuse
+# The tarball is then checked against the (verified) SHA256SUMS. A failure
+# never falls through to a weaker method.
 # ---------------------------------------------------------------------------
 
-# Release signing key (minisign public key, the second line of the .pub file).
-# Scenery release signing key (minisign key id 73F4BD707C872144), generated 2026-11-08.
-# (see context/2026-11-08-runner-signing-design.md). While this is the
-# placeholder, minisign verification is treated as unavailable.
+# Scenery release signing key (minisign key id 73F4BD707C872144), generated
+# 2026-11-08 (see context/2026-11-08-runner-signing-design.md).
 MINISIGN_PUBKEY="RWREIYd8cL30cy+6WHSsE+0oVDsfoPu/1BmCGX4rb0Fgs4+ZC3jjW/gp"
 GH_REPO="scenery-dev/scenery"
+SUMS_URL="${BASE_URL}/${TAG}/SHA256SUMS"
 
-SUMS_URL="https://github.com/scenery-dev/scenery/releases/download/${TAG}/SHA256SUMS"
-download_url "${SUMS_URL}" "${TMPDIR}/SHA256SUMS" || {
-    log_error "Could not download SHA256SUMS for ${TAG} — refusing to install."
-    exit 1
-}
+_PIN=""
+if [ -n "${STAMP_TAG}" ] && [ "${TAG}" = "${STAMP_TAG}" ]; then
+    case "${TRIPLE}" in
+        aarch64-apple-darwin)     _PIN="${STAMP_SHA256_aarch64_apple_darwin}" ;;
+        x86_64-apple-darwin)      _PIN="${STAMP_SHA256_x86_64_apple_darwin}" ;;
+        x86_64-unknown-linux-gnu) _PIN="${STAMP_SHA256_x86_64_unknown_linux_gnu}" ;;
+    esac
+    [ -n "${_PIN}" ] || { log_error "No pinned checksum for ${TRIPLE} in this installer — refusing to install."; exit 1; }
+fi
 
-case "${MINISIGN_PUBKEY}" in
-    *PLACEHOLDER*) _KEY_SET=0 ;;
-    *)             _KEY_SET=1 ;;
-esac
-
-_SIG_OK=0
-if [ "${_KEY_SET}" = "1" ] && command -v minisign >/dev/null 2>&1; then
-    log_verbose "Verifying SHA256SUMS signature with minisign..."
-    download_url "${SUMS_URL}.minisig" "${TMPDIR}/SHA256SUMS.minisig" || {
-        log_error "Could not download SHA256SUMS.minisig — refusing to install."
-        exit 1
-    }
-    if ! minisign -Vm "${TMPDIR}/SHA256SUMS" -x "${TMPDIR}/SHA256SUMS.minisig" -P "${MINISIGN_PUBKEY}" >/dev/null 2>&1; then
-        log_error "minisign signature verification FAILED for SHA256SUMS — refusing to install."
-        exit 1
-    fi
-    _SIG_OK=1
-    log_verbose "minisign signature verified."
+_VERIFIER=""
+if command -v minisign >/dev/null 2>&1; then
+    _VERIFIER=minisign
 elif command -v gh >/dev/null 2>&1; then
-    log_verbose "Verifying SHA256SUMS build provenance with gh attestation..."
-    if ! gh attestation verify "${TMPDIR}/SHA256SUMS" --repo "${GH_REPO}" >/dev/null 2>&1; then
-        log_error "gh attestation verification FAILED for SHA256SUMS — refusing to install."
-        log_error "(gh must be authenticated: run 'gh auth login'.)"
-        exit 1
-    fi
-    _SIG_OK=1
-    log_verbose "Build provenance verified."
-fi
-
-if [ "${_SIG_OK}" = "0" ]; then
-    if [ "${SCENERY_INSTALL_SKIP_SIG:-0}" = "1" ]; then
-        log "WARNING: skipping signature verification (SCENERY_INSTALL_SKIP_SIG=1)."
-        log "WARNING: only the SHA-256 from the same origin is checked; this does not prove authenticity."
-    else
-        log_error "Cannot verify the release signature: neither minisign nor gh is available."
-        log_error "Install one (brew install minisign, or https://cli.github.com), or use Homebrew:"
-        log_error "  brew tap scenery-dev/tap && brew install scenery-dev/tap/scenery"
-        log_error "To install without signature verification (not recommended): SCENERY_INSTALL_SKIP_SIG=1"
-        exit 1
+    # With a pin, gh is used only when signed in (it cannot verify otherwise).
+    if [ -z "${_PIN}" ] || gh auth status >/dev/null 2>&1; then
+        _VERIFIER=gh
     fi
 fi
-
-log_verbose "Verifying checksum..."
-_EXPECTED="$(awk -v f="${TARBALL}" '$2==f || $2=="*" f {print $1}' "${TMPDIR}/SHA256SUMS" | head -1 | tr '[:upper:]' '[:lower:]')"
-if [ -z "${_EXPECTED}" ]; then
-    log_error "${TARBALL} is not listed in SHA256SUMS — refusing to install."
+if [ -z "${_VERIFIER}" ] && [ -z "${_PIN}" ]; then
+    log_error "Cannot verify the release signature: neither minisign nor gh is available."
+    log_error "Install one (brew install minisign, or https://cli.github.com), use the installer"
+    log_error "published with the release (curl -fsSL https://install.scenery.dev | sh), or Homebrew:"
+    log_error "  brew tap scenery-dev/tap && brew install scenery-dev/tap/scenery"
     exit 1
 fi
+
+log "Downloading scenery ${VERSION} for ${TRIPLE}..."
+download_url "${TARBALL_URL}" "${TMPDIR}/${TARBALL}"
 
 _ACTUAL="$(sha256_of "${TMPDIR}/${TARBALL}" | tr '[:upper:]' '[:lower:]')" || {
     log_error "No SHA-256 tool (sha256sum, shasum, or openssl) found — cannot verify the download."
@@ -244,14 +243,56 @@ _ACTUAL="$(sha256_of "${TMPDIR}/${TARBALL}" | tr '[:upper:]' '[:lower:]')" || {
     exit 1
 }
 
-if [ "${_ACTUAL}" != "${_EXPECTED}" ]; then
-    log_error "Checksum mismatch for ${TARBALL} — refusing to install."
-    log_error "  expected: ${_EXPECTED}"
-    log_error "  actual:   ${_ACTUAL}"
-    log_error "This means a corrupted download or a tampered artifact. Aborting."
-    exit 1
+if [ -n "${_PIN}" ]; then
+    if [ "${_ACTUAL}" != "${_PIN}" ]; then
+        log_error "Checksum mismatch for ${TARBALL} against the hash pinned in this installer — refusing to install."
+        log_error "  expected: ${_PIN}"
+        log_error "  actual:   ${_ACTUAL}"
+        exit 1
+    fi
+    log_verbose "Checksum matches the pinned hash: ${_ACTUAL}"
 fi
-log_verbose "Checksum verified: ${_ACTUAL}"
+
+if [ -n "${_VERIFIER}" ]; then
+    download_url "${SUMS_URL}" "${TMPDIR}/SHA256SUMS" || {
+        log_error "Could not download SHA256SUMS for ${TAG} — refusing to install."
+        exit 1
+    }
+    if [ "${_VERIFIER}" = minisign ]; then
+        log_verbose "Verifying SHA256SUMS signature with minisign..."
+        download_url "${SUMS_URL}.minisig" "${TMPDIR}/SHA256SUMS.minisig" || {
+            log_error "Could not download SHA256SUMS.minisig — refusing to install."
+            exit 1
+        }
+        if ! minisign -Vm "${TMPDIR}/SHA256SUMS" -x "${TMPDIR}/SHA256SUMS.minisig" -P "${MINISIGN_PUBKEY}" >/dev/null 2>&1; then
+            log_error "minisign signature verification FAILED for SHA256SUMS — refusing to install."
+            exit 1
+        fi
+        log_verbose "minisign signature verified."
+    else
+        log_verbose "Verifying SHA256SUMS build provenance with gh attestation..."
+        if ! gh attestation verify "${TMPDIR}/SHA256SUMS" --repo "${GH_REPO}" >/dev/null 2>&1; then
+            log_error "gh attestation verification FAILED for SHA256SUMS — refusing to install."
+            log_error "(gh must be authenticated: run 'gh auth login'.)"
+            exit 1
+        fi
+        log_verbose "Build provenance verified."
+    fi
+
+    _EXPECTED="$(awk -v f="${TARBALL}" '$2==f || $2=="*" f {print $1}' "${TMPDIR}/SHA256SUMS" | head -1 | tr '[:upper:]' '[:lower:]')"
+    if [ -z "${_EXPECTED}" ]; then
+        log_error "${TARBALL} is not listed in SHA256SUMS — refusing to install."
+        exit 1
+    fi
+    if [ "${_ACTUAL}" != "${_EXPECTED}" ]; then
+        log_error "Checksum mismatch for ${TARBALL} — refusing to install."
+        log_error "  expected: ${_EXPECTED}"
+        log_error "  actual:   ${_ACTUAL}"
+        log_error "This means a corrupted download or a tampered artifact. Aborting."
+        exit 1
+    fi
+    log_verbose "Checksum verified against SHA256SUMS: ${_ACTUAL}"
+fi
 
 log_verbose "Extracting..."
 tar -xzf "${TMPDIR}/${TARBALL}" -C "${TMPDIR}"

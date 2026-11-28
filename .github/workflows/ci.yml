@@ -28,6 +28,10 @@ on:
       - 'scripts/test_scan_sh.sh'
       - 'scripts/scan-mdm.sh'
       - 'scripts/test_scan_mdm.sh'
+      - 'scripts/install.sh'
+      - 'scripts/test_install_sh.sh'
+      - 'scripts/stamp-release-scripts.sh'
+      - 'scripts/test_stamp.sh'
   pull_request:
     paths:
       - 'crates/**'
@@ -40,6 +44,10 @@ on:
       - 'scripts/test_scan_sh.sh'
       - 'scripts/scan-mdm.sh'
       - 'scripts/test_scan_mdm.sh'
+      - 'scripts/install.sh'
+      - 'scripts/test_install_sh.sh'
+      - 'scripts/stamp-release-scripts.sh'
+      - 'scripts/test_stamp.sh'
 
 permissions:
   contents: read
@@ -84,6 +92,12 @@ jobs:
 
       - name: scan-mdm.sh tests
         run: sh scripts/test_scan_mdm.sh
+
+      - name: release stamp tests
+        run: sh scripts/test_stamp.sh
+
+      - name: install.sh tests
+        run: sh scripts/test_install_sh.sh
 
   audit:
     name: cargo audit
